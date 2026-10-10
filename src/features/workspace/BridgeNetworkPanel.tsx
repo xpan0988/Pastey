@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { bridgeReachability, peerAddressProblem } from "../../lib/bridgeAddress";
-import { getBridgePeerAddress, setBridgePeerAddress } from "../../lib/tauri";
+import { getBridgePeerAddress, presentDeviceIdentity, setBridgePeerAddress } from "../../lib/tauri";
+import { roomPeers } from "./workspaceViewModel";
 import type { RoomInfo } from "../../lib/types";
 
 const REACHABILITY_COPY = {
@@ -20,6 +21,18 @@ export function BridgeNetworkPanel({ room }: { room: RoomInfo }) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const reachability = bridgeReachability(room);
+  const peerHostRef = roomPeers(room).find((peer) => peer.hostRef)?.hostRef ?? null;
+
+  async function showDevice() {
+    if (!peerHostRef) return;
+    setBusy(true); setMessage(null);
+    try {
+      await presentDeviceIdentity(room.id, peerHostRef);
+      setMessage("Shown. On the other device, check Settings → Unattended Codex access.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not reach the other device.");
+    } finally { setBusy(false); }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -58,7 +71,10 @@ export function BridgeNetworkPanel({ room }: { room: RoomInfo }) {
         {saved ? <button type="button" className="v2-button" disabled={busy} onClick={() => void save(null)}>Remove</button> : null}
         <button type="button" className="v2-button primary" disabled={busy || !draft.trim() || draft.trim() === saved} onClick={() => void save(draft)}>Save address</button>
       </footer>
-      {message ? <small className={message.startsWith("Saved") || message.startsWith("Removed") ? "" : "v2-error"}>{message}</small> : null}
+      <strong>Show this device</strong>
+      <small>Proves this device's identity to the other device for this session, so its user can compare fingerprints and choose to trust it. It grants nothing by itself.</small>
+      <footer><button type="button" className="v2-button" disabled={busy || !peerHostRef} onClick={() => void showDevice()}>Show this device</button></footer>
+      {message ? <small className={message.startsWith("Saved") || message.startsWith("Removed") || message.startsWith("Shown") ? "" : "v2-error"}>{message}</small> : null}
     </div> : null}
   </section>;
 }

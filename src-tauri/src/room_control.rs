@@ -81,6 +81,7 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "native_agent.reconcile",
     "native_agent.reconciliation",
     "native_agent.retry_result_return",
+    "native_agent.device_identity",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
@@ -1603,10 +1604,15 @@ pub async fn receive_room_control_event_handler(
                 }
                 // Ownership, replay, availability, then admission: a new
                 // remote invocation is held for Host Review, unstarted.
+                // A device identity proven in exactly this session lets a
+                // Host-local unattended grant apply; nothing else does.
+                let verified_device =
+                    crate::host_runtime::verified_peer_device_for(&ctx.state, &binding);
                 let _admitted = match ctx.state.native_agents.lock().receive_bridge_invocation(
                     &binding,
                     &request,
                     storage::now_ts(),
+                    verified_device.as_ref(),
                 ) {
                     Ok(status) => status,
                     Err(_) => {
@@ -1847,6 +1853,40 @@ pub async fn receive_room_control_event_handler(
                     )
                     .await;
                 });
+            }
+            "native_agent.device_identity" => {
+                // Verified against this Host's own current binding of the
+                // exact session it arrived on; it admits and authorizes
+                // nothing by itself.
+                let Ok(attestation) = serde_json::from_value::<
+                    crate::device_identity::DeviceSessionAttestationV1,
+                >(payload) else {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_native_agent",
+                        "Invalid device identity proof.",
+                    );
+                };
+                let verified = crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                )
+                .and_then(|binding| {
+                    crate::device_identity::verify_attestation(&attestation, &binding)
+                });
+                match verified {
+                    Ok(device) => {
+                        crate::host_runtime::record_verified_peer_device(&ctx.state, device)
+                    }
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::FORBIDDEN,
+                            "identity_unverified",
+                            "Device identity proof does not match this session.",
+                        )
+                    }
+                }
             }
             "native_agent.retry_result_return" => {
                 let request = match serde_json::from_value::<
@@ -2827,6 +2867,20 @@ fn validate_control_event(
                     request_id: None,
                     event,
                 });
+            }
+            "native_agent.device_identity" => {
+                let attestation = serde_json::from_value::<
+                    crate::device_identity::DeviceSessionAttestationV1,
+                >(Value::Object(payload.clone()))
+                .map_err(AppError::from)?;
+                if attestation.schema_version != crate::device_identity::DEVICE_ATTESTATION_SCHEMA
+                    || attestation.nonce.len() > 64
+                {
+                    return Err(AppError::InvalidInput(
+                        "Invalid device identity proof.".into(),
+                    ));
+                }
+                format!("native-agent-device-identity:{}", attestation.nonce)
             }
             "native_agent.retry_result_return" => {
                 let request = serde_json::from_value::<
@@ -4002,6 +4056,9 @@ mod tests {
                 "native_agent.reconcile",
                 "native_agent.reconciliation",
                 "native_agent.retry_result_return",
+                // Core's session-bound requester identity, shared by every
+                // capability; not capability-specific.
+                "native_agent.device_identity",
             ]
         );
     }

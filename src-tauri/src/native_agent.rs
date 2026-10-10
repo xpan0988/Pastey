@@ -3491,6 +3491,7 @@ impl NativeAgentServiceV1 {
         binding: &HostSessionBinding,
         request: &NativeInvocationRequestV1,
         now: i64,
+        verified_device: Option<&crate::device_identity::VerifiedPeerDevice>,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         if !valid_task_id(&request.task_id) {
             return invalid("Native Agent task identity is invalid.");
@@ -3503,6 +3504,13 @@ impl NativeAgentServiceV1 {
                 &request.input,
             )? {
                 return Ok(existing);
+            }
+            if let Some(device) = verified_device {
+                if let Some(started) =
+                    service.start_under_unattended_grant(binding, device, request, now)?
+                {
+                    return Ok(started);
+                }
             }
             service.admit_invocation(
                 NativeInvocationPrincipalV1::Remote(binding),
@@ -3577,6 +3585,92 @@ impl NativeAgentServiceV1 {
             ) => self.hold_for_review(binding, capability_id, task_id, input, continuation, now),
             _ => invalid("Native capability invocation was not admitted by this Host."),
         }
+    }
+
+    /// Starts a remote invocation without Review only under an active grant
+    /// this Host's user created for exactly this verified device key, Bridge,
+    /// peer, Host, capability and canonical workspace, spending one use
+    /// atomically right before the start. `None` when no grant applies: the
+    /// invocation then waits for Review as before. A grant authorizes
+    /// invoking the capability only; the capability's own approvals are
+    /// never answered.
+    fn start_under_unattended_grant(
+        &mut self,
+        binding: &HostSessionBinding,
+        device: &crate::device_identity::VerifiedPeerDevice,
+        request: &NativeInvocationRequestV1,
+        now: i64,
+    ) -> AppResult<Option<NativeAgentTaskStatusV1>> {
+        let Some(paths) = self.durable_paths.clone() else {
+            return Ok(None);
+        };
+        // The identity proof must belong to exactly this session.
+        if device.binding.validate_current(binding, now).is_err()
+            || self.revoked_bridges.contains(&binding.bridge_id)
+        {
+            return Ok(None);
+        }
+        let public_key = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            device.public_key,
+        );
+        let grants = crate::storage::candidate_unattended_grants(
+            &paths,
+            &device.fingerprint,
+            &public_key,
+            &binding.bridge_id,
+            binding.peer_host_ref.as_str(),
+            binding.local_host_ref.as_str(),
+            &request.agent_capability,
+            now,
+        )?;
+        if grants.is_empty() {
+            return Ok(None);
+        }
+        let adapter = self.adapter(&request.agent_capability)?;
+        adapter.require_available()?;
+        let prepared = adapter.prepare(&request.input)?;
+        let Some(workspace) = prepared.host_workspace.clone() else {
+            return Ok(None);
+        };
+        // The grant's folder must still resolve to exactly what was granted.
+        let Some(grant) = grants.iter().find(|grant| {
+            let granted = PathBuf::from(&grant.workspace);
+            granted == workspace && granted.canonicalize().ok().as_ref() == Some(&granted)
+        }) else {
+            return Ok(None);
+        };
+        // A busy workspace refuses before a use is spent.
+        if self.invocation_has_authoritative_owner(
+            prepared.exclusivity.as_ref(),
+            Some(&workspace),
+            None,
+            None,
+        )? {
+            return invalid(
+                "Native capability already has an unresolved invocation for this resource.",
+            );
+        }
+        if !crate::storage::consume_unattended_grant(
+            &paths,
+            &grant.grant_id,
+            &request.task_id,
+            now,
+        )? {
+            return Ok(None);
+        }
+        self.start_invocation_in_scope(
+            &request.agent_capability,
+            &request.task_id,
+            &request.input,
+            None,
+            Some(NativeConversationOwnerV1::Peer {
+                bridge_id: binding.bridge_id.clone(),
+                peer_host_ref: binding.peer_host_ref.as_str().to_owned(),
+            }),
+            Some(&workspace),
+        )
+        .map(Some)
     }
 
     /// Holds a remote invocation for Review as a Queued task; no adapter is
@@ -3926,12 +4020,38 @@ impl NativeAgentServiceV1 {
         movement_id: Option<&str>,
         conversation_owner: Option<NativeConversationOwnerV1>,
     ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_invocation_in_scope(
+            capability_id,
+            task_id,
+            input,
+            movement_id,
+            conversation_owner,
+            None,
+        )
+    }
+
+    /// `required_workspace` pins the exact canonical workspace an admission
+    /// authorized (an unattended grant): the invocation starts only there,
+    /// as resolved both before and by the adapter's start.
+    fn start_invocation_in_scope(
+        &mut self,
+        capability_id: &str,
+        task_id: &str,
+        input: &OpaqueCapabilityPayloadV1,
+        movement_id: Option<&str>,
+        conversation_owner: Option<NativeConversationOwnerV1>,
+        required_workspace: Option<&Path>,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         if !valid_task_id(task_id) {
             return invalid("Native Agent task identity is invalid.");
         }
         input.validate()?;
         let adapter = self.adapter(capability_id)?;
         let prepared = adapter.prepare(input)?;
+        if required_workspace.is_some() && prepared.host_workspace.as_deref() != required_workspace
+        {
+            return invalid("Native Agent workspace is outside its authorized scope.");
+        }
         if let Some(existing) = self
             .tasks
             .lock()
@@ -3992,6 +4112,11 @@ impl NativeAgentServiceV1 {
             None => None,
         };
         let started = adapter.start(task_id, input, native_conversation)?;
+        if required_workspace.is_some() && started.host_workspace.as_deref() != required_workspace {
+            // Nothing has run: the adapter only recorded the task.
+            adapter.release(task_id);
+            return invalid("Native Agent workspace changed outside its authorized scope.");
+        }
         let task_id = task_id.to_owned();
         self.task_input_digests
             .insert(task_id.clone(), input.digest());
@@ -8171,6 +8296,577 @@ done
             recorded.conversation,
             Some(NativeConversationContinuityV1::Continued)
         );
+    }
+
+    /// One Windows Host (this service) and one requesting Mac, with the Mac's
+    /// real identity proven in one exact session and a REPZ-like workspace
+    /// outside the OS temp folder (which on Windows is application data).
+    struct UnattendedFixture {
+        root: PathBuf,
+        agent: PathBuf,
+        paths: crate::storage::AppPaths,
+        workspace: PathBuf,
+        mac: crate::device_identity::DeviceIdentity,
+        windows_host: crate::host_identity::HostRef,
+        service: NativeAgentServiceV1,
+    }
+
+    const GRANT_BRIDGE: &str = "room-unattended";
+
+    impl Drop for UnattendedFixture {
+        fn drop(&mut self) {
+            self.service.shutdown();
+            let _ = fs::remove_dir_all(&self.root);
+            let _ = fs::remove_dir_all(self.workspace.parent().unwrap());
+        }
+    }
+
+    fn unattended_fixture() -> UnattendedFixture {
+        let (root, _, agent) = conversation_codex();
+        let paths = durable_paths(&root);
+        crate::storage::create_room(
+            &paths,
+            &[5u8; 32],
+            "12345678",
+            15,
+            crate::models::LocalRole::Creator,
+            Some(GRANT_BRIDGE.into()),
+            None,
+        )
+        .unwrap();
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("pastey-test-grants")
+            .join(Uuid::new_v4().to_string())
+            .join("REPZ");
+        fs::create_dir_all(&workspace).unwrap();
+        let mac_paths = durable_paths(&root.join("mac"));
+        let mac = crate::device_identity::load_or_create(&mac_paths, &[6u8; 32]).unwrap();
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        service.codex.use_executable(&agent);
+        UnattendedFixture {
+            root,
+            agent,
+            paths,
+            workspace: workspace.canonicalize().unwrap(),
+            mac,
+            windows_host: crate::host_identity::HostRef::from_device_id("windows").unwrap(),
+            service,
+        }
+    }
+
+    impl UnattendedFixture {
+        /// Both sides' bindings of one session.
+        fn session(
+            &self,
+            bridge: &str,
+            mac_device: &str,
+            session: &str,
+        ) -> (HostSessionBinding, HostSessionBinding) {
+            let mac_host = crate::host_identity::HostRef::from_device_id(mac_device).unwrap();
+            let windows = HostSessionBinding::new(
+                bridge,
+                self.windows_host.clone(),
+                mac_host.clone(),
+                &format!("win-{session}"),
+                &format!("mac-{session}"),
+                &format!("route-{session}"),
+                crate::storage::now_ts() + 3_600,
+            )
+            .unwrap();
+            let mac = HostSessionBinding::new(
+                bridge,
+                mac_host,
+                self.windows_host.clone(),
+                &format!("mac-{session}"),
+                &format!("win-{session}"),
+                &format!("route-back-{session}"),
+                crate::storage::now_ts() + 3_600,
+            )
+            .unwrap();
+            (windows, mac)
+        }
+
+        /// The Mac proves its identity in the session; Windows verifies it.
+        fn proven(
+            &self,
+            bridge: &str,
+            mac_device: &str,
+            session: &str,
+        ) -> (
+            HostSessionBinding,
+            crate::device_identity::VerifiedPeerDevice,
+        ) {
+            let (windows, mac) = self.session(bridge, mac_device, session);
+            let proof = self.mac.attest(&mac, &Uuid::new_v4().to_string()).unwrap();
+            let verified = crate::device_identity::verify_attestation(&proof, &windows).unwrap();
+            (windows, verified)
+        }
+
+        fn trust_and_grant(
+            &self,
+            device: &crate::device_identity::VerifiedPeerDevice,
+            hours: i64,
+            runs: i64,
+        ) -> String {
+            crate::unattended_access::trust_seen_device(
+                &self.paths,
+                &[device.clone()],
+                &device.fingerprint,
+                "School Mac",
+            )
+            .unwrap();
+            crate::unattended_access::create_grant(
+                &self.paths,
+                &self.windows_host,
+                &[device.clone()],
+                &crate::unattended_access::CreateUnattendedGrantV1 {
+                    device_fingerprint: device.fingerprint.clone(),
+                    room_id: device.binding.bridge_id.clone(),
+                    workspace_path: self.workspace.to_string_lossy().into_owned(),
+                    duration_hours: hours,
+                    max_runs: runs,
+                },
+                crate::storage::now_ts(),
+            )
+            .unwrap()
+            .grant_id
+        }
+
+        fn invoke(
+            &mut self,
+            binding: &HostSessionBinding,
+            device: Option<&crate::device_identity::VerifiedPeerDevice>,
+            task_id: &str,
+            workspace: &Path,
+            task: &str,
+        ) -> AppResult<NativeAgentTaskStatusV1> {
+            let request = NativeInvocationRequestV1 {
+                task_id: task_id.into(),
+                target_host_ref: self.windows_host.as_str().into(),
+                agent_capability: CODEX_CAPABILITY_ID.into(),
+                input: capability::codex::codex_input(workspace, task, true).unwrap(),
+            };
+            self.service.receive_bridge_invocation(
+                binding,
+                &request,
+                crate::storage::now_ts(),
+                device,
+            )
+        }
+
+        fn runs(&self, grant_id: &str) -> i64 {
+            crate::storage::list_unattended_grants(&self.paths)
+                .unwrap()
+                .into_iter()
+                .find(|grant| grant.grant_id == grant_id)
+                .unwrap()
+                .uses
+        }
+
+        fn launches(&self) -> usize {
+            invocation_count(&self.root, "app-server --stdio")
+        }
+
+        fn finish(&self, task_id: &str) -> NativeAgentTaskStatusV1 {
+            let terminal = wait_for_terminal(&self.service, task_id);
+            wait_for_workspace_release(&self.service, &self.workspace);
+            terminal
+        }
+    }
+
+    fn assert_waits_for_review(status: &NativeAgentTaskStatusV1) {
+        assert_eq!(status.state, NativeAgentTaskStateV1::Queued, "{status:?}");
+        assert_eq!(
+            status.code.as_deref(),
+            Some(admission::REVIEW_REQUIRED_CODE)
+        );
+    }
+
+    #[test]
+    fn an_unattended_grant_runs_only_its_trusted_scope_and_continues_its_conversation() {
+        let mut h = unattended_fixture();
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        let grant = h.trust_and_grant(&device, 24, 2);
+        let workspace = h.workspace.clone();
+        // No Review on Windows: it runs at once and returns Codex's answer.
+        let first = h
+            .invoke(&binding, Some(&device), "task-u1", &workspace, "render")
+            .unwrap();
+        assert_eq!(first.state, NativeAgentTaskStateV1::Running);
+        let first = h.finish("task-u1");
+        assert_eq!(first.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(text_output(&first).unwrap().0, "render on thread-1");
+        assert_eq!(h.runs(&grant), 1);
+        // A follow-up continues the same Pastey-managed conversation.
+        let second = h
+            .invoke(&binding, Some(&device), "task-u2", &workspace, "again")
+            .unwrap();
+        assert_eq!(second.state, NativeAgentTaskStateV1::Running);
+        let second = h.finish("task-u2");
+        assert_eq!(
+            second.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+        assert_eq!(text_output(&second).unwrap().0, "again on thread-1");
+        // The use limit holds; then the ordinary Review applies again, and
+        // its Accept still works.
+        let third = h
+            .invoke(&binding, Some(&device), "task-u3", &workspace, "more")
+            .unwrap();
+        assert_waits_for_review(&third);
+        assert_eq!(h.runs(&grant), 2);
+        let accepted = h
+            .service
+            .accept_invocation_review("task-u3", Some(&binding), crate::storage::now_ts())
+            .unwrap();
+        assert_eq!(accepted.state, NativeAgentTaskStateV1::Running);
+        h.finish("task-u3");
+        // A grant never shares folders for Find file.
+        assert!(
+            crate::file_candidates::list_authorized_search_folders(&h.paths)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn wrong_device_session_bridge_peer_host_or_workspace_waits_for_review() {
+        let mut h = unattended_fixture();
+        crate::storage::create_room(
+            &h.paths,
+            &[5u8; 32],
+            "87654321",
+            15,
+            crate::models::LocalRole::Creator,
+            Some("room-other".into()),
+            None,
+        )
+        .unwrap();
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        let grant = h.trust_and_grant(&device, 24, 10);
+        let workspace = h.workspace.clone();
+        let sibling = workspace.parent().unwrap().join("Other");
+        fs::create_dir_all(&sibling).unwrap();
+        let mut case = 0;
+        let mut expect_review = |h: &mut UnattendedFixture,
+                                 binding: &HostSessionBinding,
+                                 device: Option<&crate::device_identity::VerifiedPeerDevice>,
+                                 workspace: &Path| {
+            case += 1;
+            let status = h
+                .invoke(binding, device, &format!("task-n{case}"), workspace, "x")
+                .unwrap();
+            assert_waits_for_review(&status);
+        };
+        // No identity proof at all.
+        expect_review(&mut h, &binding, None, &workspace);
+        // Another workspace of the same Host.
+        expect_review(&mut h, &binding, Some(&device), &sibling);
+        // A proof from an earlier session presented in a later one.
+        let (later, _) = h.proven(GRANT_BRIDGE, "mac", "s2");
+        expect_review(&mut h, &later, Some(&device), &workspace);
+        // The same key, proven over another Bridge.
+        let (other_bridge, other_device) = h.proven("room-other", "mac", "s3");
+        expect_review(&mut h, &other_bridge, Some(&other_device), &workspace);
+        // The same key, now claiming to be another Host on this Bridge.
+        let (other_peer, other_peer_device) = h.proven(GRANT_BRIDGE, "imposter", "s4");
+        expect_review(&mut h, &other_peer, Some(&other_peer_device), &workspace);
+        // A different, untrusted key in the same session.
+        let stranger_paths = durable_paths(&h.root.join("stranger"));
+        let stranger = crate::device_identity::load_or_create(&stranger_paths, &[7u8; 32]).unwrap();
+        let (windows_side, mac_side) = h.session(GRANT_BRIDGE, "mac", "s5");
+        let stranger_device = crate::device_identity::verify_attestation(
+            &stranger
+                .attest(&mac_side, &Uuid::new_v4().to_string())
+                .unwrap(),
+            &windows_side,
+        )
+        .unwrap();
+        expect_review(&mut h, &windows_side, Some(&stranger_device), &workspace);
+        // Nothing ran, nothing was spent.
+        assert_eq!(h.launches(), 0);
+        assert_eq!(h.runs(&grant), 0);
+        // Another executing Host never matches a grant made here.
+        let foreign = crate::storage::candidate_unattended_grants(
+            &h.paths,
+            &device.fingerprint,
+            &base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                device.public_key,
+            ),
+            GRANT_BRIDGE,
+            binding.peer_host_ref.as_str(),
+            crate::host_identity::HostRef::from_device_id("another-windows")
+                .unwrap()
+                .as_str(),
+            CODEX_CAPABILITY_ID,
+            crate::storage::now_ts(),
+        )
+        .unwrap();
+        assert!(foreign.is_empty());
+    }
+
+    #[test]
+    fn expiry_revocation_and_device_revocation_end_unattended_runs() {
+        let mut h = unattended_fixture();
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        let grant = h.trust_and_grant(&device, 1, 10);
+        let workspace = h.workspace.clone();
+        let expired_at = crate::storage::now_ts() + 3_600;
+        assert!(crate::storage::candidate_unattended_grants(
+            &h.paths,
+            &device.fingerprint,
+            &base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                device.public_key
+            ),
+            GRANT_BRIDGE,
+            binding.peer_host_ref.as_str(),
+            h.windows_host.as_str(),
+            CODEX_CAPABILITY_ID,
+            expired_at,
+        )
+        .unwrap()
+        .is_empty());
+        assert!(!crate::storage::consume_unattended_grant(
+            &h.paths,
+            &grant,
+            "task-late",
+            expired_at
+        )
+        .unwrap());
+        crate::unattended_access::revoke_grant(&h.paths, &grant).unwrap();
+        assert_waits_for_review(
+            &h.invoke(&binding, Some(&device), "task-r1", &workspace, "x")
+                .unwrap(),
+        );
+        // A requester cannot renew or reactivate: only a new Host-local grant
+        // works, and revoking the device ends every grant it holds.
+        let renewed = h.trust_and_grant(&device, 24, 10);
+        crate::unattended_access::revoke_device(&h.paths, &device.fingerprint).unwrap();
+        assert_waits_for_review(
+            &h.invoke(&binding, Some(&device), "task-r2", &workspace, "x")
+                .unwrap(),
+        );
+        let states = crate::unattended_access::grants(&h.paths, crate::storage::now_ts()).unwrap();
+        assert!(states
+            .iter()
+            .all(|view| view.state == crate::unattended_access::GrantStateV1::Revoked));
+        assert_eq!(h.runs(&renewed), 0);
+        // A grant needs a device proven on that Bridge now.
+        assert!(crate::unattended_access::create_grant(
+            &h.paths,
+            &h.windows_host,
+            &[],
+            &crate::unattended_access::CreateUnattendedGrantV1 {
+                device_fingerprint: device.fingerprint.clone(),
+                room_id: GRANT_BRIDGE.into(),
+                workspace_path: workspace.to_string_lossy().into_owned(),
+                duration_hours: 1,
+                max_runs: 1,
+            },
+            crate::storage::now_ts(),
+        )
+        .is_err());
+        assert_eq!(h.launches(), 0);
+    }
+
+    #[test]
+    fn duplicate_and_concurrent_requests_never_spend_one_use_twice() {
+        let mut h = unattended_fixture();
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        let grant = h.trust_and_grant(&device, 24, 3);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-d1", &workspace, "once")
+            .unwrap();
+        // The same task delivered again answers with the same task.
+        let replay = h
+            .invoke(&binding, Some(&device), "task-d1", &workspace, "once")
+            .unwrap();
+        assert_eq!(replay.task_id, "task-d1");
+        h.finish("task-d1");
+        assert_eq!(h.runs(&grant), 1);
+        assert!(!crate::storage::consume_unattended_grant(
+            &h.paths,
+            &grant,
+            "task-d1",
+            crate::storage::now_ts()
+        )
+        .unwrap());
+        // Many simultaneous requests for the last two uses: exactly two win.
+        let winners = (0..8)
+            .map(|index| {
+                let paths = h.paths.clone();
+                let grant = grant.clone();
+                std::thread::spawn(move || {
+                    crate::storage::consume_unattended_grant(
+                        &paths,
+                        &grant,
+                        &format!("task-c{index}"),
+                        crate::storage::now_ts(),
+                    )
+                    .unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|won| *won)
+            .count();
+        assert_eq!(winners, 2);
+        assert_eq!(h.runs(&grant), 3);
+        let turns = native_log(&h.root)
+            .iter()
+            .filter(|line| line.starts_with("turn"))
+            .count();
+        assert_eq!(turns, 1);
+    }
+
+    #[test]
+    fn a_replaced_or_aliased_workspace_never_runs_unattended() {
+        let mut h = unattended_fixture();
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        let grant = h.trust_and_grant(&device, 24, 5);
+        let workspace = h.workspace.clone();
+        let elsewhere = workspace.parent().unwrap().join("Elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        #[cfg(unix)]
+        {
+            // An alias that resolves into the workspace is the same workspace,
+            // but one that resolves elsewhere is not.
+            let alias = workspace.parent().unwrap().join("alias-to-elsewhere");
+            std::os::unix::fs::symlink(&elsewhere, &alias).unwrap();
+            assert_waits_for_review(
+                &h.invoke(&binding, Some(&device), "task-a1", &alias, "x")
+                    .unwrap(),
+            );
+            // The granted folder itself replaced by a link to elsewhere.
+            let moved = workspace.parent().unwrap().join("REPZ-moved");
+            fs::rename(&workspace, &moved).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &workspace).unwrap();
+            assert_waits_for_review(
+                &h.invoke(&binding, Some(&device), "task-a2", &workspace, "x")
+                    .unwrap(),
+            );
+            let view =
+                crate::unattended_access::grants(&h.paths, crate::storage::now_ts()).unwrap();
+            assert_eq!(
+                view[0].state,
+                crate::unattended_access::GrantStateV1::Unavailable
+            );
+            fs::remove_file(&workspace).unwrap();
+            fs::rename(&moved, &workspace).unwrap();
+        }
+        // A start whose adapter-resolved workspace differs from the admitted
+        // one is refused before anything runs.
+        let input = capability::codex::codex_input(&elsewhere, "x", true).unwrap();
+        assert!(h
+            .service
+            .start_invocation_in_scope(
+                CODEX_CAPABILITY_ID,
+                "task-a3",
+                &input,
+                None,
+                None,
+                Some(&workspace)
+            )
+            .is_err());
+        assert_eq!(h.runs(&grant), 0);
+        assert_eq!(h.launches(), 0);
+    }
+
+    #[test]
+    fn grants_survive_restart_with_a_fresh_proof_and_end_with_burn() {
+        let mut h = unattended_fixture();
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        let grant = h.trust_and_grant(&device, 24, 5);
+        let workspace = h.workspace.clone();
+        h.service.shutdown();
+        h.service = NativeAgentServiceV1::with_paths(h.paths.clone()).unwrap();
+        h.service.codex.use_executable(&h.agent);
+        // After restart, a new session and a fresh proof are needed.
+        let (fresh, fresh_device) = h.proven(GRANT_BRIDGE, "mac", "after-restart");
+        assert_eq!(
+            h.invoke(&fresh, Some(&fresh_device), "task-b1", &workspace, "x")
+                .unwrap()
+                .state,
+            NativeAgentTaskStateV1::Running
+        );
+        h.finish("task-b1");
+        // The pre-restart proof does not carry over to the new session.
+        assert_waits_for_review(
+            &h.invoke(&fresh, Some(&device), "task-b0", &workspace, "x")
+                .unwrap(),
+        );
+        let _ = &binding;
+        // Burn: the cutoff ends the grant at once; finalization deletes it.
+        crate::storage::cut_off_bridge_authority(&h.paths, GRANT_BRIDGE).unwrap();
+        assert!(!crate::storage::unattended_grant_is_active(
+            &h.paths,
+            &grant,
+            crate::storage::now_ts()
+        )
+        .unwrap());
+        h.service.purge_bridge_authority(GRANT_BRIDGE).unwrap();
+        assert!(h
+            .invoke(&fresh, Some(&fresh_device), "task-b2", &workspace, "x")
+            .is_err());
+        crate::storage::finalize_burned_room(&h.paths, GRANT_BRIDGE, &h.paths.inbox_dir).unwrap();
+        assert!(crate::storage::list_unattended_grants(&h.paths)
+            .unwrap()
+            .is_empty());
+        assert_eq!(h.runs_or_zero(&grant), 0);
+    }
+
+    impl UnattendedFixture {
+        fn runs_or_zero(&self, grant_id: &str) -> i64 {
+            crate::storage::list_unattended_grants(&self.paths)
+                .unwrap()
+                .into_iter()
+                .find(|grant| grant.grant_id == grant_id)
+                .map_or(0, |grant| grant.uses)
+        }
+    }
+
+    #[test]
+    fn an_unattended_run_never_answers_codexs_own_approvals_and_stays_cancellable() {
+        let (approval_root, _, approval_agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s\n' '{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","command":"rm -rf Saved"}}}}'
+      ;;
+    *'"id":"approval-1"'*) printf '%s\n' "$line" > "$PWD/approval-answered" ;;
+    *'turn/interrupt'*)
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","items":[],"status":"interrupted","error":null}}}}}}'
+      ;;
+"#
+        ));
+        let mut h = unattended_fixture();
+        h.service.codex.use_executable(&approval_agent);
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        h.trust_and_grant(&device, 24, 5);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-p1", &workspace, "risky")
+            .unwrap();
+        wait_for_code(&h.service, "task-p1", Some(AWAITING_NATIVE_DECISION_CODE));
+        thread::sleep(Duration::from_millis(200));
+        assert!(!workspace.join("approval-answered").exists());
+        assert_eq!(
+            h.service.task_status("task-p1").unwrap().state,
+            NativeAgentTaskStateV1::Running
+        );
+        // The requester's Stop still works over the same Bridge.
+        assert_eq!(
+            h.service
+                .cancel_bridge_task(GRANT_BRIDGE, "task-p1")
+                .unwrap()
+                .state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        wait_for_workspace_release(&h.service, &workspace);
+        assert!(!workspace.join("approval-answered").exists());
+        let _ = fs::remove_dir_all(approval_root);
     }
 
     #[test]

@@ -157,6 +157,9 @@ pub(crate) struct StartedInvocationV1 {
     /// Known at start only when a live conversation is reused; otherwise
     /// the run confirms it through `NativeInvocationProgressV1`.
     pub(crate) conversation: Option<NativeConversationContinuityV1>,
+    /// The Host workspace the run will actually use, re-resolved at start,
+    /// so Core can confirm it is still the one it admitted.
+    pub(crate) host_workspace: Option<PathBuf>,
     pub(crate) run: Box<dyn NativeInvocationRunV1>,
 }
 

@@ -1075,7 +1075,7 @@ impl CapabilityPairV1 {
         assert_eq!(request.target_host_ref, PAIR_EXECUTOR);
         self.executor.require_capability(&request.agent_capability)?;
         self.executor
-            .receive_bridge_invocation(binding, &request, now)
+            .receive_bridge_invocation(binding, &request, now, None)
     }
 
     fn owner(&self, task_id: &str) -> Option<TaskOwnerV1> {
@@ -2622,6 +2622,7 @@ fn duplicate_preparation_and_landing_keep_one_review_and_one_start() {
             &NativeAgentPairHarnessV1::pair_binding(),
             &direct,
             crate::storage::now_ts(),
+            None,
         )
         .is_err());
     assert_eq!(h.executor.invocation_reviews(crate::storage::now_ts()).len(), 1);

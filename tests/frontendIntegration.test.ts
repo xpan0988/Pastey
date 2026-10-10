@@ -26,6 +26,7 @@ import {
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
 import { availableRevisionId, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
+import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
 
 function room(peerConnected: boolean): RoomInfo {
   return {
@@ -667,4 +668,40 @@ test("Join and reconnect failures say what the user can do", () => {
   assert.match(panel, /setBridgePeerAddress\(room\.id/);
   assert.match(panel, /gives the other device no permissions/);
   assert.match(bindings, /invoke\("join_room_at", \{ code, address \}\)/);
+});
+
+test("Unattended Codex permissions are narrow, explained and only created on the executing device", () => {
+  const seen = [
+    { fingerprint: "device:v1:a", displayFingerprint: "AAAA", bridgeId: "b", peerName: "School Mac", trusted: true },
+    { fingerprint: "device:v1:z", displayFingerprint: "ZZZZ", bridgeId: "b", peerName: "Unknown", trusted: false },
+  ];
+  assert.deepEqual(grantableDevices(seen).map((device) => device.peerName), ["School Mac"]);
+  const complete = { deviceFingerprint: "device:v1:a", roomId: "b", workspacePath: "C:\\Users\\me\\REPZ", durationHours: 24, maxRuns: 10 };
+  assert.equal(grantFormProblem(complete), null);
+  assert.notEqual(grantFormProblem({ ...complete, workspacePath: "" }), null);
+  assert.notEqual(grantFormProblem({ ...complete, durationHours: 24 * 365 }), null);
+  assert.notEqual(grantFormProblem({ ...complete, maxRuns: 1000 }), null);
+  assert.notEqual(grantFormProblem({ ...complete, deviceFingerprint: "" }), null);
+  const grant = { grantId: "g", deviceLabel: "School Mac", displayFingerprint: "AAAA", bridgeId: "b", capabilityId: "agent.coding.codex", workspace: "C:\\REPZ", createdAt: 0, expiresAt: 100, maxRuns: 10, runs: 3, state: "active" as const };
+  assert.equal(grantStateLabel(grant), "Active · 3 of 10 runs used");
+  assert.equal(grantStateLabel({ ...grant, state: "used_up" }), "All 10 runs used");
+  assert.match(grantStateLabel({ ...grant, state: "unavailable" }), /folder moved/);
+  assert.equal(expiryLabel(100, 200), "expired");
+  assert.equal(expiryLabel(200 + 2 * 3600, 200), "expires in 2 h");
+
+  const settings = readFileSync("src/features/workspace/UnattendedAccessSettings.tsx", "utf8");
+  const panel = readFileSync("src/features/workspace/BridgeNetworkPanel.tsx", "utf8");
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  // No blanket permission exists anywhere.
+  for (const file of [settings, panel, lifecycle, readFileSync("src/lib/tauri.ts", "utf8")]) {
+    assert.doesNotMatch(file, /always allow|allowAll|trust_all/i);
+  }
+  // Trust requires comparing the fingerprint; permissions say what they do not cover.
+  assert.match(settings, /Only continue if \$\{device\.peerName\} shows exactly this identity/);
+  assert.match(settings, /Codex's own approval requests are never answered by it/);
+  assert.match(settings, /must stay on, awake, signed in and running Pastey/);
+  // The requesting device can only show itself; it cannot create permissions.
+  assert.match(panel, /presentDeviceIdentity\(room\.id, peerHostRef\)/);
+  assert.doesNotMatch(panel, /createUnattendedGrant|trustPeerDevice/);
+  assert.match(lifecycle, /waiting for the other device to accept \(no unattended permission applied\)/);
 });

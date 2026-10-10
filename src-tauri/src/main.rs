@@ -10,6 +10,7 @@ mod config;
 mod crypto;
 mod dev_tools;
 mod developer_terminal;
+mod device_identity;
 mod device_profile;
 mod diagnostics;
 mod discovery;
@@ -44,6 +45,7 @@ mod storage;
 mod transfer;
 mod transfer_orchestration;
 mod transfer_tuning;
+mod unattended_access;
 #[cfg(windows)]
 mod windows_codex_backend;
 #[cfg(any(windows, test))]
@@ -72,33 +74,36 @@ use crate::{
         compose_native_v2_plan, compose_natural_v2_candidate, confirm_capability_acquisition,
         copy_last_error, copy_text_to_clipboard, create_composed_file_bridge_plan,
         create_direct_file_transfer_bridge_plan, create_managed_worker_provider, create_room,
-        delete_managed_worker_provider, delete_temp_file, deny_developer_terminal,
-        deny_native_invocation_review, discard_native_agent_conflict_result, enter_developer_mode,
+        create_unattended_grant, delete_managed_worker_provider, delete_temp_file,
+        deny_developer_terminal, deny_native_invocation_review,
+        discard_native_agent_conflict_result, enter_developer_mode,
         get_bridge_node_list_projection, get_bridge_peer_address, get_config,
-        get_developer_terminal_workspace, get_device_capabilities, get_device_profile,
-        get_file_transfer_metadata, get_last_benchmark_results,
+        get_developer_terminal_workspace, get_device_capabilities, get_device_identity,
+        get_device_profile, get_file_transfer_metadata, get_last_benchmark_results,
         get_managed_worker_provider_settings, get_native_agent_recovery_projection,
         get_native_agent_task_status, get_native_agent_workspace_movement_status,
         get_native_v2_plan_status, get_room, get_room_control_session_context, join_room,
         join_room_at, list_authorized_search_folders, list_bridge_plan_workspace,
         list_managed_runtime_options, list_native_agent_capabilities,
         list_native_invocation_reviews, list_nearby_devices, list_received_room_control_events,
-        list_remote_native_agent_capabilities, list_room_items, list_rooms,
-        log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
-        mark_join_prompt_rendered, open_logs_folder, pair_bridge_peer, pending_join_requests,
+        list_remote_native_agent_capabilities, list_room_items, list_rooms, list_seen_peer_devices,
+        list_trusted_devices, list_unattended_grants, log_frontend_diagnostic,
+        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_logs_folder,
+        pair_bridge_peer, pending_join_requests, present_device_identity,
         propose_remote_native_codex_workspace_movement, reconcile_remote_native_agent_task,
         refresh_selected_peer_capabilities, reject_nearby_join, request_developer_terminal,
         request_nearby_join, resize_developer_terminal, retry_native_agent_workspace_result_return,
         reveal_in_folder, reveal_native_agent_conflict_result, revoke_authorized_search_folder,
-        revoke_bridge_peer_pairing, run_bridge_device_diagnostics, run_bridge_device_self_check,
+        revoke_bridge_peer_pairing, revoke_trusted_device, revoke_unattended_grant,
+        rotate_device_identity, run_bridge_device_diagnostics, run_bridge_device_self_check,
         run_loopback_benchmark, run_peer_link_benchmark, select_bridge_plan_search_candidate,
         select_managed_execute_runtime, select_managed_worker_provider,
         send_developer_terminal_input, send_file_to_room, send_text_to_room,
         set_bridge_peer_address, start_bridge_plan_attempt, start_native_codex_task,
         start_native_v2_plan_attempt, start_remote_native_capability_task,
-        start_remote_native_codex_task, stop_bridge_native_agent_task, update_config,
-        update_managed_worker_provider, update_transfer_window, withdraw_bridge_plan_revision,
-        write_temp_file,
+        start_remote_native_codex_task, stop_bridge_native_agent_task, trust_peer_device,
+        update_config, update_managed_worker_provider, update_transfer_window,
+        withdraw_bridge_plan_revision, write_temp_file,
     },
     error::{AppError, AppResult},
     host_runtime::{HostEvent, HostEventSink, HostRuntime, RuntimeTask, RuntimeTaskSpawner},
@@ -189,6 +194,16 @@ fn main() {
             create_room,
             join_room,
             join_room_at,
+            get_device_identity,
+            rotate_device_identity,
+            present_device_identity,
+            list_seen_peer_devices,
+            trust_peer_device,
+            list_trusted_devices,
+            revoke_trusted_device,
+            list_unattended_grants,
+            create_unattended_grant,
+            revoke_unattended_grant,
             get_bridge_peer_address,
             set_bridge_peer_address,
             list_nearby_devices,

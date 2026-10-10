@@ -75,6 +75,10 @@ pub struct HostRuntime {
     pub antenna_handle: Mutex<Option<DiscoveryHandle>>,
     pub bridge_lifecycle_handle: Mutex<Option<DiscoveryHandle>>,
     pub(crate) bridge_reconnect_attempts: Mutex<HashMap<String, u8>>,
+    /// Peer device identities verified in their exact current Bridge
+    /// session, newest last. Process-local; an entry counts only while its
+    /// binding is still the current one.
+    pub(crate) verified_peer_devices: Mutex<Vec<crate::device_identity::VerifiedPeerDevice>>,
     /// Consecutive failed liveness probes per Bridge peer session.
     pub(crate) bridge_liveness_failures: Mutex<HashMap<String, u8>>,
     pub(crate) bridge_reconnect_rotations: Mutex<HashSet<String>>,
@@ -198,6 +202,7 @@ impl HostRuntime {
             bridge_lifecycle_handle: Mutex::new(None),
             bridge_reconnect_attempts: Mutex::new(HashMap::new()),
             bridge_liveness_failures: Mutex::new(HashMap::new()),
+            verified_peer_devices: Mutex::new(Vec::new()),
             bridge_reconnect_rotations: Mutex::new(HashSet::new()),
             nearby_devices: Mutex::new(HashMap::new()),
             pending_join_requests: Mutex::new(HashMap::new()),
@@ -569,6 +574,65 @@ pub fn inbound_controller_binding(
 /// Resolves the exact current Layer 4 association for a durable logical peer.
 /// Absence, disconnect, restart recovery, stale route replacement, expiry, or
 /// Burn all fail closed. Constructing this value grants no Plan authority.
+/// Most verified peer device sessions remembered at once.
+const MAX_VERIFIED_PEER_DEVICES: usize = 32;
+
+/// Records a peer device verified for one exact session, replacing an older
+/// proof for the same session.
+pub(crate) fn record_verified_peer_device(
+    state: &HostRuntime,
+    device: crate::device_identity::VerifiedPeerDevice,
+) {
+    let mut devices = state.verified_peer_devices.lock();
+    devices.retain(|known| known.binding.binding_ref != device.binding.binding_ref);
+    devices.push(device);
+    let overflow = devices.len().saturating_sub(MAX_VERIFIED_PEER_DEVICES);
+    devices.drain(..overflow);
+}
+
+/// The peer device verified in exactly `binding`, the current binding of
+/// the session a request arrived on. A proof from any earlier, later or
+/// other session never applies.
+pub(crate) fn verified_peer_device_for(
+    state: &HostRuntime,
+    binding: &HostSessionBinding,
+) -> Option<crate::device_identity::VerifiedPeerDevice> {
+    let now = storage::now_ts();
+    state
+        .verified_peer_devices
+        .lock()
+        .iter()
+        .rev()
+        .find(|device| device.binding.validate_current(binding, now).is_ok())
+        .cloned()
+}
+
+/// Verified peer devices whose session is still current, for this Host's
+/// own user to review. Stale entries are dropped.
+pub(crate) fn current_verified_peer_devices(
+    state: &HostRuntime,
+) -> Vec<crate::device_identity::VerifiedPeerDevice> {
+    let candidates = state.verified_peer_devices.lock().clone();
+    let now = storage::now_ts();
+    let current = candidates
+        .into_iter()
+        .filter(|device| {
+            current_host_session_binding(
+                state,
+                &device.binding.bridge_id,
+                &device.binding.peer_route_ref,
+            )
+            .is_ok_and(|binding| device.binding.validate_current(&binding, now).is_ok())
+        })
+        .collect::<Vec<_>>();
+    state.verified_peer_devices.lock().retain(|device| {
+        current
+            .iter()
+            .any(|kept| kept.binding.binding_ref == device.binding.binding_ref)
+    });
+    current
+}
+
 pub fn current_host_session_binding(
     state: &HostRuntime,
     room_id: &str,

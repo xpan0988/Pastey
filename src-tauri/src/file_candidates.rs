@@ -90,11 +90,15 @@ pub(crate) fn list_authorized_search_folders(
 /// Agent sends can. Folders too broad to share safely are refused: a
 /// filesystem root, the home folder or any folder containing it, an OS
 /// application-data or cache location, Pastey's own data, and hidden folders.
-pub(crate) fn authorize_search_folder(
+/// A specific real folder this Host's user may hand to a peer's scoped use
+/// (Bridge Search or an unattended Agent workspace): its canonical path and
+/// display name. Refuses a filesystem root, the home folder or any folder
+/// containing it, an OS application-data or cache location, Pastey's own
+/// data, hidden folders, and links.
+pub(crate) fn validate_shareable_folder(
     paths: &AppPaths,
     chosen: &Path,
-    bridge_id: &str,
-) -> AppResult<AuthorizedSearchFolderV1> {
+) -> AppResult<(String, String)> {
     let metadata = fs::symlink_metadata(chosen)
         .map_err(|_| AppError::InvalidInput("The chosen folder is unavailable.".into()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -168,6 +172,15 @@ pub(crate) fn authorize_search_folder(
         })
         .ok_or_else(|| AppError::InvalidInput("The chosen folder has an unsupported name.".into()))?
         .to_owned();
+    Ok((canonical_path, display_name))
+}
+
+pub(crate) fn authorize_search_folder(
+    paths: &AppPaths,
+    chosen: &Path,
+    bridge_id: &str,
+) -> AppResult<AuthorizedSearchFolderV1> {
+    let (canonical_path, display_name) = validate_shareable_folder(paths, chosen)?;
     let folder = crate::storage::StoredAuthorizedSearchFolder {
         folder_id: format!("search-folder-{}", uuid::Uuid::new_v4()),
         canonical_path,

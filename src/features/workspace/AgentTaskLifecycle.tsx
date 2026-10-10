@@ -135,6 +135,7 @@ export function nativeAgentLifecycleLabel(status: NativeAgentTaskStatus): string
   if (nativeAgentAwaitingNativeDecision(status)) return "running · waiting for a native approval";
   if (status.state === "failed" && status.code === "native_agent_start_failed") return "failed · did not start";
   if (nativeAgentConversationUnavailable(status)) return "failed · conversation unavailable";
+  if (status.state === "queued" && status.code === "native_agent_review_required") return "waiting for the other device to accept (no unattended permission applied)";
   return status.state.replace(/_/g, " ");
 }
 

@@ -181,6 +181,7 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
         Ok(StartedInvocationV1 {
             session_reused: false,
             conversation: None,
+            host_workspace: None,
             run: Box::new(LongJobRunV1 {
                 state: self.state.clone(),
                 task_id: task_id.to_owned(),

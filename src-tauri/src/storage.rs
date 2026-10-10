@@ -171,6 +171,49 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             created_at INTEGER NOT NULL
         );
 
+        -- This installation's durable signing identity; the private key is
+        -- stored only wrapped with the app master key.
+        CREATE TABLE IF NOT EXISTS device_signing_identity (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            wrapped_pkcs8 TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        -- Requesting devices this Host's user explicitly trusted after
+        -- comparing fingerprints. Trust alone authorizes nothing.
+        CREATE TABLE IF NOT EXISTS trusted_devices (
+            fingerprint TEXT PRIMARY KEY,
+            public_key TEXT NOT NULL,
+            label TEXT NOT NULL,
+            enrolled_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+
+        -- Host-local, expiring, use-limited permission for one trusted device
+        -- to run one capability in one workspace over one Bridge without a
+        -- per-task Review on this Host.
+        CREATE TABLE IF NOT EXISTS unattended_grants (
+            grant_id TEXT PRIMARY KEY,
+            device_fingerprint TEXT NOT NULL,
+            bridge_id TEXT NOT NULL,
+            peer_host_ref TEXT NOT NULL,
+            local_host_ref TEXT NOT NULL,
+            capability_id TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL,
+            uses INTEGER NOT NULL DEFAULT 0,
+            revoked_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS unattended_grant_uses (
+            task_id TEXT PRIMARY KEY,
+            grant_id TEXT NOT NULL,
+            used_at INTEGER NOT NULL
+        );
+
         -- The address the user gave to reach one Bridge's peer on another
         -- network (an overlay IP or name). Where to look, never authority.
         CREATE TABLE IF NOT EXISTS bridge_peer_addresses (
@@ -352,6 +395,293 @@ pub(crate) fn update_native_agent_observed_task_if_present(
         )?;
     }
     transaction.commit()?;
+    Ok(())
+}
+
+/// Most unattended grants a Host keeps active at once.
+pub(crate) const MAX_ACTIVE_UNATTENDED_GRANTS: i64 = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredTrustedDevice {
+    pub(crate) fingerprint: String,
+    pub(crate) public_key: String,
+    pub(crate) label: String,
+    pub(crate) enrolled_at: i64,
+    pub(crate) revoked_at: Option<i64>,
+}
+
+/// Trusts one device key this Host just verified in a live session. Trusting
+/// a key again after revocation re-enrolls it explicitly.
+pub(crate) fn trust_device(
+    paths: &AppPaths,
+    fingerprint: &str,
+    public_key: &str,
+    label: &str,
+) -> AppResult<()> {
+    connection(paths)?.execute(
+        "INSERT INTO trusted_devices (fingerprint, public_key, label, enrolled_at, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, NULL)
+         ON CONFLICT(fingerprint) DO UPDATE SET public_key = excluded.public_key,
+             label = excluded.label, enrolled_at = excluded.enrolled_at, revoked_at = NULL",
+        params![fingerprint, public_key, label, now_ts()],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn list_trusted_devices(paths: &AppPaths) -> AppResult<Vec<StoredTrustedDevice>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(
+        "SELECT fingerprint, public_key, label, enrolled_at, revoked_at FROM trusted_devices
+         ORDER BY enrolled_at, fingerprint",
+    )?;
+    let devices = statement
+        .query_map([], |row| {
+            Ok(StoredTrustedDevice {
+                fingerprint: row.get(0)?,
+                public_key: row.get(1)?,
+                label: row.get(2)?,
+                enrolled_at: row.get(3)?,
+                revoked_at: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(devices)
+}
+
+/// Revokes a device and, with it, every grant it holds.
+pub(crate) fn revoke_trusted_device(paths: &AppPaths, fingerprint: &str) -> AppResult<bool> {
+    let mut conn = connection(paths)?;
+    // Concurrent writers wait briefly instead of failing.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let now = now_ts();
+    let changed = transaction.execute(
+        "UPDATE trusted_devices SET revoked_at = ?2 WHERE fingerprint = ?1 AND revoked_at IS NULL",
+        params![fingerprint, now],
+    )?;
+    transaction.execute(
+        "UPDATE unattended_grants SET revoked_at = ?2 WHERE device_fingerprint = ?1 AND revoked_at IS NULL",
+        params![fingerprint, now],
+    )?;
+    transaction.commit()?;
+    Ok(changed > 0)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUnattendedGrant {
+    pub(crate) grant_id: String,
+    pub(crate) device_fingerprint: String,
+    pub(crate) bridge_id: String,
+    pub(crate) peer_host_ref: String,
+    pub(crate) local_host_ref: String,
+    pub(crate) capability_id: String,
+    pub(crate) workspace: String,
+    pub(crate) created_at: i64,
+    pub(crate) expires_at: i64,
+    pub(crate) max_uses: i64,
+    pub(crate) uses: i64,
+    pub(crate) revoked_at: Option<i64>,
+}
+
+const GRANT_COLUMNS: &str =
+    "g.grant_id, g.device_fingerprint, g.bridge_id, g.peer_host_ref, g.local_host_ref,
+    g.capability_id, g.workspace, g.created_at, g.expires_at, g.max_uses, g.uses, g.revoked_at";
+
+fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUnattendedGrant> {
+    Ok(StoredUnattendedGrant {
+        grant_id: row.get(0)?,
+        device_fingerprint: row.get(1)?,
+        bridge_id: row.get(2)?,
+        peer_host_ref: row.get(3)?,
+        local_host_ref: row.get(4)?,
+        capability_id: row.get(5)?,
+        workspace: row.get(6)?,
+        created_at: row.get(7)?,
+        expires_at: row.get(8)?,
+        max_uses: row.get(9)?,
+        uses: row.get(10)?,
+        revoked_at: row.get(11)?,
+    })
+}
+
+/// The condition every use of a grant is checked against, in SQL, so that
+/// listing candidates and consuming one apply exactly the same rule.
+const GRANT_IS_ACTIVE: &str = "g.revoked_at IS NULL AND g.expires_at > ?1 AND g.uses < g.max_uses
+    AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = g.device_fingerprint AND d.revoked_at IS NULL)
+    AND EXISTS (SELECT 1 FROM rooms r WHERE r.id = g.bridge_id AND r.status != 'burned')
+    AND NOT EXISTS (SELECT 1 FROM burned_bridges b WHERE b.room_id = g.bridge_id)";
+
+/// Creates one grant. The device must be trusted and the Bridge live; the
+/// caller has already checked everything else Host-locally.
+pub(crate) fn insert_unattended_grant(
+    paths: &AppPaths,
+    grant: &StoredUnattendedGrant,
+) -> AppResult<()> {
+    let mut conn = connection(paths)?;
+    // Concurrent writers wait briefly instead of failing.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let now = now_ts();
+    let active: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM unattended_grants g WHERE {GRANT_IS_ACTIVE}"),
+        [now],
+        |row| row.get(0),
+    )?;
+    if active >= MAX_ACTIVE_UNATTENDED_GRANTS {
+        return Err(AppError::InvalidInput(
+            "Revoke an unattended permission before adding another.".into(),
+        ));
+    }
+    let trusted: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trusted_devices WHERE fingerprint = ?1 AND revoked_at IS NULL)",
+        [&grant.device_fingerprint],
+        |row| row.get(0),
+    )?;
+    let bridge_live: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status != 'burned')
+            AND NOT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+        [&grant.bridge_id],
+        |row| row.get(0),
+    )?;
+    if trusted == 0 || bridge_live == 0 {
+        return Err(AppError::InvalidInput(
+            "That device or Bridge is no longer available for unattended permission.".into(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO unattended_grants (grant_id, device_fingerprint, bridge_id, peer_host_ref,
+            local_host_ref, capability_id, workspace, created_at, expires_at, max_uses, uses, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL)",
+        params![
+            &grant.grant_id,
+            &grant.device_fingerprint,
+            &grant.bridge_id,
+            &grant.peer_host_ref,
+            &grant.local_host_ref,
+            &grant.capability_id,
+            &grant.workspace,
+            grant.created_at,
+            grant.expires_at,
+            grant.max_uses
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn list_unattended_grants(paths: &AppPaths) -> AppResult<Vec<StoredUnattendedGrant>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {GRANT_COLUMNS} FROM unattended_grants g ORDER BY g.created_at DESC, g.grant_id"
+    ))?;
+    let grants = statement
+        .query_map([], row_to_grant)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(grants)
+}
+
+/// Whether a grant may be used at `now`.
+pub(crate) fn unattended_grant_is_active(
+    paths: &AppPaths,
+    grant_id: &str,
+    now: i64,
+) -> AppResult<bool> {
+    let active: i64 = connection(paths)?.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM unattended_grants g WHERE g.grant_id = ?2 AND {GRANT_IS_ACTIVE})"),
+        params![now, grant_id],
+        |row| row.get(0),
+    )?;
+    Ok(active != 0)
+}
+
+/// Active grants of exactly this device key, Bridge, peer, Host and
+/// capability.
+pub(crate) fn candidate_unattended_grants(
+    paths: &AppPaths,
+    device_fingerprint: &str,
+    device_public_key: &str,
+    bridge_id: &str,
+    peer_host_ref: &str,
+    local_host_ref: &str,
+    capability_id: &str,
+    now: i64,
+) -> AppResult<Vec<StoredUnattendedGrant>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {GRANT_COLUMNS} FROM unattended_grants g
+         WHERE {GRANT_IS_ACTIVE}
+           AND g.device_fingerprint = ?2 AND g.bridge_id = ?3 AND g.peer_host_ref = ?4
+           AND g.local_host_ref = ?5 AND g.capability_id = ?6
+           AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = ?2 AND d.public_key = ?7)
+         ORDER BY g.expires_at, g.grant_id"
+    ))?;
+    let grants = statement
+        .query_map(
+            params![
+                now,
+                device_fingerprint,
+                bridge_id,
+                peer_host_ref,
+                local_host_ref,
+                capability_id,
+                device_public_key
+            ],
+            row_to_grant,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(grants)
+}
+
+/// Spends one use of a grant for exactly one task, atomically: the grant
+/// must still be active at this instant, and a task can consume at most one
+/// use ever. Returns false when it cannot (revoked, expired, exhausted, or
+/// the task already used one).
+pub(crate) fn consume_unattended_grant(
+    paths: &AppPaths,
+    grant_id: &str,
+    task_id: &str,
+    now: i64,
+) -> AppResult<bool> {
+    let mut conn = connection(paths)?;
+    // Concurrent writers wait briefly instead of failing.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let already: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM unattended_grant_uses WHERE task_id = ?1)",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if already != 0 {
+        return Ok(false);
+    }
+    let spent = transaction.execute(
+        &format!("UPDATE unattended_grants AS g SET uses = uses + 1 WHERE g.grant_id = ?2 AND {GRANT_IS_ACTIVE}"),
+        params![now, grant_id],
+    )?;
+    if spent != 1 {
+        return Ok(false);
+    }
+    transaction.execute(
+        "INSERT INTO unattended_grant_uses (task_id, grant_id, used_at) VALUES (?1, ?2, ?3)",
+        params![task_id, grant_id, now],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+pub(crate) fn revoke_unattended_grant(paths: &AppPaths, grant_id: &str) -> AppResult<bool> {
+    Ok(connection(paths)?.execute(
+        "UPDATE unattended_grants SET revoked_at = ?2 WHERE grant_id = ?1 AND revoked_at IS NULL",
+        params![grant_id, now_ts()],
+    )? > 0)
+}
+
+/// Burn: a Bridge's grants end with it.
+pub(crate) fn delete_bridge_unattended_grants(paths: &AppPaths, bridge_id: &str) -> AppResult<()> {
+    connection(paths)?.execute(
+        "DELETE FROM unattended_grants WHERE bridge_id = ?1",
+        [bridge_id],
+    )?;
     Ok(())
 }
 
@@ -1875,6 +2205,7 @@ pub fn finalize_burned_room(
     crate::native_agent::purge_durable_bridge_state(paths, room_id)?;
     delete_bridge_authorized_search_folders(paths, room_id)?;
     set_bridge_peer_address(paths, room_id, None)?;
+    delete_bridge_unattended_grants(paths, room_id)?;
     let conn = connection(paths)?;
     delete_room_files(paths, room_id, effective_inbox_dir)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;

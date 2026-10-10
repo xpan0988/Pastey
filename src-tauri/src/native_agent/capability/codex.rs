@@ -576,6 +576,7 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
         Ok(StartedInvocationV1 {
             session_reused: reused,
             conversation: reused.then_some(NativeConversationContinuityV1::Continued),
+            host_workspace: Some(workspace.clone()),
             run: Box::new(CodexInvocationRunV1 {
                 executable: self.executable(),
                 workspace,
@@ -713,6 +714,21 @@ impl CodexInvocationRunV1 {
         }
         if self.slot.stop_requested() {
             return Err(stopped());
+        }
+        // The workspace must still be the canonical directory admitted: a
+        // path replaced through a link since then is never entered.
+        if self
+            .workspace
+            .canonicalize()
+            .ok()
+            .filter(|current| current.is_dir())
+            .as_ref()
+            != Some(&self.workspace)
+        {
+            return Err(not_started(
+                NativeTurnOutcomeV1::NotStarted,
+                "The workspace changed before Codex could start, so nothing ran.",
+            ));
         }
         let launched = resolve_codex_program(&self.executable)
             .ok_or_else(|| AppError::InvalidInput("Codex is unavailable.".into()))

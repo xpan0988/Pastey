@@ -581,6 +581,100 @@ export function setBridgePeerAddress(roomId: string, address: string | null): Pr
   return invoke("set_bridge_peer_address", { roomId, address });
 }
 
+/** This device's durable identity, to compare on another device. */
+export interface DeviceIdentity {
+  fingerprint: string;
+  displayFingerprint: string;
+}
+
+export function getDeviceIdentity(): Promise<DeviceIdentity> {
+  return invoke("get_device_identity");
+}
+
+/** Replaces this device's identity key; devices that trusted it must trust
+ * the new one again. */
+export function rotateDeviceIdentity(): Promise<DeviceIdentity> {
+  return invoke("rotate_device_identity");
+}
+
+/** Proves this device's identity to one Bridge Host for the current session
+ * only, so its user can choose to trust it. Grants nothing. */
+export function presentDeviceIdentity(roomId: string, targetHostRef: string): Promise<void> {
+  return invoke("present_device_identity", { roomId, targetHostRef });
+}
+
+/** A device that proved its identity in a current session on this Host. */
+export interface SeenPeerDevice {
+  fingerprint: string;
+  displayFingerprint: string;
+  bridgeId: string;
+  peerName: string;
+  trusted: boolean;
+}
+
+export interface TrustedDevice {
+  fingerprint: string;
+  displayFingerprint: string;
+  label: string;
+  enrolledAt: number;
+  revoked: boolean;
+}
+
+export type UnattendedGrantState = "active" | "expired" | "used_up" | "revoked" | "unavailable";
+
+/** A Host-local permission for one trusted device to start Codex in one
+ * folder over one Bridge without a Review here, until it expires, runs out
+ * or is revoked. There is no unrestricted permission. */
+export interface UnattendedGrant {
+  grantId: string;
+  deviceLabel: string;
+  displayFingerprint: string;
+  bridgeId: string;
+  capabilityId: string;
+  workspace: string;
+  createdAt: number;
+  expiresAt: number;
+  maxRuns: number;
+  runs: number;
+  state: UnattendedGrantState;
+}
+
+export interface CreateUnattendedGrant {
+  deviceFingerprint: string;
+  roomId: string;
+  workspacePath: string;
+  durationHours: number;
+  maxRuns: number;
+}
+
+export function listSeenPeerDevices(): Promise<SeenPeerDevice[]> {
+  return invoke("list_seen_peer_devices");
+}
+
+export function trustPeerDevice(fingerprint: string): Promise<TrustedDevice[]> {
+  return invoke("trust_peer_device", { fingerprint });
+}
+
+export function listTrustedDevices(): Promise<TrustedDevice[]> {
+  return invoke("list_trusted_devices");
+}
+
+export function revokeTrustedDevice(fingerprint: string): Promise<TrustedDevice[]> {
+  return invoke("revoke_trusted_device", { fingerprint });
+}
+
+export function listUnattendedGrants(): Promise<UnattendedGrant[]> {
+  return invoke("list_unattended_grants");
+}
+
+export function createUnattendedGrant(request: CreateUnattendedGrant): Promise<UnattendedGrant> {
+  return invoke("create_unattended_grant", { request });
+}
+
+export function revokeUnattendedGrant(grantId: string): Promise<UnattendedGrant[]> {
+  return invoke("revoke_unattended_grant", { grantId });
+}
+
 export async function listRooms(): Promise<RoomInfo[]> {
   return invoke("list_rooms");
 }

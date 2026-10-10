@@ -926,6 +926,193 @@ async fn require_remote_native_capability(
     Ok(session)
 }
 
+fn local_device_identity(state: &AppState) -> AppResult<crate::device_identity::DeviceIdentity> {
+    let master_key = {
+        let config = state.config.read();
+        config::master_key(&config)?
+    };
+    crate::device_identity::load_or_create(&state.paths, &master_key)
+}
+
+fn identity_view(
+    identity: &crate::device_identity::DeviceIdentity,
+) -> crate::unattended_access::DeviceIdentityViewV1 {
+    let fingerprint = identity.fingerprint();
+    crate::unattended_access::DeviceIdentityViewV1 {
+        display_fingerprint: crate::device_identity::display_fingerprint(&fingerprint),
+        fingerprint,
+    }
+}
+
+/// This device's identity fingerprint, to compare on another device.
+#[tauri::command]
+pub fn get_device_identity(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::unattended_access::DeviceIdentityViewV1, String> {
+    local_device_identity(&state)
+        .map(|identity| identity_view(&identity))
+        .map_err(|error| error.message())
+}
+
+/// Replaces this device's identity key. Hosts that trusted the old key stop
+/// recognizing this device until their users trust the new one.
+#[tauri::command]
+pub fn rotate_device_identity(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::unattended_access::DeviceIdentityViewV1, String> {
+    let master_key = {
+        let config = state.config.read();
+        config::master_key(&config).map_err(|error| error.message())?
+    };
+    crate::device_identity::rotate(&state.paths, &master_key)
+        .map(|identity| identity_view(&identity))
+        .map_err(|error| error.message())
+}
+
+fn peer_name_for(state: &AppState) -> impl Fn(&str) -> String + '_ {
+    move |room_id| {
+        storage::get_room_by_id(&state.paths, room_id)
+            .ok()
+            .and_then(|room| room.peer_device_name)
+            .unwrap_or_else(|| "Bridge device".into())
+    }
+}
+
+/// Devices that proved their identity in a current session on this Host.
+#[tauri::command]
+pub fn list_seen_peer_devices(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::unattended_access::SeenPeerDeviceV1>, String> {
+    let current = crate::host_runtime::current_verified_peer_devices(&state);
+    crate::unattended_access::seen_peer_devices(&state.paths, &current, peer_name_for(&state))
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn trust_peer_device(
+    fingerprint: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::unattended_access::TrustedDeviceViewV1>, String> {
+    let current = crate::host_runtime::current_verified_peer_devices(&state);
+    let label = current
+        .iter()
+        .find(|device| device.fingerprint == fingerprint)
+        .map(|device| peer_name_for(&state)(&device.binding.bridge_id))
+        .unwrap_or_default();
+    crate::unattended_access::trust_seen_device(&state.paths, &current, &fingerprint, &label)
+        .and_then(|()| crate::unattended_access::trusted_devices(&state.paths))
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn list_trusted_devices(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::unattended_access::TrustedDeviceViewV1>, String> {
+    crate::unattended_access::trusted_devices(&state.paths).map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn revoke_trusted_device(
+    fingerprint: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::unattended_access::TrustedDeviceViewV1>, String> {
+    crate::unattended_access::revoke_device(&state.paths, &fingerprint)
+        .and_then(|()| crate::unattended_access::trusted_devices(&state.paths))
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn list_unattended_grants(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::unattended_access::UnattendedGrantViewV1>, String> {
+    crate::unattended_access::grants(&state.paths, storage::now_ts())
+        .map_err(|error| error.message())
+}
+
+/// Only this Host's user, with the device connected and shown, can create a
+/// permission. Nothing a peer sends reaches this command.
+#[tauri::command]
+pub fn create_unattended_grant(
+    request: crate::unattended_access::CreateUnattendedGrantV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::unattended_access::UnattendedGrantViewV1, String> {
+    let current = crate::host_runtime::current_verified_peer_devices(&state);
+    crate::unattended_access::create_grant(
+        &state.paths,
+        &state.local_host_ref,
+        &current,
+        &request,
+        storage::now_ts(),
+    )
+    .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn revoke_unattended_grant(
+    grant_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::unattended_access::UnattendedGrantViewV1>, String> {
+    crate::unattended_access::revoke_grant(&state.paths, &grant_id)
+        .and_then(|()| crate::unattended_access::grants(&state.paths, storage::now_ts()))
+        .map_err(|error| error.message())
+}
+
+/// Proves this device's durable identity to the peer of one exact current
+/// session. The peer records it only for that session; it admits and
+/// authorizes nothing, and a Host's user must still trust the device and
+/// grant it scoped permission before anything runs unattended.
+async fn present_device_identity_over(
+    state: Arc<AppState>,
+    binding: &crate::host_identity::HostSessionBinding,
+) -> AppResult<()> {
+    let master_key = {
+        let config = state.config.read();
+        config::master_key(&config)?
+    };
+    let identity = crate::device_identity::load_or_create(&state.paths, &master_key)?;
+    let attestation = identity.attest(binding, &uuid::Uuid::new_v4().to_string())?;
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        &binding.bridge_id,
+        &binding.peer_route_ref,
+    )?;
+    let event = crate::room_control::native_agent_event(
+        "native_agent.device_identity",
+        serde_json::to_value(attestation)?,
+        &context,
+    )?;
+    crate::room_control::send_room_control_event(
+        state.clone(),
+        &binding.bridge_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            &binding.bridge_id,
+            &binding.peer_route_ref,
+        )),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Shows this device's identity to one exact current Bridge Host, so its
+/// user can choose to trust it. Explicit; grants nothing.
+#[tauri::command]
+pub async fn present_device_identity(
+    room_id: String,
+    target_host_ref: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|error| error.message())?;
+    let session = state
+        .resolve_current_remote_host_session(&room_id, &target)
+        .await
+        .map_err(|error| error.message())?;
+    present_device_identity_over(state.inner().clone(), session.binding())
+        .await
+        .map_err(|error| error.message())
+}
+
 /// Room Control delivery failures at this boundary are receipt-ambiguous. The
 /// caller must retain the exact durable task handle to reconcile; it must not
 /// infer a remote non-start or retry the native Agent.
@@ -1141,6 +1328,9 @@ pub async fn start_remote_native_codex_task(
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before native invocation.".into());
     }
+    // Lets the executing Host recognize this device for this session only;
+    // without it the invocation simply waits for that Host's Review.
+    let _ = present_device_identity_over(state.inner().clone(), session.binding()).await;
     let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
     let request = crate::native_agent::NativeAgentInvokeV1 {
         schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
@@ -1194,6 +1384,7 @@ pub async fn start_remote_native_capability_task(
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before native invocation.".into());
     }
+    let _ = present_device_identity_over(state.inner().clone(), session.binding()).await;
     let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
     let request = crate::native_agent::NativeAgentInvokeV2 {
         schema_version: crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA.into(),
