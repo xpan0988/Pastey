@@ -82,6 +82,7 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "native_agent.reconciliation",
     "native_agent.retry_result_return",
     "native_agent.device_identity",
+    "native_agent.decision",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
@@ -1854,6 +1855,44 @@ pub async fn receive_room_control_event_handler(
                     .await;
                 });
             }
+            "native_agent.decision" => {
+                let Ok(request) =
+                    serde_json::from_value::<crate::native_agent::NativeAgentDecisionV1>(payload)
+                else {
+                    return control_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_native_agent",
+                        "Invalid native Agent decision.",
+                    );
+                };
+                // The deciding principal is the exact authenticated current
+                // peer session and the device key proven in it.
+                let binding = match crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::FORBIDDEN,
+                            "host_mismatch",
+                            "Native Agent decision has no bound peer Host.",
+                        )
+                    }
+                };
+                let verified_device =
+                    crate::host_runtime::verified_peer_device_for(&ctx.state, &binding);
+                if let Err(error) = ctx.state.native_agents.lock().submit_native_decision(
+                    &binding,
+                    verified_device.as_ref(),
+                    &request,
+                    storage::now_ts(),
+                ) {
+                    let (code, message) = native_decision_rejection(&error);
+                    return control_error(StatusCode::CONFLICT, code, message);
+                }
+            }
             "native_agent.device_identity" => {
                 // Verified against this Host's own current binding of the
                 // exact session it arrived on; it admits and authorizes
@@ -2868,6 +2907,17 @@ fn validate_control_event(
                     event,
                 });
             }
+            "native_agent.decision" => {
+                let request = serde_json::from_value::<crate::native_agent::NativeAgentDecisionV1>(
+                    Value::Object(payload.clone()),
+                )
+                .map_err(AppError::from)?;
+                crate::native_agent::validate_decision(&request)?;
+                format!(
+                    "native-agent-decision:{}:{}:{}",
+                    request.task_id, request.review_ref, request.decision_id
+                )
+            }
             "native_agent.device_identity" => {
                 let attestation = serde_json::from_value::<
                     crate::device_identity::DeviceSessionAttestationV1,
@@ -3000,6 +3050,34 @@ fn encrypted_receipt_response(event_key: &[u8; 32], event_id: &str, received_at:
         .into_response()
 }
 
+/// A fixed, content-free reason a decision was not given to Codex.
+fn native_decision_rejection(error: &AppError) -> (&'static str, &'static str) {
+    let message = error.message();
+    if message.contains("expired") {
+        ("native_decision_expired", "This request expired.")
+    } else if message.contains("already given") || message.contains("no longer waits") {
+        (
+            "native_decision_resolved",
+            "Codex no longer waits for this decision.",
+        )
+    } else if message.contains("changed") {
+        (
+            "native_decision_changed",
+            "What Codex asks changed; review it again.",
+        )
+    } else if message.contains("no longer running") || message.contains("being stopped") {
+        (
+            "native_decision_task_ended",
+            "This task is no longer running.",
+        )
+    } else {
+        (
+            "native_decision_unauthorized",
+            "Only the device that started this task, in a current session, can decide its requests.",
+        )
+    }
+}
+
 fn control_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
     (
         status,
@@ -3057,6 +3135,13 @@ async fn control_response_failure(response: reqwest::Response) -> AppError {
     let message = match error_code.as_deref() {
         Some("event_expired") => "Room control event expired before delivery.",
         Some("event_replayed") => "Room control event was already received.",
+        Some("native_decision_expired") => "This request expired.",
+        Some("native_decision_resolved") => "Codex no longer waits for this decision.",
+        Some("native_decision_changed") => "What Codex asks changed; review it again.",
+        Some("native_decision_task_ended") => "This task is no longer running.",
+        Some("native_decision_unauthorized") => {
+            "Only the device that started this task, in a current session, can decide its requests."
+        }
         Some("session_mismatch") => "Room control session mismatch.",
         Some("inbox_full") => "Room control inbox is full.",
         Some("terminal_rate_limited") => "Developer Terminal flow-control limit was reached.",
@@ -3230,12 +3315,29 @@ fn transport_field_view<'a>(kind: &str, event: &'a Value) -> Cow<'a, Value> {
         ) => "/payload/taskOutput",
         _ => return Cow::Borrowed(event),
     };
-    if event.pointer(opaque).is_none() {
+    // A status's native decision reviews carry Codex's own request content
+    // (command, folder, file paths and diffs) for display only, after
+    // `validate_status` bounded it. It never names an action this side takes.
+    let review_count = match kind {
+        "native_agent.status" => event
+            .pointer("/payload/status/nativeDecisions")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        _ => 0,
+    };
+    if event.pointer(opaque).is_none() && review_count == 0 {
         return Cow::Borrowed(event);
     }
     let mut view = event.clone();
     if let Some(subtree) = view.pointer_mut(opaque) {
         *subtree = Value::Null;
+    }
+    for index in 0..review_count {
+        if let Some(content) =
+            view.pointer_mut(&format!("/payload/status/nativeDecisions/{index}/content"))
+        {
+            *content = Value::Null;
+        }
     }
     Cow::Owned(view)
 }
@@ -4059,6 +4161,9 @@ mod tests {
                 // Core's session-bound requester identity, shared by every
                 // capability; not capability-specific.
                 "native_agent.device_identity",
+                // The requesting user's decision on a native request; Core
+                // relays it to whichever capability raised the request.
+                "native_agent.decision",
             ]
         );
     }
@@ -4167,6 +4272,7 @@ mod tests {
                 code: None,
                 output: output.map(|value| serde_json::from_value(value).unwrap()),
                 conversation: None,
+                native_decisions: Vec::new(),
             },
         })
         .unwrap()
@@ -4190,6 +4296,116 @@ mod tests {
 
     fn native_event(kind: &str, payload: Value) -> Value {
         native_agent_event(kind, payload, &native_agent_test_context()).unwrap()
+    }
+
+    fn review_status_payload() -> Value {
+        use crate::native_agent::*;
+        let content = NativeDecisionContentV1 {
+            command: Some("cargo test --all".into()),
+            cwd: Some("C:\\REPZ".into()),
+            reason: Some("Run the tests".into()),
+            file_changes: vec![NativeFileChangeV1 {
+                path: "src/lib.rs".into(),
+                change: "update".into(),
+                move_to: None,
+                diff: "-a\n+b\n".into(),
+            }],
+            ..NativeDecisionContentV1::default()
+        };
+        let review = NativeDecisionReviewV1 {
+            review_ref: "native-decision:0f6c1c1e-5a2e-4b8e-9d55-3d1b2f0c9a11".into(),
+            kind: NativeDecisionKindV1::CommandExecution,
+            state: NativeDecisionStateV1::Pending,
+            submitted: None,
+            can_accept: true,
+            can_decline: true,
+            unavailable_reason: None,
+            content_digest: native_decision_content_digest(
+                NativeDecisionKindV1::CommandExecution,
+                Some(&content),
+            ),
+            content: Some(content),
+            requested_at: 1,
+            expires_at: 2,
+        };
+        serde_json::to_value(NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task-review".into(),
+            executing_host_ref: "host:remote".into(),
+            status: NativeAgentTaskStatusV1 {
+                schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+                task_id: "task-review".into(),
+                agent_id: CODEX_CAPABILITY_ID.into(),
+                workspace_name: "REPZ".into(),
+                session_reused: false,
+                state: NativeAgentTaskStateV1::Running,
+                result: None,
+                code: Some(AWAITING_NATIVE_DECISION_CODE.into()),
+                output: None,
+                conversation: None,
+                native_decisions: vec![review],
+            },
+        })
+        .unwrap()
+    }
+
+    fn decision_payload() -> Value {
+        serde_json::to_value(crate::native_agent::NativeAgentDecisionV1 {
+            schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            decision_id: "4b0e0c7a-8d0f-4d4b-9a5e-0d5a3c1e2f10".into(),
+            task_id: "task-review".into(),
+            target_host_ref: "host:remote".into(),
+            review_ref: "native-decision:0f6c1c1e-5a2e-4b8e-9d55-3d1b2f0c9a11".into(),
+            content_digest: "a".repeat(64),
+            decision: crate::native_agent::NativeDecisionV1::Accept,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn native_review_content_crosses_only_inside_each_reviews_content() {
+        let status = native_event("native_agent.status", review_status_payload());
+        validate_native(status.clone()).unwrap();
+        // The same names anywhere else in the status are still refused.
+        let mut beside = status.clone();
+        beside["payload"]["status"]["nativeDecisions"][0]["command"] = Value::from("ls");
+        rejected_as_unsafe(beside);
+        let mut top = status.clone();
+        top["payload"]["status"]["path"] = Value::from("/");
+        rejected_as_unsafe(top);
+        // Content of a review the status validation refuses never passes.
+        let mut forged = status;
+        forged["payload"]["status"]["nativeDecisions"][0]["content"]["command"] =
+            Value::from("rm -rf /");
+        assert!(validate_native(forged).is_err());
+    }
+
+    #[test]
+    fn a_native_decision_carries_no_content_and_replays_per_attempt() {
+        let decision = native_event("native_agent.decision", decision_payload());
+        let validated = validate_native(decision.clone()).unwrap();
+        assert_eq!(
+            validated.request_id.as_deref(),
+            Some(
+                "native-agent-decision:task-review:native-decision:0f6c1c1e-5a2e-4b8e-9d55-3d1b2f0c9a11:4b0e0c7a-8d0f-4d4b-9a5e-0d5a3c1e2f10"
+            )
+        );
+        // No command, path or other field rides along.
+        let mut carrying = decision.clone();
+        carrying["payload"]["command"] = Value::from("rm -rf /");
+        rejected_as_unsafe(carrying);
+        let mut extra = decision.clone();
+        extra["payload"]["scope"] = Value::from("session");
+        assert!(validate_native(extra).is_err());
+        // Only one-time answers exist.
+        for answer in ["acceptForSession", "cancel", "approved"] {
+            let mut other = decision.clone();
+            other["payload"]["decision"] = Value::from(answer);
+            assert!(validate_native(other).is_err(), "{answer}");
+        }
+        let mut native_id = decision;
+        native_id["payload"]["reviewRef"] = Value::from("approval-cmd");
+        assert!(validate_native(native_id).is_err());
     }
 
     #[test]
@@ -4368,6 +4584,7 @@ mod tests {
                         code: Some(code.into()),
                         output: None,
                         conversation: None,
+                        native_decisions: Vec::new(),
                     },
                 })
                 .unwrap(),

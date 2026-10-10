@@ -523,6 +523,180 @@ enum NativeTurnOutcomeV1 {
     ConversationUnavailable,
 }
 
+/// How long the requesting user has to decide a native request remotely.
+pub(crate) const NATIVE_DECISION_REVIEW_TTL_SECONDS: i64 = 30 * 60;
+/// Most native decision reviews one task carries at once.
+pub(crate) const MAX_NATIVE_DECISION_REVIEWS: usize = 3;
+/// Bound for one review's material content, as JSON. Larger content is
+/// never summarized or cut: the review simply cannot be approved. With
+/// `MAX_NATIVE_DECISION_REVIEWS` it keeps a status within one control event.
+pub(crate) const MAX_NATIVE_DECISION_CONTENT_BYTES: usize = 10 * 1024;
+
+/// What a native capability asks its client to decide.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeDecisionKindV1 {
+    /// Run one command.
+    CommandExecution,
+    /// Apply one set of file changes.
+    FileChange,
+    /// Something Pastey does not relay (a permission grant, a question, an
+    /// MCP form, terminal input). Visible and stoppable, never answered.
+    Unsupported,
+}
+
+/// A human's answer to one native request. Only one-time answers exist:
+/// nothing is approved for a session, a turn or by policy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeDecisionV1 {
+    /// Allow exactly this one operation.
+    Accept,
+    /// Refuse it; the native task continues without it.
+    Decline,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeDecisionStateV1 {
+    /// Waiting for the requesting user.
+    Pending,
+    /// The user's answer was given to the native capability; it has not yet
+    /// reported the request resolved.
+    Submitted,
+    /// The native capability reported the request resolved (answered, or
+    /// cleared by its own turn change).
+    Resolved,
+}
+
+/// The material, native-original content of one request. Untrusted data,
+/// displayed only as escaped text.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeDecisionContentV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) network_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) network_protocol: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) file_changes: Vec<NativeFileChangeV1>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeFileChangeV1 {
+    pub(crate) path: String,
+    /// `add`, `delete`, `update`, or `move` (with `moveTo`).
+    pub(crate) change: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) move_to: Option<String>,
+    pub(crate) diff: String,
+}
+
+/// One native request awaiting its requesting user's decision, as both Hosts
+/// see it. `review_ref` is Pastey's opaque reference; native request, thread
+/// and turn identifiers never leave the executing Host.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeDecisionReviewV1 {
+    pub(crate) review_ref: String,
+    pub(crate) kind: NativeDecisionKindV1,
+    pub(crate) state: NativeDecisionStateV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) submitted: Option<NativeDecisionV1>,
+    pub(crate) can_accept: bool,
+    pub(crate) can_decline: bool,
+    /// Why approval (or any answer) is not offered, as a lifecycle code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) content: Option<NativeDecisionContentV1>,
+    /// Digest of exactly the kind and content shown; a decision names it.
+    pub(crate) content_digest: String,
+    pub(crate) requested_at: i64,
+    pub(crate) expires_at: i64,
+}
+
+pub(crate) fn native_decision_content_digest(
+    kind: NativeDecisionKindV1,
+    content: Option<&NativeDecisionContentV1>,
+) -> String {
+    let bytes =
+        serde_json::to_vec(&json!({ "kind": kind, "content": content })).unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+fn validate_native_decision_review(review: &NativeDecisionReviewV1) -> bool {
+    review.review_ref.starts_with("native-decision:")
+        && review.review_ref.len() <= 96
+        && review
+            .review_ref
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':'))
+        && review.content_digest.len() == 64
+        && review
+            .content_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        && valid_lifecycle_code(review.unavailable_reason.as_deref())
+        && review.content.as_ref().is_none_or(|content| {
+            serde_json::to_vec(content)
+                .is_ok_and(|bytes| bytes.len() <= MAX_NATIVE_DECISION_CONTENT_BYTES)
+        })
+        && review.content_digest
+            == native_decision_content_digest(review.kind, review.content.as_ref())
+        && !(review.can_accept
+            && (review.content.is_none() || review.kind == NativeDecisionKindV1::Unsupported))
+}
+
+/// A requesting user's explicit decision on one native request of their
+/// task, sent over the authenticated Bridge. It carries no command, path or
+/// native identifier: only Pastey's reference and the digest of what was
+/// shown.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeAgentDecisionV1 {
+    pub(crate) schema_version: String,
+    /// One attempt to decide; its replay key. Once-only answering is the
+    /// executing Host's, per native request.
+    pub(crate) decision_id: String,
+    pub(crate) task_id: String,
+    pub(crate) target_host_ref: String,
+    pub(crate) review_ref: String,
+    pub(crate) content_digest: String,
+    pub(crate) decision: NativeDecisionV1,
+}
+
+pub(crate) fn validate_decision(request: &NativeAgentDecisionV1) -> AppResult<()> {
+    if request.schema_version != NATIVE_AGENT_PROTOCOL_SCHEMA
+        || !valid_task_id(&request.task_id)
+        || request.decision_id.is_empty()
+        || request.decision_id.len() > 64
+        || !request
+            .decision_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || request.target_host_ref.trim().is_empty()
+        || request.target_host_ref.len() > 256
+        || !request.review_ref.starts_with("native-decision:")
+        || request.review_ref.len() > 96
+        || request.content_digest.len() != 64
+        || !request
+            .content_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return invalid("Native Agent decision is invalid.");
+    }
+    Ok(())
+}
+
 /// Whether a task continued its owner's earlier native conversation or
 /// began a new one. Renderer-safe: no native identifier.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -659,6 +833,58 @@ impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
         }
     }
 
+    fn native_decision_updated(&self, review: NativeDecisionReviewV1) {
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        let Some(status) = tasks
+            .get_mut(&self.task_id)
+            .filter(|status| status.state == NativeAgentTaskStateV1::Running)
+        else {
+            return;
+        };
+        match status
+            .native_decisions
+            .iter_mut()
+            .find(|known| known.review_ref == review.review_ref)
+        {
+            Some(known) => *known = review,
+            None => {
+                // Resolved reviews give way first; an unrepresentable
+                // surplus is simply not offered (the native request still
+                // waits, visibly, and can be stopped).
+                if status.native_decisions.len() >= MAX_NATIVE_DECISION_REVIEWS {
+                    if let Some(index) = status
+                        .native_decisions
+                        .iter()
+                        .position(|known| known.state == NativeDecisionStateV1::Resolved)
+                    {
+                        status.native_decisions.remove(index);
+                    }
+                }
+                if status.native_decisions.len() < MAX_NATIVE_DECISION_REVIEWS {
+                    status.native_decisions.push(review);
+                }
+            }
+        }
+    }
+
+    fn native_decision_resolved(&self, review_ref: &str) {
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        if let Some(review) = tasks.get_mut(&self.task_id).and_then(|status| {
+            status
+                .native_decisions
+                .iter_mut()
+                .find(|review| review.review_ref == review_ref)
+        }) {
+            review.state = NativeDecisionStateV1::Resolved;
+            review.can_accept = false;
+            review.can_decline = false;
+        }
+    }
+
     fn conversation_established(
         &self,
         continuity: NativeConversationContinuityV1,
@@ -754,11 +980,23 @@ pub(crate) struct NativeAgentTaskStatusV1 {
     /// owner's conversation or began a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) conversation: Option<NativeConversationContinuityV1>,
+    /// Native requests of this running task awaiting its requesting user.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) native_decisions: Vec<NativeDecisionReviewV1>,
 }
 
 /// A small Host-private service: the native capability lifecycle over a
 /// fixed set of registered adapters. It is not a discoverable Agent
 /// marketplace, an authority source, or a Worker adapter.
+/// Who asked for one Bridge task: a device key proven over a session of
+/// that Bridge, from that peer Host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeTaskRequesterV1 {
+    bridge_id: String,
+    peer_host_ref: String,
+    fingerprint: String,
+}
+
 pub(crate) struct NativeAgentServiceV1 {
     /// Capabilities this Host can run, dispatched by capability id.
     adapters: Vec<Arc<dyn NativeCapabilityAdapterV1>>,
@@ -794,6 +1032,10 @@ pub(crate) struct NativeAgentServiceV1 {
     /// The conversation key each Bridge-owned task ran in, so Burn can end
     /// that conversation's live native state.
     task_conversations: HashMap<String, String>,
+    /// The device, proven in its session, that requested each Bridge task:
+    /// the only one whose user may decide that task's native requests.
+    /// Process-local; a restart never resumes a native turn.
+    task_requesters: HashMap<String, NativeTaskRequesterV1>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
     durable_paths: Option<crate::storage::AppPaths>,
     #[cfg(test)]
@@ -829,6 +1071,7 @@ impl NativeAgentServiceV1 {
             task_input_digests: HashMap::new(),
             movement_bindings: HashMap::new(),
             task_conversations: HashMap::new(),
+            task_requesters: HashMap::new(),
             workspace_movements: HashMap::new(),
             durable_paths: None,
             #[cfg(test)]
@@ -950,7 +1193,9 @@ impl NativeAgentServiceV1 {
         for stored in crate::storage::list_native_agent_envelopes(&paths)? {
             let mut persisted: PersistedNativeAgentEnvelopeV1 =
                 serde_json::from_str(&stored.record_json).map_err(AppError::from)?;
-            let mut changed = false;
+            // A restart never resumes a native turn, nor anything it asked.
+            let mut changed = !persisted.task.native_decisions.is_empty();
+            persisted.task.native_decisions.clear();
             if persisted.task.state == NativeAgentTaskStateV1::Queued
                 && persisted.task.code.as_deref() == Some(admission::REVIEW_REQUIRED_CODE)
             {
@@ -1304,6 +1549,12 @@ impl NativeAgentServiceV1 {
             // owning the landed tree.
             return Ok(());
         }
+        // Native requests are process-local display state: their content
+        // (commands, paths, diffs) is never written to disk.
+        let task = NativeAgentTaskStatusV1 {
+            native_decisions: Vec::new(),
+            ..task
+        };
         let persisted = PersistedNativeAgentEnvelopeV1 {
             task: task.clone(),
             task_workspace: self.task_workspaces.get(task_id).cloned(),
@@ -1350,7 +1601,11 @@ impl NativeAgentServiceV1 {
         task_id: &str,
         status: &NativeAgentTaskStatusV1,
     ) {
-        if let Ok(task) = serde_json::to_value(status) {
+        let status = NativeAgentTaskStatusV1 {
+            native_decisions: Vec::new(),
+            ..status.clone()
+        };
+        if let Ok(task) = serde_json::to_value(&status) {
             let _ =
                 crate::storage::update_native_agent_observed_task_if_present(paths, task_id, &task);
         }
@@ -1482,6 +1737,7 @@ impl NativeAgentServiceV1 {
                     code: Some("workspace_movement_review".into()),
                     output: None,
                     conversation: None,
+                    native_decisions: Vec::new(),
                 },
             );
         self.remote_targets
@@ -1703,6 +1959,7 @@ impl NativeAgentServiceV1 {
                     code: Some("workspace_transfer_pending".into()),
                     output: None,
                     conversation: None,
+                    native_decisions: Vec::new(),
                 },
             );
         self.task_digests
@@ -3497,30 +3754,148 @@ impl NativeAgentServiceV1 {
             return invalid("Native Agent task identity is invalid.");
         }
         request.input.validate()?;
-        self.with_bridge_task_owner(&binding.bridge_id, &request.task_id, |service| {
-            if let Some(existing) = service.replayed_invocation(
-                &request.task_id,
-                &request.agent_capability,
-                &request.input,
-            )? {
-                return Ok(existing);
-            }
-            if let Some(device) = verified_device {
-                if let Some(started) =
-                    service.start_under_unattended_grant(binding, device, request, now)?
-                {
-                    return Ok(started);
+        let first_request = !self.task_bridges.contains_key(&request.task_id);
+        let requester = verified_device
+            .filter(|device| device.binding.validate_current(binding, now).is_ok())
+            .map(|device| NativeTaskRequesterV1 {
+                bridge_id: binding.bridge_id.clone(),
+                peer_host_ref: binding.peer_host_ref.as_str().to_owned(),
+                fingerprint: device.fingerprint.clone(),
+            });
+        let status =
+            self.with_bridge_task_owner(&binding.bridge_id, &request.task_id, |service| {
+                if let Some(existing) = service.replayed_invocation(
+                    &request.task_id,
+                    &request.agent_capability,
+                    &request.input,
+                )? {
+                    return Ok(existing);
                 }
-            }
-            service.admit_invocation(
-                NativeInvocationPrincipalV1::Remote(binding),
-                &request.agent_capability,
-                &request.task_id,
-                &request.input,
-                NativeInvocationContinuationV1::Direct,
-                now,
+                if let Some(device) = verified_device {
+                    if let Some(started) =
+                        service.start_under_unattended_grant(binding, device, request, now)?
+                    {
+                        return Ok(started);
+                    }
+                }
+                service.admit_invocation(
+                    NativeInvocationPrincipalV1::Remote(binding),
+                    &request.agent_capability,
+                    &request.task_id,
+                    &request.input,
+                    NativeInvocationContinuationV1::Direct,
+                    now,
+                )
+            })?;
+        // Only the request that created the task names its requester; a
+        // replay never adds or replaces one.
+        if let (true, Some(requester)) = (first_request, requester) {
+            self.task_requesters
+                .insert(request.task_id.clone(), requester);
+        }
+        Ok(status)
+    }
+
+    /// The requesting user's explicit decision on one native request of
+    /// their running task. Accepted only over a current session of the
+    /// task's Bridge, from the same peer Host and the same device key that
+    /// requested the task, proven in this session; only for a review still
+    /// pending, unexpired, shown with exactly this content and offering this
+    /// decision. An unattended permission plays no part: it never decides a
+    /// native request. Nothing here waits for the user or the network.
+    pub(crate) fn submit_native_decision(
+        &mut self,
+        binding: &HostSessionBinding,
+        verified_device: Option<&crate::device_identity::VerifiedPeerDevice>,
+        request: &NativeAgentDecisionV1,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        validate_decision(request)?;
+        if request.target_host_ref != binding.local_host_ref.as_str() {
+            return invalid("Native Agent decision names another Host.");
+        }
+        if self.revoked_bridges.contains(&binding.bridge_id)
+            || self.task_bridges.get(&request.task_id) != Some(&binding.bridge_id)
+        {
+            return invalid("Native Agent decision crossed its Bridge authority.");
+        }
+        let requester = self.task_requesters.get(&request.task_id).ok_or_else(|| {
+            AppError::InvalidInput(
+                "Only the device that started this task can decide its requests.".into(),
             )
-        })
+        })?;
+        let device = verified_device
+            .filter(|device| device.binding.validate_current(binding, now).is_ok())
+            .ok_or_else(|| {
+                AppError::InvalidInput(
+                    "This device has not proven its identity in this session.".into(),
+                )
+            })?;
+        if requester.bridge_id != binding.bridge_id
+            || requester.peer_host_ref != binding.peer_host_ref.as_str()
+            || requester.fingerprint != device.fingerprint
+        {
+            return invalid("Only the device that started this task can decide its requests.");
+        }
+        let agent_id = {
+            let tasks = self.tasks.lock().map_err(|_| {
+                AppError::InvalidInput("Native Agent task store is unavailable.".into())
+            })?;
+            let status = tasks
+                .get(&request.task_id)
+                .filter(|status| status.state == NativeAgentTaskStateV1::Running)
+                .ok_or_else(|| AppError::InvalidInput("This task is no longer running.".into()))?;
+            let review = status
+                .native_decisions
+                .iter()
+                .find(|review| review.review_ref == request.review_ref)
+                .ok_or_else(|| {
+                    AppError::InvalidInput("Codex no longer waits for this decision.".into())
+                })?;
+            let offered = match request.decision {
+                NativeDecisionV1::Accept => review.can_accept,
+                NativeDecisionV1::Decline => review.can_decline,
+            };
+            if review.state != NativeDecisionStateV1::Pending {
+                return invalid("This decision was already given.");
+            }
+            if review.expires_at <= now {
+                return invalid("This request expired.");
+            }
+            if review.content_digest != request.content_digest {
+                return invalid("What Codex asks changed; review it again.");
+            }
+            if !offered {
+                return invalid("Codex does not offer this decision for this request.");
+            }
+            status.agent_id.clone()
+        };
+        self.adapter(&agent_id)?.respond_native_decision(
+            &request.task_id,
+            &request.review_ref,
+            &request.content_digest,
+            request.decision,
+            now,
+        )?;
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            AppError::InvalidInput("Native Agent task store is unavailable.".into())
+        })?;
+        let status = tasks
+            .get_mut(&request.task_id)
+            .ok_or_else(|| AppError::InvalidInput("Native Agent task is unavailable.".into()))?;
+        // Codex may already have reported it resolved; that fact stands.
+        if let Some(review) = status
+            .native_decisions
+            .iter_mut()
+            .find(|review| review.review_ref == request.review_ref)
+            .filter(|review| review.state == NativeDecisionStateV1::Pending)
+        {
+            review.state = NativeDecisionStateV1::Submitted;
+            review.submitted = Some(request.decision);
+            review.can_accept = false;
+            review.can_decline = false;
+        }
+        Ok(status.clone())
     }
 
     /// A replay of an existing task answers with that task. Identity is the
@@ -3713,6 +4088,7 @@ impl NativeAgentServiceV1 {
                     code: Some(admission::REVIEW_REQUIRED_CODE.into()),
                     output: None,
                     conversation: None,
+                    native_decisions: Vec::new(),
                 };
                 self.tasks
                     .lock()
@@ -3830,6 +4206,7 @@ impl NativeAgentServiceV1 {
             .ok_or_else(|| AppError::InvalidInput("Native Agent task is unavailable.".into()))?;
         if task.state == NativeAgentTaskStateV1::Queued {
             task.state = NativeAgentTaskStateV1::Failed;
+            task.native_decisions.clear();
             task.code = Some(code.into());
         }
         Ok(task.clone())
@@ -3940,6 +4317,7 @@ impl NativeAgentServiceV1 {
                             code: Some(admission::START_REJECTED_CODE.into()),
                             output: None,
                             conversation: None,
+                            native_decisions: Vec::new(),
                         },
                     );
                     self.unstarted_review_tasks.insert(task_id.into());
@@ -4137,6 +4515,7 @@ impl NativeAgentServiceV1 {
             code: None,
             output: None,
             conversation: started.conversation,
+            native_decisions: Vec::new(),
         };
         self.tasks
             .lock()
@@ -4186,6 +4565,8 @@ impl NativeAgentServiceV1 {
             let mut persisted_status = None;
             if let Ok(mut tasks) = tasks.lock() {
                 if let Some(status) = tasks.get_mut(&task_id) {
+                    // The turn ended: nothing it asked can be answered now.
+                    status.native_decisions.clear();
                     // Cancellation wins a concurrent late native completion.
                     // The observer still reaches this point to release its
                     // Host-private execution occupancy.
@@ -4468,6 +4849,7 @@ impl NativeAgentServiceV1 {
             code: Some("remote_agent_queued".into()),
             output: None,
             conversation: None,
+            native_decisions: Vec::new(),
         };
         self.tasks
             .lock()
@@ -4594,6 +4976,7 @@ impl NativeAgentServiceV1 {
             ))
         {
             task.state = NativeAgentTaskStateV1::Cancelled;
+            task.native_decisions.clear();
             task.code = Some("native_agent_cancel_requested".into());
         }
         let status = task.clone();
@@ -4653,6 +5036,7 @@ impl NativeAgentServiceV1 {
                 // this exact durable identity for fresh-session reconciliation;
                 // it is not evidence that the Agent did not start.
                 task.state = NativeAgentTaskStateV1::Interrupted;
+                task.native_decisions.clear();
                 task.code = Some("native_agent_reconciliation_required".into());
             }
             task.clone()
@@ -4701,6 +5085,7 @@ impl NativeAgentServiceV1 {
                         | NativeAgentTaskStateV1::Cancelled
                 ) {
                     task.state = NativeAgentTaskStateV1::Interrupted;
+                    task.native_decisions.clear();
                     task.code = Some(code.into());
                 }
             }
@@ -4761,6 +5146,54 @@ impl NativeAgentServiceV1 {
         Ok(unresolved.into_iter().next())
     }
 
+    /// The requesting side's check before sending its user's decision: the
+    /// task is this Bridge's, runs on `target_host_ref`, and its executing
+    /// Host last reported this exact review pending, offering this decision.
+    /// The executing Host decides again; this only refuses stale clicks.
+    pub(crate) fn remote_decision_target(
+        &self,
+        bridge_id: &str,
+        task_id: &str,
+        review_ref: &str,
+        content_digest: &str,
+        decision: NativeDecisionV1,
+    ) -> AppResult<String> {
+        if self.revoked_bridges.contains(bridge_id)
+            || self.task_bridges.get(task_id).map(String::as_str) != Some(bridge_id)
+        {
+            return invalid("Native Agent task crossed its Bridge authority.");
+        }
+        let target = self
+            .remote_targets
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| AppError::InvalidInput("This task runs on this device.".into()))?;
+        let tasks = self.tasks.lock().map_err(|_| {
+            AppError::InvalidInput("Native Agent task store is unavailable.".into())
+        })?;
+        let review = tasks
+            .get(task_id)
+            .filter(|status| status.state == NativeAgentTaskStateV1::Running)
+            .and_then(|status| {
+                status
+                    .native_decisions
+                    .iter()
+                    .find(|review| review.review_ref == review_ref)
+            })
+            .filter(|review| review.state == NativeDecisionStateV1::Pending)
+            .ok_or_else(|| {
+                AppError::InvalidInput("Codex no longer waits for this decision.".into())
+            })?;
+        let offered = match decision {
+            NativeDecisionV1::Accept => review.can_accept,
+            NativeDecisionV1::Decline => review.can_decline,
+        };
+        if review.content_digest != content_digest || !offered {
+            return invalid("What Codex asks changed; review it again.");
+        }
+        Ok(target)
+    }
+
     pub(crate) fn bridge_remote_target(
         &self,
         bridge_id: &str,
@@ -4801,6 +5234,7 @@ impl NativeAgentServiceV1 {
                     | NativeAgentTaskStateV1::Cancelled
             ) {
                 task.state = NativeAgentTaskStateV1::Cancelled;
+                task.native_decisions.clear();
                 task.code = Some("native_agent_cancel_requested".into());
             }
             task.clone()
@@ -4881,6 +5315,7 @@ impl NativeAgentServiceV1 {
                     ) && !actively_observed_tasks.contains(task_id)
                     {
                         task.state = NativeAgentTaskStateV1::Interrupted;
+                        task.native_decisions.clear();
                         task.code = Some("native_agent_reconciliation_required".into());
                     }
                 }
@@ -5038,7 +5473,9 @@ impl NativeAgentServiceV1 {
                 if let Some(task) = tasks.get_mut(task_id) {
                     task.state = NativeAgentTaskStateV1::Cancelled;
                     task.code = Some("bridge_authority_revoked".into());
+                    task.native_decisions.clear();
                 }
+                self.task_requesters.remove(task_id);
             }
         }
         for adapter in &self.adapters {
@@ -5173,6 +5610,8 @@ impl NativeAgentServiceV1 {
             let native_execution_needs_cancellation = task.state != NativeAgentTaskStateV1::Queued;
             task.state = NativeAgentTaskStateV1::Cancelled;
             task.code = Some("native_agent_cancel_requested".into());
+            // No outstanding review may be answered once stopping began.
+            task.native_decisions.clear();
             (task.clone(), native_execution_needs_cancellation)
         };
         self.cancel_matching_workspace_movement(
@@ -6398,6 +6837,14 @@ pub(crate) fn validate_status(status: &NativeAgentStatusV1) -> AppResult<()> {
         || status.status.workspace_name.contains('/')
         || status.status.workspace_name.contains('\\')
         || !valid_lifecycle_code(status.status.code.as_deref())
+        || status.status.native_decisions.len() > MAX_NATIVE_DECISION_REVIEWS
+        || (status.status.state != NativeAgentTaskStateV1::Running
+            && !status.status.native_decisions.is_empty())
+        || !status
+            .status
+            .native_decisions
+            .iter()
+            .all(validate_native_decision_review)
     {
         return invalid("Native Agent status is invalid.");
     }
@@ -7191,6 +7638,152 @@ done
         assert_eq!(service.codex.session_count(), 0);
         service.shutdown();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_requester_shows_reviews_and_refuses_stale_decisions_locally() {
+        let bridge = "room-requester-review";
+        let executor_host = "executor-host";
+        let task_id = "native-agent:remote-review";
+        let mut requester = NativeAgentServiceV1::default();
+        requester
+            .queue_bridge_remote_task(bridge, task_id, executor_host, r"C:\REPZ", "work")
+            .unwrap();
+        let content = NativeDecisionContentV1 {
+            command: Some("cargo test".into()),
+            cwd: Some(r"C:\REPZ".into()),
+            ..NativeDecisionContentV1::default()
+        };
+        let review = NativeDecisionReviewV1 {
+            review_ref: "native-decision:abc".into(),
+            kind: NativeDecisionKindV1::CommandExecution,
+            state: NativeDecisionStateV1::Pending,
+            submitted: None,
+            can_accept: true,
+            can_decline: true,
+            unavailable_reason: None,
+            content_digest: native_decision_content_digest(
+                NativeDecisionKindV1::CommandExecution,
+                Some(&content),
+            ),
+            content: Some(content),
+            requested_at: 1,
+            expires_at: i64::MAX,
+        };
+        let running = |reviews: Vec<NativeDecisionReviewV1>, state| NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: task_id.into(),
+            executing_host_ref: executor_host.into(),
+            status: NativeAgentTaskStatusV1 {
+                schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+                task_id: task_id.into(),
+                agent_id: CODEX_CAPABILITY_ID.into(),
+                workspace_name: "REPZ".into(),
+                session_reused: false,
+                state,
+                result: None,
+                code: Some(AWAITING_NATIVE_DECISION_CODE.into()),
+                output: None,
+                conversation: None,
+                native_decisions: reviews,
+            },
+        };
+        let recorded = requester
+            .record_bridge_remote_status(
+                bridge,
+                running(vec![review.clone()], NativeAgentTaskStateV1::Running),
+            )
+            .unwrap();
+        assert_eq!(recorded.native_decisions, [review.clone()]);
+        let digest = review.content_digest.clone();
+        assert_eq!(
+            requester
+                .remote_decision_target(
+                    bridge,
+                    task_id,
+                    &review.review_ref,
+                    &digest,
+                    NativeDecisionV1::Accept
+                )
+                .unwrap(),
+            executor_host
+        );
+        // Another Bridge, another review, other content.
+        assert!(requester
+            .remote_decision_target(
+                "room-x",
+                task_id,
+                &review.review_ref,
+                &digest,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        assert!(requester
+            .remote_decision_target(
+                bridge,
+                task_id,
+                "native-decision:zzz",
+                &digest,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        assert!(requester
+            .remote_decision_target(
+                bridge,
+                task_id,
+                &review.review_ref,
+                &"0".repeat(64),
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        // Once the executor reports it submitted, the click is stale.
+        let mut submitted = review.clone();
+        submitted.state = NativeDecisionStateV1::Submitted;
+        submitted.submitted = Some(NativeDecisionV1::Decline);
+        submitted.can_accept = false;
+        submitted.can_decline = false;
+        requester
+            .record_bridge_remote_status(
+                bridge,
+                running(vec![submitted], NativeAgentTaskStateV1::Running),
+            )
+            .unwrap();
+        assert!(requester
+            .remote_decision_target(
+                bridge,
+                task_id,
+                &review.review_ref,
+                &digest,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        // A terminal status never carries reviews.
+        assert!(requester
+            .record_bridge_remote_status(
+                bridge,
+                running(vec![review.clone()], NativeAgentTaskStateV1::Completed)
+            )
+            .is_err());
+        // The requester's own Stop ends it locally at once.
+        requester
+            .record_bridge_remote_status(
+                bridge,
+                running(vec![review.clone()], NativeAgentTaskStateV1::Running),
+            )
+            .unwrap();
+        let cancelled = requester
+            .cancel_remote_task(task_id, executor_host)
+            .unwrap();
+        assert!(cancelled.native_decisions.is_empty());
+        assert!(requester
+            .remote_decision_target(
+                bridge,
+                task_id,
+                &review.review_ref,
+                &digest,
+                NativeDecisionV1::Decline
+            )
+            .is_err());
     }
 
     #[test]
@@ -8278,6 +8871,7 @@ done
             code: None,
             output: None,
             conversation: Some(NativeConversationContinuityV1::Continued),
+            native_decisions: Vec::new(),
         };
         let wire = serde_json::to_value(NativeAgentStatusV1 {
             schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
@@ -8869,6 +9463,787 @@ done
         let _ = fs::remove_dir_all(approval_root);
     }
 
+    /// Codex raising a command approval and a file-change approval (whose
+    /// diff its `item/started` carried) in one turn. Each answer is recorded
+    /// verbatim in `answers`, and Codex then reports that request resolved.
+    /// Background waits end with the app-server shell (`$$`) or its
+    /// workspace, so a stopped task leaves no fixture process behind.
+    const APPROVAL_TURN: &str = r#"    *'"id":3,'*)
+      {ACK}
+      printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","startedAtMs":1,"item":{"type":"fileChange","id":"patch-1","status":"inProgress","changes":[{"path":"src/lib.rs","kind":{"type":"update","move_path":null},"diff":"-a\n+b\n"}]}}}'
+      printf '%s\n' '{"id":"approval-cmd","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","startedAtMs":1,"command":"cargo test","cwd":"/repo","reason":"Run the tests <b>now</b>"}}'
+      printf '%s\n' '{"id":7,"method":"item/fileChange/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"patch-1","startedAtMs":1}}'
+      (
+        while [ ! -f "$PWD/patch-updated" ]; do [ -f "$PWD/finish-turn" ] && break; kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        if [ -f "$PWD/patch-updated" ]; then
+          printf '%s\n' '{"method":"item/fileChange/patchUpdated","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"patch-1","changes":[{"path":"src/main.rs","kind":{"type":"delete"},"diff":""}]}}'
+          touch "$PWD/patch-update-sent"
+        fi
+        while [ ! -f "$PWD/finish-turn" ]; do kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"m","text":"Done after review."}}}'
+        {COMPLETED}
+      ) &
+      ;;
+    *'"id":"approval-cmd"'*)
+      printf '%s\n' "$line" >> "$PWD/answers"
+      printf '%s\n' '{"method":"serverRequest/resolved","params":{"threadId":"native-thread","requestId":"approval-cmd"}}'
+      ;;
+    *'"id":7,'*)
+      printf '%s\n' "$line" >> "$PWD/answers"
+      printf '%s\n' '{"method":"serverRequest/resolved","params":{"threadId":"native-thread","requestId":7}}'
+      ;;
+    *'turn/interrupt'*)
+      printf '%s\n' '{"method":"serverRequest/resolved","params":{"threadId":"native-thread","requestId":"approval-cmd"}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"interrupted","error":null}}}'
+      ;;
+"#;
+
+    /// The unattended fixture's Host running `turn` on its Codex, with the
+    /// requesting Mac proven in session `s1` and holding a grant.
+    fn approval_fixture(
+        turn: &str,
+    ) -> (
+        UnattendedFixture,
+        PathBuf,
+        HostSessionBinding,
+        crate::device_identity::VerifiedPeerDevice,
+    ) {
+        let (script_root, _, agent) = scripted_codex(&format!("{SCRIPTED_OPEN}{turn}"));
+        let mut h = unattended_fixture();
+        h.service.codex.use_executable(&agent);
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        h.trust_and_grant(&device, 24, 5);
+        (h, script_root, binding, device)
+    }
+
+    fn wait_for_reviews(
+        service: &NativeAgentServiceV1,
+        task_id: &str,
+        count: usize,
+    ) -> Vec<NativeDecisionReviewV1> {
+        for _ in 0..500 {
+            let reviews = service.task_status(task_id).unwrap().native_decisions;
+            if reviews.len() >= count {
+                return reviews;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "{count} reviews never appeared: {:?}",
+            service.task_status(task_id)
+        )
+    }
+
+    fn wait_for_review_state(
+        service: &NativeAgentServiceV1,
+        task_id: &str,
+        review_ref: &str,
+        state: NativeDecisionStateV1,
+    ) -> NativeDecisionReviewV1 {
+        for _ in 0..500 {
+            if let Some(review) = service
+                .task_status(task_id)
+                .unwrap()
+                .native_decisions
+                .into_iter()
+                .find(|review| review.review_ref == review_ref && review.state == state)
+            {
+                return review;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "review never became {state:?}: {:?}",
+            service.task_status(task_id)
+        )
+    }
+
+    fn answers(workspace: &Path) -> Vec<String> {
+        fs::read_to_string(workspace.join("answers"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn review_of_kind(
+        reviews: &[NativeDecisionReviewV1],
+        kind: NativeDecisionKindV1,
+    ) -> NativeDecisionReviewV1 {
+        reviews
+            .iter()
+            .find(|review| review.kind == kind)
+            .unwrap()
+            .clone()
+    }
+
+    impl UnattendedFixture {
+        fn decide(
+            &mut self,
+            binding: &HostSessionBinding,
+            device: Option<&crate::device_identity::VerifiedPeerDevice>,
+            task_id: &str,
+            review: &NativeDecisionReviewV1,
+            decision: NativeDecisionV1,
+        ) -> AppResult<NativeAgentTaskStatusV1> {
+            self.decide_at(
+                binding,
+                device,
+                task_id,
+                review,
+                decision,
+                crate::storage::now_ts(),
+            )
+        }
+
+        fn decide_at(
+            &mut self,
+            binding: &HostSessionBinding,
+            device: Option<&crate::device_identity::VerifiedPeerDevice>,
+            task_id: &str,
+            review: &NativeDecisionReviewV1,
+            decision: NativeDecisionV1,
+            now: i64,
+        ) -> AppResult<NativeAgentTaskStatusV1> {
+            let request = NativeAgentDecisionV1 {
+                schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                decision_id: Uuid::new_v4().to_string(),
+                task_id: task_id.into(),
+                target_host_ref: self.windows_host.as_str().into(),
+                review_ref: review.review_ref.clone(),
+                content_digest: review.content_digest.clone(),
+                decision,
+            };
+            self.service
+                .submit_native_decision(binding, device, &request, now)
+        }
+    }
+
+    #[test]
+    fn the_requesting_user_approves_a_command_once_and_declines_a_file_change() {
+        let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-a1", &workspace, "work")
+            .unwrap();
+        let reviews = wait_for_reviews(&h.service, "task-a1", 2);
+        let status = h.service.task_status("task-a1").unwrap();
+        assert_eq!(status.state, NativeAgentTaskStateV1::Running);
+        assert_eq!(status.code.as_deref(), Some(AWAITING_NATIVE_DECISION_CODE));
+        let command = review_of_kind(&reviews, NativeDecisionKindV1::CommandExecution);
+        let content = command.content.clone().unwrap();
+        assert_eq!(content.command.as_deref(), Some("cargo test"));
+        assert_eq!(content.cwd.as_deref(), Some("/repo"));
+        assert_eq!(content.reason.as_deref(), Some("Run the tests <b>now</b>"));
+        assert!(command.can_accept && command.can_decline);
+        let patch = review_of_kind(&reviews, NativeDecisionKindV1::FileChange);
+        let changes = patch.content.clone().unwrap().file_changes;
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "src/lib.rs");
+        assert_eq!(changes[0].diff, "-a\n+b\n");
+        assert!(patch.can_accept && patch.can_decline);
+        // A valid status carrying them crosses the wire; native ids do not.
+        let wire = NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task-a1".into(),
+            executing_host_ref: h.windows_host.as_str().into(),
+            status: status.clone(),
+        };
+        validate_status(&wire).unwrap();
+        let encoded = serde_json::to_string(&wire).unwrap();
+        for native in [
+            "approval-cmd",
+            "native-thread",
+            "native-turn",
+            "patch-1",
+            "cmd-1",
+        ] {
+            assert!(!encoded.contains(native), "{native}");
+        }
+
+        // Review content is never written to disk.
+        h.service.persist_envelope("task-a1", None).unwrap();
+        let stored = crate::storage::get_native_agent_envelope(&h.paths, "task-a1")
+            .unwrap()
+            .unwrap();
+        assert!(!stored.record_json.contains("cargo test"));
+        assert!(!stored.record_json.contains("nativeDecisions"));
+
+        // The grant that started the task answered nothing.
+        thread::sleep(Duration::from_millis(150));
+        assert!(answers(&workspace).is_empty());
+
+        h.decide(
+            &binding,
+            Some(&device),
+            "task-a1",
+            &command,
+            NativeDecisionV1::Accept,
+        )
+        .unwrap();
+        // Replays and second answers never reach Codex again.
+        for decision in [NativeDecisionV1::Accept, NativeDecisionV1::Decline] {
+            assert!(h
+                .decide(&binding, Some(&device), "task-a1", &command, decision)
+                .is_err());
+        }
+        wait_for_review_state(
+            &h.service,
+            "task-a1",
+            &command.review_ref,
+            NativeDecisionStateV1::Resolved,
+        );
+        h.decide(
+            &binding,
+            Some(&device),
+            "task-a1",
+            &patch,
+            NativeDecisionV1::Decline,
+        )
+        .unwrap();
+        let resolved = wait_for_review_state(
+            &h.service,
+            "task-a1",
+            &patch.review_ref,
+            NativeDecisionStateV1::Resolved,
+        );
+        assert_eq!(resolved.submitted, Some(NativeDecisionV1::Decline));
+        assert!(!resolved.can_accept && !resolved.can_decline);
+        assert_eq!(
+            answers(&workspace),
+            [
+                r#"{"id":"approval-cmd","result":{"decision":"accept"}}"#,
+                r#"{"id":7,"result":{"decision":"decline"}}"#,
+            ]
+        );
+        wait_for_code(&h.service, "task-a1", None);
+
+        // The turn continues and its answer is captured as before.
+        fs::write(workspace.join("finish-turn"), b"").unwrap();
+        let terminal = wait_for_terminal(&h.service, "task-a1");
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(
+            text_output(&terminal),
+            Some(("Done after review.".into(), false))
+        );
+        assert!(terminal.native_decisions.is_empty());
+        wait_for_workspace_release(&h.service, &workspace);
+        // Nothing is answerable after the turn ended.
+        assert!(h
+            .decide(
+                &binding,
+                Some(&device),
+                "task-a1",
+                &patch,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        assert_eq!(answers(&workspace).len(), 2);
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    #[test]
+    fn only_the_requesting_device_in_a_current_session_of_its_bridge_may_decide() {
+        let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-a2", &workspace, "work")
+            .unwrap();
+        let reviews = wait_for_reviews(&h.service, "task-a2", 2);
+        let command = review_of_kind(&reviews, NativeDecisionKindV1::CommandExecution);
+        let accept = NativeDecisionV1::Accept;
+
+        // No device proof at all.
+        assert!(h
+            .decide(&binding, None, "task-a2", &command, accept)
+            .is_err());
+        // Another device key, even in the requester's own session.
+        let intruder = crate::device_identity::load_or_create(
+            &durable_paths(&h.root.join("intruder")),
+            &[7u8; 32],
+        )
+        .unwrap();
+        let (_, mac_side) = h.session(GRANT_BRIDGE, "mac", "s1");
+        let intruder_here = crate::device_identity::verify_attestation(
+            &intruder
+                .attest(&mac_side, &Uuid::new_v4().to_string())
+                .unwrap(),
+            &binding,
+        )
+        .unwrap();
+        assert!(h
+            .decide(&binding, Some(&intruder_here), "task-a2", &command, accept)
+            .is_err());
+        // Another member of the same Bridge, with its own proven session.
+        let (other_session, other_mac) = h.session(GRANT_BRIDGE, "other-mac", "s9");
+        let other = crate::device_identity::verify_attestation(
+            &intruder
+                .attest(&other_mac, &Uuid::new_v4().to_string())
+                .unwrap(),
+            &other_session,
+        )
+        .unwrap();
+        assert!(h
+            .decide(&other_session, Some(&other), "task-a2", &command, accept)
+            .is_err());
+        // The requesting device over another Bridge.
+        let (elsewhere, elsewhere_device) = h.proven("room-other", "mac", "s3");
+        assert!(h
+            .decide(
+                &elsewhere,
+                Some(&elsewhere_device),
+                "task-a2",
+                &command,
+                accept
+            )
+            .is_err());
+        // Its proof from an earlier session does not carry to a new one.
+        let (reconnected, _) = h.session(GRANT_BRIDGE, "mac", "s2");
+        assert!(h
+            .decide(&reconnected, Some(&device), "task-a2", &command, accept)
+            .is_err());
+        // Content other than what was shown, or another Host.
+        let mut altered = command.clone();
+        altered.content_digest = "0".repeat(64);
+        assert!(h
+            .decide(&binding, Some(&device), "task-a2", &altered, accept)
+            .is_err());
+        let mut request = NativeAgentDecisionV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            decision_id: "d1".into(),
+            task_id: "task-a2".into(),
+            target_host_ref: "host:someone-else".into(),
+            review_ref: command.review_ref.clone(),
+            content_digest: command.content_digest.clone(),
+            decision: accept,
+        };
+        assert!(h
+            .service
+            .submit_native_decision(&binding, Some(&device), &request, crate::storage::now_ts())
+            .is_err());
+        // An expired request.
+        assert!(h
+            .decide_at(
+                &binding,
+                Some(&device),
+                "task-a2",
+                &command,
+                accept,
+                command.expires_at
+            )
+            .is_err());
+        thread::sleep(Duration::from_millis(100));
+        assert!(answers(&workspace).is_empty());
+
+        // After a reconnect, the same device proven in the new session decides.
+        let (reconnected, reproven) = h.proven(GRANT_BRIDGE, "mac", "s2");
+        request.target_host_ref = h.windows_host.as_str().into();
+        h.service
+            .submit_native_decision(
+                &reconnected,
+                Some(&reproven),
+                &request,
+                crate::storage::now_ts(),
+            )
+            .unwrap();
+        wait_for_review_state(
+            &h.service,
+            "task-a2",
+            &command.review_ref,
+            NativeDecisionStateV1::Resolved,
+        );
+        assert_eq!(answers(&workspace).len(), 1);
+        h.service
+            .cancel_bridge_task(GRANT_BRIDGE, "task-a2")
+            .unwrap();
+        wait_for_workspace_release(&h.service, &workspace);
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    #[test]
+    fn stopping_or_burning_a_task_ends_every_outstanding_review() {
+        for burn in [false, true] {
+            let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+            let workspace = h.workspace.clone();
+            h.invoke(&binding, Some(&device), "task-a3", &workspace, "work")
+                .unwrap();
+            let reviews = wait_for_reviews(&h.service, "task-a3", 2);
+            if burn {
+                h.service.purge_bridge_authority(GRANT_BRIDGE).unwrap();
+            } else {
+                h.service
+                    .cancel_bridge_task(GRANT_BRIDGE, "task-a3")
+                    .unwrap();
+            }
+            let stopped = h.service.task_status("task-a3");
+            if let Ok(stopped) = stopped {
+                assert_eq!(stopped.state, NativeAgentTaskStateV1::Cancelled);
+                assert!(stopped.native_decisions.is_empty());
+            }
+            for review in &reviews {
+                for decision in [NativeDecisionV1::Accept, NativeDecisionV1::Decline] {
+                    assert!(h
+                        .decide(&binding, Some(&device), "task-a3", review, decision)
+                        .is_err());
+                }
+            }
+            wait_for_workspace_release(&h.service, &workspace);
+            assert!(answers(&workspace).is_empty(), "burn={burn}");
+            let _ = fs::remove_dir_all(script_root);
+        }
+    }
+
+    #[test]
+    fn a_request_codex_resolved_or_changed_first_is_not_answered() {
+        let resolved_first = r#"    *'"id":3,'*)
+      {ACK}
+      printf '%s\n' '{"id":"approval-cmd","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","startedAtMs":1,"command":"cargo test","cwd":"/repo"}}'
+      (
+        while [ ! -f "$PWD/resolve" ]; do kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        printf '%s\n' '{"method":"serverRequest/resolved","params":{"threadId":"native-thread","requestId":"approval-cmd"}}'
+        while [ ! -f "$PWD/finish-turn" ]; do kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        {COMPLETED}
+      ) &
+      ;;
+    *'"id":"approval-cmd"'*) printf '%s\n' "$line" >> "$PWD/answers" ;;
+"#;
+        let (mut h, script_root, binding, device) = approval_fixture(resolved_first);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-a4", &workspace, "work")
+            .unwrap();
+        let command = wait_for_reviews(&h.service, "task-a4", 1).remove(0);
+        fs::write(workspace.join("resolve"), b"").unwrap();
+        wait_for_review_state(
+            &h.service,
+            "task-a4",
+            &command.review_ref,
+            NativeDecisionStateV1::Resolved,
+        );
+        assert!(h
+            .decide(
+                &binding,
+                Some(&device),
+                "task-a4",
+                &command,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        fs::write(workspace.join("finish-turn"), b"").unwrap();
+        assert_eq!(
+            wait_for_terminal(&h.service, "task-a4").state,
+            NativeAgentTaskStateV1::Completed
+        );
+        assert!(answers(&workspace).is_empty());
+        let _ = fs::remove_dir_all(script_root);
+
+        // A diff that changes after it was shown can no longer be approved.
+        let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-a5", &workspace, "work")
+            .unwrap();
+        let patch = review_of_kind(
+            &wait_for_reviews(&h.service, "task-a5", 2),
+            NativeDecisionKindV1::FileChange,
+        );
+        fs::write(workspace.join("patch-updated"), b"").unwrap();
+        wait_for_file(&workspace.join("patch-update-sent"));
+        let mut changed = patch.clone();
+        for _ in 0..500 {
+            changed = review_of_kind(
+                &h.service.task_status("task-a5").unwrap().native_decisions,
+                NativeDecisionKindV1::FileChange,
+            );
+            if !changed.can_accept {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            changed.unavailable_reason.as_deref(),
+            Some("native_decision_content_changed")
+        );
+        assert!(h
+            .decide(
+                &binding,
+                Some(&device),
+                "task-a5",
+                &patch,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        h.decide(
+            &binding,
+            Some(&device),
+            "task-a5",
+            &changed,
+            NativeDecisionV1::Decline,
+        )
+        .unwrap();
+        wait_for_review_state(
+            &h.service,
+            "task-a5",
+            &patch.review_ref,
+            NativeDecisionStateV1::Resolved,
+        );
+        assert_eq!(
+            answers(&workspace),
+            [r#"{"id":7,"result":{"decision":"decline"}}"#]
+        );
+        h.service
+            .cancel_bridge_task(GRANT_BRIDGE, "task-a5")
+            .unwrap();
+        wait_for_workspace_release(&h.service, &workspace);
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    #[test]
+    fn unsupported_requests_stay_visible_unanswerable_and_bounded() {
+        let many = r#"    *'"id":3,'*)
+      {ACK}
+      printf '%s\n' '{"id":"perm-1","method":"item/permissions/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"p","permissions":{"network":{"enabled":true}}}}'
+      printf '%s\n' '{"id":"ask-1","method":"item/tool/requestUserInput","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"q","questions":[]}}'
+      printf '%s\n' '{"id":"cmd-x","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"c","command":{"injected":true},"cwd":"/"}}'
+      printf '%s\n' '{"id":"cmd-4","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"c4","command":"ls","cwd":"/"}}'
+      printf '%s\n' '{"id":"cmd-other","method":"item/commandExecution/requestApproval","params":{"threadId":"other-thread","turnId":"other-turn","itemId":"c5","command":"ls","cwd":"/"}}'
+      touch "$PWD/all-sent"
+      ;;
+    *'"result"'*) printf '%s\n' "$line" >> "$PWD/answers" ;;
+    *'turn/interrupt'*)
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"interrupted","error":null}}}'
+      ;;
+"#;
+        let (mut h, script_root, binding, device) = approval_fixture(many);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-a6", &workspace, "work")
+            .unwrap();
+        wait_for_file(&workspace.join("all-sent"));
+        thread::sleep(Duration::from_millis(200));
+        let reviews = h.service.task_status("task-a6").unwrap().native_decisions;
+        // Bounded: the first three are shown; the rest still wait, visibly.
+        assert_eq!(reviews.len(), MAX_NATIVE_DECISION_REVIEWS);
+        for review in &reviews {
+            assert_eq!(review.kind, NativeDecisionKindV1::Unsupported);
+            assert!(!review.can_accept && !review.can_decline);
+            assert_eq!(review.content, None);
+            for decision in [NativeDecisionV1::Accept, NativeDecisionV1::Decline] {
+                assert!(h
+                    .decide(&binding, Some(&device), "task-a6", review, decision)
+                    .is_err());
+            }
+        }
+        assert_eq!(
+            h.service.task_status("task-a6").unwrap().code.as_deref(),
+            Some(AWAITING_NATIVE_DECISION_CODE)
+        );
+        assert!(answers(&workspace).is_empty());
+        h.service
+            .cancel_bridge_task(GRANT_BRIDGE, "task-a6")
+            .unwrap();
+        wait_for_workspace_release(&h.service, &workspace);
+        assert!(answers(&workspace).is_empty());
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    #[test]
+    fn app_server_loss_during_review_ends_it_without_an_answer() {
+        let dies = r#"    *'"id":3,'*)
+      {ACK}
+      printf '%s\n' '{"id":"approval-cmd","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","command":"cargo test","cwd":"/repo"}}'
+      while [ ! -f "$PWD/die" ]; do [ -d "$PWD" ] || exit 0; sleep 0.01; done
+      exit 0
+      ;;
+"#;
+        let (mut h, script_root, binding, device) = approval_fixture(dies);
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-a7", &workspace, "work")
+            .unwrap();
+        let command = wait_for_reviews(&h.service, "task-a7", 1).remove(0);
+        fs::write(workspace.join("die"), b"").unwrap();
+        let terminal = wait_for_terminal(&h.service, "task-a7");
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Interrupted);
+        assert_eq!(
+            terminal.code.as_deref(),
+            Some("native_agent_outcome_unknown")
+        );
+        assert!(terminal.native_decisions.is_empty());
+        assert!(h
+            .decide(
+                &binding,
+                Some(&device),
+                "task-a7",
+                &command,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    #[test]
+    fn a_task_whose_requester_proved_no_device_takes_no_remote_decisions() {
+        let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+        let workspace = h.workspace.clone();
+        // Held for Review (no device, so no grant), then accepted here.
+        let held = h
+            .invoke(&binding, None, "task-a8", &workspace, "work")
+            .unwrap();
+        assert_eq!(held.code.as_deref(), Some(admission::REVIEW_REQUIRED_CODE));
+        h.service
+            .accept_invocation_review("task-a8", Some(&binding), crate::storage::now_ts())
+            .unwrap();
+        let command = review_of_kind(
+            &wait_for_reviews(&h.service, "task-a8", 2),
+            NativeDecisionKindV1::CommandExecution,
+        );
+        assert!(h
+            .decide(
+                &binding,
+                Some(&device),
+                "task-a8",
+                &command,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        // A later proof cannot attach itself through a replayed invocation.
+        let _ = h.invoke(&binding, Some(&device), "task-a8", &workspace, "work");
+        assert!(h
+            .decide(
+                &binding,
+                Some(&device),
+                "task-a8",
+                &command,
+                NativeDecisionV1::Accept
+            )
+            .is_err());
+        thread::sleep(Duration::from_millis(100));
+        assert!(answers(&workspace).is_empty());
+        h.service
+            .cancel_bridge_task(GRANT_BRIDGE, "task-a8")
+            .unwrap();
+        wait_for_workspace_release(&h.service, &workspace);
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    #[test]
+    fn a_reviewed_task_with_a_proven_requester_takes_its_decisions() {
+        let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+        // No grant applies to this other folder, so it waits for Review.
+        let workspace = h.workspace.parent().unwrap().join("Other");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let held = h
+            .invoke(&binding, Some(&device), "task-a9", &workspace, "work")
+            .unwrap();
+        assert_eq!(held.code.as_deref(), Some(admission::REVIEW_REQUIRED_CODE));
+        h.service
+            .accept_invocation_review("task-a9", Some(&binding), crate::storage::now_ts())
+            .unwrap();
+        let command = review_of_kind(
+            &wait_for_reviews(&h.service, "task-a9", 2),
+            NativeDecisionKindV1::CommandExecution,
+        );
+        h.decide(
+            &binding,
+            Some(&device),
+            "task-a9",
+            &command,
+            NativeDecisionV1::Decline,
+        )
+        .unwrap();
+        wait_for_review_state(
+            &h.service,
+            "task-a9",
+            &command.review_ref,
+            NativeDecisionStateV1::Resolved,
+        );
+        assert_eq!(
+            answers(&workspace),
+            [r#"{"id":"approval-cmd","result":{"decision":"decline"}}"#]
+        );
+        h.service
+            .cancel_bridge_task(GRANT_BRIDGE, "task-a9")
+            .unwrap();
+        wait_for_workspace_release(&h.service, &workspace);
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    #[test]
+    fn statuses_carry_reviews_only_while_running_and_within_bounds() {
+        let review = NativeDecisionReviewV1 {
+            review_ref: "native-decision:r".into(),
+            kind: NativeDecisionKindV1::CommandExecution,
+            state: NativeDecisionStateV1::Pending,
+            submitted: None,
+            can_accept: true,
+            can_decline: true,
+            unavailable_reason: None,
+            content: Some(NativeDecisionContentV1 {
+                command: Some("ls".into()),
+                cwd: Some("/".into()),
+                ..NativeDecisionContentV1::default()
+            }),
+            content_digest: String::new(),
+            requested_at: 1,
+            expires_at: 2,
+        };
+        let digest = |review: &NativeDecisionReviewV1| {
+            native_decision_content_digest(review.kind, review.content.as_ref())
+        };
+        let wire = |state, reviews: Vec<NativeDecisionReviewV1>| NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task".into(),
+            executing_host_ref: "host:windows".into(),
+            status: NativeAgentTaskStatusV1 {
+                schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+                task_id: "task".into(),
+                agent_id: CODEX_CAPABILITY_ID.into(),
+                workspace_name: "REPZ".into(),
+                session_reused: false,
+                state,
+                result: None,
+                code: None,
+                output: None,
+                conversation: None,
+                native_decisions: reviews,
+            },
+        };
+        let mut valid = review.clone();
+        valid.content_digest = digest(&valid);
+        validate_status(&wire(NativeAgentTaskStateV1::Running, vec![valid.clone()])).unwrap();
+        // Not after the task ended.
+        assert!(validate_status(&wire(
+            NativeAgentTaskStateV1::Completed,
+            vec![valid.clone()]
+        ))
+        .is_err());
+        // Not more than the bound.
+        assert!(validate_status(&wire(
+            NativeAgentTaskStateV1::Running,
+            vec![valid.clone(); MAX_NATIVE_DECISION_REVIEWS + 1]
+        ))
+        .is_err());
+        // Not with a digest of other content, an approvable unsupported or
+        // content-less request, or oversized content.
+        let mut forged = valid.clone();
+        forged.content.as_mut().unwrap().command = Some("rm -rf /".into());
+        assert!(validate_status(&wire(NativeAgentTaskStateV1::Running, vec![forged])).is_err());
+        let mut unsupported = valid.clone();
+        unsupported.kind = NativeDecisionKindV1::Unsupported;
+        unsupported.content_digest = digest(&unsupported);
+        assert!(
+            validate_status(&wire(NativeAgentTaskStateV1::Running, vec![unsupported])).is_err()
+        );
+        let mut blind = valid.clone();
+        blind.content = None;
+        blind.content_digest = digest(&blind);
+        assert!(validate_status(&wire(NativeAgentTaskStateV1::Running, vec![blind])).is_err());
+        let mut huge = valid.clone();
+        huge.content.as_mut().unwrap().command =
+            Some("x".repeat(MAX_NATIVE_DECISION_CONTENT_BYTES));
+        huge.content_digest = digest(&huge);
+        assert!(validate_status(&wire(NativeAgentTaskStateV1::Running, vec![huge])).is_err());
+        let mut bad_ref = valid;
+        bad_ref.review_ref = "approval-cmd".into();
+        assert!(validate_status(&wire(NativeAgentTaskStateV1::Running, vec![bad_ref])).is_err());
+    }
+
     #[test]
     fn codex_capability_distinguishes_compatible_incompatible_and_absent_interfaces() {
         let root = std::env::temp_dir().join(format!("pastey-native-compat-{}", Uuid::new_v4()));
@@ -9021,6 +10396,7 @@ done
                     code: Some("native_agent_outcome_unknown".into()),
                     output: None,
                     conversation: None,
+                    native_decisions: Vec::new(),
                 },
             );
             service.task_workspaces.insert(task_id.into(), root.clone());
@@ -9554,6 +10930,7 @@ done
                     code: None,
                     output: None,
                     conversation: None,
+                    native_decisions: Vec::new(),
                 },
             );
             service.workspace_movements.insert(
@@ -9638,6 +11015,7 @@ done
             code: None,
             output: None,
             conversation: None,
+            native_decisions: Vec::new(),
         };
         let wrong = NativeAgentStatusV1 {
             schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
@@ -9751,6 +11129,7 @@ done
             code: None,
             output: None,
             conversation: None,
+            native_decisions: Vec::new(),
         };
         assert_eq!(
             service
@@ -10943,6 +12322,7 @@ done
             code: None,
             output: None,
             conversation: None,
+            native_decisions: Vec::new(),
         };
         before
             .tasks
@@ -13146,6 +14526,7 @@ done
                 code: code.map(str::to_owned),
                 output: None,
                 conversation: None,
+                native_decisions: Vec::new(),
             },
         };
         service
@@ -13210,6 +14591,7 @@ done
                     code: Some("late".into()),
                     output: None,
                     conversation: None,
+                    native_decisions: Vec::new(),
                 },
             })
             .unwrap();
@@ -13579,6 +14961,7 @@ done
                 code: None,
                 output: None,
                 conversation: None,
+                native_decisions: Vec::new(),
             },
         };
         assert!(service

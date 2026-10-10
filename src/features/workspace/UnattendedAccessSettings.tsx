@@ -65,7 +65,7 @@ export function UnattendedAccessSettings() {
   return <section className="v2-settings-group" aria-label="Unattended Codex access">
     <h2>Unattended Codex access</h2>
     <div>
-      <p className="v2-settings-note">A permission lets one trusted device start Codex in one folder on this device, over one Bridge, without you clicking Accept, until it expires, runs out or you revoke it. Codex's own approval requests are never answered by it: a task that needs one waits until it is stopped. This device must stay on, awake, signed in and running Pastey. Without a permission, every request still waits for your Accept.</p>
+      <p className="v2-settings-note">A permission lets one trusted device start Codex in one folder on this device, over one Bridge, without you clicking Accept, until it expires, runs out or you revoke it. Codex's own approval requests are never answered by it: each one is shown on the device that started the task, where its user may approve it once or deny it; otherwise the task waits until it is stopped. This device must stay on, awake, signed in and running Pastey. Without a permission, every request still waits for your Accept.</p>
       <div className="v2-settings-row"><span><strong>This device's identity</strong><small>Compare this on the other device before trusting.</small></span><b>{identity?.displayFingerprint ?? "…"}</b></div>
       <button type="button" className="v2-button" disabled={pending} onClick={() => { if (window.confirm("Replace this device's identity key? Devices that trusted this one will no longer recognize it until they trust it again.")) void act(rotateDeviceIdentity); }}>Replace identity key…</button>
 

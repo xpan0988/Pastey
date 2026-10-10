@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use super::{
     NativeAgentCapabilityStateV1, NativeAgentCapabilityV1, NativeConversationContinuityV1,
-    NativeTurnOutcomeV1,
+    NativeDecisionReviewV1, NativeDecisionV1, NativeTurnOutcomeV1,
 };
 use crate::error::{AppError, AppResult};
 
@@ -178,6 +178,11 @@ pub(crate) trait NativeInvocationProgressV1: Send + Sync {
     /// The native capability is blocked until its own client answers a
     /// request (for example an approval) that Pastey does not answer.
     fn awaiting_native_decision(&self, waiting: bool);
+    /// A native request its requesting user may decide was raised or
+    /// changed. Never an answer: only the user's explicit decision is.
+    fn native_decision_updated(&self, review: NativeDecisionReviewV1);
+    /// The native capability reported that request resolved.
+    fn native_decision_resolved(&self, review_ref: &str);
     /// The native capability confirmed the invocation's conversation: newly
     /// begun, or the earlier one continued. `continuation` is what continuing
     /// it after a restart requires; Core keeps it Host-private.
@@ -242,6 +247,23 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     fn cancel(&self, task_id: &str) -> AppResult<()>;
     /// Burn: stop and forget everything the adapter keeps for the task.
     fn release(&self, task_id: &str);
+    /// Gives one explicit human decision to the exact native request behind
+    /// `review_ref`, only while it is still outstanding, unexpired, shown
+    /// with exactly `content_digest`, and offers that decision. Adapters
+    /// that relay no native requests refuse.
+    fn respond_native_decision(
+        &self,
+        _task_id: &str,
+        _review_ref: &str,
+        _content_digest: &str,
+        _decision: NativeDecisionV1,
+        _now: i64,
+    ) -> AppResult<()> {
+        Err(AppError::InvalidInput(
+            "This native capability takes no remote decisions.".into(),
+        ))
+    }
+
     /// Burn: end the live native state of one conversation key.
     fn release_conversation(&self, _key: &str) {}
     fn shutdown(&self);

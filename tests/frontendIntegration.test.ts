@@ -27,6 +27,8 @@ import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent,
 import { availableRevisionId, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
+import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
+import type { NativeDecisionReview } from "../src/lib/tauri";
 
 function room(peerConnected: boolean): RoomInfo {
   return {
@@ -487,7 +489,7 @@ test("Native approval waits stay running and are explained, not hidden", () => {
   assert.equal(nativeAgentAwaitingNativeDecision({ ...running, state: "cancelled" }), false);
   assert.equal(nativeAgentLifecycleLabel({ ...running, state: "failed", code: "native_agent_start_failed" }), "failed · did not start");
   const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
-  assert.match(card, /Pastey does not answer native approvals in this version/);
+  assert.match(card, /waiting for a native request that cannot be answered from here/);
   assert.match(card, /agent\.canCancel \? <button[\s\S]*?>Stop Codex<\/button>/);
 });
 
@@ -704,4 +706,75 @@ test("Unattended Codex permissions are narrow, explained and only created on the
   assert.match(panel, /presentDeviceIdentity\(room\.id, peerHostRef\)/);
   assert.doesNotMatch(panel, /createUnattendedGrant|trustPeerDevice/);
   assert.match(lifecycle, /waiting for the other device to accept \(no unattended permission applied\)/);
+});
+
+test("Codex requests are shown as untrusted text and answered only once, by the requesting device", () => {
+  const review: NativeDecisionReview = {
+    reviewRef: "native-decision:r1",
+    kind: "command_execution",
+    state: "pending",
+    canAccept: true,
+    canDecline: true,
+    content: { command: "cargo test", cwd: "C:\\REPZ", reason: "<img src=x onerror=alert(1)>" },
+    contentDigest: "a".repeat(64),
+    requestedAt: 0,
+    expiresAt: 1000,
+  };
+  const remote = { now: 10, remote: true, hostName: "Windows" };
+  const pending = nativeDecisionPresentation(review, remote);
+  assert.equal(pending.title, "Codex asks to run a command");
+  assert.equal(pending.stateLabel, "Waiting for your decision.");
+  assert.equal(pending.canAccept && pending.canDecline, true);
+  // A task running on this device is never answered from here.
+  const local = nativeDecisionPresentation(review, { ...remote, remote: false });
+  assert.equal(local.canAccept || local.canDecline, false);
+  // Sending, sent, submitted and resolved never offer a second answer, and
+  // nothing claims the operation ran.
+  for (const view of [
+    nativeDecisionPresentation(review, { ...remote, delivery: "sending" }),
+    nativeDecisionPresentation(review, { ...remote, delivery: "sent" }),
+    nativeDecisionPresentation({ ...review, state: "submitted", submitted: "accept", canAccept: false, canDecline: false }, remote),
+    nativeDecisionPresentation({ ...review, state: "resolved", submitted: "accept", canAccept: false, canDecline: false }, remote),
+    nativeDecisionPresentation({ ...review, state: "resolved", canAccept: false, canDecline: false }, remote),
+  ]) {
+    assert.equal(view.canAccept || view.canDecline, false, view.stateLabel);
+    assert.doesNotMatch(view.stateLabel, /\b(ran|executed|applied|completed)\b/i, view.stateLabel);
+  }
+  assert.match(nativeDecisionPresentation({ ...review, state: "submitted", submitted: "accept" }, remote).stateLabel, /Waiting for Codex to confirm/);
+  assert.match(nativeDecisionPresentation({ ...review, state: "resolved", submitted: "decline" }, remote).stateLabel, /denied/);
+  // Expired requests offer nothing.
+  const expired = nativeDecisionPresentation(review, { ...remote, now: 1000 });
+  assert.equal(expired.canAccept || expired.canDecline, false);
+  assert.match(expired.stateLabel, /expired/);
+  // Approval withheld: only what Rust offers is offered, with the reason.
+  const withheld = nativeDecisionPresentation({ ...review, canAccept: false, unavailableReason: "native_decision_widens_permissions" }, remote);
+  assert.equal(withheld.canAccept, false);
+  assert.equal(withheld.canDecline, true);
+  assert.match(withheld.note ?? "", /wider sandbox permissions/);
+  const unsupported = nativeDecisionPresentation({ ...review, kind: "unsupported", content: null, canAccept: false, canDecline: false, unavailableReason: "native_decision_unsupported" }, remote);
+  assert.equal(unsupported.canAccept || unsupported.canDecline, false);
+  assert.match(unsupported.stateLabel, /Stop the task/);
+  assert.equal(nativeFileChangeLabel({ change: "move", path: "a.rs", moveTo: "b.rs" }), "Move a.rs → b.rs");
+
+  const status = { schemaVersion: "pastey-native-agent-task-v1" as const, taskId: "t", agentId: "agent.coding.codex", workspaceName: "REPZ", state: "running" as const, code: "native_agent_awaiting_native_decision", nativeDecisions: [review] };
+  assert.equal(nativeDecisionsAwaitUser(status, true, 10), true);
+  assert.equal(nativeDecisionsAwaitUser(status, false, 10), false);
+  assert.equal(nativeDecisionsAwaitUser({ ...status, state: "cancelled" }, true, 10), false);
+  assert.equal(nativeDecisionsAwaitUser(status, true, 1000), false);
+
+  const panel = readFileSync("src/features/workspace/NativeDecisionPanel.tsx", "utf8");
+  const helpers = readFileSync("src/lib/nativeDecisions.ts", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  // Untrusted content is only ever text.
+  assert.doesNotMatch(panel, /dangerouslySetInnerHTML|innerHTML|href=|<a /);
+  // Only one-time answers exist; nothing approves for a session or by policy.
+  for (const file of [panel, helpers, bindings]) {
+    assert.doesNotMatch(file, /acceptForSession|"cancel"|always allow|allowAll|approveAll/i);
+  }
+  assert.match(panel, />Approve once</);
+  assert.match(panel, /respondRemoteNativeDecision\(roomId, status\.taskId, review\.reviewRef, review\.contentDigest, decision\)/);
+  assert.match(bindings, /invoke\("respond_remote_native_decision", \{ roomId, taskId, reviewRef, contentDigest, decision \}\)/);
+  // A permission never approves; the settings say where requests go instead.
+  const settings = readFileSync("src/features/workspace/UnattendedAccessSettings.tsx", "utf8");
+  assert.match(settings, /shown on the device that started the task, where its user may approve it once or deny it/);
 });

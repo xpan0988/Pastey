@@ -83,6 +83,10 @@ The Native Agent control payloads are `NativeAgentInvokeV1` (Codex's original in
 - `native_agent.reconcile`
 - `native_agent.reconciliation`
 - `native_agent.retry_result_return`
+- `native_agent.device_identity`
+- `native_agent.decision`
+
+`NativeAgentStatusV1.status.nativeDecisions` carries at most 3 `NativeDecisionReviewV1` of a running task (`reviewRef`, `kind` `command_execution` | `file_change` | `unsupported`, `state` `pending` | `submitted` | `resolved`, `submitted`, `canAccept`, `canDecline`, `unavailableReason`, `content`, `contentDigest`, `requestedAt`, `expiresAt`); a status of any other state carries none. Each review's `content` (command, cwd, reason, network host/protocol, file changes with path, change, `moveTo` and diff) is native, untrusted display text bounded to 10 KiB, and is the only other subtree exempt from the field-name check, after `validate_status` checked its bound and that `contentDigest` is exactly its digest. `native_agent.decision` carries `NativeAgentDecisionV1` (`decisionId`, `taskId`, `targetHostRef`, `reviewRef`, `contentDigest`, `decision` `accept` | `decline`) and no content; its replay key is task, review and attempt. See Layer 5 for who may decide and when.
 
 The renderer-visible task states are `queued`, `running`, `completed`, `failed`, `cancelled`, and `interrupted`. Workspace movement states are `review`, `awaiting_approval`, `transferring_to_agent`, `agent_running`, `returning_result`, `applying_result`, `completed`, `conflict_recovery_required`, `failed`, `cancelled`, and `interrupted`.
 

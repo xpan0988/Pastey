@@ -1113,6 +1113,72 @@ pub async fn present_device_identity(
         .map_err(|error| error.message())
 }
 
+/// Sends this device's user's explicit decision on one native request of
+/// their remote task. The executing Host gives it to Codex only after
+/// checking it again; delivery is not application, and the task's status
+/// reports what Codex confirmed.
+#[tauri::command]
+pub async fn respond_remote_native_decision(
+    room_id: String,
+    task_id: String,
+    review_ref: String,
+    content_digest: String,
+    decision: crate::native_agent::NativeDecisionV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let target_host_ref = state
+        .native_agents
+        .lock()
+        .remote_decision_target(&room_id, &task_id, &review_ref, &content_digest, decision)
+        .map_err(|error| error.message())?;
+    let target = crate::host_identity::HostRef::parse_peer(target_host_ref, &state.local_host_ref)
+        .map_err(|error| error.message())?;
+    let session = state
+        .resolve_current_remote_host_session(&room_id, &target)
+        .await
+        .map_err(|error| error.message())?;
+    let binding = session.binding().clone();
+    // The executing Host accepts a decision only from the device key that
+    // requested the task, proven in this exact session.
+    present_device_identity_over(state.inner().clone(), &binding)
+        .await
+        .map_err(|error| error.message())?;
+    let request = crate::native_agent::NativeAgentDecisionV1 {
+        schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+        decision_id: uuid::Uuid::new_v4().to_string(),
+        task_id,
+        target_host_ref: target.as_str().into(),
+        review_ref,
+        content_digest,
+        decision,
+    };
+    crate::native_agent::validate_decision(&request).map_err(|error| error.message())?;
+    let context = crate::room_control::room_control_session_context_for_peer(
+        &state,
+        &room_id,
+        &binding.peer_route_ref,
+    )
+    .map_err(|error| error.message())?;
+    let event = crate::room_control::native_agent_event(
+        "native_agent.decision",
+        serde_json::to_value(request).map_err(|error| error.to_string())?,
+        &context,
+    )
+    .map_err(|error| error.message())?;
+    crate::room_control::send_room_control_event(
+        state.inner().clone(),
+        &room_id,
+        event,
+        Some(crate::room_control::selected_peer_route(
+            &room_id,
+            &binding.peer_route_ref,
+        )),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| error.message())
+}
+
 /// Room Control delivery failures at this boundary are receipt-ambiguous. The
 /// caller must retain the exact durable task handle to reconcile; it must not
 /// infer a remote non-start or retry the native Agent.

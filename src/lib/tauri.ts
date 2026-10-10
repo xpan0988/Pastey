@@ -192,6 +192,33 @@ export interface NativeAgentTaskStatus {
   /** Set once the Agent confirms whether the task continued this owner's
    * earlier conversation or began a new one. Never a native identifier. */
   conversation?: "new" | "continued" | null;
+  /** Native requests of this running task awaiting the user who started it.
+   * Their content is the native Agent's own, untrusted and possibly remote:
+   * shown only as escaped text. */
+  nativeDecisions?: NativeDecisionReview[];
+}
+
+export type NativeDecision = "accept" | "decline";
+
+export interface NativeDecisionReview {
+  reviewRef: string;
+  kind: "command_execution" | "file_change" | "unsupported";
+  state: "pending" | "submitted" | "resolved";
+  submitted?: NativeDecision | null;
+  canAccept: boolean;
+  canDecline: boolean;
+  unavailableReason?: string | null;
+  content?: {
+    command?: string;
+    cwd?: string;
+    reason?: string;
+    networkHost?: string;
+    networkProtocol?: string;
+    fileChanges?: { path: string; change: string; moveTo?: string; diff: string }[];
+  } | null;
+  contentDigest: string;
+  requestedAt: number;
+  expiresAt: number;
 }
 
 export type NativeAgentWorkspaceMovementState =
@@ -354,6 +381,15 @@ export function cancelRemoteNativeAgentTask(
   roomId: string, peerSessionId: string, targetHostRef: string, taskId: string,
 ): Promise<NativeAgentTaskStatus> {
   return invoke("cancel_remote_native_agent_task", { roomId, peerSessionId, targetHostRef, taskId });
+}
+
+/** Sends this user's explicit decision on one native request of their task
+ * running on another device. Delivery is not application: the task's status
+ * reports what the native Agent confirmed. */
+export function respondRemoteNativeDecision(
+  roomId: string, taskId: string, reviewRef: string, contentDigest: string, decision: NativeDecision,
+): Promise<void> {
+  return invoke("respond_remote_native_decision", { roomId, taskId, reviewRef, contentDigest, decision });
 }
 
 export function stopBridgeNativeAgentTask(
