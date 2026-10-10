@@ -16,7 +16,13 @@ use crate::{
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
-const LIVENESS_TIMEOUT: Duration = Duration::from_millis(900);
+/// One liveness probe's bound. A path across the internet (an overlay such
+/// as Tailscale, possibly relayed) has latency and jitter a LAN does not.
+const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1_800);
+/// Consecutive failed probes before a session is treated as gone. One slow
+/// probe is jitter, not a lost peer; liveness never authorizes anything, and
+/// every use of a session still requires the transport-key proof.
+const LIVENESS_FAILURES_BEFORE_INVALIDATION: u8 = 3;
 const DISCONNECTED_AFTER_ATTEMPTS: u8 = 2;
 
 #[derive(Deserialize)]
@@ -134,7 +140,8 @@ impl CurrentRemoteHostSession {
         )
         .await?;
 
-        for _ in 0..80 {
+        // Up to 8 s: the query and its answer may each cross the internet.
+        for _ in 0..320 {
             let projection = {
                 state.peer_capabilities.lock().projection(
                     &current.binding.bridge_id,
@@ -259,7 +266,12 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
             if peer.liveness != BridgePeerLiveness::Connected {
                 continue;
             }
+            let failure_key = format!("{}\n{}", room.id, peer.peer_session_id);
             if probe_exact_peer(&room, &peer).await {
+                state.bridge_liveness_failures.lock().remove(&failure_key);
+                continue;
+            }
+            if !liveness_failure_confirmed(&state, &failure_key) {
                 continue;
             }
             if storage::mark_bridge_peer_reconnecting(
@@ -284,6 +296,19 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
         }
     }
     Ok(())
+}
+
+/// Counts one failed probe; true once enough consecutive ones confirm it.
+fn liveness_failure_confirmed(state: &AppState, failure_key: &str) -> bool {
+    let mut failures = state.bridge_liveness_failures.lock();
+    let count = failures.entry(failure_key.to_owned()).or_default();
+    *count = count.saturating_add(1);
+    if *count >= LIVENESS_FAILURES_BEFORE_INVALIDATION {
+        failures.remove(failure_key);
+        true
+    } else {
+        false
+    }
 }
 
 /// Performs the production Bridge liveness proof for one exact stored route.
@@ -468,12 +493,31 @@ async fn reconnect_preserved_bridges(state: Arc<AppState>) -> AppResult<()> {
 }
 
 async fn reconnect_room(state: Arc<AppState>, room: &StoredRoom) -> AppResult<()> {
-    let (source, discovered) = discovery::discover_room(
-        room.room_code_hash.clone(),
-        Some(discovery::local_device_id(&state)),
-        Some(room.id.clone()),
-    )
-    .await?;
+    // A peer on another network is looked for where the user said it is;
+    // the LAN broadcast still finds a peer that came back to this network.
+    let remembered = storage::get_bridge_peer_address(&state.paths, &room.id)?;
+    let unicast = match remembered.as_deref() {
+        Some(address) => discovery::discover_room_at(
+            address,
+            room.room_code_hash.clone(),
+            Some(discovery::local_device_id(&state)),
+            Some(room.id.clone()),
+        )
+        .await
+        .ok(),
+        None => None,
+    };
+    let (source, discovered) = match unicast {
+        Some(found) => found,
+        None => {
+            discovery::discover_room(
+                room.room_code_hash.clone(),
+                Some(discovery::local_device_id(&state)),
+                Some(room.id.clone()),
+            )
+            .await?
+        }
+    };
     if discovered.room_id != room.id {
         return Err(AppError::InvalidInput(
             "Discovered Bridge identity does not match the preserved Bridge.".into(),
@@ -1010,5 +1054,7 @@ mod tests {
     fn reconnect_policy_is_bounded_before_disconnected() {
         assert_eq!(DISCONNECTED_AFTER_ATTEMPTS, 2);
         assert!(LIVENESS_TIMEOUT < RECONCILE_INTERVAL);
+        // One slow probe across the internet is jitter, not a lost peer.
+        assert!(LIVENESS_FAILURES_BEFORE_INVALIDATION >= 3);
     }
 }

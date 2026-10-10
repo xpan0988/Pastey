@@ -75,6 +75,8 @@ pub struct HostRuntime {
     pub antenna_handle: Mutex<Option<DiscoveryHandle>>,
     pub bridge_lifecycle_handle: Mutex<Option<DiscoveryHandle>>,
     pub(crate) bridge_reconnect_attempts: Mutex<HashMap<String, u8>>,
+    /// Consecutive failed liveness probes per Bridge peer session.
+    pub(crate) bridge_liveness_failures: Mutex<HashMap<String, u8>>,
     pub(crate) bridge_reconnect_rotations: Mutex<HashSet<String>>,
     pub nearby_devices: Mutex<HashMap<String, discovery::NearbyDeviceRecord>>,
     pub pending_join_requests: Mutex<HashMap<String, discovery::PendingJoinRequest>>,
@@ -195,6 +197,7 @@ impl HostRuntime {
             antenna_handle: Mutex::new(None),
             bridge_lifecycle_handle: Mutex::new(None),
             bridge_reconnect_attempts: Mutex::new(HashMap::new()),
+            bridge_liveness_failures: Mutex::new(HashMap::new()),
             bridge_reconnect_rotations: Mutex::new(HashSet::new()),
             nearby_devices: Mutex::new(HashMap::new()),
             pending_join_requests: Mutex::new(HashMap::new()),

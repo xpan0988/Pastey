@@ -1009,9 +1009,11 @@ pub(crate) fn prepare_bridge_departure_delivery(
 pub(crate) async fn deliver_prepared_room_control_event(
     delivery: PreparedRoomControlDelivery,
 ) -> AppResult<RoomControlDeliveryReceipt> {
+    // Bounds sized for an internet path between Hosts. A delivery that does
+    // time out is still receipt-ambiguous and handled as such by callers.
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
         .build()
         .map_err(|_| AppError::Network("Room control transport unavailable.".into()))?;
     let response = client

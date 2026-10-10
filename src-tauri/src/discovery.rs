@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     process::Command,
     sync::Arc,
     time::Duration,
@@ -486,6 +486,174 @@ pub async fn send_join_response(
             )
         })?;
     Ok(())
+}
+
+/// How long a unicast room query to a peer on another network may take. An
+/// overlay path (Tailscale, WireGuard) can add hundreds of milliseconds and
+/// jitter, and a relayed path more.
+const UNICAST_DISCOVERY_WAIT: Duration = Duration::from_secs(10);
+const UNICAST_DISCOVERY_SENDS: usize = 4;
+const MAX_PEER_ADDRESS_LENGTH: usize = 253;
+
+/// A peer address the user typed to reach a Host on another network, such
+/// as its overlay (Tailscale or WireGuard) IP or name. It only says where to
+/// send the existing room query: the Bridge code, the room identity and the
+/// transport key exchange still decide whether a Bridge forms, and an address
+/// never authorizes anything.
+pub fn validate_peer_address(input: &str) -> AppResult<String> {
+    let address = input.trim();
+    let invalid = |message: &str| Err(AppError::InvalidInput(message.into()));
+    if address.is_empty() || address.len() > MAX_PEER_ADDRESS_LENGTH {
+        return invalid("Enter the other device's network address or name.");
+    }
+    if let Ok(ip) = address.parse::<IpAddr>() {
+        let IpAddr::V4(ip) = ip else {
+            return invalid("Use the other device's IPv4 address or its network name.");
+        };
+        if ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_multicast()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_documentation()
+        {
+            return invalid("That address cannot be another device.");
+        }
+        // Private, carrier-grade NAT (Tailscale's 100.64.0.0/10) or other
+        // overlay ranges. A public address would mean Pastey is exposed
+        // directly to the internet, which it must not be.
+        let octets = ip.octets();
+        let shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+        if !(ip.is_private() || shared) {
+            return invalid("Use an address on a private or overlay network (for example Tailscale or WireGuard). Pastey must not be exposed directly to the internet.");
+        }
+        return Ok(address.to_owned());
+    }
+    // A DNS name, such as a Tailscale MagicDNS name. No scheme, port, path
+    // or credentials: Pastey uses its own fixed ports.
+    let labels_ok = address.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    if !labels_ok
+        || address
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return invalid("Enter only the device's address or name, without a port, path or scheme.");
+    }
+    Ok(address.to_ascii_lowercase())
+}
+
+/// Finds one Bridge's room server on a peer at an explicitly given address
+/// on another network, with the same request the LAN broadcast sends. Only a
+/// reply from an address the name resolved to, for exactly this request, is
+/// accepted.
+pub async fn discover_room_at(
+    address: &str,
+    room_code_hash: String,
+    requester_device_id: Option<String>,
+    expected_room_id: Option<String>,
+) -> AppResult<(SocketAddr, DiscoveryResponse)> {
+    let address = validate_peer_address(address)?;
+    let targets = timeout(
+        UNICAST_DISCOVERY_WAIT,
+        tokio::net::lookup_host((address.as_str(), DISCOVERY_PORT)),
+    )
+    .await
+    .map_err(|_| {
+        AppError::Timeout("The other device's name could not be resolved in time.".into())
+    })?
+    .map_err(|_| AppError::Network("The other device's name could not be resolved.".into()))?
+    .filter(SocketAddr::is_ipv4)
+    .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err(AppError::Network(
+            "The other device's name has no IPv4 address.".into(),
+        ));
+    }
+    discover_room_unicast(
+        &targets,
+        room_code_hash,
+        requester_device_id,
+        expected_room_id,
+        UNICAST_DISCOVERY_WAIT,
+    )
+    .await
+}
+
+async fn discover_room_unicast(
+    targets: &[SocketAddr],
+    room_code_hash: String,
+    requester_device_id: Option<String>,
+    expected_room_id: Option<String>,
+    wait: Duration,
+) -> AppResult<(SocketAddr, DiscoveryResponse)> {
+    let socket = UdpSocket::bind(("0.0.0.0", 0))
+        .await
+        .map_err(|error| AppError::Network(format!("unable to open discovery socket: {error}")))?;
+    let request = DiscoveryRequest {
+        kind: "discover_room".to_string(),
+        request_id: uuid::Uuid::new_v4().to_string(),
+        room_code_hash,
+        requester_device_id,
+        expected_room_id: expected_room_id.clone(),
+    };
+    let request_id = request.request_id.clone();
+    let payload = serde_json::to_vec(&request)?;
+    let deadline = tokio::time::Instant::now() + wait;
+    let resend_every = wait / UNICAST_DISCOVERY_SENDS as u32;
+    let mut next_send = tokio::time::Instant::now();
+    let mut sends = 0;
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(AppError::Timeout(
+                "The other device did not answer. Check that it is running Pastey with this Bridge open and that both devices are on the same overlay network.".into(),
+            ));
+        }
+        // Resend over a lossy path; each reply must still match this request.
+        if sends < UNICAST_DISCOVERY_SENDS && now >= next_send {
+            for target in targets {
+                let _ = socket.send_to(&payload, target).await;
+            }
+            sends += 1;
+            next_send = now + resend_every;
+        }
+        let until = if sends < UNICAST_DISCOVERY_SENDS {
+            next_send.min(deadline)
+        } else {
+            deadline
+        };
+        let Ok(received) = tokio::time::timeout_at(until, socket.recv_from(&mut buffer)).await
+        else {
+            continue;
+        };
+        let (size, source) = received
+            .map_err(|error| AppError::Network(format!("discovery receive failed: {error}")))?;
+        if !targets.iter().any(|target| target.ip() == source.ip()) {
+            continue;
+        }
+        let Ok(response) = serde_json::from_slice::<DiscoveryResponse>(&buffer[..size]) else {
+            continue;
+        };
+        if response.kind != "room_offer" || response.request_id != request_id {
+            continue;
+        }
+        if expected_room_id
+            .as_deref()
+            .is_some_and(|room_id| room_id != response.room_id)
+        {
+            continue;
+        }
+        return Ok((source, response));
+    }
 }
 
 pub async fn discover_room(
@@ -1231,6 +1399,147 @@ mod tests {
             room_offer_id: "offer".into(),
             expires_at,
             availability: availability.into(),
+        }
+    }
+
+    #[test]
+    fn a_peer_address_is_only_a_private_or_overlay_location() {
+        for accepted in [
+            "100.101.102.103",
+            "192.168.1.20",
+            "10.0.0.7",
+            "172.20.4.9",
+            "home-pc",
+            "Windows-PC.tail1234.TS.net",
+        ] {
+            assert!(validate_peer_address(accepted).is_ok(), "{accepted}");
+        }
+        assert_eq!(
+            validate_peer_address(" Windows-PC.tail1234.ts.net ").unwrap(),
+            "windows-pc.tail1234.ts.net"
+        );
+        for refused in [
+            "",
+            "8.8.8.8",
+            "203.0.113.5",
+            "0.0.0.0",
+            "255.255.255.255",
+            "127.0.0.1",
+            "169.254.10.10",
+            "224.0.0.1",
+            "::1",
+            "fd7a:115c:a1e0::1",
+            "1.2.3",
+            "https://home-pc",
+            "home-pc:48392",
+            "home-pc/rooms",
+            "user@home-pc",
+            "home pc",
+            "-bad.example",
+            "bad..example",
+        ] {
+            assert!(validate_peer_address(refused).is_err(), "{refused}");
+        }
+    }
+
+    /// A stand-in for a peer's discovery service on this machine.
+    async fn responder(
+        reply: impl Fn(&DiscoveryRequest) -> Vec<DiscoveryResponse> + Send + 'static,
+    ) -> SocketAddr {
+        let socket = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buffer = vec![0u8; 4096];
+            while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+                let Ok(request) = serde_json::from_slice::<DiscoveryRequest>(&buffer[..size])
+                else {
+                    continue;
+                };
+                for response in reply(&request) {
+                    let _ = socket
+                        .send_to(&serde_json::to_vec(&response).unwrap(), source)
+                        .await;
+                }
+            }
+        });
+        address
+    }
+
+    fn offer(request_id: &str, room_id: &str) -> DiscoveryResponse {
+        DiscoveryResponse {
+            kind: "room_offer".into(),
+            request_id: request_id.into(),
+            room_id: room_id.into(),
+            port: 40_000,
+            expires_at: 0,
+            transport_public_key: "key".into(),
+            device_name: "Windows".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unicast_discovery_accepts_only_the_exact_reply_for_the_expected_room() {
+        let target = responder(|request| {
+            vec![
+                // Noise first: another request, another room, another kind.
+                offer("some-other-request", "room-a"),
+                offer(&request.request_id, "room-b"),
+                DiscoveryResponse {
+                    kind: "nearby_beacon".into(),
+                    ..offer(&request.request_id, "room-a")
+                },
+                offer(&request.request_id, "room-a"),
+            ]
+        })
+        .await;
+        let (source, found) = discover_room_unicast(
+            &[target],
+            "hash".into(),
+            Some("requester".into()),
+            Some("room-a".into()),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.ip(), target.ip());
+        assert_eq!(found.room_id, "room-a");
+    }
+
+    #[tokio::test]
+    async fn unicast_discovery_of_a_wrong_or_silent_host_times_out_truthfully() {
+        // The device answers, but for another Bridge only.
+        let wrong = responder(|request| vec![offer(&request.request_id, "another-bridge")]).await;
+        let error = discover_room_unicast(
+            &[wrong],
+            "hash".into(),
+            None,
+            Some("room-a".into()),
+            Duration::from_millis(600),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Timeout(_)));
+        // Nothing answers at all.
+        let silent = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let error = discover_room_unicast(
+            &[silent.local_addr().unwrap()],
+            "hash".into(),
+            None,
+            None,
+            Duration::from_millis(600),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, AppError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn a_public_or_malformed_address_is_refused_before_any_packet_is_sent() {
+        for address in ["8.8.8.8", "http://home-pc", "home-pc:1"] {
+            assert!(matches!(
+                discover_room_at(address, "hash".into(), None, None).await,
+                Err(AppError::InvalidInput(_))
+            ));
         }
     }
 }

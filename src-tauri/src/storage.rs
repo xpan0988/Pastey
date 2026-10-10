@@ -171,6 +171,14 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             created_at INTEGER NOT NULL
         );
 
+        -- The address the user gave to reach one Bridge's peer on another
+        -- network (an overlay IP or name). Where to look, never authority.
+        CREATE TABLE IF NOT EXISTS bridge_peer_addresses (
+            room_id TEXT PRIMARY KEY,
+            address TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         -- Folders this Host's own user authorized for authenticated Bridge
         -- peers' bounded file Search. Host-local: never received from a
         -- peer, and never sent to one (peers name only the scope label).
@@ -345,6 +353,56 @@ pub(crate) fn update_native_agent_observed_task_if_present(
     }
     transaction.commit()?;
     Ok(())
+}
+
+pub(crate) fn set_bridge_peer_address(
+    paths: &AppPaths,
+    room_id: &str,
+    address: Option<&str>,
+) -> AppResult<()> {
+    let conn = connection(paths)?;
+    match address {
+        Some(address) => {
+            let current: i64 = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status != 'burned')
+                    AND NOT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+                [room_id],
+                |row| row.get(0),
+            )?;
+            if current == 0 {
+                return Err(AppError::InvalidInput(
+                    "That Bridge is no longer available.".into(),
+                ));
+            }
+            conn.execute(
+                "INSERT INTO bridge_peer_addresses (room_id, address, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(room_id) DO UPDATE SET address = excluded.address, updated_at = excluded.updated_at",
+                params![room_id, address, now_ts()],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM bridge_peer_addresses WHERE room_id = ?1",
+                [room_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn get_bridge_peer_address(
+    paths: &AppPaths,
+    room_id: &str,
+) -> AppResult<Option<String>> {
+    connection(paths)?
+        .query_row(
+            "SELECT address FROM bridge_peer_addresses WHERE room_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+            [room_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(AppError::from)
 }
 
 /// Most folders a Host user may authorize for Bridge Search.
@@ -1816,6 +1874,7 @@ pub fn finalize_burned_room(
     bridge_plan::delete_bridge_records(paths, room_id)?;
     crate::native_agent::purge_durable_bridge_state(paths, room_id)?;
     delete_bridge_authorized_search_folders(paths, room_id)?;
+    set_bridge_peer_address(paths, room_id, None)?;
     let conn = connection(paths)?;
     delete_room_files(paths, room_id, effective_inbox_dir)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;
@@ -4727,5 +4786,50 @@ mod tests {
         );
         assert!(detached.is_err());
         let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn a_remembered_peer_address_belongs_to_one_live_bridge_and_ends_with_burn() {
+        let paths = test_paths("peer-address");
+        init_database(&paths).unwrap();
+        let room = create_room(
+            &paths,
+            &[3u8; 32],
+            "12345678",
+            15,
+            LocalRole::Creator,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(get_bridge_peer_address(&paths, &room.id).unwrap(), None);
+        set_bridge_peer_address(&paths, &room.id, Some("home-pc.tail1234.ts.net")).unwrap();
+        assert_eq!(
+            get_bridge_peer_address(&paths, &room.id)
+                .unwrap()
+                .as_deref(),
+            Some("home-pc.tail1234.ts.net")
+        );
+        set_bridge_peer_address(&paths, &room.id, Some("100.64.0.9")).unwrap();
+        assert_eq!(
+            get_bridge_peer_address(&paths, &room.id)
+                .unwrap()
+                .as_deref(),
+            Some("100.64.0.9")
+        );
+        // No address for a Bridge that does not exist.
+        assert!(set_bridge_peer_address(&paths, "no-such-bridge", Some("100.64.0.9")).is_err());
+        // The Burn cutoff hides it at once; finalization deletes it.
+        cut_off_bridge_authority(&paths, &room.id).unwrap();
+        assert_eq!(get_bridge_peer_address(&paths, &room.id).unwrap(), None);
+        assert!(set_bridge_peer_address(&paths, &room.id, Some("100.64.0.9")).is_err());
+        finalize_burned_room(&paths, &room.id, &paths.inbox_dir).unwrap();
+        let remaining: i64 = connection(&paths)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM bridge_peer_addresses", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

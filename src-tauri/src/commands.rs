@@ -2586,51 +2586,126 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
             None,
         )
         .await?;
-        let master_key = {
-            let config = state.config.read();
-            config::master_key(&config)?
-        };
-
-        let room = storage::create_room(
-            &state.paths,
-            &master_key,
-            &compact,
-            15,
-            LocalRole::Joined,
-            Some(discovered.room_id.clone()),
-            Some(discovered.expires_at),
-        )?;
-        transfer::start_room_server(state.inner().clone(), &room.id).await?;
-        let response = transfer::announce_join(
-            state.inner().clone(),
-            &room.id,
-            &source.ip().to_string(),
-            discovered.port,
-        )
-        .await?;
-        let peer_host_ref = response
-            .host_ref
-            .as_deref()
-            .map(|value| crate::host_identity::HostRef::parse_peer(value, &state.local_host_ref))
-            .transpose()?;
-
-        storage::update_room_peer(
-            &state.paths,
-            &room.id,
-            Some(&source.ip().to_string()),
-            Some(discovered.port),
-            Some(&response.device_name),
-            Some(&discovered.transport_public_key),
-            crate::models::RoomStatus::Active,
-        )?;
-        if let Some(host_ref) = peer_host_ref.as_ref() {
-            storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, host_ref.as_str())?;
-        }
-
-        let updated = storage::get_room_by_id(&state.paths, &room.id)?;
-        storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
+        join_discovered_room(state.inner().clone(), &compact, source, discovered, None).await
     })
     .await
+}
+
+/// Joins a Bridge whose creator is on another network, reached at an
+/// address the user gives (for example its Tailscale or WireGuard address).
+/// Only discovery is unicast: the Bridge code, room identity, transport key
+/// exchange and session binding are exactly those of a LAN join. The address
+/// is remembered for this Bridge's reconnects and grants nothing.
+#[tauri::command]
+pub async fn join_room_at(
+    code: String,
+    address: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let compact = normalize_code(&code)?;
+        let address = discovery::validate_peer_address(&address)?;
+        let room_code_hash = crypto::hash_code(&compact);
+        let (source, discovered) = discovery::discover_room_at(
+            &address,
+            room_code_hash,
+            Some(discovery::local_device_id(state.inner())),
+            None,
+        )
+        .await?;
+        join_discovered_room(
+            state.inner().clone(),
+            &compact,
+            source,
+            discovered,
+            Some(address),
+        )
+        .await
+    })
+    .await
+}
+
+async fn join_discovered_room(
+    state: Arc<AppState>,
+    compact: &str,
+    source: std::net::SocketAddr,
+    discovered: crate::models::DiscoveryResponse,
+    peer_address: Option<String>,
+) -> AppResult<RoomInfo> {
+    let master_key = {
+        let config = state.config.read();
+        config::master_key(&config)?
+    };
+
+    let room = storage::create_room(
+        &state.paths,
+        &master_key,
+        compact,
+        15,
+        LocalRole::Joined,
+        Some(discovered.room_id.clone()),
+        Some(discovered.expires_at),
+    )?;
+    transfer::start_room_server(state.clone(), &room.id).await?;
+    let response = transfer::announce_join(
+        state.clone(),
+        &room.id,
+        &source.ip().to_string(),
+        discovered.port,
+    )
+    .await?;
+    let peer_host_ref = response
+        .host_ref
+        .as_deref()
+        .map(|value| crate::host_identity::HostRef::parse_peer(value, &state.local_host_ref))
+        .transpose()?;
+
+    storage::update_room_peer(
+        &state.paths,
+        &room.id,
+        Some(&source.ip().to_string()),
+        Some(discovered.port),
+        Some(&response.device_name),
+        Some(&discovered.transport_public_key),
+        crate::models::RoomStatus::Active,
+    )?;
+    if let Some(host_ref) = peer_host_ref.as_ref() {
+        storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, host_ref.as_str())?;
+    }
+    if let Some(address) = peer_address.as_deref() {
+        storage::set_bridge_peer_address(&state.paths, &room.id, Some(address))?;
+    }
+
+    let updated = storage::get_room_by_id(&state.paths, &room.id)?;
+    storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
+}
+
+/// The address this device uses to reach a Bridge's peer on another network,
+/// if one was given.
+#[tauri::command]
+pub fn get_bridge_peer_address(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<String>, String> {
+    storage::get_bridge_peer_address(&state.paths, &room_id).map_err(|error| error.message())
+}
+
+/// Remembers (or with `None` forgets) where to reach a Bridge's peer when it
+/// is not on this network, so the Bridge can reconnect across networks.
+#[tauri::command]
+pub fn set_bridge_peer_address(
+    room_id: String,
+    address: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<String>, String> {
+    let address = address
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| discovery::validate_peer_address(&value))
+        .transpose()
+        .map_err(|error| error.message())?;
+    storage::set_bridge_peer_address(&state.paths, &room_id, address.as_deref())
+        .map_err(|error| error.message())?;
+    Ok(address)
 }
 
 #[tauri::command]

@@ -564,6 +564,23 @@ export async function markJoinPromptRendered(): Promise<boolean> {
   return invoke("mark_join_prompt_rendered");
 }
 
+/** Joins a Bridge whose device is on another network, reached at its
+ * private or overlay (Tailscale/WireGuard) address or name. The address only
+ * says where to look; the Bridge code and session keys decide the join. */
+export function joinRoomAt(code: string, address: string): Promise<RoomInfo> {
+  return invoke("join_room_at", { code, address });
+}
+
+export function getBridgePeerAddress(roomId: string): Promise<string | null> {
+  return invoke("get_bridge_peer_address", { roomId });
+}
+
+/** Remembers (or with null forgets) where this Bridge's peer can be reached
+ * from another network, for reconnects. Grants nothing. */
+export function setBridgePeerAddress(roomId: string, address: string | null): Promise<string | null> {
+  return invoke("set_bridge_peer_address", { roomId, address });
+}
+
 export async function listRooms(): Promise<RoomInfo[]> {
   return invoke("list_rooms");
 }

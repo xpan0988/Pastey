@@ -8,6 +8,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Added
 
+- Bridges can form and reconnect across networks through a user-managed overlay such as Tailscale or WireGuard: join by code at the other device's private or overlay address, or remember that address for an existing Bridge. Discovery is unicast to that address only; the Bridge code, room identity, transport key exchange and session binding are unchanged, and an address never authorizes anything. Public internet addresses are refused. (Backend commands and bindings; the join/address screens are not yet in the UI.)
 - Find file: from a Bridge, search another device for a file by name (for example a validation `.mp4`) and receive only the one you choose in this device's Inbox, through the existing reviewed Search → Select → encrypted Transfer flow. Nothing else moves and nothing on the other device changes. Results show name, size, modification time and a redacted location, and expire after 10 minutes.
 - Shared search folders: under Settings, a device's user can share specific folders (for example a project's output folder) for Find file, and stop sharing them. Other devices can only name "shared search folders", never a path. Folders too broad or private to share safely are refused.
 - A Codex conversation started through Pastey now survives a Pastey restart: a follow-up in the same workspace from the same requester reopens the same native conversation with Codex's `thread/resume`. The task card says whether a task continued the conversation or began a new one, and offers "Start a new conversation". If Codex cannot reopen the conversation, nothing runs and the card says so; Pastey never silently starts a new one. Conversations are bound to their requester (this device, or one peer device over one Bridge) and are forgotten when that Bridge is burned.
@@ -25,6 +26,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- A single slow liveness probe no longer ends a Bridge session: three consecutive failures are required, and Room Control and capability-query waits now allow for internet latency.
 - A shared search folder is now shared with one chosen Bridge only, instead of with every Bridge on the device. Folders shared before this change are not searched until shared again, and burning the Bridge ends the share.
 - Find file now returns the 20 most recently modified matches, newest first, instead of the first 20 found, so a just-rendered video deep in a folder is no longer missed.
 - A Bridge search result is no longer sent if the file was replaced with another file of the same size and modification time after it was found.
