@@ -16,7 +16,10 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::{NativeAgentCapabilityStateV1, NativeAgentCapabilityV1, NativeTurnOutcomeV1};
+use super::{
+    NativeAgentCapabilityStateV1, NativeAgentCapabilityV1, NativeConversationContinuityV1,
+    NativeTurnOutcomeV1,
+};
 use crate::error::{AppError, AppResult};
 
 pub(super) mod codex;
@@ -124,10 +127,36 @@ pub(crate) struct PreparedInvocationV1 {
     /// Host workspace bound to the task. Only workspace-scoped adapters
     /// (Codex) set it; workspace movement and its recovery use it.
     pub(crate) host_workspace: Option<PathBuf>,
+    /// Set by adapters whose native capability keeps a conversation.
+    pub(crate) conversation: Option<PreparedConversationV1>,
+}
+
+/// The adapter's conversation scope for one invocation (Codex: its
+/// canonical workspace). Core binds the scope to the invocation's owner
+/// and capability; the adapter never learns who the owner is.
+pub(crate) struct PreparedConversationV1 {
+    pub(crate) scope: String,
+    /// Continue the owner's conversation in this scope, or begin a new one.
+    pub(crate) continue_existing: bool,
+}
+
+/// The conversation Core hands an adapter at start.
+pub(crate) struct NativeConversationV1 {
+    /// Opaque to the adapter: exactly one owner, capability and scope. Live
+    /// native state is keyed by it, so two owners never share one.
+    pub(crate) key: String,
+    pub(crate) continue_existing: bool,
+    /// The continuation this adapter reported for `key` when the
+    /// conversation began, kept durably by Core. Present only when the
+    /// invocation continues.
+    pub(crate) continuation: Option<OpaqueCapabilityPayloadV1>,
 }
 
 pub(crate) struct StartedInvocationV1 {
     pub(crate) session_reused: bool,
+    /// Known at start only when a live conversation is reused; otherwise
+    /// the run confirms it through `NativeInvocationProgressV1`.
+    pub(crate) conversation: Option<NativeConversationContinuityV1>,
     pub(crate) run: Box<dyn NativeInvocationRunV1>,
 }
 
@@ -146,6 +175,14 @@ pub(crate) trait NativeInvocationProgressV1: Send + Sync {
     /// The native capability is blocked until its own client answers a
     /// request (for example an approval) that Pastey does not answer.
     fn awaiting_native_decision(&self, waiting: bool);
+    /// The native capability confirmed the invocation's conversation: newly
+    /// begun, or the earlier one continued. `continuation` is what continuing
+    /// it after a restart requires; Core keeps it Host-private.
+    fn conversation_established(
+        &self,
+        continuity: NativeConversationContinuityV1,
+        continuation: OpaqueCapabilityPayloadV1,
+    );
 }
 
 /// One started invocation, observed on a Core-owned thread.
@@ -195,11 +232,14 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
         &self,
         task_id: &str,
         input: &OpaqueCapabilityPayloadV1,
+        conversation: Option<NativeConversationV1>,
     ) -> AppResult<StartedInvocationV1>;
     /// Best-effort native stop. Pastey has already revoked the invocation's
     /// authority; an error means delivery of the stop is uncertain.
     fn cancel(&self, task_id: &str) -> AppResult<()>;
     /// Burn: stop and forget everything the adapter keeps for the task.
     fn release(&self, task_id: &str);
+    /// Burn: end the live native state of one conversation key.
+    fn release_conversation(&self, _key: &str) {}
     fn shutdown(&self);
 }

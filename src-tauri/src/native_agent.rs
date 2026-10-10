@@ -33,7 +33,7 @@ use admission::{
 use capability::codex::codex_compatibility_at;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
 use capability::{
-    codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1,
+    codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1,
     NativeInvocationOutcomeV1, NativeInvocationProgressV1,
 };
 
@@ -68,6 +68,10 @@ pub(crate) const GENERIC_NATIVE_INVOKE_PROTOCOLS: [&str; 2] =
 pub(crate) const AWAITING_NATIVE_DECISION_CODE: &str = "native_agent_awaiting_native_decision";
 /// The adapter proved its invocation never started any native work.
 const START_FAILED_CODE: &str = "native_agent_start_failed";
+/// The owner's earlier native conversation could not be continued, so
+/// nothing ran. Pastey never substitutes a new conversation for it.
+pub(crate) const CONVERSATION_UNAVAILABLE_CODE: &str = "native_agent_conversation_unavailable";
+const NATIVE_CONVERSATION_SCHEMA: &str = "pastey-native-conversation-v1";
 const MAX_TASK_ID_BYTES: usize = 256;
 const MAX_WORKSPACE_BYTES: usize = 4 * 1024;
 const MAX_MOVEMENT_ID_BYTES: usize = 256;
@@ -514,12 +518,125 @@ enum NativeTurnOutcomeV1 {
     /// Nothing native ran: the capability could not even begin the
     /// invocation. A definite non-start, never an indeterminate outcome.
     NotStarted,
+    /// Nothing native ran: the conversation the invocation continues could
+    /// not be reopened.
+    ConversationUnavailable,
+}
+
+/// Whether a task continued its owner's earlier native conversation or
+/// began a new one. Renderer-safe: no native identifier.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeConversationContinuityV1 {
+    New,
+    Continued,
+}
+
+/// Who a native conversation belongs to. A conversation is continued only
+/// for exactly this principal: this Host's own user, or one authenticated
+/// peer Host over one Bridge. A workspace path alone never grants it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum NativeConversationOwnerV1 {
+    Local,
+    Peer {
+        bridge_id: String,
+        peer_host_ref: String,
+    },
+}
+
+impl NativeConversationOwnerV1 {
+    fn bridge_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Peer { bridge_id, .. } => Some(bridge_id),
+        }
+    }
+}
+
+/// The durable, Host-private record of one confirmed native conversation.
+/// Its lifecycle is the conversation's, not any task envelope's.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeConversationRecordV1 {
+    schema_version: String,
+    owner: NativeConversationOwnerV1,
+    capability_id: String,
+    scope_digest: String,
+    continuation: OpaqueCapabilityPayloadV1,
+}
+
+/// One owner's conversation in one adapter scope.
+#[derive(Clone)]
+struct NativeConversationBindingV1 {
+    key: String,
+    owner: NativeConversationOwnerV1,
+    capability_id: String,
+    scope_digest: String,
+}
+
+impl NativeConversationBindingV1 {
+    fn new(owner: NativeConversationOwnerV1, capability_id: &str, scope: &str) -> AppResult<Self> {
+        let scope_digest = blake3::hash(scope.as_bytes()).to_hex().to_string();
+        let identity = serde_json::to_vec(&json!({
+            "schemaVersion": NATIVE_CONVERSATION_SCHEMA,
+            "owner": owner,
+            "capabilityId": capability_id,
+            "scopeDigest": scope_digest,
+        }))?;
+        Ok(Self {
+            key: blake3::hash(&identity).to_hex().to_string(),
+            owner,
+            capability_id: capability_id.into(),
+            scope_digest,
+        })
+    }
+
+    /// The saved continuation of exactly this binding, if any.
+    fn saved_continuation(
+        &self,
+        paths: &crate::storage::AppPaths,
+    ) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+        let Some(record) = crate::storage::get_native_agent_conversation(paths, &self.key)? else {
+            return Ok(None);
+        };
+        let record: NativeConversationRecordV1 = serde_json::from_str(&record)?;
+        Ok((record.schema_version == NATIVE_CONVERSATION_SCHEMA
+            && record.owner == self.owner
+            && record.capability_id == self.capability_id
+            && record.scope_digest == self.scope_digest
+            && record.continuation.validate().is_ok())
+        .then_some(record.continuation))
+    }
+
+    fn save(
+        &self,
+        paths: &crate::storage::AppPaths,
+        continuation: OpaqueCapabilityPayloadV1,
+    ) -> AppResult<bool> {
+        continuation.validate()?;
+        let record = NativeConversationRecordV1 {
+            schema_version: NATIVE_CONVERSATION_SCHEMA.into(),
+            owner: self.owner.clone(),
+            capability_id: self.capability_id.clone(),
+            scope_digest: self.scope_digest.clone(),
+            continuation,
+        };
+        crate::storage::save_native_agent_conversation(
+            paths,
+            &self.key,
+            self.owner.bridge_id(),
+            &serde_json::to_string(&record)?,
+        )
+    }
 }
 
 /// Core's receiver for one observed invocation's non-terminal facts.
 struct ObservedTaskProgressV1 {
     tasks: Arc<Mutex<HashMap<String, NativeAgentTaskStatusV1>>>,
     task_id: String,
+    conversation: Option<NativeConversationBindingV1>,
+    durable_paths: Option<crate::storage::AppPaths>,
 }
 
 impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
@@ -539,6 +656,34 @@ impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
             status.code = Some(AWAITING_NATIVE_DECISION_CODE.into());
         } else if status.code.as_deref() == Some(AWAITING_NATIVE_DECISION_CODE) {
             status.code = None;
+        }
+    }
+
+    fn conversation_established(
+        &self,
+        continuity: NativeConversationContinuityV1,
+        continuation: OpaqueCapabilityPayloadV1,
+    ) {
+        // The native conversation exists whatever becomes of this task, so
+        // it is kept even if the task was cancelled meanwhile. A burned
+        // Bridge's tombstone refuses it inside the same storage transaction.
+        if let (Some(binding), Some(paths)) = (&self.conversation, &self.durable_paths) {
+            if let Err(error) = binding.save(paths, continuation) {
+                crate::logging::write_error_line(&format!(
+                    "Native Agent conversation record was not saved: {}",
+                    error.message()
+                ));
+            }
+        }
+        let Ok(mut tasks) = self.tasks.lock() else {
+            return;
+        };
+        if let Some(status) = tasks
+            .get_mut(&self.task_id)
+            .filter(|status| status.state == NativeAgentTaskStateV1::Running)
+        {
+            status.conversation = Some(continuity);
+            status.session_reused = continuity == NativeConversationContinuityV1::Continued;
         }
     }
 }
@@ -605,6 +750,10 @@ pub(crate) struct NativeAgentTaskStatusV1 {
     /// data (for example, escaped text).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) output: Option<OpaqueCapabilityPayloadV1>,
+    /// Set once the capability confirms whether this task continued its
+    /// owner's conversation or began a new one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) conversation: Option<NativeConversationContinuityV1>,
 }
 
 /// A small Host-private service: the native capability lifecycle over a
@@ -642,6 +791,9 @@ pub(crate) struct NativeAgentServiceV1 {
     /// was prepared over: the principal of its executor Review once the
     /// workspace lands. Process-local, like the Review itself.
     movement_bindings: HashMap<String, HostSessionBinding>,
+    /// The conversation key each Bridge-owned task ran in, so Burn can end
+    /// that conversation's live native state.
+    task_conversations: HashMap<String, String>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
     durable_paths: Option<crate::storage::AppPaths>,
     #[cfg(test)]
@@ -676,6 +828,7 @@ impl NativeAgentServiceV1 {
             unstarted_review_tasks: HashSet::new(),
             task_input_digests: HashMap::new(),
             movement_bindings: HashMap::new(),
+            task_conversations: HashMap::new(),
             workspace_movements: HashMap::new(),
             durable_paths: None,
             #[cfg(test)]
@@ -1328,6 +1481,7 @@ impl NativeAgentServiceV1 {
                     result: None,
                     code: Some("workspace_movement_review".into()),
                     output: None,
+                    conversation: None,
                 },
             );
         self.remote_targets
@@ -1548,6 +1702,7 @@ impl NativeAgentServiceV1 {
                     result: None,
                     code: Some("workspace_transfer_pending".into()),
                     output: None,
+                    conversation: None,
                 },
             );
         self.task_digests
@@ -1887,11 +2042,14 @@ impl NativeAgentServiceV1 {
             .remove(task_id);
         let was_unstarted_review = self.unstarted_review_tasks.remove(task_id);
         let had_session = self.codex.has_session(&canonical_workspace);
+        // A landed workspace is fresh for each movement: its conversation is
+        // the movement's own and is not kept past it.
         let started = self.start_invocation_in_movement(
             CODEX_CAPABILITY_ID,
             task_id,
             input,
             Some(movement_id),
+            None,
         );
         let status = match started {
             Ok(status) => status,
@@ -3138,10 +3296,22 @@ impl NativeAgentServiceV1 {
         self.movement_status(movement_id)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_codex_task(
         &mut self,
         workspace: &Path,
         task: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_codex_conversation_task(workspace, task, false)
+    }
+
+    /// Continues this Host user's Codex conversation in `workspace` (or
+    /// begins one), or with `new_conversation` explicitly begins a new one.
+    pub(crate) fn start_codex_conversation_task(
+        &mut self,
+        workspace: &Path,
+        task: &str,
+        new_conversation: bool,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
             return invalid("Native Agent task is empty or exceeds its bound.");
@@ -3152,13 +3322,15 @@ impl NativeAgentServiceV1 {
         if !workspace.is_dir() {
             return invalid("Native Agent workspace must be a directory.");
         }
-        self.start_codex_task_with_id(
+        self.start_codex_task_with_id_resume(
             &format!("native-agent:{}", Uuid::new_v4()),
             &workspace,
             task,
+            !new_conversation,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn start_codex_task_with_id(
         &mut self,
         task_id: &str,
@@ -3229,12 +3401,13 @@ impl NativeAgentServiceV1 {
             }
             return Ok(existing);
         }
-        if !resume && self.codex.has_session(&workspace) {
-            return invalid(
-                "Native Agent workspace already has a session; resumption is required.",
-            );
-        }
-        self.start_codex_task_with_executable_and_id(Path::new("codex"), task_id, &workspace, task)
+        self.start_codex_task_with_executable_id_and_resume(
+            Path::new("codex"),
+            task_id,
+            &workspace,
+            task,
+            resume,
+        )
     }
 
     #[cfg(test)]
@@ -3252,6 +3425,7 @@ impl NativeAgentServiceV1 {
         )
     }
 
+    #[cfg(test)]
     fn start_codex_task_with_executable_and_id(
         &mut self,
         executable: &Path,
@@ -3259,8 +3433,23 @@ impl NativeAgentServiceV1 {
         workspace: &Path,
         task: &str,
     ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_codex_task_with_executable_id_and_resume(
+            executable, task_id, workspace, task, true,
+        )
+    }
+
+    /// `resume` continues this owner's conversation in the workspace, or
+    /// begins one when none exists; `false` explicitly begins a new one.
+    fn start_codex_task_with_executable_id_and_resume(
+        &mut self,
+        executable: &Path,
+        task_id: &str,
+        workspace: &Path,
+        task: &str,
+        resume: bool,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         self.codex.use_executable(executable);
-        let input = capability::codex::codex_input(workspace, task, true)?;
+        let input = capability::codex::codex_input(workspace, task, resume)?;
         self.start_local_invocation(CODEX_CAPABILITY_ID, task_id, &input)
     }
 
@@ -3274,7 +3463,13 @@ impl NativeAgentServiceV1 {
     ) -> AppResult<NativeAgentTaskStatusV1> {
         self.require_local_task_owner(task_id)?;
         if self.task_owner(task_id)?.is_some() {
-            return self.start_invocation_in_movement(capability_id, task_id, input, None);
+            return self.start_invocation_in_movement(
+                capability_id,
+                task_id,
+                input,
+                None,
+                Some(NativeConversationOwnerV1::Local),
+            );
         }
         self.admit_invocation(
             NativeInvocationPrincipalV1::Local,
@@ -3363,7 +3558,14 @@ impl NativeAgentServiceV1 {
         match (admission::decide(&principal), principal) {
             (NativeAdmissionDecisionV1::Allow, _) => match continuation {
                 NativeInvocationContinuationV1::Direct => {
-                    self.start_invocation_in_movement(capability_id, task_id, input, None)
+                    // Only the Local principal is admitted without Review.
+                    self.start_invocation_in_movement(
+                        capability_id,
+                        task_id,
+                        input,
+                        None,
+                        Some(NativeConversationOwnerV1::Local),
+                    )
                 }
                 NativeInvocationContinuationV1::ReceivedWorkspace { movement_id } => {
                     self.start_admitted_received_workspace(&movement_id, task_id, input)
@@ -3416,6 +3618,7 @@ impl NativeAgentServiceV1 {
                     result: None,
                     code: Some(admission::REVIEW_REQUIRED_CODE.into()),
                     output: None,
+                    conversation: None,
                 };
                 self.tasks
                     .lock()
@@ -3612,11 +3815,16 @@ impl NativeAgentServiceV1 {
             .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
             .remove(task_id);
         self.unstarted_review_tasks.remove(task_id);
+        // The Review's exact authenticated peer owns the conversation.
         match self.start_invocation_in_movement(
             &pending.capability_id,
             task_id,
             &pending.input,
             None,
+            Some(NativeConversationOwnerV1::Peer {
+                bridge_id: pending.binding.bridge_id.clone(),
+                peer_host_ref: pending.binding.peer_host_ref.as_str().to_owned(),
+            }),
         ) {
             Ok(status) => Ok(status),
             Err(error) => {
@@ -3637,6 +3845,7 @@ impl NativeAgentServiceV1 {
                             result: None,
                             code: Some(admission::START_REJECTED_CODE.into()),
                             output: None,
+                            conversation: None,
                         },
                     );
                     self.unstarted_review_tasks.insert(task_id.into());
@@ -3715,6 +3924,7 @@ impl NativeAgentServiceV1 {
         task_id: &str,
         input: &OpaqueCapabilityPayloadV1,
         movement_id: Option<&str>,
+        conversation_owner: Option<NativeConversationOwnerV1>,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         if !valid_task_id(task_id) {
             return invalid("Native Agent task identity is invalid.");
@@ -3748,10 +3958,49 @@ impl NativeAgentServiceV1 {
                 "Native capability already has an unresolved invocation for this resource.",
             );
         }
-        let started = adapter.start(task_id, input)?;
+        // A conversation belongs to exactly one owner, capability and scope.
+        // Only a continuing invocation sees its saved continuation, and only
+        // its own; a revoked Bridge's conversation is never reopened.
+        let conversation = match (conversation_owner, prepared.conversation.as_ref()) {
+            (Some(owner), Some(prepared_conversation)) => {
+                if owner
+                    .bridge_id()
+                    .is_some_and(|bridge_id| self.revoked_bridges.contains(bridge_id))
+                {
+                    return invalid("Native Agent Bridge authority was revoked.");
+                }
+                Some((
+                    NativeConversationBindingV1::new(
+                        owner,
+                        capability_id,
+                        &prepared_conversation.scope,
+                    )?,
+                    prepared_conversation.continue_existing,
+                ))
+            }
+            _ => None,
+        };
+        let native_conversation = match &conversation {
+            Some((binding, continue_existing)) => Some(NativeConversationV1 {
+                key: binding.key.clone(),
+                continue_existing: *continue_existing,
+                continuation: match (*continue_existing, self.durable_paths.as_ref()) {
+                    (true, Some(paths)) => binding.saved_continuation(paths)?,
+                    _ => None,
+                },
+            }),
+            None => None,
+        };
+        let started = adapter.start(task_id, input, native_conversation)?;
         let task_id = task_id.to_owned();
         self.task_input_digests
             .insert(task_id.clone(), input.digest());
+        if let Some((binding, _)) = &conversation {
+            if binding.owner.bridge_id().is_some() {
+                self.task_conversations
+                    .insert(task_id.clone(), binding.key.clone());
+            }
+        }
         let status = NativeAgentTaskStatusV1 {
             schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
             task_id: task_id.clone(),
@@ -3762,6 +4011,7 @@ impl NativeAgentServiceV1 {
             result: None,
             code: None,
             output: None,
+            conversation: started.conversation,
         };
         self.tasks
             .lock()
@@ -3799,6 +4049,8 @@ impl NativeAgentServiceV1 {
         let progress = ObservedTaskProgressV1 {
             tasks: tasks.clone(),
             task_id: task_id.clone(),
+            conversation: conversation.map(|(binding, _)| binding),
+            durable_paths: durable_paths.clone(),
         };
         thread::spawn(move || {
             let NativeInvocationOutcomeV1 {
@@ -3843,6 +4095,11 @@ impl NativeAgentServiceV1 {
                             NativeTurnOutcomeV1::NotStarted => {
                                 status.state = NativeAgentTaskStateV1::Failed;
                                 status.code = Some(START_FAILED_CODE.into());
+                                status.result = summary;
+                            }
+                            NativeTurnOutcomeV1::ConversationUnavailable => {
+                                status.state = NativeAgentTaskStateV1::Failed;
+                                status.code = Some(CONVERSATION_UNAVAILABLE_CODE.into());
                                 status.result = summary;
                             }
                         }
@@ -4085,6 +4342,7 @@ impl NativeAgentServiceV1 {
             result: None,
             code: Some("remote_agent_queued".into()),
             output: None,
+            conversation: None,
         };
         self.tasks
             .lock()
@@ -4666,6 +4924,22 @@ impl NativeAgentServiceV1 {
                 }
             }
         }
+        // The Bridge's peers' conversations end with it: their live native
+        // state now, their durable records below and again on finalization.
+        let mut conversation_keys = task_ids
+            .iter()
+            .filter_map(|task_id| self.task_conversations.remove(task_id))
+            .collect::<HashSet<_>>();
+        if let Some(paths) = self.durable_paths.as_ref() {
+            conversation_keys.extend(crate::storage::delete_bridge_native_agent_conversations(
+                paths, bridge_id,
+            )?);
+        }
+        for adapter in &self.adapters {
+            for key in &conversation_keys {
+                adapter.release_conversation(key);
+            }
+        }
         let movement_ids = self
             .workspace_movements
             .iter()
@@ -4754,8 +5028,14 @@ impl NativeAgentServiceV1 {
             let task = tasks.get_mut(task_id).ok_or_else(|| {
                 AppError::InvalidInput("Native Agent task is unavailable.".into())
             })?;
+            // An uncertain turn, also one restored after restart for
+            // reconciliation, is resolved only by this explicit cancellation.
             let uncertain_active_turn = task.state == NativeAgentTaskStateV1::Interrupted
-                && task.code.as_deref() == Some("native_agent_outcome_unknown");
+                && matches!(
+                    task.code.as_deref(),
+                    Some("native_agent_outcome_unknown")
+                        | Some("native_agent_reconciliation_required")
+                );
             if !matches!(
                 task.state,
                 NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
@@ -4837,6 +5117,7 @@ pub(crate) fn purge_durable_bridge_state(
     paths: &crate::storage::AppPaths,
     bridge_id: &str,
 ) -> AppResult<()> {
+    crate::storage::delete_bridge_native_agent_conversations(paths, bridge_id)?;
     for stored in crate::storage::list_native_agent_envelopes(paths)? {
         let mut persisted: PersistedNativeAgentEnvelopeV1 =
             serde_json::from_str(&stored.record_json).map_err(AppError::from)?;
@@ -6987,6 +7268,801 @@ done
         assert!(state_of(Vec::new()).is_empty());
     }
 
+    /// An app-server that keeps its threads on disk like Codex's rollouts:
+    /// `thread/start` creates one, `thread/resume` reopens only a stored one
+    /// (or misbehaves as `resume-mode` says), and each turn answers with the
+    /// thread it ran on. Every native step is logged outside the workspace.
+    fn conversation_codex() -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("pastey-native-conv-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let agent = root.join("codex-conversation-fixture");
+        let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> '{ROOT}/invocations'
+if [ "$1" = "--version" ]; then exit 0; fi
+if [ "$2" = "--help" ]; then exit 0; fi
+STORE='{ROOT}/threads'
+mkdir -p "$STORE"
+field() { printf '%s' "$line" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*)
+      n=$(cat '{ROOT}/counter' 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > '{ROOT}/counter'
+      tid="thread-$n"; touch "$STORE/$tid"
+      printf '%s\n' "start $tid" >> '{ROOT}/log'
+      printf '{"id":2,"result":{"thread":{"id":"%s"}}}\n' "$tid" ;;
+    *'"method":"thread/resume"'*)
+      tid=$(field threadId)
+      printf '%s\n' "resume $tid" >> '{ROOT}/log'
+      while [ -f '{ROOT}/hold-resume' ]; do sleep 0.01; done
+      mode=$(cat '{ROOT}/resume-mode' 2>/dev/null)
+      if [ "$mode" = unsupported ]; then printf '%s\n' '{"id":6,"error":{"code":-32601,"message":"method not found"}}'
+      elif [ "$mode" = other ]; then printf '%s\n' '{"id":6,"result":{"thread":{"id":"thread-other"}}}'
+      elif [ -f "$STORE/$tid" ]; then printf '{"id":6,"result":{"thread":{"id":"%s"}}}\n' "$tid"
+      else printf '%s\n' '{"id":6,"error":{"code":-32600,"message":"thread not found"}}'; fi ;;
+    *'"method":"turn/start"'*)
+      tid=$(field threadId); task=$(field text)
+      printf '%s\n' "turn $tid $task" >> '{ROOT}/log'
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-x"}}}'
+      while [ -f '{ROOT}/hold-turn' ]; do sleep 0.01; done
+      printf '{"method":"item/completed","params":{"threadId":"%s","turnId":"turn-x","item":{"type":"agentMessage","id":"m","phase":"final_answer","text":"%s on %s"}}}\n' "$tid" "$task" "$tid"
+      printf '{"method":"turn/completed","params":{"threadId":"%s","turn":{"id":"turn-x","items":[],"status":"completed","error":null}}}\n' "$tid" ;;
+  esac
+done
+"#
+        .replace("{ROOT}", root.to_str().unwrap());
+        fs::write(&agent, script).unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&agent).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&agent, permissions).unwrap();
+        }
+        (root, workspace, agent)
+    }
+
+    fn native_log(root: &Path) -> Vec<String> {
+        fs::read_to_string(root.join("log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A Codex task owned by one authenticated peer Host over one Bridge,
+    /// as its accepted Review starts it.
+    fn start_peer_codex_task(
+        service: &mut NativeAgentServiceV1,
+        agent: &Path,
+        bridge_id: &str,
+        peer_host_ref: &str,
+        task_id: &str,
+        workspace: &Path,
+        task: &str,
+        resume: bool,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        service.codex.use_executable(agent);
+        let input = capability::codex::codex_input(workspace, task, resume)?;
+        service.with_bridge_task_owner(bridge_id, task_id, |service| {
+            service.start_invocation_in_movement(
+                CODEX_CAPABILITY_ID,
+                task_id,
+                &input,
+                None,
+                Some(NativeConversationOwnerV1::Peer {
+                    bridge_id: bridge_id.into(),
+                    peer_host_ref: peer_host_ref.into(),
+                }),
+            )
+        })
+    }
+
+    fn local_conversation(workspace: &Path) -> NativeConversationBindingV1 {
+        NativeConversationBindingV1::new(
+            NativeConversationOwnerV1::Local,
+            CODEX_CAPABILITY_ID,
+            &workspace.canonicalize().unwrap().to_string_lossy(),
+        )
+        .unwrap()
+    }
+
+    fn run_local(
+        service: &mut NativeAgentServiceV1,
+        agent: &Path,
+        workspace: &Path,
+        task: &str,
+        resume: bool,
+    ) -> NativeAgentTaskStatusV1 {
+        let started = service
+            .start_codex_task_with_executable_id_and_resume(
+                agent,
+                &format!("native-agent:{}", Uuid::new_v4()),
+                &workspace.canonicalize().unwrap(),
+                task,
+                resume,
+            )
+            .unwrap();
+        let terminal = wait_for_terminal(service, &started.task_id);
+        wait_for_workspace_release(service, workspace);
+        terminal
+    }
+
+    #[test]
+    fn a_pastey_conversation_is_saved_once_created_and_continued_after_restart() {
+        let (root, workspace, agent) = conversation_codex();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let first = run_local(&mut service, &agent, &workspace, "first", true);
+        assert_eq!(first.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(
+            first.conversation,
+            Some(NativeConversationContinuityV1::New)
+        );
+        assert!(!first.session_reused);
+        assert_eq!(text_output(&first).unwrap().0, "first on thread-1");
+        // Saved after confirmed creation, Host-private, never in the status.
+        let saved = local_conversation(&workspace)
+            .saved_continuation(&paths)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            json!({"threadId": "thread-1"})
+        );
+        // The status says only "new"; the thread id stays Host-private.
+        let projected = serde_json::to_value(&first).unwrap();
+        assert_eq!(projected["conversation"], "new");
+        assert!(!serde_json::to_string(&projected)
+            .unwrap()
+            .contains("threadId"));
+        // The live session continues without reopening.
+        let live = run_local(&mut service, &agent, &workspace, "second", true);
+        assert_eq!(
+            live.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+        assert!(live.session_reused);
+        assert_eq!(text_output(&live).unwrap().0, "second on thread-1");
+        service.shutdown();
+        drop(service);
+
+        // Pastey restarts: the same conversation is reopened natively.
+        let mut restarted = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let started = restarted
+            .start_codex_task_with_executable_id_and_resume(
+                &agent,
+                "native-agent:after-restart",
+                &workspace.canonicalize().unwrap(),
+                "third",
+                true,
+            )
+            .unwrap();
+        // Not claimed before Codex confirms it.
+        assert_eq!(started.conversation, None);
+        assert!(!started.session_reused);
+        let continued = wait_for_terminal(&restarted, &started.task_id);
+        assert_eq!(continued.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(
+            continued.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+        assert!(continued.session_reused);
+        assert_eq!(text_output(&continued).unwrap().0, "third on thread-1");
+        assert_eq!(
+            native_log(&root),
+            [
+                "start thread-1",
+                "turn thread-1 first",
+                "turn thread-1 second",
+                "resume thread-1",
+                "turn thread-1 third",
+            ]
+        );
+        restarted.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn another_owner_or_workspace_never_inherits_a_conversation() {
+        let (root, workspace, agent) = conversation_codex();
+        let other_workspace = root.join("other");
+        fs::create_dir(&other_workspace).unwrap();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let local = run_local(&mut service, &agent, &workspace, "local", true);
+        assert_eq!(text_output(&local).unwrap().0, "local on thread-1");
+
+        // The same workspace path, but a peer Host: its own conversation.
+        let peer_task = |service: &mut NativeAgentServiceV1,
+                         bridge: &str,
+                         peer: &str,
+                         task_id: &str,
+                         workspace: &Path,
+                         task: &str| {
+            let started = start_peer_codex_task(
+                service, &agent, bridge, peer, task_id, workspace, task, true,
+            )
+            .unwrap();
+            let terminal = wait_for_terminal(service, &started.task_id);
+            wait_for_workspace_release(service, workspace);
+            terminal
+        };
+        let peer_a = peer_task(
+            &mut service,
+            "room-a",
+            "host:mac",
+            "task-a1",
+            &workspace,
+            "peera",
+        );
+        assert_eq!(
+            peer_a.conversation,
+            Some(NativeConversationContinuityV1::New)
+        );
+        assert_eq!(text_output(&peer_a).unwrap().0, "peera on thread-2");
+        // Another Host on the same Bridge, and the same Host on another
+        // Bridge, are other principals.
+        let peer_b = peer_task(
+            &mut service,
+            "room-a",
+            "host:other",
+            "task-b1",
+            &workspace,
+            "peerb",
+        );
+        assert_eq!(text_output(&peer_b).unwrap().0, "peerb on thread-3");
+        let other_bridge = peer_task(
+            &mut service,
+            "room-b",
+            "host:mac",
+            "task-c1",
+            &workspace,
+            "bridgeb",
+        );
+        assert_eq!(text_output(&other_bridge).unwrap().0, "bridgeb on thread-4");
+        // Another workspace of the same owner is another conversation.
+        let elsewhere = run_local(&mut service, &agent, &other_workspace, "elsewhere", true);
+        assert_eq!(
+            elsewhere.conversation,
+            Some(NativeConversationContinuityV1::New)
+        );
+        service.shutdown();
+        drop(service);
+
+        // After restart each owner reopens only its own thread.
+        let mut restarted = NativeAgentServiceV1::with_paths(paths).unwrap();
+        let again_a = peer_task(
+            &mut restarted,
+            "room-a",
+            "host:mac",
+            "task-a2",
+            &workspace,
+            "again",
+        );
+        assert_eq!(
+            again_a.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+        assert_eq!(text_output(&again_a).unwrap().0, "again on thread-2");
+        let again_local = run_local(&mut restarted, &agent, &workspace, "mine", true);
+        assert_eq!(text_output(&again_local).unwrap().0, "mine on thread-1");
+        // A peer that never had a conversation here gets a new one.
+        let stranger = peer_task(
+            &mut restarted,
+            "room-a",
+            "host:stranger",
+            "task-s1",
+            &workspace,
+            "hi",
+        );
+        assert_eq!(
+            stranger.conversation,
+            Some(NativeConversationContinuityV1::New)
+        );
+        assert_eq!(text_output(&stranger).unwrap().0, "hi on thread-6");
+        restarted.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unavailable_conversation_is_never_replaced_by_a_new_one() {
+        for mode in ["missing", "unsupported", "other"] {
+            let (root, workspace, agent) = conversation_codex();
+            let paths = durable_paths(&root);
+            let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+            run_local(&mut service, &agent, &workspace, "first", true);
+            service.shutdown();
+            drop(service);
+            match mode {
+                // Codex no longer has the thread (deleted or unreadable).
+                "missing" => fs::remove_file(root.join("threads").join("thread-1")).unwrap(),
+                // An app-server without thread/resume, or one that answers
+                // with another thread.
+                _ => fs::write(root.join("resume-mode"), mode).unwrap(),
+            }
+            let mut restarted = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+            let unavailable = run_local(&mut restarted, &agent, &workspace, "follow", true);
+            assert_eq!(unavailable.state, NativeAgentTaskStateV1::Failed, "{mode}");
+            assert_eq!(
+                unavailable.code.as_deref(),
+                Some(CONVERSATION_UNAVAILABLE_CODE),
+                "{mode}"
+            );
+            assert_eq!(unavailable.conversation, None);
+            assert!(unavailable
+                .result
+                .unwrap()
+                .contains("Start a new conversation"));
+            // No new thread, and no turn ran.
+            assert_eq!(
+                native_log(&root),
+                ["start thread-1", "turn thread-1 first", "resume thread-1"],
+                "{mode}"
+            );
+            wait_for_workspace_release(&restarted, &workspace);
+            // The record is kept: continuing again is still truthful.
+            assert!(local_conversation(&workspace)
+                .saved_continuation(&paths)
+                .unwrap()
+                .is_some());
+            // Only an explicit new conversation starts one, and it becomes
+            // the one later tasks continue.
+            let _ = fs::remove_file(root.join("resume-mode"));
+            let fresh = run_local(&mut restarted, &agent, &workspace, "fresh", false);
+            assert_eq!(fresh.state, NativeAgentTaskStateV1::Completed);
+            assert_eq!(
+                fresh.conversation,
+                Some(NativeConversationContinuityV1::New)
+            );
+            assert_eq!(text_output(&fresh).unwrap().0, "fresh on thread-2");
+            restarted.shutdown();
+            drop(restarted);
+            let mut again = NativeAgentServiceV1::with_paths(paths).unwrap();
+            let continued = run_local(&mut again, &agent, &workspace, "next", true);
+            assert_eq!(text_output(&continued).unwrap().0, "next on thread-2");
+            again.shutdown();
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn a_new_conversation_replaces_the_live_one_without_touching_other_owners() {
+        let (root, workspace, agent) = conversation_codex();
+        let mut service = NativeAgentServiceV1::with_paths(durable_paths(&root)).unwrap();
+        run_local(&mut service, &agent, &workspace, "one", true);
+        let peer = start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-a",
+            "host:mac",
+            "task-peer",
+            &workspace,
+            "peer",
+            true,
+        )
+        .unwrap();
+        wait_for_terminal(&service, &peer.task_id);
+        wait_for_workspace_release(&service, &workspace);
+        let fresh = run_local(&mut service, &agent, &workspace, "two", false);
+        assert_eq!(text_output(&fresh).unwrap().0, "two on thread-3");
+        let peer_again = start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-a",
+            "host:mac",
+            "task-peer-2",
+            &workspace,
+            "back",
+            true,
+        )
+        .unwrap();
+        let peer_again = wait_for_terminal(&service, &peer_again.task_id);
+        assert_eq!(text_output(&peer_again).unwrap().0, "back on thread-2");
+        assert!(peer_again.session_reused);
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unknown_turn_at_restart_blocks_follow_ups_and_is_never_rerun() {
+        let (root, workspace, agent) = conversation_codex();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        fs::write(root.join("hold-turn"), b"").unwrap();
+        start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-a",
+            "host:mac",
+            "task-inflight",
+            &workspace,
+            "inflight",
+            true,
+        )
+        .unwrap();
+        for _ in 0..500 {
+            if native_log(&root)
+                .iter()
+                .any(|line| line.starts_with("turn"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Pastey stops while the turn is in flight.
+        service.shutdown();
+        drop(service);
+        let _ = fs::remove_file(root.join("hold-turn"));
+
+        let mut restarted = NativeAgentServiceV1::with_paths(paths).unwrap();
+        let restored = restarted.task_status("task-inflight").unwrap();
+        assert_eq!(restored.state, NativeAgentTaskStateV1::Interrupted);
+        assert_eq!(
+            restored.code.as_deref(),
+            Some("native_agent_reconciliation_required")
+        );
+        // The unresolved turn still owns the workspace: no follow-up overlaps it.
+        assert!(start_peer_codex_task(
+            &mut restarted,
+            &agent,
+            "room-a",
+            "host:mac",
+            "task-follow",
+            &workspace,
+            "follow",
+            true,
+        )
+        .is_err());
+        // Explicit stop resolves it; then the conversation continues, and
+        // the interrupted prompt is never sent again.
+        restarted
+            .cancel_bridge_task("room-a", "task-inflight")
+            .unwrap();
+        let follow = start_peer_codex_task(
+            &mut restarted,
+            &agent,
+            "room-a",
+            "host:mac",
+            "task-follow-2",
+            &workspace,
+            "follow",
+            true,
+        )
+        .unwrap();
+        let follow = wait_for_terminal(&restarted, &follow.task_id);
+        assert_eq!(
+            follow.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+        assert_eq!(text_output(&follow).unwrap().0, "follow on thread-1");
+        let log = native_log(&root);
+        assert_eq!(
+            log.iter().filter(|line| line.contains("inflight")).count(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|line| line.starts_with("start")).count(),
+            1
+        );
+        restarted.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn concurrent_follow_ups_are_exclusive_and_each_runs_once() {
+        let (root, workspace, agent) = conversation_codex();
+        let mut service = NativeAgentServiceV1::with_paths(durable_paths(&root)).unwrap();
+        run_local(&mut service, &agent, &workspace, "opening", true);
+        fs::write(root.join("hold-turn"), b"").unwrap();
+        let first = service
+            .start_codex_task_with_executable_id_and_resume(
+                &agent,
+                "native-agent:follow-1",
+                &workspace.canonicalize().unwrap(),
+                "followone",
+                true,
+            )
+            .unwrap();
+        // A second follow-up of the same conversation, and a new
+        // conversation, both wait for the workspace.
+        for resume in [true, false] {
+            assert!(service
+                .start_codex_task_with_executable_id_and_resume(
+                    &agent,
+                    &format!("native-agent:follow-2-{resume}"),
+                    &workspace.canonicalize().unwrap(),
+                    "followtwo",
+                    resume,
+                )
+                .is_err());
+        }
+        // Replaying the first task's identity starts nothing new.
+        assert_eq!(
+            service
+                .start_codex_task_with_executable_id_and_resume(
+                    &agent,
+                    "native-agent:follow-1",
+                    &workspace.canonicalize().unwrap(),
+                    "followone",
+                    true,
+                )
+                .unwrap()
+                .task_id,
+            first.task_id
+        );
+        fs::remove_file(root.join("hold-turn")).unwrap();
+        wait_for_terminal(&service, &first.task_id);
+        wait_for_workspace_release(&service, &workspace);
+        let second = run_local(&mut service, &agent, &workspace, "followtwo", true);
+        assert_eq!(text_output(&second).unwrap().0, "followtwo on thread-1");
+        let log = native_log(&root);
+        assert_eq!(
+            log.iter().filter(|line| line.starts_with("turn")).count(),
+            3,
+            "{log:?}"
+        );
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancel_while_a_conversation_reopens_sends_no_turn_and_keeps_it() {
+        let (root, workspace, agent) = conversation_codex();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        run_local(&mut service, &agent, &workspace, "first", true);
+        service.shutdown();
+        drop(service);
+        fs::write(root.join("hold-resume"), b"").unwrap();
+        let mut restarted = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let started = restarted
+            .start_codex_task_with_executable_id_and_resume(
+                &agent,
+                "native-agent:reopening",
+                &workspace.canonicalize().unwrap(),
+                "cancelled",
+                true,
+            )
+            .unwrap();
+        for _ in 0..500 {
+            if native_log(&root)
+                .iter()
+                .any(|line| line.starts_with("resume"))
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            restarted.cancel_task(&started.task_id).unwrap().state,
+            NativeAgentTaskStateV1::Cancelled
+        );
+        fs::remove_file(root.join("hold-resume")).unwrap();
+        wait_for_workspace_release(&restarted, &workspace);
+        let after = restarted.task_status(&started.task_id).unwrap();
+        assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(after.output, None);
+        let next = run_local(&mut restarted, &agent, &workspace, "next", true);
+        assert_eq!(text_output(&next).unwrap().0, "next on thread-1");
+        assert!(!native_log(&root)
+            .iter()
+            .any(|line| line.contains("cancelled")));
+        restarted.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn burn_forgets_a_bridges_conversations_and_stale_records_cannot_return() {
+        let (root, workspace, agent) = conversation_codex();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let started = start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-burn",
+            "host:mac",
+            "task-burn",
+            &workspace,
+            "before",
+            true,
+        )
+        .unwrap();
+        wait_for_terminal(&service, &started.task_id);
+        wait_for_workspace_release(&service, &workspace);
+        let kept = start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-kept",
+            "host:mac",
+            "task-kept",
+            &workspace,
+            "kept",
+            true,
+        );
+        wait_for_terminal(&service, &kept.unwrap().task_id);
+        let binding = |bridge: &str| {
+            NativeConversationBindingV1::new(
+                NativeConversationOwnerV1::Peer {
+                    bridge_id: bridge.into(),
+                    peer_host_ref: "host:mac".into(),
+                },
+                CODEX_CAPABILITY_ID,
+                &workspace.canonicalize().unwrap().to_string_lossy(),
+            )
+            .unwrap()
+        };
+        assert!(binding("room-burn")
+            .saved_continuation(&paths)
+            .unwrap()
+            .is_some());
+        assert_eq!(service.codex.session_count(), 2);
+
+        service.purge_bridge_authority("room-burn").unwrap();
+        assert!(binding("room-burn")
+            .saved_continuation(&paths)
+            .unwrap()
+            .is_none());
+        assert!(binding("room-kept")
+            .saved_continuation(&paths)
+            .unwrap()
+            .is_some());
+        assert_eq!(service.codex.session_count(), 1);
+        // The burned Bridge can start nothing, so nothing reopens.
+        assert!(start_peer_codex_task(
+            &mut service,
+            &agent,
+            "room-burn",
+            "host:mac",
+            "task-burn-2",
+            &workspace,
+            "after",
+            true,
+        )
+        .is_err());
+
+        // A late write after the durable Burn cutoff is refused, and a
+        // record that survived somehow is never read back.
+        let connection = rusqlite::Connection::open(&paths.db_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO burned_bridges (room_id, burned_at) VALUES ('room-burn', 1)",
+                [],
+            )
+            .unwrap();
+        assert!(!binding("room-burn")
+            .save(
+                &paths,
+                serde_json::from_value::<OpaqueCapabilityPayloadV1>(
+                    json!({"threadId": "thread-1"})
+                )
+                .unwrap()
+            )
+            .unwrap());
+        connection
+            .execute(
+                "INSERT INTO native_agent_conversations (conversation_key, bridge_id, record_json, updated_at)
+                 VALUES (?1, 'room-burn', ?2, 1)",
+                rusqlite::params![
+                    binding("room-burn").key,
+                    serde_json::to_string(&NativeConversationRecordV1 {
+                        schema_version: NATIVE_CONVERSATION_SCHEMA.into(),
+                        owner: binding("room-burn").owner,
+                        capability_id: CODEX_CAPABILITY_ID.into(),
+                        scope_digest: binding("room-burn").scope_digest,
+                        continuation: serde_json::from_value::<OpaqueCapabilityPayloadV1>(json!({"threadId": "thread-1"})).unwrap(),
+                    })
+                    .unwrap()
+                ],
+            )
+            .unwrap();
+        assert!(binding("room-burn")
+            .saved_continuation(&paths)
+            .unwrap()
+            .is_none());
+        // Finalization removes it for good.
+        purge_durable_bridge_state(&paths, "room-burn").unwrap();
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM native_agent_conversations WHERE bridge_id = 'room-burn'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_sessions_and_task_slots_stay_bounded_and_evicted_conversations_reopen() {
+        let (root, workspace, agent) = conversation_codex();
+        let mut service = NativeAgentServiceV1::with_paths(durable_paths(&root)).unwrap();
+        for turn in 0..6 {
+            run_local(
+                &mut service,
+                &agent,
+                &workspace,
+                &format!("turn{turn}"),
+                true,
+            );
+        }
+        // Many tasks in one conversation keep only what Burn can reach.
+        assert!(
+            service.codex.task_count() <= 2,
+            "{}",
+            service.codex.task_count()
+        );
+        let workspaces = (0..5)
+            .map(|index| {
+                let path = root.join(format!("ws{index}"));
+                fs::create_dir(&path).unwrap();
+                run_local(&mut service, &agent, &path, "open", true);
+                path
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            service.codex.session_count() <= 4,
+            "{}",
+            service.codex.session_count()
+        );
+        // The least recently used conversation was evicted, not forgotten.
+        let reopened = run_local(&mut service, &agent, &workspace, "back", true);
+        assert_eq!(
+            reopened.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+        assert_eq!(text_output(&reopened).unwrap().0, "back on thread-1");
+        assert!(native_log(&root).contains(&"resume thread-1".to_owned()));
+        assert!(
+            service.codex.task_count() <= 6,
+            "{}",
+            service.codex.task_count()
+        );
+        drop(workspaces);
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_requesters_see_only_whether_the_conversation_continued() {
+        let mut requester = NativeAgentServiceV1::default();
+        requester
+            .queue_bridge_remote_task("room-c", "task-c", "executor-host", r"C:\repz", "go")
+            .unwrap();
+        let status = NativeAgentTaskStatusV1 {
+            schema_version: NATIVE_AGENT_TASK_SCHEMA.into(),
+            task_id: "task-c".into(),
+            agent_id: CODEX_CAPABILITY_ID.into(),
+            workspace_name: "repz".into(),
+            session_reused: true,
+            state: NativeAgentTaskStateV1::Running,
+            result: None,
+            code: None,
+            output: None,
+            conversation: Some(NativeConversationContinuityV1::Continued),
+        };
+        let wire = serde_json::to_value(NativeAgentStatusV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "task-c".into(),
+            executing_host_ref: "executor-host".into(),
+            status,
+        })
+        .unwrap();
+        assert_eq!(wire["status"]["conversation"], "continued");
+        let message: NativeAgentStatusV1 = serde_json::from_value(wire).unwrap();
+        validate_status(&message).unwrap();
+        let recorded = requester
+            .record_bridge_remote_status("room-c", message)
+            .unwrap();
+        assert_eq!(
+            recorded.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+    }
+
     #[test]
     fn codex_capability_distinguishes_compatible_incompatible_and_absent_interfaces() {
         let root = std::env::temp_dir().join(format!("pastey-native-compat-{}", Uuid::new_v4()));
@@ -7021,9 +8097,20 @@ done
         service.codex.use_executable(executable);
         let input = capability::codex::codex_input(workspace, task, true)?;
         service.with_bridge_task_owner(bridge_id, task_id, |service| {
-            service.start_invocation_in_movement(CODEX_CAPABILITY_ID, task_id, &input, None)
+            service.start_invocation_in_movement(
+                CODEX_CAPABILITY_ID,
+                task_id,
+                &input,
+                None,
+                Some(NativeConversationOwnerV1::Peer {
+                    bridge_id: bridge_id.into(),
+                    peer_host_ref: TEST_PEER_HOST.into(),
+                }),
+            )
         })
     }
+
+    const TEST_PEER_HOST: &str = "host:test-requester";
 
     /// The executor's exact current session with a movement's source peer.
     fn test_movement_binding(bridge_id: &str) -> HostSessionBinding {
@@ -7080,6 +8167,10 @@ done
     }
 
     fn wait_for_workspace_release(service: &NativeAgentServiceV1, workspace: &Path) {
+        // Occupancy is keyed by the canonical workspace.
+        let workspace = &workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
         for _ in 0..300 {
             if service.workspace_occupant(workspace).is_none() {
                 return;
@@ -7123,6 +8214,7 @@ done
                     result: None,
                     code: Some("native_agent_outcome_unknown".into()),
                     output: None,
+                    conversation: None,
                 },
             );
             service.task_workspaces.insert(task_id.into(), root.clone());
@@ -7221,6 +8313,7 @@ done
                 capability::fake_longjob::FAKE_LONGJOB_ID,
                 "task-fake-job",
                 &job_input,
+                None,
                 None,
             )
             .unwrap();
@@ -7654,6 +8747,7 @@ done
                     result: None,
                     code: None,
                     output: None,
+                    conversation: None,
                 },
             );
             service.workspace_movements.insert(
@@ -7737,6 +8831,7 @@ done
             result: Some("done".into()),
             code: None,
             output: None,
+            conversation: None,
         };
         let wrong = NativeAgentStatusV1 {
             schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
@@ -7849,6 +8944,7 @@ done
             result: Some("late result".into()),
             code: None,
             output: None,
+            conversation: None,
         };
         assert_eq!(
             service
@@ -9040,6 +10136,7 @@ done
             result: None,
             code: None,
             output: None,
+            conversation: None,
         };
         before
             .tasks
@@ -9668,7 +10765,7 @@ done
             thread::sleep(Duration::from_millis(10));
         }
         assert!(controller.active_turn.lock().unwrap().is_some());
-        assert!(workspace.join("turn-started").exists());
+        wait_for_file(&workspace.join("turn-started"));
         assert_eq!(
             service.workspace_occupant(&canonical_workspace).as_deref(),
             Some(started.task_id.as_str())
@@ -11242,6 +12339,7 @@ done
                 result: None,
                 code: code.map(str::to_owned),
                 output: None,
+                conversation: None,
             },
         };
         service
@@ -11305,6 +12403,7 @@ done
                     result: None,
                     code: Some("late".into()),
                     output: None,
+                    conversation: None,
                 },
             })
             .unwrap();
@@ -11673,6 +12772,7 @@ done
                 result: Some("late".into()),
                 code: None,
                 output: None,
+                conversation: None,
             },
         };
         assert!(service

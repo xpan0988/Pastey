@@ -32,14 +32,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeInvocationOutcomeV1,
+    ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1, NativeInvocationOutcomeV1,
     NativeInvocationProgressV1, NativeInvocationRunV1, OpaqueCapabilityPayloadV1,
-    PreparedInvocationV1, StartedInvocationV1,
+    PreparedConversationV1, PreparedInvocationV1, StartedInvocationV1,
 };
 use crate::error::{AppError, AppResult};
 use crate::native_agent::{
-    invalid, NativeAgentCapabilityStateV1, NativeAgentServiceV1, NativeTurnOutcomeV1,
-    CODEX_CAPABILITY_ID, MAX_LINE_BYTES, MAX_STDERR_BYTES, MAX_TASK_BYTES,
+    invalid, NativeAgentCapabilityStateV1, NativeAgentServiceV1, NativeConversationContinuityV1,
+    NativeTurnOutcomeV1, CODEX_CAPABILITY_ID, MAX_LINE_BYTES, MAX_STDERR_BYTES, MAX_TASK_BYTES,
     NATIVE_AGENT_RPC_TIMEOUT, WORKSPACE_MOVEMENT_PROTOCOLS,
 };
 
@@ -67,6 +67,7 @@ const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
 const TURN_INTERRUPT_ID: u64 = 4;
 const SHUTDOWN_ID: u64 = 5;
+const THREAD_RESUME_ID: u64 = 6;
 
 /// Server requests that wait for a decision only Codex's own client may make:
 /// approvals, permission grants, questions to the user and MCP elicitations
@@ -152,7 +153,7 @@ struct AvailabilityCacheStateV1 {
 }
 
 type AvailabilityCacheV1 = Arc<Mutex<AvailabilityCacheStateV1>>;
-type SessionStoreV1 = Arc<Mutex<HashMap<PathBuf, NativeCodexSessionV1>>>;
+type SessionStoreV1 = Arc<Mutex<HashMap<String, NativeCodexSessionV1>>>;
 
 /// Availability for describing and admitting. A fresh fact is reused; a
 /// stale fact of the same executable is answered at once and re-observed in
@@ -220,8 +221,11 @@ enum CodexTaskAttachmentV1 {
 }
 
 struct CodexTaskSlotV1 {
-    workspace: PathBuf,
+    /// Start order, so pruning keeps the latest finished task of a session.
+    sequence: u64,
     attachment: Mutex<CodexTaskAttachmentV1>,
+    /// The task's run has ended (dropped); only Burn may still need it.
+    finished: AtomicBool,
 }
 
 impl CodexTaskSlotV1 {
@@ -248,16 +252,55 @@ impl CodexTaskSlotV1 {
             CodexTaskAttachmentV1::Attached(controller) => Some(controller.clone()),
         }
     }
+
+    fn attached(&self) -> Option<Weak<CodexAppServerV1>> {
+        match &*self.attachment.lock().ok()? {
+            CodexTaskAttachmentV1::Attached(controller) => Some(controller.clone()),
+            CodexTaskAttachmentV1::Starting { .. } => None,
+        }
+    }
+}
+
+/// Keeps task slots bounded: a finished task is kept only while it is the
+/// latest finished task of a still-live app-server, which is all Burn's
+/// `release` can still reach. Running tasks are always kept.
+fn prune_finished_slots(tasks: &mut HashMap<String, Arc<CodexTaskSlotV1>>) {
+    let mut latest: Vec<(Weak<CodexAppServerV1>, u64)> = Vec::new();
+    for slot in tasks.values() {
+        if !slot.finished.load(Ordering::Acquire) {
+            continue;
+        }
+        let Some(controller) = slot.attached().filter(|weak| weak.strong_count() > 0) else {
+            continue;
+        };
+        match latest
+            .iter_mut()
+            .find(|(seen, _)| Weak::ptr_eq(seen, &controller))
+        {
+            Some((_, sequence)) => *sequence = (*sequence).max(slot.sequence),
+            None => latest.push((controller, slot.sequence)),
+        }
+    }
+    tasks.retain(|_, slot| {
+        if !slot.finished.load(Ordering::Acquire) {
+            return true;
+        }
+        slot.attached().is_some_and(|controller| {
+            latest.iter().any(|(seen, sequence)| {
+                Weak::ptr_eq(seen, &controller) && *sequence == slot.sequence
+            })
+        })
+    });
 }
 
 pub(in crate::native_agent) struct CodexNativeAdapterV1 {
     executable: Mutex<PathBuf>,
     availability: AvailabilityCacheV1,
     sessions: SessionStoreV1,
-    /// The workspace and app-server of each task. A task acts only on its own
-    /// controller, never on a later session that has replaced it at the same
-    /// workspace.
+    /// The app-server of each task. A task acts only on its own controller,
+    /// never on a later session that has replaced it.
     task_sessions: Mutex<HashMap<String, Arc<CodexTaskSlotV1>>>,
+    next_sequence: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     shutdowns: std::sync::atomic::AtomicUsize,
 }
@@ -269,10 +312,17 @@ impl Default for CodexNativeAdapterV1 {
             availability: Arc::default(),
             sessions: Arc::default(),
             task_sessions: Mutex::default(),
+            next_sequence: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             shutdowns: std::sync::atomic::AtomicUsize::new(0),
         }
     }
+}
+
+/// The live-session key of an invocation without a Core conversation
+/// (a received workspace): its own workspace.
+fn workspace_session_key(workspace: &Path) -> String {
+    format!("workspace\n{}", workspace.to_string_lossy())
 }
 
 impl CodexNativeAdapterV1 {
@@ -292,20 +342,31 @@ impl CodexNativeAdapterV1 {
 
     /// Workspace movement only: whether a Host-private session exists.
     pub(in crate::native_agent) fn has_session(&self, workspace: &Path) -> bool {
-        self.sessions
-            .lock()
-            .is_ok_and(|sessions| sessions.contains_key(workspace))
+        self.sessions.lock().is_ok_and(|sessions| {
+            sessions
+                .values()
+                .any(|session| session.workspace == workspace)
+        })
     }
 
-    /// Workspace movement only: close the session of a workspace that is
+    /// Workspace movement only: close every session of a workspace that is
     /// about to be removed.
     pub(in crate::native_agent) fn shutdown_session(&self, workspace: &Path) {
-        let session = self
+        let closed = self
             .sessions
             .lock()
-            .ok()
-            .and_then(|mut sessions| sessions.remove(workspace));
-        if let Some(session) = session {
+            .map(|mut sessions| {
+                let keys = sessions
+                    .iter()
+                    .filter(|(_, session)| session.workspace == workspace)
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .filter_map(|key| sessions.remove(&key))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for session in closed {
             session.controller.shutdown();
         }
     }
@@ -318,7 +379,8 @@ impl CodexNativeAdapterV1 {
         self.sessions
             .lock()
             .ok()?
-            .get(workspace)
+            .values()
+            .find(|session| session.workspace == workspace)
             .map(|session| session.controller.clone())
     }
 
@@ -354,6 +416,14 @@ impl CodexNativeAdapterV1 {
     }
 
     #[cfg(test)]
+    pub(in crate::native_agent) fn task_count(&self) -> usize {
+        self.task_sessions
+            .lock()
+            .map(|tasks| tasks.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
     pub(in crate::native_agent) fn shutdown_count(&self) -> usize {
         self.shutdowns.load(Ordering::SeqCst)
     }
@@ -366,14 +436,9 @@ impl CodexNativeAdapterV1 {
             .ok_or_else(|| AppError::InvalidInput("Native Agent session is unavailable.".into()))
     }
 
-    fn forget_session_of(&self, workspace: &Path, controller: &Arc<CodexAppServerV1>) {
+    fn forget_session_of(&self, controller: &Arc<CodexAppServerV1>) {
         if let Ok(mut sessions) = self.sessions.lock() {
-            if sessions
-                .get(workspace)
-                .is_some_and(|session| Arc::ptr_eq(&session.controller, controller))
-            {
-                sessions.remove(workspace);
-            }
+            sessions.retain(|_, session| !Arc::ptr_eq(&session.controller, controller));
         }
     }
 }
@@ -419,34 +484,77 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
                 .and_then(|name| name.to_str())
                 .unwrap_or("workspace")
                 .into(),
+            conversation: Some(PreparedConversationV1 {
+                scope: workspace.to_string_lossy().into_owned(),
+                continue_existing: parsed.resume,
+            }),
             host_workspace: Some(workspace),
         })
     }
 
-    /// Records the task against its workspace's existing session, or against
-    /// a new session that its observer opens. No process launch or native RPC
-    /// wait happens here, so Core's lock is never held across one.
+    /// Records the task against its conversation's live session, or against
+    /// a session its observer opens: continuing a saved conversation with
+    /// `thread/resume`, or beginning a new one. No process launch or native
+    /// RPC wait happens here, so Core's lock is never held across one.
     fn start(
         &self,
         task_id: &str,
         input: &OpaqueCapabilityPayloadV1,
+        conversation: Option<NativeConversationV1>,
     ) -> AppResult<StartedInvocationV1> {
         let (parsed, workspace) = parse_input(input)?;
-        let existing = {
-            let sessions = self.sessions.lock().map_err(|_| {
+        let (key, continuation) = match conversation {
+            Some(conversation) => {
+                if conversation.continue_existing != parsed.resume {
+                    return invalid("Native Agent conversation does not match its invocation.");
+                }
+                (conversation.key, conversation.continuation)
+            }
+            None => (workspace_session_key(&workspace), None),
+        };
+        // The saved continuation names Codex's thread, which only this
+        // adapter reads.
+        let resume_thread = match continuation {
+            Some(continuation) => Some(
+                continuation
+                    .value()
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .filter(|thread_id| !thread_id.is_empty() && thread_id.len() <= 256)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        AppError::InvalidInput(
+                            "Native Agent conversation record is invalid.".into(),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let (existing, replaced) = {
+            let mut sessions = self.sessions.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent session store is unavailable.".into())
             })?;
-            if !parsed.resume && sessions.contains_key(&workspace) {
-                return invalid(
-                    "Native Agent workspace already has a session; resumption is required.",
-                );
-            }
-            sessions
-                .get(&workspace)
-                .map(|session| (session.controller.clone(), session.thread_id.clone()))
+            // A new conversation replaces this owner's live one; a session
+            // whose app-server has exited is never reused.
+            let replaced = match sessions.get(&key) {
+                Some(session) if !parsed.resume || session.controller.has_exited() => {
+                    sessions.remove(&key)
+                }
+                _ => None,
+            };
+            let existing = sessions.get_mut(&key).map(|session| {
+                session.last_used = Instant::now();
+                session.controller.in_use.store(true, Ordering::Release);
+                (session.controller.clone(), session.thread_id.clone())
+            });
+            (existing, replaced)
         };
+        if let Some(replaced) = replaced {
+            // Exclusivity guarantees it runs no turn.
+            replaced.controller.shutdown();
+        }
         let slot = Arc::new(CodexTaskSlotV1 {
-            workspace: workspace.clone(),
+            sequence: self.next_sequence.fetch_add(1, Ordering::AcqRel),
             attachment: Mutex::new(match &existing {
                 Some((controller, _)) => {
                     CodexTaskAttachmentV1::Attached(Arc::downgrade(controller))
@@ -455,18 +563,24 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
                     stop_requested: false,
                 },
             }),
+            finished: AtomicBool::new(false),
         });
-        self.task_sessions
-            .lock()
-            .map_err(|_| {
+        {
+            let mut tasks = self.task_sessions.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent session store is unavailable.".into())
-            })?
-            .insert(task_id.to_owned(), slot.clone());
+            })?;
+            prune_finished_slots(&mut tasks);
+            tasks.insert(task_id.to_owned(), slot.clone());
+        }
+        let reused = existing.is_some();
         Ok(StartedInvocationV1 {
-            session_reused: existing.is_some(),
+            session_reused: reused,
+            conversation: reused.then_some(NativeConversationContinuityV1::Continued),
             run: Box::new(CodexInvocationRunV1 {
                 executable: self.executable(),
                 workspace,
+                key,
+                resume_thread: if reused { None } else { resume_thread },
                 slot,
                 sessions: self.sessions.clone(),
                 availability: self.availability.clone(),
@@ -488,13 +602,13 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
         if controller.cancel_owned_turn_or_session()? {
             // The observer keeps its Arc long enough to see the terminated
             // app-server channel, but no later task may reuse this session.
-            self.forget_session_of(&slot.workspace, &controller);
+            self.forget_session_of(&controller);
         }
         Ok(())
     }
 
     /// Burn: forget this task and end the session it ran on, but nothing a
-    /// later session at the same workspace or any other task started.
+    /// later session or any other task started.
     fn release(&self, task_id: &str) {
         let Some(slot) = self
             .task_sessions
@@ -508,8 +622,20 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
             .stop_or_attached()
             .and_then(|controller| controller.upgrade())
         {
-            self.forget_session_of(&slot.workspace, &controller);
+            self.forget_session_of(&controller);
             let _ = controller.cancel_owned_turn_or_session();
+        }
+    }
+
+    fn release_conversation(&self, key: &str) {
+        let session = self
+            .sessions
+            .lock()
+            .ok()
+            .and_then(|mut sessions| sessions.remove(key));
+        if let Some(session) = session {
+            let _ = session.controller.cancel_owned_turn_or_session();
+            session.controller.shutdown();
         }
     }
 
@@ -534,6 +660,10 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
 struct CodexInvocationRunV1 {
     executable: PathBuf,
     workspace: PathBuf,
+    /// The live-session key: Core's conversation key, or the workspace's.
+    key: String,
+    /// The saved thread this run must reopen instead of beginning one.
+    resume_thread: Option<String>,
     slot: Arc<CodexTaskSlotV1>,
     sessions: SessionStoreV1,
     availability: AvailabilityCacheV1,
@@ -544,11 +674,16 @@ struct CodexInvocationRunV1 {
 }
 
 impl CodexInvocationRunV1 {
-    /// Opens the workspace's new session on the observer thread. Every
-    /// failure here precedes `turn/start`, so it is a definite non-start.
-    fn open_session(&self) -> Result<(Arc<CodexAppServerV1>, String), NativeInvocationOutcomeV1> {
-        let not_started = |summary: &str| NativeInvocationOutcomeV1 {
-            kind: NativeTurnOutcomeV1::NotStarted,
+    /// Opens the conversation's session on the observer thread: reopening
+    /// the saved thread, or beginning a new one. Every failure here precedes
+    /// `turn/start`, so it is a definite non-start, and a thread that cannot
+    /// be reopened is never replaced by a new one.
+    fn open_session(
+        &self,
+        progress: &dyn NativeInvocationProgressV1,
+    ) -> Result<(Arc<CodexAppServerV1>, String), NativeInvocationOutcomeV1> {
+        let not_started = |kind, summary: &str| NativeInvocationOutcomeV1 {
+            kind,
             summary: Some(summary.into()),
             output: None,
         };
@@ -565,11 +700,15 @@ impl CodexInvocationRunV1 {
             NativeAgentCapabilityStateV1::Available => {}
             NativeAgentCapabilityStateV1::Incompatible => {
                 return Err(not_started(
+                    NativeTurnOutcomeV1::NotStarted,
                     "Codex is installed, but its native app-server interface is incompatible.",
                 ))
             }
             NativeAgentCapabilityStateV1::Unavailable => {
-                return Err(not_started("Codex is unavailable on this Host."))
+                return Err(not_started(
+                    NativeTurnOutcomeV1::NotStarted,
+                    "Codex is unavailable on this Host.",
+                ))
             }
         }
         if self.slot.stop_requested() {
@@ -584,15 +723,33 @@ impl CodexInvocationRunV1 {
                 if let Ok(mut cache) = self.availability.lock() {
                     cache.observed = None;
                 }
-                return Err(not_started("Codex could not start its native app-server."));
+                return Err(not_started(
+                    NativeTurnOutcomeV1::NotStarted,
+                    "Codex could not start its native app-server.",
+                ));
             }
         };
-        let thread_id = match controller.start_thread(&self.workspace) {
-            Ok(thread_id) => thread_id,
-            Err(_) => {
-                controller.shutdown();
-                return Err(not_started("Codex did not open a native session."));
-            }
+        let (thread_id, continuity) = match &self.resume_thread {
+            Some(saved) => match controller.resume_thread(saved, &self.workspace) {
+                Ok(()) => (saved.clone(), NativeConversationContinuityV1::Continued),
+                Err(_) => {
+                    controller.shutdown();
+                    return Err(not_started(
+                        NativeTurnOutcomeV1::ConversationUnavailable,
+                        "Codex could not reopen this conversation, so nothing ran. Start a new conversation to continue without its earlier context.",
+                    ));
+                }
+            },
+            None => match controller.start_thread(&self.workspace) {
+                Ok(thread_id) => (thread_id, NativeConversationContinuityV1::New),
+                Err(_) => {
+                    controller.shutdown();
+                    return Err(not_started(
+                        NativeTurnOutcomeV1::NotStarted,
+                        "Codex did not open a native session.",
+                    ));
+                }
+            },
         };
         let Ok(mut attachment) = self.slot.attachment.lock() else {
             controller.shutdown();
@@ -609,24 +766,68 @@ impl CodexInvocationRunV1 {
             return Err(stopped());
         }
         *attachment = CodexTaskAttachmentV1::Attached(Arc::downgrade(&controller));
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions
-                .entry(self.workspace.clone())
-                .or_insert_with(|| NativeCodexSessionV1 {
-                    controller: controller.clone(),
-                    thread_id: thread_id.clone(),
-                });
-        }
+        controller.in_use.store(true, Ordering::Release);
+        let evicted = self
+            .sessions
+            .lock()
+            .map(|mut sessions| {
+                sessions
+                    .entry(self.key.clone())
+                    .or_insert_with(|| NativeCodexSessionV1 {
+                        workspace: self.workspace.clone(),
+                        controller: controller.clone(),
+                        thread_id: thread_id.clone(),
+                        last_used: Instant::now(),
+                    });
+                evict_idle_sessions(&mut sessions, &self.key)
+            })
+            .unwrap_or_default();
         drop(attachment);
+        for session in evicted {
+            session.controller.shutdown();
+        }
+        progress.conversation_established(
+            continuity,
+            OpaqueCapabilityPayloadV1::new(json!({ "threadId": thread_id })),
+        );
         Ok((controller, thread_id))
     }
+}
+
+/// Bound on idle live app-servers. An evicted conversation stays saved and
+/// is reopened with `thread/resume` when its owner continues it.
+const MAX_LIVE_SESSIONS: usize = 4;
+
+/// Removes the least recently used idle sessions beyond the bound, never
+/// `keep` and never one a task is using.
+fn evict_idle_sessions(
+    sessions: &mut HashMap<String, NativeCodexSessionV1>,
+    keep: &str,
+) -> Vec<NativeCodexSessionV1> {
+    let mut evicted = Vec::new();
+    while sessions.len() > MAX_LIVE_SESSIONS {
+        let Some(oldest) = sessions
+            .iter()
+            .filter(|(key, session)| {
+                key.as_str() != keep && !session.controller.in_use.load(Ordering::Acquire)
+            })
+            .min_by_key(|(_, session)| session.last_used)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(session) = sessions.remove(&oldest) {
+            evicted.push(session);
+        }
+    }
+    evicted
 }
 
 impl NativeInvocationRunV1 for CodexInvocationRunV1 {
     fn run(&mut self, progress: &dyn NativeInvocationProgressV1) -> NativeInvocationOutcomeV1 {
         let (controller, thread_id) = match self.session.clone() {
             Some(session) => session,
-            None => match self.open_session() {
+            None => match self.open_session(progress) {
                 Ok(session) => {
                     self.session = Some(session.clone());
                     session
@@ -655,9 +856,22 @@ impl NativeInvocationRunV1 for CodexInvocationRunV1 {
     }
 }
 
+impl Drop for CodexInvocationRunV1 {
+    /// The observer is done with the task, whatever its outcome: its session
+    /// is idle again and its slot is only for Burn.
+    fn drop(&mut self) {
+        if let Some((controller, _)) = &self.session {
+            controller.in_use.store(false, Ordering::Release);
+        }
+        self.slot.finished.store(true, Ordering::Release);
+    }
+}
+
 pub(in crate::native_agent) struct NativeCodexSessionV1 {
+    workspace: PathBuf,
     controller: Arc<CodexAppServerV1>,
     thread_id: String,
+    last_used: Instant,
 }
 
 /// The user-facing reply of one exact turn, from its completed
@@ -916,6 +1130,8 @@ pub(in crate::native_agent) struct CodexAppServerV1 {
     deferred: Mutex<VecDeque<ObservedLineV1>>,
     pub(in crate::native_agent) active_turn: Mutex<Option<(String, String)>>,
     pub(in crate::native_agent) interrupt_requested: AtomicBool,
+    /// A task holds this session: it is never evicted while set.
+    in_use: AtomicBool,
 }
 
 impl CodexAppServerV1 {
@@ -957,6 +1173,7 @@ impl CodexAppServerV1 {
             deferred: Mutex::default(),
             active_turn: Mutex::new(None),
             interrupt_requested: AtomicBool::new(false),
+            in_use: AtomicBool::new(false),
         };
         controller.send(json!({"id": INITIALIZE_ID, "method": "initialize", "params": {"clientInfo": {"name": "Pastey", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
         controller.await_result(
@@ -985,6 +1202,33 @@ impl CodexAppServerV1 {
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| AppError::InvalidInput("Codex did not return a native session.".into()))
+    }
+
+    /// Reopens one saved thread with `thread/resume`. Codex answers an
+    /// unknown or unreadable thread with an error; Pastey additionally
+    /// requires the reopened thread to be exactly the saved one, so a
+    /// different or new thread is never taken for it.
+    fn resume_thread(&self, thread_id: &str, workspace: &Path) -> AppResult<()> {
+        let cwd = dunce::simplified(workspace).to_str().ok_or_else(|| {
+            AppError::InvalidInput("Native Agent workspace is unavailable.".into())
+        })?;
+        self.send(json!({"id": THREAD_RESUME_ID, "method": "thread/resume", "params": {"threadId": thread_id, "cwd": cwd, "excludeTurns": true}}))?;
+        let resumed = self.await_result(
+            THREAD_RESUME_ID,
+            Instant::now() + NATIVE_AGENT_RPC_TIMEOUT,
+            false,
+        )?;
+        if resumed.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
+            return invalid("Codex reopened a different conversation.");
+        }
+        Ok(())
+    }
+
+    /// Whether the app-server process has exited.
+    fn has_exited(&self) -> bool {
+        self.child
+            .lock()
+            .map_or(true, |mut child| !matches!(child.try_wait(), Ok(None)))
     }
 
     /// Obtains the exact turn identity with a bounded RPC timeout, then waits

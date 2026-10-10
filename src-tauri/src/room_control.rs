@@ -4107,6 +4107,7 @@ mod tests {
                 result: None,
                 code: None,
                 output: output.map(|value| serde_json::from_value(value).unwrap()),
+                conversation: None,
             },
         })
         .unwrap()
@@ -4307,6 +4308,7 @@ mod tests {
                         result: None,
                         code: Some(code.into()),
                         output: None,
+                        conversation: None,
                     },
                 })
                 .unwrap(),

@@ -8,6 +8,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Added
 
+- A Codex conversation started through Pastey now survives a Pastey restart: a follow-up in the same workspace from the same requester reopens the same native conversation with Codex's `thread/resume`. The task card says whether a task continued the conversation or began a new one, and offers "Start a new conversation". If Codex cannot reopen the conversation, nothing runs and the card says so; Pastey never silently starts a new one. Conversations are bound to their requester (this device, or one peer device over one Bridge) and are forgotten when that Bridge is burned.
 - Native capability invocation is now capability-neutral. Core dispatches each invocation by capability ID to a registered adapter that owns its input, start, stop, and terminal output; Core keeps task identity, ownership, admission, status, cancellation, reconciliation, restart recovery, Bridge authority, and the durable envelope. Codex is the only shipped adapter. A capability-neutral `pastey-native-agent-invoke-v2` invocation and its `start_remote_native_capability_task` command exist without a renderer entry point yet.
 - Native capability input and terminal output are opaque, capability-owned payloads bounded to 16 KiB. Core carries, persists, compares, and digests them without interpreting them, and Room Control's field-name safety check skips exactly those payload subtrees while still checking every other field.
 - A completed Codex task now returns Codex's actual final reply, captured from the exact turn's completed agent messages and bounded to the output limit, instead of only a completion summary. It reaches the requesting device through the existing status and reconciliation path, and the task card shows it as escaped plain text, separate from the task state, including when it came from another Host.
@@ -22,6 +23,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- Cancelling a remote Codex task that was in flight when the executing device restarted now releases its workspace instead of leaving it blocked.
 - Starting a Codex task no longer holds the native service lock while Codex launches and opens its session, so status, cancellation, and remote status updates stay responsive; Codex availability is cached briefly and rechecked before each new session.
 - A long or malformed Codex app-server line no longer ends task observation or releases the workspace early.
 - On Windows, an npm-installed Codex (`codex.cmd`) is now found and started, and its app-server stops when Pastey closes the session.

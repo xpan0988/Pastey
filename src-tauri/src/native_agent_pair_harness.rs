@@ -1679,7 +1679,15 @@ fn a_capability_adds_no_tables() {
         .filter(|name| name.starts_with("native_agent"))
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(native, ["native_agent_conflicts", "native_agent_envelopes"]);
+    // Core's own native tables; a capability adds none of its own.
+    assert_eq!(
+        native,
+        [
+            "native_agent_conflicts",
+            "native_agent_conversations",
+            "native_agent_envelopes"
+        ]
+    );
     let task = "task-cap-tables";
     h.invoke(task, json!({ "steps": 1, "payload": "tables", "lane": "t" }));
     h.settle(task);

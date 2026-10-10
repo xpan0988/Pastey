@@ -171,6 +171,16 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             created_at INTEGER NOT NULL
         );
 
+        -- One Pastey-managed native conversation per owner, capability and
+        -- adapter scope. Host-private: its continuation is native state that
+        -- never crosses a Bridge. Distinct from a task envelope's lifecycle.
+        CREATE TABLE IF NOT EXISTS native_agent_conversations (
+            conversation_key TEXT PRIMARY KEY,
+            bridge_id TEXT,
+            record_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS native_agent_envelopes (
             task_id TEXT PRIMARY KEY,
             movement_id TEXT UNIQUE,
@@ -323,6 +333,94 @@ pub(crate) fn update_native_agent_observed_task_if_present(
     }
     transaction.commit()?;
     Ok(())
+}
+
+/// Most native conversation records a Host keeps. The oldest beyond it is
+/// forgotten: Pastey then starts that scope's next conversation anew instead
+/// of continuing it, which the task reports truthfully.
+pub(crate) const MAX_NATIVE_AGENT_CONVERSATIONS: i64 = 256;
+
+/// Saves one confirmed native conversation, unless its Bridge was burned:
+/// the tombstone is checked in the same transaction, so a late observer can
+/// never restore a burned Bridge's conversation.
+pub(crate) fn save_native_agent_conversation(
+    paths: &AppPaths,
+    conversation_key: &str,
+    bridge_id: Option<&str>,
+    record_json: &str,
+) -> AppResult<bool> {
+    if conversation_key.is_empty() || conversation_key.len() > 128 || record_json.is_empty() {
+        return Err(AppError::InvalidInput(
+            "Native Agent conversation record is invalid.".into(),
+        ));
+    }
+    let mut conn = connection(paths)?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(bridge_id) = bridge_id {
+        let burned: i64 = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+            [bridge_id],
+            |row| row.get(0),
+        )?;
+        if burned != 0 {
+            return Ok(false);
+        }
+    }
+    transaction.execute(
+        r#"
+        INSERT INTO native_agent_conversations (conversation_key, bridge_id, record_json, updated_at)
+        VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(conversation_key) DO UPDATE SET
+            bridge_id = excluded.bridge_id,
+            record_json = excluded.record_json,
+            updated_at = excluded.updated_at
+        "#,
+        params![conversation_key, bridge_id, record_json, now_ts()],
+    )?;
+    transaction.execute(
+        "DELETE FROM native_agent_conversations WHERE conversation_key NOT IN (
+            SELECT conversation_key FROM native_agent_conversations
+            ORDER BY updated_at DESC, conversation_key LIMIT ?1
+        )",
+        [MAX_NATIVE_AGENT_CONVERSATIONS],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+/// One saved conversation, never one whose Bridge was burned.
+pub(crate) fn get_native_agent_conversation(
+    paths: &AppPaths,
+    conversation_key: &str,
+) -> AppResult<Option<String>> {
+    connection(paths)?
+        .query_row(
+            "SELECT record_json FROM native_agent_conversations
+             WHERE conversation_key = ?1
+               AND (bridge_id IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM burned_bridges WHERE room_id = bridge_id))",
+            [conversation_key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(AppError::from)
+}
+
+/// Burn: forget every conversation one Bridge's peers own.
+pub(crate) fn delete_bridge_native_agent_conversations(
+    paths: &AppPaths,
+    bridge_id: &str,
+) -> AppResult<Vec<String>> {
+    let conn = connection(paths)?;
+    let keys = conn
+        .prepare("SELECT conversation_key FROM native_agent_conversations WHERE bridge_id = ?1")?
+        .query_map([bridge_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    conn.execute(
+        "DELETE FROM native_agent_conversations WHERE bridge_id = ?1",
+        [bridge_id],
+    )?;
+    Ok(keys)
 }
 
 pub(crate) fn delete_native_agent_envelope(paths: &AppPaths, task_id: &str) -> AppResult<bool> {

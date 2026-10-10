@@ -189,6 +189,9 @@ export interface NativeAgentTaskStatus {
    * Untrusted data: displayed only as escaped text, never interpreted as
    * markup, a command, a path, or a link. */
   output?: unknown;
+  /** Set once the Agent confirms whether the task continued this owner's
+   * earlier conversation or began a new one. Never a native identifier. */
+  conversation?: "new" | "continued" | null;
 }
 
 export type NativeAgentWorkspaceMovementState =
@@ -233,8 +236,10 @@ export function listRemoteNativeAgentCapabilities(roomId: string, targetHostRef:
   return invoke("list_remote_native_agent_capabilities", { roomId, targetHostRef });
 }
 
-export function startNativeCodexTask(workspace: string, task: string): Promise<NativeAgentTaskStatus> {
-  return invoke("start_native_codex_task", { workspace, task });
+/** Continues this device's Codex conversation in the workspace (or begins
+ * one); `newConversation` explicitly begins a new one instead. */
+export function startNativeCodexTask(workspace: string, task: string, newConversation = false): Promise<NativeAgentTaskStatus> {
+  return invoke("start_native_codex_task", { workspace, task, newConversation });
 }
 
 export function getNativeAgentTaskStatus(taskId: string): Promise<NativeAgentTaskStatus> {

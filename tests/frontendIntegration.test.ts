@@ -20,6 +20,8 @@ import {
   nativeAgentLifecycleLabel,
   nativeAgentResponse,
   nativeAgentTargetAvailability,
+  nativeAgentConversationLabel,
+  nativeAgentConversationUnavailable,
 } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../src/lib/types";
 
@@ -516,4 +518,39 @@ test("A selected remote Host shows its own advertised Codex availability", () =>
   assert.match(bindings, /invoke\("list_remote_native_agent_capabilities", \{ roomId, targetHostRef \}\)/);
   // A finished task stays visible (with its response) when recovery drains.
   assert.match(lifecycle, /loadRecoveryProjection\(undefined, true\)/);
+});
+
+test("Continued and new Agent conversations are shown only once confirmed", () => {
+  const status = {
+    schemaVersion: "pastey-native-agent-task-v1" as const,
+    taskId: "task-conversation",
+    agentId: "agent.coding.codex",
+    workspaceName: "repz",
+    sessionReused: false,
+    state: "running" as const,
+    code: null,
+  };
+  // Not yet confirmed: never claimed either way, whatever sessionReused says.
+  assert.equal(nativeAgentConversationLabel(status), "opening conversation…");
+  assert.equal(nativeAgentConversationLabel({ ...status, sessionReused: true }), "opening conversation…");
+  assert.equal(nativeAgentConversationLabel({ ...status, conversation: "continued" }), "continued conversation");
+  assert.equal(nativeAgentConversationLabel({ ...status, state: "completed", conversation: "new" }), "new conversation");
+  assert.equal(nativeAgentConversationLabel({ ...status, state: "completed" }), null);
+  const unavailable = { ...status, state: "failed" as const, code: "native_agent_conversation_unavailable" };
+  assert.equal(nativeAgentConversationUnavailable(unavailable), true);
+  assert.equal(nativeAgentLifecycleLabel(unavailable), "failed · conversation unavailable");
+  assert.equal(nativeAgentConversationUnavailable({ ...unavailable, code: "native_agent_start_failed" }), false);
+
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  assert.doesNotMatch(card, /resumed native session/);
+  assert.match(card, /Start a new conversation/);
+  assert.match(card, /could not reopen your earlier conversation, so nothing ran/);
+  // A new conversation is only ever an explicit choice, sent as such.
+  assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), taskText\.trim\(\), newConversation\)/);
+  assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, workspace\.trim\(\), taskText\.trim\(\), !newConversation\)/);
+  assert.match(bindings, /invoke\("start_native_codex_task", \{ workspace, task, newConversation \}\)/);
+  assert.match(bindings, /conversation\?: "new" \| "continued" \| null;/);
+  assert.doesNotMatch(bindings, /threadId/);
 });

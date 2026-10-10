@@ -134,7 +134,25 @@ export function nativeAgentAwaitingNativeDecision(status: NativeAgentTaskStatus 
 export function nativeAgentLifecycleLabel(status: NativeAgentTaskStatus): string {
   if (nativeAgentAwaitingNativeDecision(status)) return "running · waiting for a native approval";
   if (status.state === "failed" && status.code === "native_agent_start_failed") return "failed · did not start";
+  if (nativeAgentConversationUnavailable(status)) return "failed · conversation unavailable";
   return status.state.replace(/_/g, " ");
+}
+
+export const CONVERSATION_UNAVAILABLE_CODE = "native_agent_conversation_unavailable";
+
+/** Whether the task continued its earlier conversation or began a new one,
+ * shown only once the Agent has confirmed it. */
+export function nativeAgentConversationLabel(status: NativeAgentTaskStatus | null): string | null {
+  if (status?.conversation === "continued") return "continued conversation";
+  if (status?.conversation === "new") return "new conversation";
+  if (status && ["queued", "running"].includes(status.state)) return "opening conversation…";
+  return null;
+}
+
+/** The earlier conversation could not be reopened, so nothing ran. Only an
+ * explicit new conversation continues the work, without that context. */
+export function nativeAgentConversationUnavailable(status: NativeAgentTaskStatus | null): boolean {
+  return status?.state === "failed" && status.code === CONVERSATION_UNAVAILABLE_CODE;
 }
 
 export function nativeAgentDisplayName(agentId: string | null | undefined): string {
@@ -357,6 +375,8 @@ export function useNativeAgentTask(roomId: string) {
   const [capabilities, setCapabilities] = useState<NativeAgentCapability[]>([]);
   const [workspace, setWorkspace] = useState("");
   const [taskText, setTaskText] = useState("");
+  /** Explicitly begin a new Agent conversation instead of continuing. */
+  const [newConversation, setNewConversation] = useState(false);
   const [status, setStatus] = useState<NativeAgentTaskStatus | null>(null);
   const [movement, setMovement] = useState<NativeAgentWorkspaceMovement | null>(null);
   const [recoveryProjection, setRecoveryProjection] = useState<NativeAgentRecoveryProjection | null>(null);
@@ -496,16 +516,17 @@ export function useNativeAgentTask(roomId: string) {
   const start = useCallback(async () => {
     if (!workspace.trim() || !taskText.trim() || busy) return;
     setBusy(true); setMessage(null);
-    try { setStatus(await startNativeCodexTask(workspace.trim(), taskText.trim())); setTaskHostRef(null); }
+    try { setStatus(await startNativeCodexTask(workspace.trim(), taskText.trim(), newConversation)); setTaskHostRef(null); setNewConversation(false); }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start Codex."); }
     finally { setBusy(false); }
-  }, [busy, taskText, workspace]);
+  }, [busy, newConversation, taskText, workspace]);
 
   const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
     if (!roomId || !peerSessionId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
     setBusy(true); setMessage(null);
     try {
-      const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, workspace.trim(), taskText.trim(), true);
+      const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, workspace.trim(), taskText.trim(), !newConversation);
+      setNewConversation(false);
       setTaskHostRef(hostRef);
       try {
         const projection = await loadRecoveryProjection();
@@ -517,7 +538,7 @@ export function useNativeAgentTask(roomId: string) {
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start remote Codex."); }
     finally { setBusy(false); }
-  }, [busy, loadRecoveryProjection, taskText, workspace]);
+  }, [busy, loadRecoveryProjection, newConversation, taskText, workspace]);
 
   const proposeRemoteMovement = useCallback(async (roomId: string, hostRef: string) => {
     if (!roomId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
@@ -625,7 +646,7 @@ export function useNativeAgentTask(roomId: string) {
 
   const retryingResultReturn = returnRetryObservation?.roomId === roomId
     && returnRetryObservation.movement.movementId === movement?.movementId;
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
+  return { capabilities, workspace, setWorkspace, taskText, setTaskText, newConversation, setNewConversation, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
 }
 
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {

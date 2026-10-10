@@ -94,6 +94,28 @@ interrupts the turn, which clears the request natively. Other client requests
 Pastey never advertised receive the protocol's method-not-found error.
 Forwarding approval decisions between Hosts is not implemented.
 
+Each Pastey-managed Codex conversation belongs to exactly one owner — this
+Host's user, or one authenticated peer Host over one Bridge — and one
+canonical workspace. When Codex confirms a new thread, Core saves its
+continuation in the Host-private `native_agent_conversations` table (never
+sent over a Bridge); the conversation's lifecycle is separate from any task
+envelope. A task that continues (`resume: true`, every product path) reuses
+that owner's live session, or after a restart or eviction reopens the saved
+thread with `thread/resume` and requires Codex to return exactly that thread.
+If it cannot be reopened (deleted, unreadable, unsupported, or another thread)
+the task fails as a definite non-start with
+`native_agent_conversation_unavailable`; Pastey never substitutes a new
+thread. Only an explicit new conversation (`resume: false`) begins one and
+replaces the saved record once Codex confirms it. Status carries only
+`conversation: new | continued`, set once confirmed. Another owner, another
+workspace, or a burned Bridge never reopens a conversation: Burn deletes the
+Bridge's records and live sessions, the burned-Bridge tombstone refuses late
+writes and reads, and records are capped (256). At most four idle live
+sessions are kept; an evicted one is reopened when its owner continues.
+Workspace exclusivity still serializes follow-ups, an uncertain turn at
+restart still blocks them until reconciled or explicitly cancelled, and no
+turn is ever re-sent.
+
 A new session opens on the task's observer thread, so no process launch,
 `initialize` or `thread/start` wait holds the native service lock; a stop
 before the turn starts closes the opening session without sending the turn,

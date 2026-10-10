@@ -857,12 +857,17 @@ pub async fn list_remote_native_agent_capabilities(
 pub fn start_native_codex_task(
     workspace: String,
     task: String,
+    new_conversation: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     state
         .native_agents
         .lock()
-        .start_codex_task(std::path::Path::new(&workspace), &task)
+        .start_codex_conversation_task(
+            std::path::Path::new(&workspace),
+            &task,
+            new_conversation.unwrap_or(false),
+        )
         .map_err(|error| error.message())
 }
 

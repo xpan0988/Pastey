@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeInvocationOutcomeV1,
+    ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1, NativeInvocationOutcomeV1,
     NativeInvocationProgressV1, NativeInvocationRunV1, OpaqueCapabilityPayloadV1,
     PreparedInvocationV1, StartedInvocationV1,
 };
@@ -156,6 +156,7 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
                 .map(|lane| ExclusivityKeyV1::new(FAKE_LONGJOB_ID, lane)),
             label: "longjob".into(),
             host_workspace: None,
+            conversation: None,
         })
     }
 
@@ -163,6 +164,7 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
         &self,
         task_id: &str,
         input: &OpaqueCapabilityPayloadV1,
+        _conversation: Option<NativeConversationV1>,
     ) -> AppResult<StartedInvocationV1> {
         let parsed = parse(input)?;
         self.with(|state| {
@@ -178,6 +180,7 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
         });
         Ok(StartedInvocationV1 {
             session_reused: false,
+            conversation: None,
             run: Box::new(LongJobRunV1 {
                 state: self.state.clone(),
                 task_id: task_id.to_owned(),
