@@ -171,6 +171,16 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             created_at INTEGER NOT NULL
         );
 
+        -- Folders this Host's own user authorized for authenticated Bridge
+        -- peers' bounded file Search. Host-local: never received from a
+        -- peer, and never sent to one (peers name only the scope label).
+        CREATE TABLE IF NOT EXISTS authorized_search_folders (
+            folder_id TEXT PRIMARY KEY,
+            canonical_path TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
         -- One Pastey-managed native conversation per owner, capability and
         -- adapter scope. Host-private: its continuation is native state that
         -- never crosses a Bridge. Distinct from a task envelope's lifecycle.
@@ -333,6 +343,89 @@ pub(crate) fn update_native_agent_observed_task_if_present(
     }
     transaction.commit()?;
     Ok(())
+}
+
+/// Most folders a Host user may authorize for Bridge Search.
+pub(crate) const MAX_AUTHORIZED_SEARCH_FOLDERS: i64 = 16;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredAuthorizedSearchFolder {
+    pub(crate) folder_id: String,
+    pub(crate) canonical_path: String,
+    pub(crate) display_name: String,
+    pub(crate) created_at: i64,
+}
+
+pub(crate) fn list_authorized_search_folders(
+    paths: &AppPaths,
+) -> AppResult<Vec<StoredAuthorizedSearchFolder>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(
+        "SELECT folder_id, canonical_path, display_name, created_at
+         FROM authorized_search_folders ORDER BY created_at, folder_id",
+    )?;
+    let folders = statement
+        .query_map([], |row| {
+            Ok(StoredAuthorizedSearchFolder {
+                folder_id: row.get(0)?,
+                canonical_path: row.get(1)?,
+                display_name: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(folders)
+}
+
+/// Adds one folder unless it is already authorized or the bound is reached.
+pub(crate) fn add_authorized_search_folder(
+    paths: &AppPaths,
+    folder: &StoredAuthorizedSearchFolder,
+) -> AppResult<()> {
+    let mut conn = connection(paths)?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let existing: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM authorized_search_folders",
+        [],
+        |row| row.get(0),
+    )?;
+    let duplicate: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM authorized_search_folders WHERE canonical_path = ?1)",
+        [&folder.canonical_path],
+        |row| row.get(0),
+    )?;
+    if duplicate != 0 {
+        return Err(AppError::InvalidInput(
+            "This folder is already shared for Bridge search.".into(),
+        ));
+    }
+    if existing >= MAX_AUTHORIZED_SEARCH_FOLDERS {
+        return Err(AppError::InvalidInput(
+            "Remove a shared search folder before adding another.".into(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO authorized_search_folders (folder_id, canonical_path, display_name, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            &folder.folder_id,
+            &folder.canonical_path,
+            &folder.display_name,
+            folder.created_at
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn remove_authorized_search_folder(
+    paths: &AppPaths,
+    folder_id: &str,
+) -> AppResult<bool> {
+    Ok(connection(paths)?.execute(
+        "DELETE FROM authorized_search_folders WHERE folder_id = ?1",
+        [folder_id],
+    )? > 0)
 }
 
 /// Most native conversation records a Host keeps. The oldest beyond it is

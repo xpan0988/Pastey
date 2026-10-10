@@ -260,6 +260,17 @@ pub(crate) struct SourceFingerprint {
     link_count: u64,
 }
 
+/// The cheap identity of one contained regular file (volume/file id, size,
+/// modification and change times, link count), opened without following a
+/// final symlink. Equal fingerprints mean the same unchanged file object; a
+/// replaced or rewritten file differs.
+pub(crate) fn capture_source_fingerprint(
+    source_path: &Path,
+    scope_root: &Path,
+) -> AppResult<SourceFingerprint> {
+    source_fingerprint(&open_regular_source(source_path, scope_root)?)
+}
+
 pub(crate) fn capture_source_identity(
     source_path: &Path,
     scope_root: &Path,

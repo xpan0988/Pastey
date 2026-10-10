@@ -1,5 +1,7 @@
 /** Renderer editing state. Rust remains the immutable revision authority. */
-export type SafeSearchScope = "downloads" | "desktop" | "documents" | "pastey_shared";
+/** `authorized_folders` names whatever folders the searched device's own
+ * user shared for Bridge search; it is never a path. */
+export type SafeSearchScope = "downloads" | "desktop" | "documents" | "pastey_shared" | "authorized_folders";
 export type ComposerPrimitive = "Search" | "Transform" | "Transfer" | "Execute";
 export type ComposerDevice = "requesting_device" | "selected_device";
 export type ComposerTransferDestination = ComposerDevice | "pastey_shared";

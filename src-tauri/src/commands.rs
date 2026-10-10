@@ -721,6 +721,36 @@ pub(crate) async fn run_bridge_device_managed_self_check(
     diagnostics
 }
 
+/// Folders this Host's user authorized for authenticated Bridge peers'
+/// bounded file Search. Local only: no Room Control event reaches these
+/// commands, and no physical path is returned.
+#[tauri::command]
+pub fn list_authorized_search_folders(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<file_candidates::AuthorizedSearchFolderV1>, String> {
+    file_candidates::list_authorized_search_folders(&state.paths).map_err(|error| error.message())
+}
+
+/// Authorizes one folder the local user chose with the system folder picker.
+#[tauri::command]
+pub fn authorize_search_folder(
+    path: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<file_candidates::AuthorizedSearchFolderV1, String> {
+    file_candidates::authorize_search_folder(&state.paths, std::path::Path::new(&path))
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn revoke_authorized_search_folder(
+    folder_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<file_candidates::AuthorizedSearchFolderV1>, String> {
+    file_candidates::revoke_authorized_search_folder(&state.paths, &folder_id)
+        .and_then(|()| file_candidates::list_authorized_search_folders(&state.paths))
+        .map_err(|error| error.message())
+}
+
 /// Requests a fresh, selected-peer capability observation over the existing
 /// current-session Room Control channel. Delivery is not availability: the
 /// response remains a separate non-authorizing fact.
@@ -4551,6 +4581,7 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
         let candidate_file = {
             let mut candidates = state.bridge_plan_candidate_store.lock();
             file_candidates::resolve_bridge_plan_selected_file(
+                &state.paths,
                 &mut candidates,
                 &room_id,
                 &grant.requester_device_ref,

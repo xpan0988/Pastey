@@ -230,6 +230,29 @@ export function listNativeAgentCapabilities(): Promise<NativeAgentCapability[]> 
   return invoke("list_native_agent_capabilities");
 }
 
+/** A folder this device's user shared for other Bridge devices' bounded
+ * file search. Never a physical path. */
+export interface AuthorizedSearchFolder {
+  folderId: string;
+  displayName: string;
+  /** Moved, deleted, or replaced since it was shared; search skips it. */
+  unavailable: boolean;
+}
+
+export function listAuthorizedSearchFolders(): Promise<AuthorizedSearchFolder[]> {
+  return invoke("list_authorized_search_folders");
+}
+
+/** Only this device's own user, choosing a folder with the system picker,
+ * can share it. */
+export function authorizeSearchFolder(path: string): Promise<AuthorizedSearchFolder> {
+  return invoke("authorize_search_folder", { path });
+}
+
+export function revokeAuthorizedSearchFolder(folderId: string): Promise<AuthorizedSearchFolder[]> {
+  return invoke("revoke_authorized_search_folder", { folderId });
+}
+
 /** A fresh observation of what one exact current Bridge Host advertises.
  * Presentation only: it neither selects the Host nor grants invocation. */
 export function listRemoteNativeAgentCapabilities(roomId: string, targetHostRef: string): Promise<NativeAgentCapability[]> {

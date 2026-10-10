@@ -663,7 +663,13 @@ pub(crate) fn build_composed_file_revision(
     original_user_goal: String,
     blocks: Vec<ComposedFilePlanBlock>,
 ) -> AppResult<BridgePlanRevision> {
-    const ALLOWED_SCOPES: &[&str] = &["downloads", "desktop", "documents", "pastey_shared"];
+    const ALLOWED_SCOPES: &[&str] = &[
+        "downloads",
+        "desktop",
+        "documents",
+        "pastey_shared",
+        crate::file_candidates::AUTHORIZED_FOLDERS_SCOPE,
+    ];
     if blocks.is_empty() || blocks.len() > MAX_STEPS {
         return invalid_revision("The composed Bridge Plan has an invalid number of blocks.");
     }
@@ -1109,7 +1115,13 @@ pub(crate) fn build_file_plan_revision(
     safe_scope_labels: Vec<String>,
     transfer_to_requester: bool,
 ) -> AppResult<BridgePlanRevision> {
-    const ALLOWED_SCOPES: &[&str] = &["downloads", "desktop", "documents", "pastey_shared"];
+    const ALLOWED_SCOPES: &[&str] = &[
+        "downloads",
+        "desktop",
+        "documents",
+        "pastey_shared",
+        crate::file_candidates::AUTHORIZED_FOLDERS_SCOPE,
+    ];
     if safe_scope_labels.is_empty()
         || safe_scope_labels
             .iter()

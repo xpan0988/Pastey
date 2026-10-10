@@ -11,6 +11,7 @@ import type { AgentTaskController } from "./AgentTaskLifecycle";
 import { nativeAgentAwaitingNativeDecision, nativeAgentConsequenceAbandonmentRequired, nativeAgentConversationLabel, nativeAgentConversationUnavailable, nativeAgentDisplayName, nativeAgentLifecycleLabel, nativeAgentMovementBlocksNewRun, nativeAgentRemoteReconciliationRequired, nativeAgentResponse, nativeAgentTargetAvailability, StatusBadge, useNativeAgentTask, useRemoteNativeCapabilities, type NativeAgentTargetAvailability } from "./AgentTaskLifecycle";
 import type { NativeAgentCapability, NativeAgentTaskStatus } from "../../lib/tauri";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
+import { RemoteFileFinder } from "./RemoteFileFinder";
 import { bridgeCode, bridgeDeviceCount, fileName, formatBytes, formatClock, roomPeers } from "./workspaceViewModel";
 
 interface BridgeWorkspaceProps {
@@ -31,7 +32,7 @@ interface BridgeWorkspaceProps {
 }
 
 export function BridgeWorkspace({ room, items, queueItems, task, developerMode, developerSession, developerWorkspace, onDeveloperSession, onRefreshDeveloper, onNewBridge, onRefresh, onDeveloper, onBurn, onEnqueue }: BridgeWorkspaceProps) {
-  const [composerMode, setComposerMode] = useState<"send" | "task">("send");
+  const [composerMode, setComposerMode] = useState<ComposerMode>("send");
   const [text, setText] = useState("");
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
@@ -136,6 +137,7 @@ export function BridgeWorkspace({ room, items, queueItems, task, developerMode, 
           selectedPeerId={selectedPeer?.peerSessionId ?? ""}
           onPeer={setSelectedPeerId}
           disabled={!selectedRoute || busy}
+          route={selectedRoute}
           task={task}
           onFiles={() => void chooseFiles()}
           onSend={() => void sendText()}
@@ -198,16 +200,19 @@ function ResultCard({ task }: { task: AgentTaskController }) {
   );
 }
 
-function TaskComposer({ mode, roomId, onMode, text, onText, peers, selectedPeerId, onPeer, disabled, task, onFiles, onSend, onDeveloper }: {
-  mode: "send" | "task";
+type ComposerMode = "send" | "task" | "find";
+
+function TaskComposer({ mode, roomId, onMode, text, onText, peers, selectedPeerId, onPeer, disabled, route, task, onFiles, onSend, onDeveloper }: {
+  mode: ComposerMode;
   roomId: string;
-  onMode: (mode: "send" | "task") => void;
+  onMode: (mode: ComposerMode) => void;
   text: string;
   onText: (text: string) => void;
   peers: ReturnType<typeof roomPeers>;
   selectedPeerId: string;
   onPeer: (id: string) => void;
   disabled: boolean;
+  route: BridgeRoute | null;
   task: AgentTaskController;
   onFiles: () => void;
   onSend: () => void;
@@ -217,17 +222,19 @@ function TaskComposer({ mode, roomId, onMode, text, onText, peers, selectedPeerI
     <section className="v2-composer">
       {mode === "send" ? (
         <textarea value={text} onChange={(event) => onText(event.target.value)} placeholder="Paste text or image, or drop files here…" aria-label="Send message" />
+      ) : mode === "find" ? (
+        <RemoteFileFinder roomId={roomId} peerName={peers.find((peer) => peer.peerSessionId === selectedPeerId)?.displayName ?? null} route={route} />
       ) : (
         <NativeAgentTaskCard roomId={roomId} peers={peers} />
       )}
       <div className="v2-composer-controls">
         <button type="button" className="v2-square-button" disabled={mode === "send" && disabled} onClick={mode === "send" ? onFiles : undefined}>＋</button>
-        <label className="v2-mode-select"><select value={mode} onChange={(event) => onMode(event.target.value as "send" | "task")}><option value="send">Send</option><option value="task">Task</option></select></label>
-        {mode === "send" ? (
+        <label className="v2-mode-select"><select value={mode} onChange={(event) => onMode(event.target.value as ComposerMode)}><option value="send">Send</option><option value="find">Find file</option><option value="task">Task</option></select></label>
+        {mode === "find" ? <label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label> : mode === "send" ? (
           <><label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label><button type="button" className="v2-developer-button" disabled={!peers.length} onClick={onDeveloper}>Developer Mode</button><button type="button" className="v2-send-button" disabled={disabled || !text.trim()} onClick={onSend}>↑</button></>
         ) : <><span className="v2-plan-scope">Device → Agent → Task</span></>}
       </div>
-      <small className="v2-composer-help">{mode === "send" ? "Send mode targets one selected device. Developer Mode is human-only current-session terminal access; it does not grant Agent, Plan, or Execute authority." : "Agent Tasks use the whole Plan scope when opening an existing Plan. Native Agents own their workspace, authentication, tools, sandbox, and context; Pastey only observes their lifecycle."}</small>
+      <small className="v2-composer-help">{mode === "find" ? "Find file searches only the places you choose on the selected device and sends only the file you pick to this device's Inbox. It never moves a project or workspace." : mode === "send" ? "Send mode targets one selected device. Developer Mode is human-only current-session terminal access; it does not grant Agent, Plan, or Execute authority." : "Agent Tasks use the whole Plan scope when opening an existing Plan. Native Agents own their workspace, authentication, tools, sandbox, and context; Pastey only observes their lifecycle."}</small>
     </section>
   );
 }

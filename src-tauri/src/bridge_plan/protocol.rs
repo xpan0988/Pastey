@@ -2611,6 +2611,99 @@ mod tests {
     }
 
     #[test]
+    fn an_authorized_folder_search_with_inbox_delivery_grants_only_its_label() {
+        let paths = paths();
+        let conn = super::super::connection(&paths).unwrap();
+        init_schema(&conn).unwrap();
+        let now = crate::storage::now_ts();
+        let compose = |scopes: Vec<String>| {
+            super::super::build_composed_file_revision(
+                "bridge".into(),
+                "requester".into(),
+                "receiver".into(),
+                "Find the validation MP4 and send it to this device's Inbox.".into(),
+                vec![
+                    super::super::ComposedFilePlanBlock::Search {
+                        execution_device_ref: "receiver".into(),
+                        filename_hint: "validation".into(),
+                        extensions: vec!["mp4".into()],
+                        safe_scope_labels: scopes,
+                    },
+                    super::super::ComposedFilePlanBlock::Transfer {
+                        source_device_ref: "receiver".into(),
+                        destination_device_ref: "requester".into(),
+                        landing: super::super::ComposedTransferLanding::Inbox,
+                    },
+                ],
+            )
+        };
+        // A requester can name the label, never a folder.
+        for scope in ["C:\\REPZ\\Saved", "/Users/someone/REPZ", "../REPZ", "repz"] {
+            assert!(compose(vec![scope.into()]).is_err(), "{scope}");
+        }
+        let revision =
+            compose(vec![crate::file_candidates::AUTHORIZED_FOLDERS_SCOPE.into()]).unwrap();
+        let approval = BridgePlanApproval {
+            approval_id: "approval".into(),
+            plan_id: revision.plan_id.clone(),
+            revision_id: revision.revision_id.clone(),
+            revision_hash: revision.revision_hash.clone(),
+            bridge_id: revision.bridge_id.clone(),
+            requester_device_ref: revision.requesting_device_ref.clone(),
+            selected_device_ref: revision.selected_device_ref.clone(),
+            expires_at: now + 600,
+        };
+        let review = review_request_payload(&approval, &revision).unwrap();
+        let authorities = ProtocolSearchAuthorityStore::default();
+        let mut candidates = crate::file_candidates::BridgePlanCandidateStore::default();
+        accept_inbound_protocol_event(
+            &paths,
+            &authorities,
+            &mut candidates,
+            "bridge_plan.review_request",
+            &outer(
+                "bridge_plan.review_request",
+                review.clone(),
+                "requester",
+                "receiver",
+            ),
+            now,
+        )
+        .unwrap();
+        let payload = review.as_object().unwrap();
+        let start = serde_json::json!({
+            "schemaVersion": PROTOCOL_VERSION,
+            "bridgeId": "bridge", "planId": revision.plan_id, "revisionId": revision.revision_id,
+            "revisionHash": revision.revision_hash, "requesterDeviceRef": "requester", "receiverDeviceRef": "receiver",
+            "approvalId": "approval", "attemptId": "attempt", "searchStep": payload["searchStep"].clone(),
+            "searchStepDigest": payload["searchStepDigest"].clone(), "attemptNonce": "attempt-nonce", "attemptExpiresAt": now + 600,
+        });
+        accept_inbound_protocol_event(
+            &paths,
+            &authorities,
+            &mut candidates,
+            "bridge_plan.attempt_start",
+            &outer("bridge_plan.attempt_start", start, "requester", "receiver"),
+            now,
+        )
+        .unwrap();
+        let grant =
+            consume_search_execution_grant(&paths, &authorities, "bridge", "attempt", now).unwrap();
+        assert_eq!(grant.extensions, vec!["mp4"]);
+        assert_eq!(
+            grant.safe_scope_labels,
+            vec![crate::file_candidates::AUTHORIZED_FOLDERS_SCOPE]
+        );
+        // Another Bridge, or a replay, gets nothing.
+        assert!(
+            consume_search_execution_grant(&paths, &authorities, "other", "attempt", now).is_err()
+        );
+        assert!(
+            consume_search_execution_grant(&paths, &authorities, "bridge", "attempt", now).is_err()
+        );
+    }
+
+    #[test]
     fn pipeline_private_input_is_one_use_and_bound_to_its_exact_attempt() {
         let paths = paths();
         let root = paths.temp_dir.join("pipeline-handoffs").join("transfer");

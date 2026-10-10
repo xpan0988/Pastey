@@ -302,3 +302,9 @@ button { color: inherit; }
   .v2-app-shell { grid-template-columns: 190px minmax(300px, 1fr) 250px; }
   .v2-settings-columns { grid-template-columns: 1fr; }
 }
+.v2-file-finder input { width: 100%; }
+.v2-finder-scopes { margin: 6px 0; padding: 0; border: 0; color: #c9c7cf; font-size: 11px; }
+.v2-finder-scopes label { display: block; margin-top: 2px; }
+.v2-finder-results { margin: 8px 0 0; padding: 0; list-style: none; }
+.v2-finder-results li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 0; border-top: 1px solid rgba(255, 255, 255, 0.06); }
+.v2-finder-results li span { min-width: 0; overflow-wrap: anywhere; }

@@ -1841,6 +1841,7 @@ fn execute_authored_search(
     let private_file = {
         let mut candidates = runtime.bridge_plan_candidate_store.lock();
         crate::file_candidates::resolve_bridge_plan_selected_file(
+            &runtime.paths,
             &mut candidates,
             &revision.bridge_id,
             revision.requester.as_str(),

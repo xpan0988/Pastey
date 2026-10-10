@@ -1,6 +1,10 @@
+import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import {
+  authorizeSearchFolder,
+  listAuthorizedSearchFolders,
+  revokeAuthorizedSearchFolder,
   checkManagedWorkerProviderHealth,
   createManagedWorkerProvider,
   deleteManagedWorkerProvider,
@@ -11,7 +15,7 @@ import {
   updateConfig,
   updateManagedWorkerProvider,
 } from "../../lib/tauri";
-import type { ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot } from "../../lib/tauri";
+import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot } from "../../lib/tauri";
 import type { AppConfig } from "../../lib/types";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
@@ -66,6 +70,7 @@ export function SettingsOverview({ config, onNavigate, onConfigChange }: Setting
             <SettingsRow title="Agent Plan approval" description="Requester review is always required for an immutable Draft." value="Always required" status="ready" />
             <SettingsRow title="Developer Mode admission" description="Separate human approval for this terminal session." value="Always required" status="ready" />
           </SettingsGroup>
+          <SharedSearchFolders />
           <SettingsGroup title="Discovery"><SettingsRow title="Local network discovery" description="Current discovery state is Host-owned." value="Not projected" /></SettingsGroup>
           <SettingsGroup title="Tasks">
             <SettingsRow title="Task features" description="Reviewed cross-device managed Plan workflow." value="Available when Host ready" />
@@ -83,6 +88,42 @@ export function SettingsOverview({ config, onNavigate, onConfigChange }: Setting
       {error ? <p className="v2-error" role="alert">{error}</p> : null}
     </SettingsFrame>
   );
+}
+
+/** Folders this device's user shares for other Bridge devices' file search.
+ * Sharing a folder lets a connected device find files in it by name and
+ * request one; it never lets that device browse, change or delete anything,
+ * and nothing it or an Agent sends can add a folder here. */
+function SharedSearchFolders() {
+  const [folders, setFolders] = useState<AuthorizedSearchFolder[] | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    void listAuthorizedSearchFolders().then(setFolders).catch(() => setFolders([]));
+  }, []);
+  async function add() {
+    setPending(true); setError(null);
+    try {
+      const chosen = await open({ directory: true, multiple: false });
+      if (typeof chosen !== "string") return;
+      await authorizeSearchFolder(chosen);
+      setFolders(await listAuthorizedSearchFolders());
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally { setPending(false); }
+  }
+  async function remove(folderId: string) {
+    setPending(true); setError(null);
+    try { setFolders(await revokeAuthorizedSearchFolder(folderId)); }
+    catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
+    finally { setPending(false); }
+  }
+  return <SettingsGroup title="Shared search folders">
+    <p className="v2-settings-note">Connected Bridge devices can find files in these folders by name and ask for one; you choose which folders. Nothing in them is changed or deleted.</p>
+    {folders === null ? <SettingsRow title="Shared folders" value="Checking…" /> : folders.length === 0 ? <SettingsRow title="No shared folders" description="Downloads, Desktop and Documents remain searchable as before." value="None" /> : folders.map((folder) => <div className="v2-settings-row" key={folder.folderId}><span><strong>{folder.displayName}</strong>{folder.unavailable ? <small>Moved or replaced; not searched.</small> : null}</span><button type="button" className="v2-button" disabled={pending} onClick={() => void remove(folder.folderId)}>Stop sharing</button></div>)}
+    <button type="button" className="v2-button" disabled={pending} onClick={() => void add()}>Share a folder…</button>
+    {error ? <p className="v2-error" role="alert">{error}</p> : null}
+  </SettingsGroup>;
 }
 
 export function DiagnosticsSettings({ onNavigate }: Pick<SettingsProps, "onNavigate">) {

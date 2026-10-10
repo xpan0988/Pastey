@@ -8,6 +8,8 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Added
 
+- Find file: from a Bridge, search another device for a file by name (for example a validation `.mp4`) and receive only the one you choose in this device's Inbox, through the existing reviewed Search → Select → encrypted Transfer flow. Nothing else moves and nothing on the other device changes. Results show name, size, modification time and a redacted location, and expire after 10 minutes.
+- Shared search folders: under Settings, a device's user can share specific folders (for example a project's output folder) for Find file, and stop sharing them. Other devices can only name "shared search folders", never a path. Folders too broad or private to share safely are refused.
 - A Codex conversation started through Pastey now survives a Pastey restart: a follow-up in the same workspace from the same requester reopens the same native conversation with Codex's `thread/resume`. The task card says whether a task continued the conversation or began a new one, and offers "Start a new conversation". If Codex cannot reopen the conversation, nothing runs and the card says so; Pastey never silently starts a new one. Conversations are bound to their requester (this device, or one peer device over one Bridge) and are forgotten when that Bridge is burned.
 - Native capability invocation is now capability-neutral. Core dispatches each invocation by capability ID to a registered adapter that owns its input, start, stop, and terminal output; Core keeps task identity, ownership, admission, status, cancellation, reconciliation, restart recovery, Bridge authority, and the durable envelope. Codex is the only shipped adapter. A capability-neutral `pastey-native-agent-invoke-v2` invocation and its `start_remote_native_capability_task` command exist without a renderer entry point yet.
 - Native capability input and terminal output are opaque, capability-owned payloads bounded to 16 KiB. Core carries, persists, compares, and digests them without interpreting them, and Room Control's field-name safety check skips exactly those payload subtrees while still checking every other field.
@@ -23,6 +25,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- A Bridge search result is no longer sent if the file was replaced with another file of the same size and modification time after it was found.
 - Cancelling a remote Codex task that was in flight when the executing device restarted now releases its workspace instead of leaving it blocked.
 - Starting a Codex task no longer holds the native service lock while Codex launches and opens its session, so status, cancellation, and remote status updates stay responsive; Codex availability is cached briefly and rechecked before each new session.
 - A long or malformed Codex app-server line no longer ends task observation or releases the workspace early.

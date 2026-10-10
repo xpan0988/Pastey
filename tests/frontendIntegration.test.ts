@@ -23,7 +23,8 @@ import {
   nativeAgentConversationLabel,
   nativeAgentConversationUnavailable,
 } from "../src/features/workspace/AgentTaskLifecycle";
-import type { FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../src/lib/types";
+import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
+import { availableRevisionId, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 
 function room(peerConnected: boolean): RoomInfo {
   return {
@@ -553,4 +554,76 @@ test("Continued and new Agent conversations are shown only once confirmed", () =
   assert.match(bindings, /invoke\("start_native_codex_task", \{ workspace, task, newConversation \}\)/);
   assert.match(bindings, /conversation\?: "new" \| "continued" \| null;/);
   assert.doesNotMatch(bindings, /threadId/);
+});
+
+function planEvent(kind: string, payload: Record<string, unknown>): ReceivedRoomControlEvent {
+  return {
+    eventId: `event-${Math.random()}`,
+    kind,
+    roomRef: "room",
+    sourceDeviceRef: "windows",
+    targetPeerRef: "mac",
+    createdAt: "2026-10-10T00:00:00Z",
+    expiresAt: "2026-10-10T00:10:00Z",
+    receivedAt: "2026-10-10T00:00:01Z",
+    event: { payload },
+  };
+}
+
+test("Find file composes only a Search on the other device and a Transfer of the chosen file to this Inbox", () => {
+  const found = remoteFindBlocks({ filenameHint: " validation ", extension: ".MP4", scopes: ["documents", "authorized_folders"] });
+  assert.equal(found.error, null);
+  assert.deepEqual(found.blocks, [
+    { primitive: "Search", executionDevice: "selected_device", filenameHint: "validation", extension: "mp4", safeScopes: ["authorized_folders", "documents"] },
+    { primitive: "Transfer", source: "selected_device", destination: "requesting_device", landingMode: "final_delivery" },
+  ]);
+  // A path (for example one an Agent mentioned) is never a search target.
+  for (const filenameHint of ["C:\\REPZ\\Saved\\clip.mp4", "/Users/me/REPZ/clip.mp4", "../clip.mp4", "", "   ", "..."]) {
+    assert.equal(remoteFindBlocks({ filenameHint, extension: "mp4", scopes: ["authorized_folders"] }).blocks, null, filenameHint);
+  }
+  assert.equal(remoteFindBlocks({ filenameHint: "clip", extension: "mp4/../x", scopes: ["authorized_folders"] }).blocks, null);
+  assert.equal(remoteFindBlocks({ filenameHint: "clip", extension: "mp4", scopes: [] }).blocks, null);
+  // Only the finder's own places can be named.
+  assert.equal(remoteFindBlocks({ filenameHint: "clip", extension: "", scopes: ["pastey_shared"] }).blocks, null);
+  assert.equal(availableRevisionId({ plans: [], revisions: [{ revision: { revision_id: "old" }, state: "withdrawn" }, { revision: { revision_id: "r2" }, state: "available" }], approvals: [], attempts: [], activities: [], results: [] }), "r2");
+});
+
+test("Find file follows exactly its own attempt from search to Inbox delivery", () => {
+  const candidate = (attemptId: string, candidateId: string, displayName: string) => planEvent("bridge_plan.step_result", {
+    attemptId,
+    stepId: "search",
+    safeResult: { summary: "found", candidates: [{ candidateId, displayName, extension: "mp4", mimeFamily: "media", sizeBytes: 1024, matchReason: "filename_substring_match", redactedLocation: "ValidationCaptures/.../walk.mp4", modifiedAt: "2026-10-10T00:00:00Z", confidence: "medium" }] },
+  });
+  const workspace = (state: string, results: unknown[] = []) => ({ plans: [], revisions: [], approvals: [], attempts: [{ attempt: { attempt_id: "mine" }, state }], activities: [], results });
+  assert.deepEqual(remoteFindProgress("mine", workspace("running"), [], null), { phase: "searching" });
+  const events = [candidate("other", "c-other", "other.mp4"), candidate("mine", "c-mine", "walk.mp4"), candidate("mine", "c-bad", "../../etc/passwd")];
+  const listed = remoteFindProgress("mine", workspace("running"), events, null);
+  assert.equal(listed.phase, "candidates");
+  assert.deepEqual(listed.phase === "candidates" ? listed.candidates.map((entry) => entry.candidateId) : [], ["c-mine"]);
+  assert.deepEqual(remoteFindProgress("mine", workspace("running"), [planEvent("bridge_plan.step_result", { attemptId: "mine", stepId: "search", safeResult: { summary: "none", candidates: [] } })], null), { phase: "no_matches" });
+  const failed = remoteFindProgress("mine", workspace("failed"), [planEvent("bridge_plan.step_failed", { attemptId: "mine", stepId: "search", failureCode: "no_searchable_scopes" })], null);
+  assert.equal(failed.phase, "search_failed");
+  assert.match(failed.phase === "search_failed" ? failed.message : "", /Shared search folders/);
+  assert.deepEqual(remoteFindProgress("mine", workspace("running"), events, "c-mine"), { phase: "sending" });
+  // Delivered only once the attempt completed with its Transfer result.
+  assert.deepEqual(remoteFindProgress("mine", workspace("running", [{ attempt_id: "mine", step_id: "transfer", summary: "Transfer completed." }]), events, "c-mine"), { phase: "sending" });
+  assert.deepEqual(remoteFindProgress("mine", workspace("completed", [{ attempt_id: "mine", step_id: "search", summary: "found" }, { attempt_id: "mine", step_id: "transfer", summary: "Transfer completed." }]), events, "c-mine"), { phase: "delivered", summary: "Transfer completed." });
+  assert.deepEqual(remoteFindProgress("mine", workspace("completed", [{ attempt_id: "other", step_id: "transfer", summary: "x" }]), events, "c-mine"), { phase: "sending" });
+  assert.equal(remoteFindProgress("mine", workspace("interrupted"), events, "c-mine").phase, "transfer_failed");
+});
+
+test("Find file and shared folders keep paths and authority on the searched device", () => {
+  const finder = readFileSync("src/features/workspace/RemoteFileFinder.tsx", "utf8");
+  const settings = readFileSync("src/features/workspace/SettingsScreens.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.doesNotMatch(finder, /innerHTML|sourcePath|createDirectFileTransferBridgePlan|propose.*Movement/);
+  assert.match(finder, /selectBridgePlanSearchCandidate\(roomId, attemptId, candidateId, controlRoute\)/);
+  assert.match(finder, /approveBridgePlan\(revisionId, approvalId\)/);
+  assert.match(card, /<option value="find">Find file<\/option>/);
+  // A folder is shared only from this device's own folder picker.
+  assert.match(settings, /open\(\{ directory: true, multiple: false \}\)/);
+  assert.match(bindings, /invoke\("authorize_search_folder", \{ path \}\)/);
+  const folderType = bindings.slice(bindings.indexOf("export interface AuthorizedSearchFolder"), bindings.indexOf("export function listAuthorizedSearchFolders"));
+  assert.doesNotMatch(folderType, /path/i);
 });
