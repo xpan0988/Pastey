@@ -129,7 +129,7 @@ test("natural Search to Transfer keeps an explicit filename separate from the tr
     primitive: "Search",
     filenameHint: "Funding Statement.pdf",
     extensions: ["pdf"],
-    safeScopes: ["downloads", "desktop", "documents", "pastey_shared"],
+    safeScopes: ["authorized_folders"],
   });
   assert.deepEqual(transfer, {
     primitive: "Transfer",
@@ -139,7 +139,7 @@ test("natural Search to Transfer keeps an explicit filename separate from the tr
   assert.equal(isSupportedBridgePlanAdvisory(plan), true);
 });
 
-test("Windows Downloads paths narrow Search to the reviewed scope and basename", () => {
+test("Windows Downloads paths contribute only their basename; Search stays in shared folders", () => {
   const plan = buildDeterministicAskBridgeNaturalV1Plan(
     "Find C:\\Users\\admin\\Downloads\\INFO2222-2026-PD.pdf on the selected device.",
   );
@@ -149,7 +149,7 @@ test("Windows Downloads paths narrow Search to the reviewed scope and basename",
     primitive: "Search",
     filenameHint: "INFO2222-2026-PD.pdf",
     extensions: ["pdf"],
-    safeScopes: ["downloads"],
+    safeScopes: ["authorized_folders"],
   });
   assert.equal(validateAskBridgeNaturalV1Plan(plan).valid, true);
 });
@@ -161,7 +161,7 @@ test("an arbitrary absolute path never becomes Search authority", () => {
   const search = plan.steps[0];
   assert.equal(search.primitive, "Search");
   assert.equal(search.filenameHint, "report.pdf");
-  assert.deepEqual(search.safeScopes, ["downloads", "desktop", "documents", "pastey_shared"]);
+  assert.deepEqual(search.safeScopes, ["authorized_folders"]);
   assert.equal(JSON.stringify(plan).includes("Sensitive"), false);
   assert.equal(JSON.stringify(plan).includes("C:\\"), false);
 });
@@ -215,10 +215,12 @@ test("zero-result Search is a successful terminal completion that replaces runna
 });
 
 test("manual composer preserves bounded Search metadata in the authored blocks", () => {
-  const search = updateSearchBlock(newSearchBlock(), { filenameHint: " Funding Statement.txt ", extension: "TXT", safeScopes: ["downloads"] });
+  const search = updateSearchBlock(newSearchBlock(), { filenameHint: " Funding Statement.txt ", extension: "TXT", safeScopes: ["authorized_folders"] });
   const result = manualBridgePlanInput([search]);
   assert.deepEqual(result.value?.blocks[0], { ...search, filenameHint: "Funding Statement.txt" });
-  assert.deepEqual(SAFE_SEARCH_SCOPES.map((scope) => scope.value), ["downloads", "desktop", "documents", "pastey_shared"]);
+  // Another device searches only folders its user shared with this Bridge.
+  assert.deepEqual(SAFE_SEARCH_SCOPES.map((scope) => scope.value), ["authorized_folders"]);
+  assert.deepEqual(newSearchBlock().safeScopes, ["authorized_folders"]);
 });
 
 test("Search@Windows → Transform@Windows preserves locality and contains no Transfer", () => {

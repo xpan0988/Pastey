@@ -8,7 +8,7 @@ import type { AiGenerateResult, CloudOpenAICompatibleProviderConfig } from "./ty
  * object resolution, destinations, and execution authority. */
 export type AskBridgePrimitive = "Search" | "Transform" | "Transfer" | "Execute";
 export type AskBridgeNaturalV1Status = "supported" | "unsupported_future";
-export type AskBridgeSafeScope = "downloads" | "desktop" | "documents" | "pastey_shared";
+export type AskBridgeSafeScope = "downloads" | "desktop" | "documents" | "pastey_shared" | "authorized_folders";
 
 export interface AskBridgeNaturalV1SearchStep {
   primitive: "Search";
@@ -74,7 +74,11 @@ const SEARCH_FIELDS = new Set(["primitive", "filenameHint", "extensions", "safeS
 const TRANSFORM_FIELDS = new Set(["primitive", "modificationIntent"]);
 const TRANSFER_FIELDS = new Set(["primitive", "destination", "object"]);
 const EXECUTE_FIELDS = new Set(["primitive", "executionIntent"]);
-const SAFE_SCOPES = new Set<AskBridgeSafeScope>(["downloads", "desktop", "documents", "pastey_shared"]);
+const SAFE_SCOPES = new Set<AskBridgeSafeScope>(["downloads", "desktop", "documents", "pastey_shared", "authorized_folders"]);
+/** The selected device searches only folders its user shared with this
+ * Bridge; it refuses its built-in places, so a path naming one only
+ * contributes its filename. */
+const SHARED_FOLDERS: AskBridgeSafeScope[] = ["authorized_folders"];
 const FORBIDDEN_NATURAL_FIELD_NAMES = new Set([
   "command",
   "cmd",
@@ -384,23 +388,19 @@ function buildSearchStep(userRequest: string): AskBridgeNaturalV1SearchStep {
     primitive: "Search",
     filenameHint: pathMetadata?.filenameHint ?? extractFilenameHint(userRequest, extensions),
     extensions,
-    safeScopes: pathMetadata?.safeScope ? [pathMetadata.safeScope] : ["downloads", "desktop", "documents", "pastey_shared"],
+    safeScopes: [...SHARED_FOLDERS],
   };
 }
 
-function extractReviewedPathMetadata(value: string): { filenameHint: string; safeScope?: AskBridgeSafeScope } | null {
-  // A path is only a filename hint. It never crosses into the plan as a root
-  // or permission; an explicit reviewed-folder segment can merely narrow the
-  // existing labels already accepted by the host.
+function extractReviewedPathMetadata(value: string): { filenameHint: string } | null {
+  // A path is only a filename hint. It never crosses into the plan as a root,
+  // a permission or a place to search.
   const path = value.match(/(?:[a-z]:)?[\\/][^\s"'<>]*/i)?.[0]?.replace(/[),.;!?]+$/, "");
   if (!path) return null;
   const segments = path.split(/[\\/]+/).filter(Boolean);
   const filenameHint = segments[segments.length - 1];
   if (!filenameHint || !/^[a-z0-9][a-z0-9._ -]{0,127}$/i.test(filenameHint)) return null;
-  const safeScope = segments
-    .map((segment) => segment.toLowerCase())
-    .find((segment): segment is AskBridgeSafeScope => SAFE_SCOPES.has(segment as AskBridgeSafeScope));
-  return { filenameHint, safeScope };
+  return { filenameHint };
 }
 
 function extractExtensions(value: string): string[] {

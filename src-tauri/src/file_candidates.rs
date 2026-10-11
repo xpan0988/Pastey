@@ -220,7 +220,17 @@ pub struct BridgePlanSearchRequest {
     pub extensions: Vec<String>,
     pub safe_scope_labels: Vec<String>,
     pub expires_at: String,
+    /// The search was requested by this Host's own user (its own Plan's
+    /// Search on itself, such as the Bridge Device Check), not by a peer.
+    /// Only then may it use this Host's built-in places; a peer's search
+    /// reaches only folders this Host's user shared with that Bridge.
+    pub requested_by_this_host: bool,
 }
+
+/// Built-in places a Host's own Plans may search on itself. Another device
+/// never searches them: it reaches only folders this Host's user shared
+/// with that Bridge (`AUTHORIZED_FOLDERS_SCOPE`).
+const HOST_LOCAL_SCOPES: [&str; 4] = ["downloads", "desktop", "documents", "pastey_shared"];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -323,6 +333,8 @@ pub struct BridgePlanCandidateEntry {
     room_ref: String,
     requester_device_ref: String,
     receiver_device_ref: String,
+    /// Copied from the search that found it; see `BridgePlanSearchRequest`.
+    requested_by_this_host: bool,
 }
 
 /// Private candidate and ObjectRef bindings for live Bridge Plan Search.
@@ -703,6 +715,19 @@ fn resolve_scope(
     request: &BridgePlanSearchRequest,
     omitted: &mut FileCandidateOmitted,
 ) -> Option<SearchScope> {
+    // A peer never searches this Host's built-in places, whatever its
+    // approved Plan names: only folders shared with its Bridge.
+    if HOST_LOCAL_SCOPES.contains(&label) && !request.requested_by_this_host {
+        omitted.scopes_skipped.push(label.to_string());
+        log_search_scope(
+            request,
+            "search_scope_unavailable",
+            label,
+            false,
+            "scope_not_shared_with_bridge",
+        );
+        return None;
+    }
     let known_folder_resolved = matches!(label, "downloads" | "desktop" | "documents")
         && scope_roots.root_for(label).is_some();
     let root = if label == "pastey_shared" {
@@ -942,6 +967,7 @@ impl BridgePlanCandidateStore {
                 room_ref: request.room_ref.clone(),
                 requester_device_ref: request.requester_device_ref.clone(),
                 receiver_device_ref: request.receiver_device_ref.clone(),
+                requested_by_this_host: request.requested_by_this_host,
             };
             self.entries.insert(key, entry);
         }
@@ -1214,6 +1240,12 @@ pub(crate) fn resolve_bridge_plan_selected_file(
             "Bridge Plan candidate changed.".into(),
         ));
     }
+    // Only this Host's own search may hand out a file from a built-in place.
+    if entry.scope_label != AUTHORIZED_FOLDERS_SCOPE && !entry.requested_by_this_host {
+        return Err(AppError::InvalidInput(
+            "This file is not in a folder shared with this Bridge.".into(),
+        ));
+    }
     // A folder's authorization ends for its found files too.
     if entry.scope_label == AUTHORIZED_FOLDERS_SCOPE
         && !current_authorized_search_roots(paths, &entry.room_ref)?
@@ -1316,6 +1348,16 @@ mod tests {
             expires_at: (OffsetDateTime::now_utc() + time::Duration::minutes(1))
                 .format(&Rfc3339)
                 .unwrap(),
+            requested_by_this_host: false,
+        }
+    }
+
+    /// A search this Host's own user requested on itself (the only kind
+    /// that may use its built-in places).
+    fn own_request(scopes: Vec<&str>, filename_hint: &str) -> BridgePlanSearchRequest {
+        BridgePlanSearchRequest {
+            requested_by_this_host: true,
+            ..request(scopes, filename_hint)
         }
     }
 
@@ -1338,7 +1380,7 @@ mod tests {
             "downloads",
             &paths,
             &roots,
-            &request(vec!["downloads"], "report.pdf"),
+            &own_request(vec!["downloads"], "report.pdf"),
             &mut omitted,
         )
         .unwrap();
@@ -1357,7 +1399,7 @@ mod tests {
             ..Default::default()
         };
         let (result, _) = execute_bridge_plan_search_internal_with_roots(
-            request(vec!["downloads", "desktop"], "missing.pdf"),
+            own_request(vec!["downloads", "desktop"], "missing.pdf"),
             &paths,
             &roots,
         )
@@ -1371,7 +1413,7 @@ mod tests {
     fn missing_all_reviewed_scopes_returns_the_safe_failure_code() {
         let paths = test_paths();
         let (result, _) = execute_bridge_plan_search_internal_with_roots(
-            request(vec!["downloads"], "missing.pdf"),
+            own_request(vec!["downloads"], "missing.pdf"),
             &paths,
             &ReviewedScopeRoots::default(),
         )
@@ -1392,7 +1434,7 @@ mod tests {
             ..Default::default()
         };
         let (result, _) = execute_bridge_plan_search_internal_with_roots(
-            request(vec!["downloads"], "info2222-2026-pd.pdf"),
+            own_request(vec!["downloads"], "info2222-2026-pd.pdf"),
             &paths,
             &roots,
         )
@@ -1620,6 +1662,115 @@ mod tests {
         assert!(list_authorized_search_folders(&fixture.paths)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_peer_never_searches_built_in_places_without_a_shared_folder() {
+        let paths = test_paths();
+        crate::storage::init_database(&paths).unwrap();
+        let built_in = paths.app_data_dir.join("private-root");
+        for place in ["Downloads", "Desktop", "Documents"] {
+            fs::create_dir_all(built_in.join(place)).unwrap();
+            fs::write(built_in.join(place).join("validation.mp4"), b"mp4").unwrap();
+        }
+        fs::create_dir_all(paths.app_data_dir.join("shared")).unwrap();
+        fs::write(
+            paths.app_data_dir.join("shared").join("validation.mp4"),
+            b"mp4",
+        )
+        .unwrap();
+        let roots = ReviewedScopeRoots {
+            downloads: Some(built_in.join("Downloads")),
+            desktop: Some(built_in.join("Desktop")),
+            documents: Some(built_in.join("Documents")),
+        };
+        let every_place = vec!["downloads", "desktop", "documents", "pastey_shared"];
+        let peer = BridgePlanSearchRequest {
+            extensions: vec!["mp4".into()],
+            ..request(every_place.clone(), "validation")
+        };
+        // A peer's approved Plan may name them; the searched Host refuses
+        // them all, so nothing is found, and says why.
+        let (result, discovered) =
+            execute_bridge_plan_search_internal_with_roots(peer.clone(), &paths, &roots).unwrap();
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.error_code.as_deref(), Some("no_searchable_scopes"));
+        assert!(discovered.is_empty());
+        // Also beside an existing shared-folders label with no folder shared.
+        let (result, _) = execute_bridge_plan_search_internal_with_roots(
+            BridgePlanSearchRequest {
+                safe_scope_labels: vec![AUTHORIZED_FOLDERS_SCOPE.into(), "downloads".into()],
+                ..peer.clone()
+            },
+            &paths,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(result.status, "failed");
+        // This Host's own search on itself still reaches them.
+        let (result, discovered) = execute_bridge_plan_search_internal_with_roots(
+            BridgePlanSearchRequest {
+                requested_by_this_host: true,
+                ..peer
+            },
+            &paths,
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(result.status, "completed");
+        assert_eq!(discovered.len(), 4);
+        fs::remove_dir_all(paths.app_data_dir).unwrap();
+    }
+
+    #[test]
+    fn a_built_in_place_candidate_is_never_handed_to_a_peer() {
+        let fixture = authorized_fixture();
+        let downloads = fixture.outside.join("Downloads");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::write(downloads.join("private_validation.mp4"), b"private").unwrap();
+        let roots = ReviewedScopeRoots {
+            downloads: Some(downloads),
+            ..ReviewedScopeRoots::default()
+        };
+        // A candidate found by this Host's own search, then requested by a
+        // peer's selection with the same correlation, is refused.
+        let own = BridgePlanSearchRequest {
+            requested_by_this_host: true,
+            safe_scope_labels: vec!["downloads".into()],
+            ..video_request("own1", "private_validation")
+        };
+        let (_, discovered) =
+            execute_bridge_plan_search_internal_with_roots(own.clone(), &fixture.paths, &roots)
+                .unwrap();
+        assert_eq!(discovered.len(), 1);
+        let mut store = BridgePlanCandidateStore::default();
+        let peer = BridgePlanSearchRequest {
+            requested_by_this_host: false,
+            ..own
+        };
+        let candidate = discovered[0].public.candidate_id.clone();
+        store
+            .store_discovered_candidates(&peer, discovered)
+            .unwrap();
+        let error = resolve(&fixture, &mut store, "own1", &candidate).unwrap_err();
+        assert!(
+            error.message().contains("not in a folder shared"),
+            "{}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn burning_a_bridge_ends_search_and_selection_in_its_shared_folders() {
+        let fixture = authorized_fixture();
+        let mut store = BridgePlanCandidateStore::default();
+        let found = search(&fixture, "b1", "lighting", &mut store);
+        let candidate = found.candidates[0].candidate_id.clone();
+        crate::storage::burn_room(&fixture.paths, "bridge", &fixture.paths.inbox_dir).unwrap();
+        assert!(resolve(&fixture, &mut store, "b1", &candidate).is_err());
+        let after = search(&fixture, "b2", "lighting", &mut store);
+        assert_eq!(after.status, "failed");
+        assert_eq!(after.error_code.as_deref(), Some("no_searchable_scopes"));
     }
 
     #[test]

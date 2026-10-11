@@ -599,15 +599,29 @@ pub async fn send_room_file_to_bridge_peer_endpoint(
         None,
         None,
         crate::transfer_orchestration::TransferCapacityOrigin::Ordinary,
+        None,
     )
     .await
 }
 
+/// The exact file a managed Transfer was approved to send: its approved
+/// scope and the identity captured when it was selected.
+pub(crate) struct ExpectedTransferSourceV1 {
+    pub(crate) scope_root: PathBuf,
+    pub(crate) identity: crate::safe_file_identity::SourceIdentity,
+}
+
+/// Sends one selected file of a Bridge Plan. It is opened once, without
+/// following links and only inside its approved scope, and sent only if it
+/// is still the exact file selected; its bytes come from that descriptor, so
+/// replacing the path afterwards (for example with a link to a file outside
+/// the shared folder) cannot change what is read.
 pub(crate) async fn send_managed_room_file_to_bridge_peer_endpoint(
     state: Arc<AppState>,
     room_id: &str,
     item_id: &str,
     file_path: &Path,
+    source: ExpectedTransferSourceV1,
     queue_item_id: Option<String>,
     requested_window: Option<usize>,
     endpoint: BridgePeerTransferEndpoint,
@@ -625,6 +639,7 @@ pub(crate) async fn send_managed_room_file_to_bridge_peer_endpoint(
         None,
         None,
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
+        Some(source),
     )
     .await
 }
@@ -652,6 +667,7 @@ pub async fn send_room_file_to_bridge_peer_endpoint_with_landing(
         None,
         None,
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
+        None,
     )
     .await
 }
@@ -683,6 +699,7 @@ pub(crate) async fn send_native_v2_managed_revision_to_current_remote_session(
         None,
         None,
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
+        None,
     )
     .await
 }
@@ -719,6 +736,7 @@ pub(crate) async fn send_native_agent_workspace_to_current_remote_session(
         Some(metadata),
         Some(final_receipt_ambiguous.clone()),
         crate::transfer_orchestration::TransferCapacityOrigin::Managed,
+        None,
     )
     .await;
     result.map_err(|error| NativeAgentWorkspaceTransferFailure {
@@ -740,14 +758,35 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
     native_agent_workspace_transfer: Option<crate::native_agent::NativeAgentWorkspaceTransferV1>,
     final_receipt_ambiguous: Option<Arc<AtomicBool>>,
     capacity_origin: crate::transfer_orchestration::TransferCapacityOrigin,
+    expected_source: Option<ExpectedTransferSourceV1>,
 ) -> AppResult<()> {
     let room = storage::get_room_by_id(&state.paths, room_id)?;
     if room.status == RoomStatus::Burned {
         return Err(AppError::InvalidInput(ROOM_BURNED_MESSAGE.into()));
     }
-    let metadata = tokio::fs::metadata(file_path)
-        .await
-        .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
+    // An approved source is opened once, here, and read only through this
+    // descriptor; `verified_check` re-checks it after the last read.
+    let (verified_source, verified_check) = match &expected_source {
+        Some(expected) => {
+            let source = crate::safe_file_identity::open_source_if_identity_matches(
+                file_path,
+                &expected.scope_root,
+                &expected.identity,
+            )
+            .map_err(|_| {
+                AppError::InvalidInput("The selected file changed before Transfer started.".into())
+            })?;
+            let check = source.try_clone()?;
+            (Some(source), Some(check))
+        }
+        None => (None, None),
+    };
+    let metadata = match &verified_source {
+        Some(source) => source.metadata()?,
+        None => tokio::fs::metadata(file_path)
+            .await
+            .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?,
+    };
     storage::validate_file_size(metadata.len())?;
 
     let item = storage::get_room_item_by_id(&state.paths, item_id)?;
@@ -923,9 +962,12 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         }
     };
 
-    let mut file = tokio::fs::File::open(file_path)
-        .await
-        .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?;
+    let mut file = match verified_source {
+        Some(source) => tokio::fs::File::from_std(source),
+        None => tokio::fs::File::open(file_path)
+            .await
+            .map_err(|_| AppError::InvalidInput("Could not read selected file.".into()))?,
+    };
     let mut buffer = vec![0u8; chunk_size];
     let started_at = Instant::now();
     let mut last_report_at = started_at;
@@ -1203,6 +1245,15 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             );
             last_report_at = now;
             last_report_bytes = transferred;
+        }
+    }
+
+    if let (Some(check), Some(expected)) = (&verified_check, &expected_source) {
+        if !crate::safe_file_identity::source_still_matches(check, &expected.identity) {
+            let message = "The selected file changed while it was being sent.".to_string();
+            notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+            fail_transfer(&state, &transfer_id, item_id, message.clone());
+            return Err(AppError::InvalidInput(message));
         }
     }
 

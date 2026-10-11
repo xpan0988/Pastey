@@ -24,7 +24,7 @@ import {
   nativeAgentConversationUnavailable,
 } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
-import { availableRevisionId, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
+import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
@@ -577,8 +577,9 @@ function planEvent(kind: string, payload: Record<string, unknown>): ReceivedRoom
 test("Find file composes only a Search on the other device and a Transfer of the chosen file to this Inbox", () => {
   const found = remoteFindBlocks({ filenameHint: " validation ", extension: ".MP4", scopes: ["documents", "authorized_folders"] });
   assert.equal(found.error, null);
+  // Only shared folders: the other device refuses its built-in places.
   assert.deepEqual(found.blocks, [
-    { primitive: "Search", executionDevice: "selected_device", filenameHint: "validation", extension: "mp4", safeScopes: ["authorized_folders", "documents"] },
+    { primitive: "Search", executionDevice: "selected_device", filenameHint: "validation", extension: "mp4", safeScopes: ["authorized_folders"] },
     { primitive: "Transfer", source: "selected_device", destination: "requesting_device", landingMode: "final_delivery" },
   ]);
   // A path (for example one an Agent mentioned) is never a search target.
@@ -589,6 +590,11 @@ test("Find file composes only a Search on the other device and a Transfer of the
   assert.equal(remoteFindBlocks({ filenameHint: "clip", extension: "mp4", scopes: [] }).blocks, null);
   // Only the finder's own places can be named.
   assert.equal(remoteFindBlocks({ filenameHint: "clip", extension: "", scopes: ["pastey_shared"] }).blocks, null);
+  for (const builtIn of ["downloads", "desktop", "documents"] as const) {
+    assert.equal(remoteFindBlocks({ filenameHint: "clip", extension: "", scopes: [builtIn] }).blocks, null, builtIn);
+  }
+  assert.deepEqual(FINDER_SCOPES.map((scope) => scope.value), ["authorized_folders"]);
+  assert.match(readFileSync("src/features/workspace/SettingsScreens.tsx", "utf8"), /never searchable until you share a specific folder here for one Bridge/);
   assert.equal(availableRevisionId({ plans: [], revisions: [{ revision: { revision_id: "old" }, state: "withdrawn" }, { revision: { revision_id: "r2" }, state: "available" }], approvals: [], attempts: [], activities: [], results: [] }), "r2");
 });
 

@@ -7,11 +7,12 @@ export type ComposerDevice = "requesting_device" | "selected_device";
 export type ComposerTransferDestination = ComposerDevice | "pastey_shared";
 export type TransferLandingMode = "pipeline_handoff" | "final_delivery";
 
+/** What a Search on the selected device may name. That device searches only
+ * folders its own user shared with this Bridge and refuses its built-in
+ * places (Downloads, Desktop, Documents, Pastey Shared), so only shared
+ * folders are offered. The other labels remain readable in older revisions. */
 export const SAFE_SEARCH_SCOPES: ReadonlyArray<{ value: SafeSearchScope; label: string }> = [
-  { value: "downloads", label: "Downloads" },
-  { value: "desktop", label: "Desktop" },
-  { value: "documents", label: "Documents" },
-  { value: "pastey_shared", label: "Pastey Shared" },
+  { value: "authorized_folders", label: "Shared search folders" },
 ];
 
 export type LogicalObjectRevision = {
@@ -53,7 +54,7 @@ export type ManualBridgePlanInput = { blocks: ComposerBlock[]; originalUserGoal:
 export type ObjectFlowResult = { location: ComposerDevice | null; revision: number | null; error: string | null };
 
 export function newSearchBlock(): SearchBlock {
-  return { primitive: "Search", executionDevice: "selected_device", filenameHint: "", extension: "", safeScopes: ["downloads"] };
+  return { primitive: "Search", executionDevice: "selected_device", filenameHint: "", extension: "", safeScopes: ["authorized_folders"] };
 }
 
 export function newTransformBlock(executionDevice: ComposerDevice = "selected_device", revision = 1): TransformBlock {

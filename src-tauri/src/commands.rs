@@ -4525,6 +4525,10 @@ pub(crate) async fn execute_requester_bridge_plan_transfer_attempt_inner(
         &room_id,
         &item.id,
         &private_file.path,
+        transfer::ExpectedTransferSourceV1 {
+            scope_root: private_file.scope_root.clone(),
+            identity: private_file.identity.clone(),
+        },
         Some(format!("bridge-plan-transfer-{attempt_id}")),
         None,
         endpoint,
@@ -4749,6 +4753,8 @@ pub(crate) async fn execute_bridge_plan_search_attempt_inner(
         filename_hint: grant.filename_hint.clone(),
         extensions: grant.extensions.clone(),
         safe_scope_labels: grant.safe_scope_labels.clone(),
+        // A v1 Search grant always comes from the peer that requested it.
+        requested_by_this_host: false,
         expires_at: (created + Duration::seconds(BRIDGE_PLAN_CONTROL_LIFETIME_SECONDS))
             .format(&Rfc3339)
             .map_err(|error| error.to_string())?,
@@ -5011,6 +5017,10 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
                     &room_id,
                     &item.id,
                     &private_file.path,
+                    transfer::ExpectedTransferSourceV1 {
+                        scope_root: private_file.scope_root.clone(),
+                        identity: private_file.identity.clone(),
+                    },
                     Some(format!("bridge-plan-transfer-{}", grant.attempt_id)),
                     None,
                     endpoint,

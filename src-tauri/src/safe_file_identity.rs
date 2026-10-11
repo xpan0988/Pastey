@@ -394,6 +394,30 @@ pub(crate) fn stream_source_if_identity_matches(
     Ok(bytes)
 }
 
+/// Opens an exact, already-captured source for a caller that streams it
+/// itself (an encrypted Transfer): the same no-follow, scope-relative
+/// descriptor opening used to capture it, refused unless the opened file is
+/// the captured one. The caller reads only this descriptor, never the path
+/// again, and checks `source_still_matches` after the last read.
+pub(crate) fn open_source_if_identity_matches(
+    source_path: &Path,
+    scope_root: &Path,
+    expected: &SourceIdentity,
+) -> AppResult<File> {
+    let source = open_regular_source(source_path, scope_root)?;
+    if source_fingerprint(&source)? != expected.fingerprint {
+        return Err(AppError::InvalidInput(
+            "Safe file source identity is stale or mismatched.".into(),
+        ));
+    }
+    Ok(source)
+}
+
+/// Whether an opened source is still exactly the captured, unchanged file.
+pub(crate) fn source_still_matches(source: &File, expected: &SourceIdentity) -> bool {
+    source_fingerprint(source).is_ok_and(|current| current == expected.fingerprint)
+}
+
 /// Creates a fresh app-private tree through descriptor-relative/no-follow
 /// traversal. The returned path is still rescanned before it can become a
 /// managed binding.
@@ -919,6 +943,59 @@ mod tests {
         let path = scope.join("candidate.txt");
         fs::write(&path, b"approved bytes").unwrap();
         (scope, path)
+    }
+
+    /// The E2 race: a writer in the shared folder replaces the selected file
+    /// with a link to a file outside it, between the last identity check and
+    /// the moment Transfer reads. Transfer must never read the link target.
+    #[cfg(unix)]
+    #[test]
+    fn a_selected_file_swapped_for_a_link_is_never_read_through_it() {
+        use std::io::Read;
+        let (scope, path) = fixture();
+        let outside = scope.parent().unwrap().join("outside-secret.txt");
+        fs::write(&outside, b"SECRET OUTSIDE THE SCOPE").unwrap();
+        let identity = capture_source_identity(&path, &scope, 1024).unwrap();
+
+        // Swapped before Transfer opens it: refused, nothing is opened.
+        let swap = |path: &Path| {
+            fs::remove_file(path).unwrap();
+            std::os::unix::fs::symlink(&outside, path).unwrap();
+        };
+        swap(&path);
+        assert!(open_source_if_identity_matches(&path, &scope, &identity).is_err());
+
+        // Swapped after Transfer opened it: what is read is still exactly the
+        // selected file, never the link target.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"approved bytes").unwrap();
+        let identity = capture_source_identity(&path, &scope, 1024).unwrap();
+        let mut opened = open_source_if_identity_matches(&path, &scope, &identity).unwrap();
+        swap(&path);
+        let mut read = Vec::new();
+        opened.read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"approved bytes");
+        assert!(!String::from_utf8_lossy(&read).contains("SECRET"));
+        let _ = fs::remove_dir_all(scope.parent().unwrap());
+    }
+
+    #[test]
+    fn a_selected_file_rewritten_in_place_is_detected_before_transfer_finishes() {
+        let (scope, path) = fixture();
+        let identity = capture_source_identity(&path, &scope, 1024).unwrap();
+        let opened = open_source_if_identity_matches(&path, &scope, &identity).unwrap();
+        assert!(source_still_matches(&opened, &identity));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" and more")
+            .unwrap();
+        assert!(!source_still_matches(&opened, &identity));
+        // A stale identity is refused at open as well.
+        assert!(open_source_if_identity_matches(&path, &scope, &identity).is_err());
+        let _ = fs::remove_dir_all(scope.parent().unwrap());
     }
 
     #[test]

@@ -7,11 +7,11 @@ import { parseBridgePlanSearchCandidates, parseBridgePlanSearchTerminalResult, t
 import type { BridgePlanWorkspace } from "./tauri";
 import type { ReceivedRoomControlEvent } from "./types";
 
+/** Another device searches only folders its own user shared with this
+ * Bridge; it refuses its Downloads, Desktop, Documents and other built-in
+ * places, so they are not offered. */
 export const FINDER_SCOPES: ReadonlyArray<{ value: SafeSearchScope; label: string; detail: string }> = [
-  { value: "authorized_folders", label: "Shared search folders", detail: "Folders that device's user added in its Settings." },
-  { value: "downloads", label: "Downloads", detail: "" },
-  { value: "desktop", label: "Desktop", detail: "" },
-  { value: "documents", label: "Documents", detail: "" },
+  { value: "authorized_folders", label: "Shared search folders", detail: "Only folders that device's user shared with this Bridge in its Settings." },
 ];
 
 export interface RemoteFindInput {
@@ -111,7 +111,7 @@ export function remoteFindProgress(
 export function searchFailureMessage(code: string): string {
   switch (code) {
     case "no_searchable_scopes":
-      return "That device has none of the chosen places to search. To search a project folder, its user must add it under Settings → Shared search folders.";
+      return "That device has not shared any folder with this Bridge, so there is nowhere to search. On that device, its user must add the folder (for example a project's output folder) under Settings → Shared search folders and choose this Bridge.";
     case "search_timeout":
       return "The search took too long and stopped. Use a more specific file name.";
     default:

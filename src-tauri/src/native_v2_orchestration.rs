@@ -1822,6 +1822,10 @@ fn execute_authored_search(
         filename_hint: query.into(),
         extensions: Vec::new(),
         safe_scope_labels: safe_scope_labels.to_vec(),
+        // Host admission bound the requester: this Host for its own user's
+        // Plan, otherwise the authenticated peer, never this Host.
+        requested_by_this_host: crate::bridge_plan_v2::requester_host(&revision)?
+            == &runtime.local_host_ref,
         expires_at: (OffsetDateTime::now_utc() + Duration::seconds(120))
             .format(&Rfc3339)
             .map_err(|_| AppError::InvalidInput("Native v2 Search time is invalid.".into()))?,
