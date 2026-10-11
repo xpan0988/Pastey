@@ -7098,6 +7098,9 @@ done
         fs::write(
             &agent,
             r##"#!/bin/sh
+# Waits end with the test process ($PPID), this app-server shell ($$) or
+# its workspace, so no fixture process outlives its test, also on panic.
+fixture_alive() { kill -0 "$PPID" 2>/dev/null && kill -0 "$$" 2>/dev/null && [ -d "$PWD" ]; }
 if [ "$2" = "--help" ]; then exit 0; fi
 while IFS= read -r line; do
   case "$line" in
@@ -7106,7 +7109,7 @@ while IFS= read -r line; do
     *'"id":3'*)
       echo '{"id":3,"result":{"turn":{"id":"native-turn"}}}'
       touch "$PWD/turn-started"
-      while [ ! -f "$PWD/release-turn" ]; do sleep 0.01; done
+      while [ ! -f "$PWD/release-turn" ]; do fixture_alive || exit 0; sleep 0.01; done
       echo '{"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":"native-turn","items":[],"status":"completed","error":null}}}'
       touch "$PWD/terminal-sent"
       ;;
@@ -7158,6 +7161,9 @@ exit 1
         fs::create_dir(&workspace).unwrap();
         let agent = root.join("codex-scripted-fixture");
         let script = r#"#!/bin/sh
+# Waits end with the test process ($PPID), this app-server shell ($$) or
+# its workspace, so no fixture process outlives its test, also on panic.
+fixture_alive() { kill -0 "$PPID" 2>/dev/null && kill -0 "$$" 2>/dev/null && [ -d "$PWD" ]; }
 printf '%s\n' "$*" >> '{ROOT}/invocations'
 if [ "$1" = "--version" ]; then exit 0; fi
 if [ "$2" = "--help" ]; then exit 0; fi
@@ -7207,6 +7213,105 @@ done
             "task code never became {code:?}: {:?}",
             service.task_status(task_id).unwrap()
         )
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: &str) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_exit(pid_file: &Path) {
+        wait_for_file(pid_file);
+        let pid = fs::read_to_string(pid_file).unwrap().trim().to_owned();
+        for _ in 0..300 {
+            if !process_alive(&pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+        panic!("fixture wait {pid} outlived its owner");
+    }
+
+    /// A scripted app-server whose background (`bg`) and main-shell (`main`)
+    /// waits never end on their own.
+    #[cfg(unix)]
+    fn endless_wait_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        scripted_codex(
+            r#"    *bg*)
+      ( while [ ! -f "$PWD/never" ]; do fixture_alive || exit 0; sleep 0.01; done ) &
+      echo $! > "$PWD/waiter.pid"
+      ;;
+    *main*)
+      echo $$ > "$PWD/waiter.pid"
+      while [ ! -f "$PWD/never" ]; do fixture_alive || exit 0; sleep 0.01; done
+      ;;
+"#,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_waits_never_outlive_their_app_server_workspace_or_test() {
+        use std::io::Write as _;
+        // The app-server shell is killed, as Pastey's shutdown does.
+        let (root, workspace, agent) = endless_wait_fixture();
+        let mut child = std::process::Command::new(&agent)
+            .current_dir(&workspace)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"bg\n").unwrap();
+        wait_for_file(&workspace.join("waiter.pid"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        wait_for_process_exit(&workspace.join("waiter.pid"));
+        let _ = fs::remove_dir_all(root);
+
+        // The workspace is removed while a main-shell wait runs.
+        let (root, workspace, agent) = endless_wait_fixture();
+        let mut child = std::process::Command::new(&agent)
+            .current_dir(&workspace)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"main\n").unwrap();
+        wait_for_file(&workspace.join("waiter.pid"));
+        let pid = fs::read_to_string(workspace.join("waiter.pid")).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        for _ in 0..300 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "main wait {pid} survived"
+        );
+
+        // The process that started it goes away (a test that panicked
+        // without cleanup) while its workspace remains.
+        for wait in ["bg", "main"] {
+            let (root, workspace, agent) = endless_wait_fixture();
+            std::process::Command::new("/bin/sh")
+                .current_dir(&workspace)
+                .args([
+                    "-c",
+                    &format!("(echo {wait}; sleep 5) | '{}' & sleep 0.5", agent.display()),
+                ])
+                .status()
+                .unwrap();
+            wait_for_process_exit(&workspace.join("waiter.pid"));
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     fn wait_for_file(path: &Path) {
@@ -7360,7 +7465,7 @@ done
       {{ACK}}
       printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"m","text":"LATE-ANSWER","phase":"final_answer"}}}}}}'
       touch "$PWD/answer-sent"
-      ( while [ ! -f "$PWD/release-turn" ]; do sleep 0.01; done; {{COMPLETED}} ) &
+      ( while [ ! -f "$PWD/release-turn" ]; do fixture_alive || exit 0; sleep 0.01; done; {{COMPLETED}} ) &
       ;;
     *'turn/interrupt'*) touch "$PWD/interrupt-requested" ;;
 "#
@@ -7452,9 +7557,9 @@ done
       {{ACK}}
       printf '%s\n' '{{"id":7,"method":"item/fileChange/requestApproval","params":{{"threadId":"native-thread","turnId":"native-turn","itemId":"patch-1"}}}}'
       (
-        while [ ! -f "$PWD/resolve-approval" ]; do sleep 0.01; done
+        while [ ! -f "$PWD/resolve-approval" ]; do fixture_alive || exit 0; sleep 0.01; done
         printf '%s\n' '{{"method":"serverRequest/resolved","params":{{"threadId":"native-thread","requestId":7}}}}'
-        while [ ! -f "$PWD/finish-turn" ]; do sleep 0.01; done
+        while [ ! -f "$PWD/finish-turn" ]; do fixture_alive || exit 0; sleep 0.01; done
         printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"native-thread","turnId":"native-turn","item":{{"type":"agentMessage","id":"m","text":"Done after approval."}}}}}}'
         {{COMPLETED}}
       ) &
@@ -7494,7 +7599,7 @@ done
     fn slow_session_opening_never_holds_start_status_or_cancel() {
         let (root, workspace, agent) = scripted_codex(
             r#"    *'"id":1,'*)
-      while [ ! -f "$PWD/release-initialize" ]; do sleep 0.01; done
+      while [ ! -f "$PWD/release-initialize" ]; do fixture_alive || exit 0; sleep 0.01; done
       printf '%s\n' '{"id":1,"result":{}}'
       ;;
     *'"id":2,'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"native-thread"}}}' ;;
@@ -7997,6 +8102,9 @@ done
         fs::create_dir(&workspace).unwrap();
         let agent = root.join("codex-conversation-fixture");
         let script = r#"#!/bin/sh
+# Waits end with the test process ($PPID) or this app-server shell ($$);
+# deleting the fixture root ends them too.
+fixture_alive() { kill -0 "$PPID" 2>/dev/null && kill -0 "$$" 2>/dev/null; }
 printf '%s\n' "$*" >> '{ROOT}/invocations'
 if [ "$1" = "--version" ]; then exit 0; fi
 if [ "$2" = "--help" ]; then exit 0; fi
@@ -8014,7 +8122,7 @@ while IFS= read -r line; do
     *'"method":"thread/resume"'*)
       tid=$(field threadId)
       printf '%s\n' "resume $tid" >> '{ROOT}/log'
-      while [ -f '{ROOT}/hold-resume' ]; do sleep 0.01; done
+      while [ -f '{ROOT}/hold-resume' ]; do fixture_alive || exit 0; sleep 0.01; done
       mode=$(cat '{ROOT}/resume-mode' 2>/dev/null)
       if [ "$mode" = unsupported ]; then printf '%s\n' '{"id":6,"error":{"code":-32601,"message":"method not found"}}'
       elif [ "$mode" = other ]; then printf '%s\n' '{"id":6,"result":{"thread":{"id":"thread-other"}}}'
@@ -8024,7 +8132,7 @@ while IFS= read -r line; do
       tid=$(field threadId); task=$(field text)
       printf '%s\n' "turn $tid $task" >> '{ROOT}/log'
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-x"}}}'
-      while [ -f '{ROOT}/hold-turn' ]; do sleep 0.01; done
+      while [ -f '{ROOT}/hold-turn' ]; do fixture_alive || exit 0; sleep 0.01; done
       printf '{"method":"item/completed","params":{"threadId":"%s","turnId":"turn-x","item":{"type":"agentMessage","id":"m","phase":"final_answer","text":"%s on %s"}}}\n' "$tid" "$task" "$tid"
       printf '{"method":"turn/completed","params":{"threadId":"%s","turn":{"id":"turn-x","items":[],"status":"completed","error":null}}}\n' "$tid" ;;
   esac
@@ -9466,20 +9574,20 @@ done
     /// Codex raising a command approval and a file-change approval (whose
     /// diff its `item/started` carried) in one turn. Each answer is recorded
     /// verbatim in `answers`, and Codex then reports that request resolved.
-    /// Background waits end with the app-server shell (`$$`) or its
-    /// workspace, so a stopped task leaves no fixture process behind.
+    /// Its waits use the fixture's `fixture_alive` guard, so a stopped task
+    /// leaves no fixture process behind.
     const APPROVAL_TURN: &str = r#"    *'"id":3,'*)
       {ACK}
       printf '%s\n' '{"method":"item/started","params":{"threadId":"native-thread","turnId":"native-turn","startedAtMs":1,"item":{"type":"fileChange","id":"patch-1","status":"inProgress","changes":[{"path":"src/lib.rs","kind":{"type":"update","move_path":null},"diff":"-a\n+b\n"}]}}}'
       printf '%s\n' '{"id":"approval-cmd","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","startedAtMs":1,"command":"cargo test","cwd":"/repo","reason":"Run the tests <b>now</b>"}}'
       printf '%s\n' '{"id":7,"method":"item/fileChange/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"patch-1","startedAtMs":1}}'
       (
-        while [ ! -f "$PWD/patch-updated" ]; do [ -f "$PWD/finish-turn" ] && break; kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        while [ ! -f "$PWD/patch-updated" ]; do [ -f "$PWD/finish-turn" ] && break; fixture_alive || exit 0; sleep 0.01; done
         if [ -f "$PWD/patch-updated" ]; then
           printf '%s\n' '{"method":"item/fileChange/patchUpdated","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"patch-1","changes":[{"path":"src/main.rs","kind":{"type":"delete"},"diff":""}]}}'
           touch "$PWD/patch-update-sent"
         fi
-        while [ ! -f "$PWD/finish-turn" ]; do kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        while [ ! -f "$PWD/finish-turn" ]; do fixture_alive || exit 0; sleep 0.01; done
         printf '%s\n' '{"method":"item/completed","params":{"threadId":"native-thread","turnId":"native-turn","item":{"type":"agentMessage","id":"m","text":"Done after review."}}}'
         {COMPLETED}
       ) &
@@ -9897,9 +10005,9 @@ done
       {ACK}
       printf '%s\n' '{"id":"approval-cmd","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","startedAtMs":1,"command":"cargo test","cwd":"/repo"}}'
       (
-        while [ ! -f "$PWD/resolve" ]; do kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        while [ ! -f "$PWD/resolve" ]; do fixture_alive || exit 0; sleep 0.01; done
         printf '%s\n' '{"method":"serverRequest/resolved","params":{"threadId":"native-thread","requestId":"approval-cmd"}}'
-        while [ ! -f "$PWD/finish-turn" ]; do kill -0 $$ 2>/dev/null && [ -d "$PWD" ] || exit 0; sleep 0.01; done
+        while [ ! -f "$PWD/finish-turn" ]; do fixture_alive || exit 0; sleep 0.01; done
         {COMPLETED}
       ) &
       ;;
@@ -10047,7 +10155,7 @@ done
         let dies = r#"    *'"id":3,'*)
       {ACK}
       printf '%s\n' '{"id":"approval-cmd","method":"item/commandExecution/requestApproval","params":{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","command":"cargo test","cwd":"/repo"}}'
-      while [ ! -f "$PWD/die" ]; do [ -d "$PWD" ] || exit 0; sleep 0.01; done
+      while [ ! -f "$PWD/die" ]; do fixture_alive || exit 0; sleep 0.01; done
       exit 0
       ;;
 "#;

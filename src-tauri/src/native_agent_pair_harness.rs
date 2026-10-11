@@ -45,6 +45,9 @@ impl NativeAgentPairHarnessV1 {
             &agent,
             format!(
                 r##"#!/bin/sh
+# Waits end with the test process ($PPID) or this app-server shell ($$).
+# Not with its cwd: that is the moved workspace, which cleanup may remove.
+fixture_alive() {{ kill -0 "$PPID" 2>/dev/null && kill -0 "$$" 2>/dev/null; }}
 if [ "$2" = "--help" ]; then exit 0; fi
 if [ "$1" = "app-server" ] && [ "$2" = "--stdio" ]; then echo launch >> '{}/app-server-launches'; fi
 while IFS= read -r line; do
@@ -54,7 +57,7 @@ while IFS= read -r line; do
     *'"id":3'*)
       echo run >> '{}/turn-starts'
       echo '{{"id":3,"result":{{"turn":{{"id":"native-turn"}}}}}}'
-      while [ -f '{}/hold-turn' ] && [ ! -f '{}/release-turn' ]; do sleep 0.01; done
+      while [ -f '{}/hold-turn' ] && [ ! -f '{}/release-turn' ]; do fixture_alive || exit 0; sleep 0.01; done
       if [ -f '{}/fail-turn' ]; then
         echo done >> '{}/turn-completions'
         echo '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","items":[],"status":"failed","error":{{"message":"fixture failure"}}}}}}}}'
