@@ -5,8 +5,10 @@
 //! peer may make this Host run it. Admission is that third decision. Core
 //! makes it, capability-agnostically, before any adapter sees the input.
 //!
-//! There is no configurable policy, stored grant, ACL or per-peer memory. A
-//! remote invocation waits for one process-local, one-shot Host Review.
+//! There is no configurable policy, ACL or per-peer memory here. A remote
+//! invocation waits for one process-local, one-shot Host Review, unless an
+//! unattended grant this Host's user created applies first (see
+//! `start_under_unattended_grant`); otherwise it falls back to this Review.
 
 use serde::Serialize;
 

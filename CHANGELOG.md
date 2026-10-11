@@ -35,7 +35,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 - Cancelling a remote Codex task that was in flight when the executing device restarted now releases its workspace instead of leaving it blocked.
 - Starting a Codex task no longer holds the native service lock while Codex launches and opens its session, so status, cancellation, and remote status updates stay responsive; Codex availability is cached briefly and rechecked before each new session.
 - A long or malformed Codex app-server line no longer ends task observation or releases the workspace early.
-- On Windows, an npm-installed Codex (`codex.cmd`) is now found and started, and its app-server stops when Pastey closes the session.
+- On Windows, an npm-installed Codex (`codex.cmd`) is now found and started, and its app-server stops when Pastey closes the session (compiled and unit-tested; not yet validated on a physical Windows machine).
 - A remote Codex task's card no longer disappears as soon as the task completes.
 - Bound every Native Agent task to one immutable owner, Local or its Bridge. Another Bridge can no longer adopt, re-home, or detach a task through a duplicate or conflicting invocation, workspace preparation, or approval, and Burn again selects exactly the tasks its Bridge owns, including after restart.
 - Executor-side `native_agent.cancel` now requires the authenticated Bridge to own the task; a Bridge cannot cancel a Local task or another Bridge's task.
