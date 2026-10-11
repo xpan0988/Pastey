@@ -35,6 +35,16 @@ const MAX_EVENT_LIFETIME_SECONDS: i64 = 120;
 const MAX_INBOX_ITEMS: usize = 64;
 const MAX_REPLAY_ITEMS: usize = 256;
 const MAX_EVENTS_PER_MINUTE: usize = 30;
+/// Further attempts to deliver one unchanged native task status.
+const MAX_STATUS_RESENDS: u32 = 5;
+
+/// Whether one native task status needs no further delivery attempt: it was
+/// delivered, or it failed `MAX_STATUS_RESENDS` more times (the requester
+/// may already hold it, which its replay protection then reports as a
+/// failure, or the session is gone and reconciliation takes over).
+fn native_status_settled(delivered: bool, failed_sends: u32) -> bool {
+    delivered || failed_sends >= MAX_STATUS_RESENDS
+}
 const MAX_BURST_EVENTS: usize = 8;
 const CONTROL_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-envelope+json";
 const CONTROL_RECEIPT_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-receipt+json";
@@ -1646,6 +1656,11 @@ pub async fn receive_room_control_event_handler(
                 let host_ref = ctx.state.local_host_ref.as_str().to_owned();
                 ctx.state.spawn(async move {
                     let mut last = None;
+                    // A status that did not reach the requester is sent
+                    // again, a bounded number of times: a running task can
+                    // stay unchanged (for example waiting for its requester's
+                    // decision) and would otherwise never be reported.
+                    let mut failed_sends = 0_u32;
                     loop {
                         let status = {
                             let mut agents = response_state.native_agents.lock();
@@ -1657,6 +1672,7 @@ pub async fn receive_room_control_event_handler(
                         let Ok(status) = status else {
                             return;
                         };
+                        let mut delivered = false;
                         if last.as_ref() != Some(&status) {
                             let payload =
                                 serde_json::to_value(crate::native_agent::NativeAgentStatusV1 {
@@ -1673,16 +1689,22 @@ pub async fn receive_room_control_event_handler(
                                     &response_context,
                                 );
                                 if let Ok(payload) = payload {
-                                    let _ = send_room_control_event(
+                                    delivered = send_room_control_event(
                                         response_state.clone(),
                                         &response_room,
                                         payload,
                                         Some(response_route.clone()),
                                     )
-                                    .await;
+                                    .await
+                                    .is_ok();
                                 }
                             }
-                            last = Some(status.clone());
+                            if native_status_settled(delivered, failed_sends) {
+                                last = Some(status.clone());
+                                failed_sends = 0;
+                            } else {
+                                failed_sends += 1;
+                            }
                         }
                         if !matches!(
                             status.state,
@@ -1691,7 +1713,8 @@ pub async fn receive_room_control_event_handler(
                         ) {
                             return;
                         }
-                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        let pause = if failed_sends > 0 { 1_000 } else { 250 };
+                        tokio::time::sleep(Duration::from_millis(pause)).await;
                     }
                 });
             }
@@ -4360,6 +4383,20 @@ mod tests {
             decision: crate::native_agent::NativeDecisionV1::Accept,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn an_undelivered_native_status_is_sent_again_a_bounded_number_of_times() {
+        assert!(native_status_settled(true, 0));
+        // A failed send is retried, so an unchanging status (a task waiting
+        // for its requester's decision) still reaches the requester...
+        for failures in 0..MAX_STATUS_RESENDS {
+            assert!(!native_status_settled(false, failures));
+        }
+        // ...but not forever.
+        assert!(native_status_settled(false, MAX_STATUS_RESENDS));
+        let source = include_str!("room_control.rs");
+        assert!(source.contains("if native_status_settled(delivered, failed_sends) {"));
     }
 
     #[test]

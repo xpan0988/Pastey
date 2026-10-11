@@ -809,6 +809,9 @@ impl NativeConversationBindingV1 {
 struct ObservedTaskProgressV1 {
     tasks: Arc<Mutex<HashMap<String, NativeAgentTaskStatusV1>>>,
     task_id: String,
+    /// Whether a proven requesting device may decide this task's native
+    /// requests. Otherwise none is offered: nobody could give the answer.
+    remote_decisions: bool,
     conversation: Option<NativeConversationBindingV1>,
     durable_paths: Option<crate::storage::AppPaths>,
 }
@@ -833,7 +836,12 @@ impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
         }
     }
 
-    fn native_decision_updated(&self, review: NativeDecisionReviewV1) {
+    fn native_decision_updated(&self, mut review: NativeDecisionReviewV1) {
+        if !self.remote_decisions && (review.can_accept || review.can_decline) {
+            review.can_accept = false;
+            review.can_decline = false;
+            review.unavailable_reason = Some("native_decision_requester_unverified".into());
+        }
         let Ok(mut tasks) = self.tasks.lock() else {
             return;
         };
@@ -3762,38 +3770,45 @@ impl NativeAgentServiceV1 {
                 peer_host_ref: binding.peer_host_ref.as_str().to_owned(),
                 fingerprint: device.fingerprint.clone(),
             });
-        let status =
-            self.with_bridge_task_owner(&binding.bridge_id, &request.task_id, |service| {
-                if let Some(existing) = service.replayed_invocation(
-                    &request.task_id,
-                    &request.agent_capability,
-                    &request.input,
-                )? {
-                    return Ok(existing);
+        // Only the request that creates the task names its requester, and
+        // before anything can start, so its native requests know who may
+        // decide them; a replay never adds or replaces one.
+        let recorded = match (first_request, requester) {
+            (true, Some(requester)) => {
+                self.task_requesters
+                    .insert(request.task_id.clone(), requester);
+                true
+            }
+            _ => false,
+        };
+        let status = self.with_bridge_task_owner(&binding.bridge_id, &request.task_id, |service| {
+            if let Some(existing) = service.replayed_invocation(
+                &request.task_id,
+                &request.agent_capability,
+                &request.input,
+            )? {
+                return Ok(existing);
+            }
+            if let Some(device) = verified_device {
+                if let Some(started) =
+                    service.start_under_unattended_grant(binding, device, request, now)?
+                {
+                    return Ok(started);
                 }
-                if let Some(device) = verified_device {
-                    if let Some(started) =
-                        service.start_under_unattended_grant(binding, device, request, now)?
-                    {
-                        return Ok(started);
-                    }
-                }
-                service.admit_invocation(
-                    NativeInvocationPrincipalV1::Remote(binding),
-                    &request.agent_capability,
-                    &request.task_id,
-                    &request.input,
-                    NativeInvocationContinuationV1::Direct,
-                    now,
-                )
-            })?;
-        // Only the request that created the task names its requester; a
-        // replay never adds or replaces one.
-        if let (true, Some(requester)) = (first_request, requester) {
-            self.task_requesters
-                .insert(request.task_id.clone(), requester);
+            }
+            service.admit_invocation(
+                NativeInvocationPrincipalV1::Remote(binding),
+                &request.agent_capability,
+                &request.task_id,
+                &request.input,
+                NativeInvocationContinuationV1::Direct,
+                now,
+            )
+        });
+        if recorded && status.is_err() && !self.task_bridges.contains_key(&request.task_id) {
+            self.task_requesters.remove(&request.task_id);
         }
-        Ok(status)
+        status
     }
 
     /// The requesting user's explicit decision on one native request of
@@ -4553,6 +4568,7 @@ impl NativeAgentServiceV1 {
         let progress = ObservedTaskProgressV1 {
             tasks: tasks.clone(),
             task_id: task_id.clone(),
+            remote_decisions: self.task_requesters.contains_key(&task_id),
             conversation: conversation.map(|(binding, _)| binding),
             durable_paths: durable_paths.clone(),
         };
@@ -10196,10 +10212,16 @@ done
         h.service
             .accept_invocation_review("task-a8", Some(&binding), crate::storage::now_ts())
             .unwrap();
-        let command = review_of_kind(
-            &wait_for_reviews(&h.service, "task-a8", 2),
-            NativeDecisionKindV1::CommandExecution,
-        );
+        let reviews = wait_for_reviews(&h.service, "task-a8", 2);
+        // Nobody could give an answer, so none is offered, with the reason.
+        for review in &reviews {
+            assert!(!review.can_accept && !review.can_decline);
+            assert_eq!(
+                review.unavailable_reason.as_deref(),
+                Some("native_decision_requester_unverified")
+            );
+        }
+        let command = review_of_kind(&reviews, NativeDecisionKindV1::CommandExecution);
         assert!(h
             .decide(
                 &binding,

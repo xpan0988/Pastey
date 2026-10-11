@@ -26,6 +26,7 @@ const UNAVAILABLE_COPY: Record<string, string> = {
   native_decision_outside_task: "This request does not belong to this task's turn.",
   native_decision_unsupported: "Pastey cannot answer this kind of request (for example a permission grant, a question or a form).",
   native_decision_malformed: "Codex sent this request in a form Pastey cannot read safely.",
+  native_decision_requester_unverified: "Only the device that started this task, after proving its identity, can answer Codex here, and this task has no such device.",
 };
 
 export function nativeDecisionUnavailableCopy(reason: string | null | undefined): string {
