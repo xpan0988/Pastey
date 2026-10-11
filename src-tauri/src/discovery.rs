@@ -510,22 +510,11 @@ pub fn validate_peer_address(input: &str) -> AppResult<String> {
         let IpAddr::V4(ip) = ip else {
             return invalid("Use the other device's IPv4 address or its network name.");
         };
-        if ip.is_unspecified()
-            || ip.is_broadcast()
-            || ip.is_multicast()
-            || ip.is_loopback()
-            || ip.is_link_local()
-            || ip.is_documentation()
-        {
+        if !is_device_ipv4(ip) {
             return invalid("That address cannot be another device.");
         }
-        // Private, carrier-grade NAT (Tailscale's 100.64.0.0/10) or other
-        // overlay ranges. A public address would mean Pastey is exposed
-        // directly to the internet, which it must not be.
-        let octets = ip.octets();
-        let shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
-        if !(ip.is_private() || shared) {
-            return invalid("Use an address on a private or overlay network (for example Tailscale or WireGuard). Pastey must not be exposed directly to the internet.");
+        if !is_private_or_overlay_ipv4(ip) {
+            return invalid(PUBLIC_ADDRESS_REFUSAL);
         }
         return Ok(address.to_owned());
     }
@@ -547,7 +536,43 @@ pub fn validate_peer_address(input: &str) -> AppResult<String> {
     {
         return invalid("Enter only the device's address or name, without a port, path or scheme.");
     }
+    // A system resolver reads names like `0x08080808` or `0x7f.1` as numeric
+    // IPv4 addresses without any lookup; they are addresses, not names.
+    let numeric_label = |label: &str| {
+        label.bytes().all(|byte| byte.is_ascii_digit())
+            || label
+                .strip_prefix("0x")
+                .or_else(|| label.strip_prefix("0X"))
+                .is_some_and(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    };
+    if address.split('.').all(numeric_label) {
+        return invalid(
+            "Enter an IPv4 address as four decimal numbers, or the device's network name.",
+        );
+    }
     Ok(address.to_ascii_lowercase())
+}
+
+const PUBLIC_ADDRESS_REFUSAL: &str = "Use an address on a private or overlay network (for example Tailscale or WireGuard). Pastey must not be exposed directly to the internet.";
+
+/// Whether an IPv4 address can name another device at all.
+fn is_device_ipv4(ip: Ipv4Addr) -> bool {
+    !(ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_documentation())
+}
+
+/// Private, carrier-grade NAT (Tailscale's 100.64.0.0/10) or other overlay
+/// ranges. A public address would mean Pastey is exposed directly to the
+/// internet, which it must not be. Applies to an address entered directly
+/// and to every address a name resolves to.
+fn is_private_or_overlay_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    is_device_ipv4(ip) && (ip.is_private() || shared)
 }
 
 /// Finds one Bridge's room server on a peer at an explicitly given address
@@ -576,6 +601,18 @@ pub async fn discover_room_at(
         return Err(AppError::Network(
             "The other device's name has no IPv4 address.".into(),
         ));
+    }
+    // A name is only as private as what it resolves to, now: every
+    // reconnect resolves it again. Nothing is sent to any other address.
+    let targets = targets
+        .into_iter()
+        .filter(|target| match target {
+            SocketAddr::V4(target) => is_private_or_overlay_ipv4(*target.ip()),
+            SocketAddr::V6(_) => false,
+        })
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return Err(AppError::InvalidInput(PUBLIC_ADDRESS_REFUSAL.into()));
     }
     discover_room_unicast(
         &targets,
@@ -1437,8 +1474,17 @@ mod tests {
             "home pc",
             "-bad.example",
             "bad..example",
+            // Numeric forms a resolver reads as addresses without a lookup.
+            "0x08080808",
+            "0X7f000001",
+            "0x7f.1",
+            "0xa.0x0.0x0.0x1",
         ] {
             assert!(validate_peer_address(refused).is_err(), "{refused}");
+        }
+        // Names that merely contain hex-like or numeric labels remain names.
+        for accepted in ["0xbox", "pc-0x1.tail1234.ts.net", "a1.lan"] {
+            assert!(validate_peer_address(accepted).is_ok(), "{accepted}");
         }
     }
 
@@ -1535,7 +1581,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_public_or_malformed_address_is_refused_before_any_packet_is_sent() {
-        for address in ["8.8.8.8", "http://home-pc", "home-pc:1"] {
+        // `localhost` is a valid name, but it resolves outside any private
+        // or overlay network, so nothing may be sent to what it resolves to.
+        for address in ["8.8.8.8", "http://home-pc", "home-pc:1", "localhost"] {
             assert!(matches!(
                 discover_room_at(address, "hash".into(), None, None).await,
                 Err(AppError::InvalidInput(_))

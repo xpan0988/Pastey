@@ -643,6 +643,9 @@ test("An overlay address is checked like Rust checks it and is only a place to l
     assert.notEqual(peerAddressProblem(refused), null, refused);
   }
   assert.match(peerAddressProblem("8.8.8.8") ?? "", /must not be exposed directly to the internet/);
+  // Numeric forms a resolver reads as addresses are not names.
+  for (const numeric of ["0x08080808", "0X7f000001", "0x7f.1"]) assert.notEqual(peerAddressProblem(numeric), null, numeric);
+  assert.equal(peerAddressProblem("0xbox"), null);
 });
 
 test("Join and reconnect failures say what the user can do", () => {

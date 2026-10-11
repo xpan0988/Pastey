@@ -32,6 +32,10 @@ export function peerAddressProblem(input: string): string | null {
   if (labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) {
     return "Enter only the device's address or name, without a port, path or scheme.";
   }
+  // Resolvers read `0x08080808` or `0x7f.1` as addresses without a lookup.
+  if (labels.every((label) => /^(?:[0-9]+|0x[0-9a-f]*)$/i.test(label))) {
+    return "Enter an IPv4 address as four decimal numbers, or the device's network name.";
+  }
   return null;
 }
 
