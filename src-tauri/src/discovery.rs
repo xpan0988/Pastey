@@ -1591,3 +1591,123 @@ mod tests {
         }
     }
 }
+
+/// Characterization of the current room-query boundary (see the join audit
+/// in docs/layers/layer-4-join-audit.md). Each test asserts behaviour that is
+/// insecure today; a fix is expected to flip it.
+#[cfg(test)]
+mod join_characterization {
+    use super::*;
+    use crate::{
+        config::StoredConfig,
+        host_runtime::{
+            ActiveRoomServer, HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner,
+        },
+        storage::AppPaths,
+    };
+
+    struct NoopEventSink;
+
+    impl HostEventSink for NoopEventSink {
+        fn emit(&self, _event: HostEvent) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopTaskSpawner;
+
+    impl RuntimeTaskSpawner for NoopTaskSpawner {
+        fn spawn(&self, _task: RuntimeTask) {}
+    }
+
+    /// Anyone who presents the code lookup value learns the Bridge id, room
+    /// server port and transport key, which is everything `/join` needs.
+    /// Wrong guesses are neither throttled nor remembered.
+    #[tokio::test]
+    async fn characterization_room_query_answers_any_holder_of_the_code_hash() {
+        let root = std::env::temp_dir().join(format!(
+            "pastey-discovery-characterization-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let app_secret = [43u8; 32];
+        let config = StoredConfig {
+            version: 5,
+            default_expiry_minutes: 15,
+            inbox_dir: None,
+            auto_burn_after_download: false,
+            save_received_files_to_inbox: true,
+            save_received_images_to_inbox: true,
+            transfer_window_override: None,
+            dev_tools_enabled: false,
+            micro_flow_group_mode: "off".into(),
+            shortcut: "test".into(),
+            app_secret: crate::crypto::encode_key(&app_secret),
+            device_id: "discovery-characterization".into(),
+        };
+        let state = Arc::new(
+            AppState::new(
+                paths,
+                config,
+                Arc::new(NoopEventSink),
+                Arc::new(NoopTaskSpawner),
+            )
+            .unwrap(),
+        );
+        let code_hash = crate::crypto::hash_code("12345678");
+        let transport_secret = crate::crypto::generate_transport_secret();
+        state.active_servers.lock().insert(
+            "characterized-room".into(),
+            ActiveRoomServer {
+                room_id: "characterized-room".into(),
+                room_code_hash: code_hash.clone(),
+                port: 4242,
+                expires_at: storage::now_ts() + 600,
+                transport_secret,
+                shutdown: None,
+            },
+        );
+
+        let responder = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let asker = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let asker_addr = asker.local_addr().unwrap();
+        let query = |hash: String| {
+            serde_json::to_value(DiscoveryRequest {
+                kind: "discover_room".into(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                room_code_hash: hash,
+                // Any device id, or none: the asker is not identified.
+                requester_device_id: None,
+                expected_room_id: None,
+            })
+            .unwrap()
+        };
+
+        for wrong in ["00000000", "00000001", "00000002"] {
+            handle_room_discovery(
+                state.clone(),
+                &responder,
+                query(crate::crypto::hash_code(wrong)),
+                asker_addr,
+            )
+            .await;
+        }
+        handle_room_discovery(state.clone(), &responder, query(code_hash), asker_addr).await;
+
+        let mut buffer = vec![0u8; 4096];
+        let (size, _) = timeout(Duration::from_secs(2), asker.recv_from(&mut buffer))
+            .await
+            .expect("the matching query is still answered after wrong guesses")
+            .unwrap();
+        let offer: DiscoveryResponse = serde_json::from_slice(&buffer[..size]).unwrap();
+        assert_eq!(offer.room_id, "characterized-room");
+        assert_eq!(offer.port, 4242);
+        assert_eq!(
+            offer.transport_public_key,
+            crate::crypto::encode_key(&crate::crypto::transport_public_key(&transport_secret))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

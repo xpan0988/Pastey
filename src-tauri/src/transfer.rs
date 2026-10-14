@@ -6232,3 +6232,298 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
 }
+
+/// Characterization of the current Bridge join boundary (see the join audit
+/// in docs/layers/layer-4-join-audit.md). Each test asserts behaviour that is
+/// insecure today; a fix is expected to flip it.
+#[cfg(test)]
+mod join_characterization {
+    use super::*;
+    use crate::{
+        config::StoredConfig,
+        host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
+        models::{BridgePeerLiveness, LocalRole, RoomItemDirection},
+        storage::AppPaths,
+    };
+
+    const ROOM_ID: &str = "join-characterization-room";
+
+    struct NoopEventSink;
+
+    impl HostEventSink for NoopEventSink {
+        fn emit(&self, _event: HostEvent) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    struct NoopTaskSpawner;
+
+    impl RuntimeTaskSpawner for NoopTaskSpawner {
+        fn spawn(&self, _task: RuntimeTask) {}
+    }
+
+    /// One Host's Bridge room server on loopback, with the production join,
+    /// item and liveness handlers.
+    struct RoomServerFixture {
+        state: Arc<AppState>,
+        base_url: String,
+        server_public_key: [u8; 32],
+        shutdown: Option<oneshot::Sender<()>>,
+        root: PathBuf,
+    }
+
+    impl RoomServerFixture {
+        async fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "pastey-join-characterization-{label}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let paths = AppPaths::new(root.clone(), root.join("logs"));
+            paths.ensure_directories().unwrap();
+            storage::init_database(&paths).unwrap();
+            let app_secret = [41u8; 32];
+            let room = storage::create_room(
+                &paths,
+                &app_secret,
+                "12345678",
+                15,
+                LocalRole::Creator,
+                Some(ROOM_ID.into()),
+                Some(storage::now_ts() + 3_600),
+            )
+            .unwrap();
+            let config = StoredConfig {
+                version: 5,
+                default_expiry_minutes: 15,
+                inbox_dir: Some(root.join("inbox").display().to_string()),
+                auto_burn_after_download: false,
+                save_received_files_to_inbox: true,
+                save_received_images_to_inbox: true,
+                transfer_window_override: None,
+                dev_tools_enabled: false,
+                micro_flow_group_mode: "off".into(),
+                shortcut: "test".into(),
+                app_secret: crypto::encode_key(&app_secret),
+                device_id: format!("creator-{label}"),
+            };
+            let state = Arc::new(
+                AppState::new(
+                    paths,
+                    config,
+                    Arc::new(NoopEventSink),
+                    Arc::new(NoopTaskSpawner),
+                )
+                .unwrap(),
+            );
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let transport_secret = crypto::generate_transport_secret();
+            state.active_servers.lock().insert(
+                ROOM_ID.into(),
+                ActiveRoomServer {
+                    room_id: ROOM_ID.into(),
+                    room_code_hash: room.room_code_hash.clone(),
+                    port,
+                    expires_at: room.expires_at,
+                    transport_secret,
+                    shutdown: None,
+                },
+            );
+            let router = Router::new()
+                .route("/rooms/:room_id/join", post(join_handler))
+                .route("/rooms/:room_id/items", post(receive_item_handler))
+                .route(
+                    "/rooms/:room_id/diagnostics/ping",
+                    post(diagnostics_ping_handler),
+                )
+                .with_state(RoomServerContext {
+                    state: state.clone(),
+                    room_id: ROOM_ID.into(),
+                });
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            tokio::spawn(async move {
+                let _ = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+            });
+            Self {
+                state,
+                base_url: format!("http://127.0.0.1:{port}/rooms/{ROOM_ID}"),
+                server_public_key: crypto::transport_public_key(&transport_secret),
+                shutdown: Some(shutdown_tx),
+                root,
+            }
+        }
+
+        async fn post_join(&self, transport_public_key: &str, host_ref: &str) -> StatusCode {
+            reqwest::Client::new()
+                .post(format!("{}/join", self.base_url))
+                .json(&JoinRoomRequest {
+                    port: 9,
+                    device_name: "claimed name".into(),
+                    transport_public_key: transport_public_key.into(),
+                    host_ref: Some(host_ref.into()),
+                })
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+
+        fn peers(&self) -> Vec<crate::models::StoredBridgePeerEndpoint> {
+            storage::list_bridge_peer_endpoints(&self.state.paths, ROOM_ID).unwrap()
+        }
+    }
+
+    impl Drop for RoomServerFixture {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn fresh_public_key() -> String {
+        crypto::encode_key(&crypto::transport_public_key(
+            &crypto::generate_transport_secret(),
+        ))
+    }
+
+    fn host_ref(device_id: &str) -> String {
+        crate::host_identity::HostRef::from_device_id(device_id)
+            .unwrap()
+            .as_str()
+            .to_string()
+    }
+
+    /// `/join` proves neither knowledge of the Bridge code nor possession of
+    /// any earlier key: a second, unrelated join replaces the connected peer,
+    /// and the HostRef it claims is bound to the new session unverified.
+    #[tokio::test]
+    async fn characterization_join_without_proof_replaces_the_connected_peer() {
+        let fixture = RoomServerFixture::new("replace").await;
+        let first_key = fresh_public_key();
+        assert_eq!(
+            fixture.post_join(&first_key, &host_ref("first-peer")).await,
+            StatusCode::OK
+        );
+        let first = fixture.peers();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].liveness, BridgePeerLiveness::Connected);
+        assert_eq!(
+            first[0].transport_public_key.as_deref(),
+            Some(first_key.as_str())
+        );
+
+        // No code, no signature, no reference to the first session.
+        let second_key = fresh_public_key();
+        let claimed = host_ref("first-peer");
+        assert_eq!(
+            fixture.post_join(&second_key, &claimed).await,
+            StatusCode::OK
+        );
+
+        let peers = fixture.peers();
+        let connected = peers
+            .iter()
+            .filter(|peer| peer.liveness == BridgePeerLiveness::Connected)
+            .collect::<Vec<_>>();
+        assert_eq!(connected.len(), 1, "exactly one current peer remains");
+        assert_eq!(
+            connected[0].transport_public_key.as_deref(),
+            Some(second_key.as_str()),
+            "the unproven joiner is now the current peer"
+        );
+        assert_eq!(
+            connected[0].logical_host_ref.as_deref(),
+            Some(claimed.as_str()),
+            "the claimed HostRef is bound without verification"
+        );
+        let replaced = peers
+            .iter()
+            .find(|peer| peer.peer_session_id == first[0].peer_session_id)
+            .unwrap();
+        assert_eq!(replaced.liveness, BridgePeerLiveness::Stale);
+        assert_eq!(replaced.transport_public_key, None);
+    }
+
+    /// The ordinary item route unwraps with whatever sender key the request
+    /// names; it never checks that key against the Bridge's current peer.
+    #[tokio::test]
+    async fn characterization_item_upload_from_a_non_member_key_is_stored() {
+        let fixture = RoomServerFixture::new("item").await;
+        let member_key = fresh_public_key();
+        assert_eq!(
+            fixture.post_join(&member_key, &host_ref("member")).await,
+            StatusCode::OK
+        );
+
+        let outsider_secret = crypto::generate_transport_secret();
+        let session_key = crypto::random_key();
+        let (ciphertext, payload_nonce) =
+            crypto::encrypt_bytes(b"not from the member", &session_key).unwrap();
+        let (wrapped_session_key, transport_nonce, sender_public_key) =
+            crypto::wrap_session_for_receiver(
+                &session_key,
+                &outsider_secret,
+                &fixture.server_public_key,
+            )
+            .unwrap();
+        assert_ne!(sender_public_key, member_key);
+        let upload = RoomItemUpload {
+            item_id: uuid::Uuid::new_v4().to_string(),
+            payload_type: PayloadType::Text,
+            display_name: None,
+            mime_type: None,
+            size_bytes: 19,
+            created_at: storage::now_ts(),
+            payload_nonce: crypto::encode_nonce(&payload_nonce),
+            wrapped_session_key,
+            transport_nonce,
+            sender_public_key,
+            encrypted_payload: STANDARD.encode(ciphertext),
+        };
+        let status = reqwest::Client::new()
+            .post(format!("{}/items", fixture.base_url))
+            .json(&upload)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::OK);
+
+        let items = storage::list_room_items(&fixture.state.paths, ROOM_ID).unwrap();
+        assert!(
+            items
+                .iter()
+                .any(|item| item.id == upload.item_id
+                    && item.direction == RoomItemDirection::Incoming)
+        );
+    }
+
+    /// The liveness ping returns the server's transport public key to any
+    /// caller. Matching it proves reachability of something that knows a
+    /// public value, not possession of the matching secret.
+    #[tokio::test]
+    async fn characterization_liveness_ping_is_unauthenticated() {
+        let fixture = RoomServerFixture::new("ping").await;
+        let probe: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}/diagnostics/ping", fixture.base_url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            probe["transportPublicKey"].as_str(),
+            Some(crypto::encode_key(&fixture.server_public_key).as_str())
+        );
+    }
+}

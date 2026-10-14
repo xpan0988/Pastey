@@ -806,6 +806,69 @@ mod tests {
         )));
     }
 
+    /// Characterization (see the join audit in docs/layers/layer-4-join-audit.md):
+    /// the liveness probe server below was given only the public key, never
+    /// the secret, yet the production probe accepts it as the exact peer.
+    #[tokio::test]
+    async fn characterization_liveness_probe_accepts_an_echo_of_the_public_key() {
+        let fixture = ResolverFixture::new("echo-probe").await;
+        let peer = fixture.peer("echo-route", BridgePeerLiveness::Connected);
+        assert!(probe_exact_peer(&fixture.room, &peer).await);
+    }
+
+    /// Characterization: after rediscovery, `reconnect_room` stores whatever
+    /// key the room offer carried and binds whatever HostRef the join reply
+    /// claimed. Nothing pins either to the previous session's peer.
+    #[tokio::test]
+    async fn characterization_reconnect_rebinds_a_different_key_and_host_ref() {
+        let fixture = ResolverFixture::new("rebind").await;
+        let paths = &fixture.runtime.paths;
+        let original_key = crate::crypto::encode_key(&crate::crypto::random_key());
+        storage::update_room_peer(
+            paths,
+            ROOM_ID,
+            Some("192.168.1.20"),
+            Some(5000),
+            Some("peer"),
+            Some(&original_key),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        storage::bind_legacy_room_peer_host_ref(paths, ROOM_ID, fixture.remote_host.as_str())
+            .unwrap();
+
+        // The storage steps `reconnect_room` performs after a rediscovery.
+        let other_key = crate::crypto::encode_key(&crate::crypto::random_key());
+        let other_host = HostRef::from_device_id("some-other-device").unwrap();
+        storage::update_room_peer(
+            paths,
+            ROOM_ID,
+            Some("192.168.1.99"),
+            Some(5001),
+            Some("peer"),
+            Some(&other_key),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        storage::bind_legacy_room_peer_host_ref(paths, ROOM_ID, other_host.as_str()).unwrap();
+
+        let connected = storage::list_bridge_peer_endpoints(paths, ROOM_ID)
+            .unwrap()
+            .into_iter()
+            .filter(|peer| peer.liveness == BridgePeerLiveness::Connected)
+            .collect::<Vec<_>>();
+        assert_eq!(connected.len(), 1);
+        assert_eq!(
+            connected[0].transport_public_key.as_deref(),
+            Some(other_key.as_str())
+        );
+        assert_eq!(
+            connected[0].logical_host_ref.as_deref(),
+            Some(other_host.as_str()),
+            "a different HostRef is accepted on reconnect"
+        );
+    }
+
     #[tokio::test]
     async fn resolves_one_transport_proven_current_remote_session() {
         let fixture = ResolverFixture::new("one-live").await;
