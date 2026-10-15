@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     ChaCha20Poly1305, Key, Nonce,
 };
 use hkdf::Hkdf;
@@ -55,6 +55,45 @@ pub fn decrypt_bytes(ciphertext: &[u8], key: &[u8; 32], nonce: &[u8; 12]) -> App
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     cipher
         .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|_| AppError::Crypto("failed to decrypt payload".into()))
+}
+
+/// Encrypts `plaintext` bound to `associated_data`: the same key, nonce and
+/// ciphertext fail to decrypt under any other associated data.
+pub fn encrypt_bytes_with_aad(
+    plaintext: &[u8],
+    key: &[u8; 32],
+    associated_data: &[u8],
+) -> AppResult<(Vec<u8>, [u8; 12])> {
+    let nonce = random_nonce();
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: associated_data,
+            },
+        )
+        .map_err(|_| AppError::Crypto("failed to encrypt payload".into()))?;
+    Ok((ciphertext, nonce))
+}
+
+pub fn decrypt_bytes_with_aad(
+    ciphertext: &[u8],
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    associated_data: &[u8],
+) -> AppResult<Vec<u8>> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: associated_data,
+            },
+        )
         .map_err(|_| AppError::Crypto("failed to decrypt payload".into()))
 }
 

@@ -39,6 +39,26 @@ impl BinaryChunkFrameError {
     }
 }
 
+/// Associated data that binds one encrypted chunk to its transfer and its
+/// place in it. A chunk body moved to another index, transfer, final flag or
+/// size fails to decrypt.
+pub fn chunk_associated_data(
+    transfer_id: &str,
+    chunk_index: u64,
+    total_chunks: u64,
+    plaintext_size: u64,
+    is_final: bool,
+) -> Vec<u8> {
+    let mut aad = b"pastey-transfer-chunk-v2\0".to_vec();
+    aad.extend_from_slice(&(transfer_id.len() as u64).to_be_bytes());
+    aad.extend_from_slice(transfer_id.as_bytes());
+    aad.extend_from_slice(&chunk_index.to_be_bytes());
+    aad.extend_from_slice(&total_chunks.to_be_bytes());
+    aad.extend_from_slice(&plaintext_size.to_be_bytes());
+    aad.push(u8::from(is_final));
+    aad
+}
+
 pub fn encode_binary_chunk_frame(
     frame: &BinaryChunkFrame,
 ) -> Result<Vec<u8>, BinaryChunkFrameError> {

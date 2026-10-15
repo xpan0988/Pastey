@@ -634,6 +634,8 @@ pub struct ChunkAckResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileTransferFinishRequest {
     pub item_id: String,
+    /// BLAKE3 of the whole plaintext, checked before the file is finalized.
+    pub plaintext_blake3: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

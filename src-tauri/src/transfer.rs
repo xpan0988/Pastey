@@ -29,8 +29,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     chunk_frame::{
-        decode_binary_chunk_frame, encode_binary_chunk_frame, BinaryChunkFrame,
-        BinaryChunkFrameError, BINARY_CHUNK_NONCE_LEN,
+        chunk_associated_data, decode_binary_chunk_frame, encode_binary_chunk_frame,
+        BinaryChunkFrame, BinaryChunkFrameError, BINARY_CHUNK_NONCE_LEN,
     },
     config, crypto, discovery,
     error::{AppError, AppResult},
@@ -1042,6 +1042,9 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         chunk_protocol,
     );
 
+    // The whole plaintext, hashed as it is read; the receiver checks it
+    // before finalizing.
+    let mut plaintext_hasher = blake3::Hasher::new();
     if chunk_protocol == ChunkProtocol::BinaryV1 {
         chunk_index = match send_binary_chunks_pipelined(
             &state,
@@ -1051,6 +1054,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             &transfer_id,
             &mut file,
             &mut buffer,
+            &mut plaintext_hasher,
             chunk_size,
             total_chunks,
             file_size,
@@ -1122,8 +1126,18 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
                 return Err(AppError::Network(message));
             }
 
-            let (encrypted_bytes, nonce) =
-                crypto::encrypt_bytes(&buffer[..bytes_read], &payload_key)?;
+            plaintext_hasher.update(&buffer[..bytes_read]);
+            let (encrypted_bytes, nonce) = crypto::encrypt_bytes_with_aad(
+                &buffer[..bytes_read],
+                &payload_key,
+                &chunk_associated_data(
+                    &transfer_id,
+                    chunk_index,
+                    total_chunks,
+                    bytes_read as u64,
+                    is_final,
+                ),
+            )?;
             let ack = match send_chunk_with_retry(
                 &client,
                 &base_url,
@@ -1346,6 +1360,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
 
     let finish_body = serde_json::to_vec(&FileTransferFinishRequest {
         item_id: item.id.clone(),
+        plaintext_blake3: plaintext_hasher.finalize().to_hex().to_string(),
     })?;
     let (finish_request, _) = signer.apply(
         client.post(format!("{base_url}/transfers/{transfer_id}/finish")),
@@ -1503,6 +1518,7 @@ async fn send_binary_chunks_pipelined<R>(
     transfer_id: &str,
     file: &mut R,
     buffer: &mut Vec<u8>,
+    plaintext_hasher: &mut blake3::Hasher,
     chunk_size: usize,
     total_chunks: u64,
     file_size: u64,
@@ -1564,15 +1580,24 @@ where
                 });
             }
 
+            plaintext_hasher.update(&buffer[..bytes_read]);
             let encrypt_started = Instant::now();
-            let (encrypted_bytes, nonce) =
-                crypto::encrypt_bytes(&buffer[..bytes_read], payload_key).map_err(|_| {
-                    ChunkSendFailure {
-                        message: "Invalid chunk payload".into(),
-                        kind: ChunkSendFailureKind::HttpStatus,
-                        retryable: false,
-                    }
-                })?;
+            let (encrypted_bytes, nonce) = crypto::encrypt_bytes_with_aad(
+                &buffer[..bytes_read],
+                payload_key,
+                &chunk_associated_data(
+                    transfer_id,
+                    chunk_index,
+                    total_chunks,
+                    bytes_read as u64,
+                    is_final,
+                ),
+            )
+            .map_err(|_| ChunkSendFailure {
+                message: "Invalid chunk payload".into(),
+                kind: ChunkSendFailureKind::HttpStatus,
+                retryable: false,
+            })?;
             let encrypt_elapsed = encrypt_started.elapsed();
 
             let client = client.clone();
@@ -3779,7 +3804,7 @@ async fn receive_file_chunk_handler(
                 status,
                 &format!("body_rejected: {body_text}"),
             );
-            fail_receiver_transfer(&ctx.state, &transfer_id, message).await;
+            // Nothing here is authenticated yet: reject this request only.
             return transfer_error(status, code, message.into());
         }
     };
@@ -3798,7 +3823,6 @@ async fn receive_file_chunk_handler(
                 error.status,
                 &error.cause,
             );
-            fail_receiver_transfer(&ctx.state, &transfer_id, error.message).await;
             return transfer_error(error.status, error.code, error.message.into());
         }
     };
@@ -3820,7 +3844,6 @@ async fn receive_file_chunk_handler(
             StatusCode::BAD_REQUEST,
             "invalid_chunk_payload",
         );
-        fail_receiver_transfer(&ctx.state, &transfer_id, "Invalid chunk payload").await;
         return transfer_error(
             StatusCode::BAD_REQUEST,
             "invalid_chunk_payload",
@@ -3928,10 +3951,11 @@ async fn receive_file_chunk_handler(
                 part_path.clone(),
                 cancel_token_clone(transfer),
                 transfer.chunk_size.saturating_mul(chunk_index),
+                transfer.total_chunks,
             ))
         }
     };
-    let (session_key, part_path, cancel_token, write_offset) = match transfer_lookup {
+    let (session_key, part_path, cancel_token, write_offset, total_chunks) = match transfer_lookup {
         Ok(value) => value,
         Err((code, message, cause)) => {
             dev_log_receiver_chunk_failure(
@@ -3944,7 +3968,7 @@ async fn receive_file_chunk_handler(
                 StatusCode::BAD_REQUEST,
                 cause,
             );
-            fail_receiver_transfer(&ctx.state, &transfer_id, message).await;
+            // Not yet authenticated: reject this request, keep the transfer.
             return transfer_error(StatusCode::BAD_REQUEST, code, message.into());
         }
     };
@@ -3957,7 +3981,20 @@ async fn receive_file_chunk_handler(
     }
 
     let decrypt_started = Instant::now();
-    let plaintext = match crypto::decrypt_bytes(&ciphertext, &session_key, &nonce) {
+    // The chunk's place (transfer, index, total, size, final flag) is bound
+    // as associated data, so a body moved anywhere else fails here.
+    let plaintext = match crypto::decrypt_bytes_with_aad(
+        &ciphertext,
+        &session_key,
+        &nonce,
+        &chunk_associated_data(
+            &transfer_id,
+            chunk_index,
+            total_chunks,
+            plaintext_size,
+            upload.is_final,
+        ),
+    ) {
         Ok(plaintext) => plaintext,
         Err(_) => {
             dev_log_receiver_chunk_failure(
@@ -3970,7 +4007,9 @@ async fn receive_file_chunk_handler(
                 StatusCode::BAD_REQUEST,
                 "integrity_failed",
             );
-            fail_receiver_transfer(&ctx.state, &transfer_id, "Chunk integrity check failed").await;
+            // Anyone can send bytes that fail to decrypt: reject only this
+            // request. The sender of a genuine bad chunk ends the transfer
+            // with its signed cancel.
             return transfer_error(
                 StatusCode::BAD_REQUEST,
                 "integrity_failed",
@@ -4280,6 +4319,30 @@ async fn finish_file_transfer_handler(
             Some(message.into()),
         );
         return transfer_error(StatusCode::BAD_REQUEST, code, message.into());
+    }
+    if !part_file_matches_digest(part_path, &finish.plaintext_blake3).await {
+        dev_log_receiver_finalize(
+            &transfer_id,
+            &room_id,
+            "finalize_failure",
+            "error_kind=integrity_failed message=\"File digest does not match\"",
+        );
+        let _ = remove_active_receiver_part_file(&room_id, "finalize_failed", part_path).await;
+        emit_event(
+            &ctx.state,
+            &transfer,
+            "failed",
+            *transferred_bytes,
+            0.0,
+            average_speed(&transfer, *transferred_bytes),
+            None,
+            Some("Chunk integrity check failed".into()),
+        );
+        return transfer_error(
+            StatusCode::BAD_REQUEST,
+            "integrity_failed",
+            "Chunk integrity check failed".into(),
+        );
     }
     dev_log_receiver_transfer_summary(
         &transfer_id,
@@ -5345,6 +5408,24 @@ fn json_base64_estimated_chunk_len(
     .len()
         + nonce_len
         + ciphertext_len
+}
+
+/// Whether the assembled part file hashes to the sender's signed BLAKE3 of
+/// the whole plaintext. Chunks are written at offsets in any order, so the
+/// file is read back once.
+async fn part_file_matches_digest(part_path: &Path, expected_hex: &str) -> bool {
+    let Ok(expected) = blake3::Hash::from_hex(expected_hex) else {
+        return false;
+    };
+    let part_path = part_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut hasher = blake3::Hasher::new();
+        std::fs::File::open(&part_path)
+            .and_then(|file| hasher.update_reader(file).map(|_| ()))
+            .is_ok_and(|()| hasher.finalize() == expected)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn verify_finalize_metadata(
@@ -6596,7 +6677,8 @@ mod join_authentication {
                 )
                 .route(
                     "/rooms/:room_id/transfers/:transfer_id/chunks",
-                    post(receive_file_chunk_handler),
+                    post(receive_file_chunk_handler)
+                        .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
                 )
                 .route(
                     "/rooms/:room_id/transfers/:transfer_id/finish",
@@ -7205,15 +7287,30 @@ mod join_authentication {
         session_key
     }
 
+    /// Posts one chunk of the 3-chunk test transfer, encrypted as if it
+    /// belonged at `bound_index`, and sent at `index`.
+    #[allow(clippy::too_many_arguments)]
     async fn post_chunk(
         host: &HostFixture,
         transfer_id: &str,
         index: u64,
+        bound_index: u64,
         plaintext: &[u8],
         key: &[u8; 32],
-        is_final: bool,
     ) -> StatusCode {
-        let (ciphertext, nonce) = crypto::encrypt_bytes(plaintext, key).unwrap();
+        let is_final = index == 2;
+        let (ciphertext, nonce) = crypto::encrypt_bytes_with_aad(
+            plaintext,
+            key,
+            &chunk_associated_data(
+                transfer_id,
+                bound_index,
+                3,
+                plaintext.len() as u64,
+                bound_index == 2,
+            ),
+        )
+        .unwrap();
         let frame =
             crate::chunk_frame::encode_binary_chunk_frame(&crate::chunk_frame::BinaryChunkFrame {
                 chunk_index: index,
@@ -7227,6 +7324,32 @@ mod join_authentication {
             .post(format!("{}/transfers/{transfer_id}/chunks", host.base_url))
             .header(CHUNK_PROTOCOL_HEADER, CHUNK_PROTOCOL_BINARY_V1)
             .body(frame)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    async fn signed_finish(
+        host: &HostFixture,
+        member: &Joiner,
+        transfer_id: &str,
+        digest: &str,
+    ) -> StatusCode {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "item_id": format!("item-{transfer_id}"),
+            "plaintext_blake3": digest,
+        }))
+        .unwrap();
+        let (request, _) = member.signer(host).apply(
+            reqwest::Client::new()
+                .post(format!("{}/transfers/{transfer_id}/finish", host.base_url)),
+            &format!("finish:{transfer_id}"),
+            &body,
+        );
+        request
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .await
             .unwrap()
@@ -7249,62 +7372,59 @@ mod join_authentication {
         found
     }
 
-    /// Characterization (remaining HTTP chunk limitation): a chunk's AEAD
-    /// does not bind its index or transfer, so an on-path attacker that
-    /// swaps two chunk bodies in flight produces a reordered file that the
-    /// receiver accepts and finishes. It cannot forge content.
+    /// Regression (Stage 2 finding): a chunk is bound to its transfer and
+    /// index, so a body swapped into another slot fails to decrypt. The
+    /// rejected request does not end the transfer, and the genuine chunks
+    /// still complete it intact.
     #[tokio::test]
-    async fn characterization_chunk_bodies_are_not_bound_to_their_index() {
+    async fn a_chunk_body_moved_to_another_index_is_rejected() {
         let host = HostFixture::new("reorder").await;
         let member = Joiner::new("member");
         member.pair(&host, CODE).await.expect("code pairs");
         let key = start_small_transfer(&host, &member, "reorder").await;
-        // The sender meant AAAA BBBB CCCC; the bodies of 0 and 1 are swapped.
+        // Bodies bound to 1 and 0, sent at 0 and 1.
         assert_eq!(
-            post_chunk(&host, "reorder", 0, b"BBBB", &key, false).await,
-            StatusCode::OK
-        );
-        assert_eq!(
-            post_chunk(&host, "reorder", 1, b"AAAA", &key, false).await,
-            StatusCode::OK
+            post_chunk(&host, "reorder", 0, 1, b"BBBB", &key).await,
+            StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            post_chunk(&host, "reorder", 2, b"CCCC", &key, true).await,
-            StatusCode::OK
+            post_chunk(&host, "reorder", 1, 0, b"AAAA", &key).await,
+            StatusCode::BAD_REQUEST
         );
-        let body = br#"{"item_id":"item-reorder"}"#.to_vec();
-        let (request, _) = member.signer(&host).apply(
-            reqwest::Client::new().post(format!("{}/transfers/reorder/finish", host.base_url)),
-            "finish:reorder",
-            &body,
-        );
-        let status = request
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
-            .unwrap()
-            .status();
-        assert_eq!(status, StatusCode::OK, "the reordered file is accepted");
-        assert!(files_under(&host.root)
-            .iter()
-            .any(|bytes| bytes.as_slice() == b"BBBBAAAACCCC"));
-    }
-
-    /// Characterization (remaining HTTP chunk limitation): the chunk route
-    /// is not peer-authenticated; one malformed request naming an active
-    /// transfer id ends that transfer. Transfer ids travel in clear URLs.
-    #[tokio::test]
-    async fn characterization_an_unsigned_malformed_chunk_ends_an_active_transfer() {
-        let host = HostFixture::new("chunk-dos").await;
-        let member = Joiner::new("member");
-        member.pair(&host, CODE).await.expect("code pairs");
-        start_small_transfer(&host, &member, "victim").await;
         assert!(host
             .state
             .active_file_transfers
             .lock()
-            .contains_key("victim"));
+            .contains_key("reorder"));
+        for (index, body) in [(0, b"AAAA"), (1, b"BBBB"), (2, b"CCCC")] {
+            assert_eq!(
+                post_chunk(&host, "reorder", index, index, body, &key).await,
+                StatusCode::OK
+            );
+        }
+        let digest = blake3::hash(b"AAAABBBBCCCC").to_hex().to_string();
+        assert_eq!(
+            signed_finish(&host, &member, "reorder", &digest).await,
+            StatusCode::OK
+        );
+        let files = files_under(&host.root);
+        assert!(files
+            .iter()
+            .any(|bytes| bytes.as_slice() == b"AAAABBBBCCCC"));
+        assert!(!files
+            .iter()
+            .any(|bytes| bytes.as_slice() == b"BBBBAAAACCCC"));
+    }
+
+    /// Regression (Stage 2 finding): unauthenticated chunk traffic, whether
+    /// malformed or encrypted under the wrong key, is refused per request
+    /// and never ends the legitimate transfer.
+    #[tokio::test]
+    async fn unauthenticated_chunk_traffic_does_not_end_a_transfer() {
+        let host = HostFixture::new("chunk-dos").await;
+        let member = Joiner::new("member");
+        member.pair(&host, CODE).await.expect("code pairs");
+        let key = start_small_transfer(&host, &member, "victim").await;
         let status = reqwest::Client::new()
             .post(format!("{}/transfers/victim/chunks", host.base_url))
             .header(CHUNK_PROTOCOL_HEADER, CHUNK_PROTOCOL_BINARY_V1)
@@ -7314,14 +7434,50 @@ mod join_authentication {
             .unwrap()
             .status();
         assert!(status.is_client_error());
+        let forged = post_chunk(&host, "victim", 0, 0, b"EVIL", &crypto::random_key()).await;
+        assert_eq!(forged, StatusCode::BAD_REQUEST);
         assert!(
-            !host
-                .state
+            host.state
                 .active_file_transfers
                 .lock()
                 .contains_key("victim"),
-            "an outsider ended the transfer"
+            "the transfer survives"
         );
+        for (index, body) in [(0, b"AAAA"), (1, b"BBBB"), (2, b"CCCC")] {
+            assert_eq!(
+                post_chunk(&host, "victim", index, index, body, &key).await,
+                StatusCode::OK
+            );
+        }
+        let digest = blake3::hash(b"AAAABBBBCCCC").to_hex().to_string();
+        assert_eq!(
+            signed_finish(&host, &member, "victim", &digest).await,
+            StatusCode::OK
+        );
+    }
+
+    /// The whole file must match the sender's signed digest before it is
+    /// finalized; a mismatch lands nothing.
+    #[tokio::test]
+    async fn a_file_whose_digest_does_not_match_is_not_finalized() {
+        let host = HostFixture::new("digest").await;
+        let member = Joiner::new("member");
+        member.pair(&host, CODE).await.expect("code pairs");
+        let key = start_small_transfer(&host, &member, "digest").await;
+        for (index, body) in [(0, b"AAAA"), (1, b"BBBB"), (2, b"CCCC")] {
+            assert_eq!(
+                post_chunk(&host, "digest", index, index, body, &key).await,
+                StatusCode::OK
+            );
+        }
+        let wrong = blake3::hash(b"something else").to_hex().to_string();
+        assert_eq!(
+            signed_finish(&host, &member, "digest", &wrong).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!files_under(&host.root)
+            .iter()
+            .any(|bytes| bytes.as_slice() == b"AAAABBBBCCCC"));
     }
 
     /// Characterization (legacy re-pairing): with no pin, the Host side of a
@@ -7359,5 +7515,71 @@ mod join_authentication {
             .unwrap();
         assert_eq!(pin.peer_host_ref, other.host_ref);
         assert_ne!(pin.peer_host_ref, original.host_ref);
+    }
+
+    /// The production sender and receiver agree end to end: chunks bound to
+    /// their place, the whole-file digest checked, the file intact.
+    #[tokio::test]
+    async fn a_real_file_transfer_round_trips_with_bound_chunks_and_a_verified_digest() {
+        let receiver = HostFixture::new("e2e-receive").await;
+        let sender = HostFixture::new("e2e-send").await;
+        let sender_secret = sender
+            .state
+            .active_servers
+            .lock()
+            .get(ROOM_ID)
+            .unwrap()
+            .transport_secret;
+        let sending_device = Joiner {
+            secret: sender_secret,
+            identity: DeviceIdentity::generate_for_test(),
+            host_ref: sender.state.local_host_ref.as_str().to_string(),
+        };
+        sending_device
+            .pair(&receiver, CODE)
+            .await
+            .expect("sender pairs with receiver");
+
+        let content = (0..(DEFAULT_CHUNK_SIZE_BYTES as usize * 2 + 12_345))
+            .map(|index| (index * 31 % 251) as u8)
+            .collect::<Vec<_>>();
+        let source = sender.root.join("payload.bin");
+        std::fs::write(&source, &content).unwrap();
+        let item = storage::create_outgoing_file_item_with_metadata(
+            &sender.state.paths,
+            &[41u8; 32],
+            ROOM_ID,
+            &source,
+            None,
+            None,
+        )
+        .unwrap();
+        let port = receiver
+            .base_url
+            .trim_start_matches("http://127.0.0.1:")
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        send_room_file_to_bridge_peer_endpoint(
+            sender.state.clone(),
+            ROOM_ID,
+            &item.id,
+            &source,
+            None,
+            None,
+            BridgePeerTransferEndpoint {
+                peer_session_id: "receiver".into(),
+                host: "127.0.0.1".into(),
+                port,
+                transport_public_key: receiver.server_public_key.clone(),
+            },
+        )
+        .await
+        .expect("transfer completes");
+        assert!(files_under(&receiver.root.join("inbox"))
+            .iter()
+            .any(|bytes| *bytes == content));
     }
 }
