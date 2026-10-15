@@ -20,7 +20,24 @@ The Host probes each exact connected peer on a two-second reconciliation cadence
 
 ## Product interaction boundary
 
-**New Bridge** is a non-mutating choice screen. Nearby discovery and refresh only observe available devices. A nearby request is a prompt, not authentication: when the other device's user accepts, that device creates one new Bridge and shows a one-time code, and the requester's user types it to pair; the acceptance itself carries no code, Bridge id, port or key. Manual code entry pairs with an existing Bridge's open code, and **Create Bridge** is the only action on that screen that creates an empty Bridge/code. Opening the screen from the sidebar or empty workspace creates no storage record. The Bridge header's network panel shows the pairing state and can show a new code for the open Bridge.
+**New Bridge** is a non-mutating choice screen. Nearby discovery and refresh only observe available devices. A nearby request is a prompt, not authentication: when the other device's user accepts, that device creates one new Bridge and shows a one-time code, and the requester's user types it to pair; the acceptance itself carries no code, Bridge id, port or key.
+
+**Paired devices.** A code pairing proves the other device's identity key, and both devices remember it as a known device (`known_bridge_devices`). A nearby Join to a known device carries a request signed by this device's identity key, bound to the request id, both HostRefs, a time and a nonce.
+
+When the receiver still knows that key:
+- it creates the Bridge pinned to it, without a prompt or code, and shows a notice;
+- it answers with a single-use offer signed by its own key, and the requester completes the join with the same identity-proven handshake as a reconnect;
+- a Bridge that is not joined within two minutes is burned again.
+
+Anything that does not verify is shown to the receiver's user as an ordinary request. Being Busy (having a Bridge) does not block a known device. Membership grants nothing else: Agent work still needs Review or an unattended permission.
+
+Forgetting a known device (Settings → Paired devices):
+- revokes it;
+- removes every pin to its key;
+- ends those Bridges' current sessions, so they need pairing again;
+- keeps Bridge history.
+
+A new key paired for the same HostRef supersedes the old one. Burn does not forget a device. Other devices on the network are never trusted by being there. Manual code entry pairs with an existing Bridge's open code, and **Create Bridge** is the only action on that screen that creates an empty Bridge/code. Opening the screen from the sidebar or empty workspace creates no storage record. The Bridge header's network panel shows the pairing state and can show a new code for the open Bridge.
 
 **Devices** inspects the selected Bridge's known members and current liveness. It has no add/find/join action because Pastey does not implement adding another Host to an existing Bridge. Nearby admission belongs to New Bridge.
 

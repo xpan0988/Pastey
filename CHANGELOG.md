@@ -8,6 +8,10 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Added
 
+- Paired devices connect without a code. After two devices pair once with a code, each remembers the other's identity key.
+  - Nearby shows such a device as "Paired before", and **Connect** starts a new Bridge with it, even when it already has one, without a code or an Accept prompt on the other device. The other device shows a notice.
+  - The connection still proves both identity keys. A device that only claims to be paired, or that was forgotten, gets the ordinary prompt-and-code flow. Other devices on the same network never connect without a code.
+  - Settings → Paired devices lists the remembered devices. Forgetting one makes it need a code again and ends the current session of each Bridge with it.
 - Unattended Codex access: on the device that runs Codex, its user can trust a specific requesting device (after comparing identity fingerprints shown on both) and give it a limited permission to start Codex in one folder over one Bridge without clicking Accept, for up to 7 days and up to 50 runs, revocable at any time. Devices prove a durable identity key bound to the exact current Bridge session; addresses, names and codes never count as identity. Without a valid permission, requests still wait for Accept. Codex's own approval requests are never answered by a permission.
 - Bridges can form and reconnect across networks through a user-managed overlay such as Tailscale or WireGuard: join by code at the other device's private or overlay address, or remember that address for an existing Bridge. Discovery is unicast to that address only; pairing and reconnect are authenticated exactly as on the LAN, and an address never authorizes anything. Public internet addresses are refused, including a name that resolves to one (every reconnect resolves the name again) and numeric forms such as `0x08080808`. Join by code has an "another network" option, and the Bridge header shows the connection state and lets you set or remove the remote address, with errors that say whether the address, the code, the Bridge or the network is the problem.
 - Find file: from a Bridge, search another device for a file by name (for example a validation `.mp4`) and receive only the one you choose in this device's Inbox, through the existing reviewed Search → Select → encrypted Transfer flow. Nothing else moves and nothing on the other device changes. Results show name, size, modification time and a redacted location, and expire after 10 minutes.
@@ -28,6 +32,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- Windows: Codex installed as an app execution alias (in `%LOCALAPPDATA%\Microsoft\WindowsApps`), or installed after Pastey started, was reported as unavailable. Pastey now:
+  - finds aliases;
+  - also searches the current user and system PATH;
+  - starts Codex with that PATH, so an npm-installed Codex finds Node.
+
+  When Codex still cannot be used, the task card says why: not installed or not found, could not start, exits with an error (with its message, on the device itself), did not answer in time, or incompatible. It also says what to do. The requesting device sees the same reason. `scripts/diagnose-windows-codex.ps1` collects read-only facts for diagnosis. This is unit-tested and cross-compiled; it is not yet validated on a Windows machine.
 - Security: joining a Bridge is now authenticated end to end. Previously anyone who could reach a device's Bridge server and learn the Bridge id, which the code lookup broadcast on the LAN revealed, could replace the connected device, send it text and files, and receive what the user sent next. Now:
   - The 8-digit code is a one-time password of a SPAKE2 exchange. Nothing derived from it crosses the network, so it cannot be recovered by listening or offline guessing. Each code answers at most 20 guesses, expires after 15 minutes, and admits one device.
   - Pairing binds the Bridge, both devices' identity keys and HostRefs, and both session keys. Each device remembers the other's identity key.

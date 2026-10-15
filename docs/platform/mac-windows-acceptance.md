@@ -57,6 +57,8 @@ Record results in the template at the end. Never record codes, keys, device fing
 | B2 | On a new Mac code, type a wrong code on Windows three times, then the right one. | Wrong codes: "did not answer" each time, and no Bridge appears on Windows. The right code then pairs. |
 | B3 | After B1, enter the same code again on Windows, or on a third device if available. | Refused or no answer. A code admits one device. |
 | B4 | Nearby flow. Windows: New Bridge → Nearby → Join on the Mac. Mac: Accept. | The Mac shows "Enter NNNN NNNN on <Windows>". Windows shows an "accepted" card asking for the code. Typing it pairs. Repeat once with **Reject**; Windows says rejected. |
+| B4a | After B1 or B4, open New Bridge on Windows again. The Mac shows **Paired before**; choose **Connect**. Repeat once from the Mac towards Windows. | A new Bridge connects with no code and no Accept; the other device shows "started a new Bridge with this device". Busy does not block it. |
+| B4b | On the Mac, open Settings → Paired devices and **Forget** Windows. Then Connect from Windows again. | The Mac now shows the ordinary Accept prompt and code. Mac Bridges with Windows are disconnected and need pairing again. |
 | B5 | Explicit re-pair. On the Mac's Bridge from B1: network panel → Pair another device. On Windows, enter that code under **New Bridge**. | Refused: "This device already has that Bridge". Then, on Windows, open that Bridge's network panel, type the code in **Pair with code**, and pairing succeeds. |
 | B6 | Legacy upgrade, if a pre-pairing build with an existing Bridge is available. Before upgrading, share a folder with that Bridge. | After upgrading both: the Bridge shows **Pairing required**, never reconnects on its own, and its history is visible. Re-pair it as in B5 (Show new code on one side, Pair with code on the other). Afterwards the folder share is gone and must be shared again; the history is still there. |
 
@@ -88,6 +90,7 @@ After each step, send one text and the small file both ways.
 
 | # | Do | Expect |
 |---|---|---|
+| E0 | On Windows, check that `codex --version` works in a new terminal. In Pastey on the Mac, select Windows in the Codex card. | "Codex is available on <Windows>". If not, the card names the failing layer. Run `powershell -ExecutionPolicy Bypass -File .\scripts\diagnose-windows-codex.ps1` on Windows and record its report: it masks the user name, but review it before sharing. |
 | E1 | From the Mac, start a small Codex task on Windows. | Windows shows the executor Review. Accept runs it; the reply returns to the Mac card. |
 | E2 | Repeat and choose Deny. | Nothing runs; the Mac shows that it did not start. |
 | E3 | Workspace movement: propose with a small folder, approve on the Mac, Accept on Windows. | The workspace lands, Codex runs, the result returns and applies, and the Mac's original folder is unchanged until it is applied. |
