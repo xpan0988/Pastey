@@ -1,5 +1,6 @@
 # Read-only diagnosis of why Pastey on this Windows account reports Codex as
-# unavailable. It changes nothing, installs nothing and reads no credential.
+# unavailable, covering both a Codex CLI and the Codex bundled with a desktop
+# app. It changes nothing, installs nothing and reads no credential.
 # Run in a normal (non-elevated) PowerShell:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\diagnose-windows-codex.ps1
 # The report is printed and saved to %TEMP%\pastey-codex-diagnostics.txt with
@@ -44,6 +45,37 @@ Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WindowsApps" -Filter 'codex*' -Force 
     ForEach-Object { Say ("{0}  attributes={1}" -f $_.FullName, $_.Attributes) }
 Get-AppxPackage -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'codex|chatgpt|openai' } |
     ForEach-Object { Say ("package {0} {1}" -f $_.Name, $_.Version) }
+
+Section 'Codex bundled with a desktop app (codex-cli\codex-package.json)'
+$desktopRoots = @()
+if ($env:LOCALAPPDATA) { $desktopRoots += Join-Path $env:LOCALAPPDATA 'Programs' }
+$desktopRoots += Get-AppxPackage -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match 'OpenAI|ChatGPT|Codex' } | ForEach-Object { $_.InstallLocation }
+$manifests = foreach ($root in $desktopRoots | Where-Object { $_ }) {
+    Get-ChildItem -LiteralPath $root -Recurse -Depth 5 -Filter 'codex-package.json' -ErrorAction SilentlyContinue
+}
+if (-not $manifests) { Say 'No codex-package.json found under per-user programs or OpenAI packages.' }
+foreach ($manifestFile in $manifests) {
+    Say ("manifest: " + $manifestFile.FullName)
+    $manifest = Get-Content -LiteralPath $manifestFile.FullName -Raw | ConvertFrom-Json
+    Say ("  layoutVersion={0} version={1} target={2} variant={3} entrypoint={4}" -f
+        $manifest.layoutVersion, $manifest.version, $manifest.target, $manifest.variant, $manifest.entrypoint)
+    $entry = Join-Path $manifestFile.DirectoryName $manifest.entrypoint
+    $item = Get-Item -LiteralPath $entry -Force -ErrorAction SilentlyContinue
+    Say ("  entrypoint exists={0} attributes={1}" -f [bool]$item, $(if ($item) { $item.Attributes } else { '-' }))
+    if ($item) {
+        foreach ($probe in @(@('--version'), @('app-server', '--help'))) {
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            $output = & $entry @probe 2>&1 | Select-Object -First 2
+            Say ("  {0}: exit={1} ms={2}" -f ($probe -join ' '), $LASTEXITCODE, $watch.ElapsedMilliseconds)
+            $output | ForEach-Object { Say ("    " + $_) }
+        }
+        $login = & $entry login status 2>&1 | Select-Object -First 1
+        Say ("  login status: " + $login)
+    }
+}
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -match 'codex' } |
+    ForEach-Object { Say ("running: {0} {1}" -f $_.ProcessName, $_.Path) }
 
 Section 'npm global shims and Node'
 Get-ChildItem "$env:APPDATA\npm" -Filter 'codex*' -ErrorAction SilentlyContinue | ForEach-Object { Say $_.FullName }
