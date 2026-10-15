@@ -141,7 +141,7 @@ The audit added seven `characterization_*` tests that asserted the insecure beha
 Option A is implemented in `src-tauri/src/bridge_auth.rs` with SPAKE2 from RustCrypto's `spake2` 0.4 (Ed25519 group). It is wired into discovery, `/join`, reconnect, the room routes and the renderer. Both devices must run the new version; an older peer can neither pair nor reconnect, which fails closed.
 
 Decisions applied:
-- **Existing Bridges** are not trusted on upgrade: without a pin they do not reconnect, and they keep their local data. Startup recovery already clears every legacy route and key. A user re-pairs by showing a new code ("Show new code" in the Bridge network panel) and entering it on the other device. A code for an existing local Bridge is accepted only from the same logical Host as that Bridge's last known or pinned peer.
+- **Existing Bridges** are not trusted on upgrade: without a pin they do not reconnect, and they keep their local data. Startup recovery already clears every legacy route and key. A user re-pairs by showing a new code ("Show new code" in the Bridge network panel) and entering it on the other device. The joining side refuses a code whose offer names a different HostRef than that Bridge's last known or pinned peer. This guards against a mistaken code only: a HostRef is not cryptographic, and the Host side does not check it (section 8).
 - **Nearby**: the accepting device shows a fresh one-time code and the requester types it. The acceptance carries no secret.
 
 | # | Status | How | Evidence (all local tests, loopback) |
@@ -167,6 +167,39 @@ Remaining risks (not fixed in Stage 1):
 - **Self-described HostRef and nearby prompt.** A paired device can claim any HostRef at pairing, so the user's code entry decides which device is trusted. The nearby prompt's device name is unauthenticated.
 - **Device identity rotation** (`rotate_device_identity`) breaks pinned reconnect until the Bridge is paired again. This is intended, and it is not yet explained in the UI.
 - **Not validated on physical devices.** Everything above is local, in-process or loopback tests. Two-device LAN, overlay and nearby flows have not been run.
+
+## 8. Stage 2 verification (2026-10-15)
+
+### Legacy re-pairing does not authenticate the original device
+
+The question was whether re-pairing a Bridge that has no pin proves that the device on the other end is the Bridge's original peer. **It does not, and from the stored state it cannot.** A Bridge from before pairing existed never recorded its peer's device key. Its only remnants are:
+- a HostRef, which is a hash of the `device_id` that every nearby beacon broadcasts;
+- display "pairing" fingerprints of per-session transport keys, which rotate on every start.
+
+What re-pairing proves is that the other device knows the fresh one-time code shown on this device's screen. SPAKE2 makes that a strong, unguessable proof, so the user deciding where the code goes is the authenticator.
+
+- **Host side** (the device showing the code): it admits any device that completes pairing with the code, whatever HostRef it claims. Test: `transfer::join_authentication::characterization_legacy_repairing_admits_any_device_holding_the_code`.
+- **Joining side** (the device typing the code): `refuse_repairing_with_another_host` compares the offer's HostRef with the Bridge's last known peer HostRef. Anyone who heard a beacon can compute that HostRef, so the check only stops a code typed by mistake for another Bridge's Host. Test: `commands::tests::characterization_repairing_continuity_rests_on_a_claimable_host_ref`.
+
+Options before Stage 3; none is implemented:
+1. Show both devices' identity fingerprints after a re-pair and ask the user to confirm they match. The fingerprint display already exists for unattended access. This is the only option that authenticates the original *physical* device without prior state.
+2. Make the Host side apply the same HostRef continuity check as the joining side. This is cheap and symmetric, but still not cryptographic.
+3. Treat a legacy Bridge as new: drop its peer history and pair from scratch. This is the simplest honest model, at the cost of continuity.
+
+Stage 3 must not pin an iroh `EndpointId` to a legacy Bridge's peer until one of these is decided. Otherwise the reachability pin inherits the weaker of the two guarantees.
+
+### HTTP chunk authentication: remaining limitations
+
+The room server authenticates who may start, finish and cancel a transfer (section 7), but not the individual chunk requests. Two characterization tests assert what an on-path party can still do:
+- **Kill a transfer.** One unsigned, malformed `POST /transfers/{id}/chunks` naming an active transfer id makes the receiver fail and drop that transfer. Transfer ids are visible in clear URLs. Test: `characterization_an_unsigned_malformed_chunk_ends_an_active_transfer`.
+- **Reorder content.** A chunk's AEAD (ChaCha20-Poly1305, random nonce, no associated data) binds neither its index nor its transfer. A party that swaps two chunk bodies in flight produces a reordered file, which the receiver accepts, and the signed finish succeeds, because finish checks sizes and counts but not a whole-file digest. Content cannot be forged or read, and chunks from another transfer fail to decrypt, because each transfer has its own key. Test: `characterization_chunk_bodies_are_not_bound_to_their_index`.
+
+Fixes, each local and small, but changing the chunk wire format:
+- put `(transfer id, chunk index, is_final, plaintext size)` into the AEAD associated data;
+- verify a sender-supplied BLAKE3 digest of the plaintext at finish;
+- make decrypt or decode failures from an unauthenticated chunk reject only that request, without failing the transfer.
+
+Moving Bridge traffic onto QUIC (Stage 3) would stop on-path parties seeing or touching the HTTP layer. These fixes still matter for LAN and overlay routes, which stay on TCP.
 
 Run the focused suites (they bind loopback TCP/UDP ports):
 
