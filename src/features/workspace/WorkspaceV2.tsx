@@ -141,10 +141,20 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   async function joinNearbyDevice(deviceId: string) {
     setMessage(null);
     try {
-      await props.onJoinNearbyDevice(deviceId);
-      setRoute("bridge");
+      return await props.onJoinNearbyDevice(deviceId);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Pastey could not join this nearby device.");
+      throw error;
+    }
+  }
+
+  async function completeNearbyJoin(requestId: string, code: string) {
+    setMessage(null);
+    try {
+      await props.onCompleteNearbyJoin(requestId, code.replace(/\D/g, ""));
+      setRoute("bridge");
+    } catch (error) {
+      setMessage(bridgeConnectionErrorMessage(error, false));
       throw error;
     }
   }
@@ -216,7 +226,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
         {route === "bridge" ? <BridgeWorkspace room={activeRoom} items={props.roomItems} queueItems={props.queueItems} task={task} developerMode={bridgeMode === "developer"} developerSession={activeRoom ? developerSessions[activeRoom.id] ?? null : null} developerWorkspace={activeRoom ? developerWorkspaces[activeRoom.id] ?? { pendingRequests: [], sessions: [] } : { pendingRequests: [], sessions: [] }} onDeveloperSession={(session) => setDeveloperSessions((current) => ({ ...current, [session.roomId]: session }))} onRefreshDeveloper={refreshDeveloperWorkspaces} onNewBridge={() => navigate("new-bridge")} onRefresh={props.onRefreshBridge} onDeveloper={() => setBridgeMode((current) => current === "normal" ? "developer" : "normal")} onBurn={props.onBurnBridge} onEnqueue={props.onEnqueueTransferInputs} /> : null}
         {route === "activity" ? <ActivityScreen items={props.activityItems} transfers={props.transfers} queueItems={props.queueItems} onRevealInFolder={props.onRevealInFolder} /> : null}
         {route === "devices" ? <DevicesScreen room={activeRoom} /> : null}
-        {route === "new-bridge" ? <NewBridgeScreen onCreate={createBridge} onJoin={joinBridge} onListNearby={props.onListNearbyDevices} onJoinNearby={joinNearbyDevice} nearbyDiscoveryAvailable={props.nearbyDiscoveryAvailable} /> : null}
+        {route === "new-bridge" ? <NewBridgeScreen onCreate={createBridge} onJoin={joinBridge} onListNearby={props.onListNearbyDevices} onJoinNearby={joinNearbyDevice} onCompleteNearby={completeNearbyJoin} nearbyDiscoveryAvailable={props.nearbyDiscoveryAvailable} /> : null}
         {route === "inbox" ? <InboxScreen items={props.activityItems} inboxDir={props.config.inbox_dir} onRevealInFolder={props.onRevealInFolder} /> : null}
         {route === "settings" ? <SettingsOverview config={props.config} onNavigate={navigate} onConfigChange={props.onConfigChange} /> : null}
         {route === "settings-diagnostics" ? <DiagnosticsSettings onNavigate={navigate} /> : null}

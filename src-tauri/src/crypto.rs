@@ -199,29 +199,3 @@ fn key_from_slice(value: &[u8]) -> AppResult<[u8; 32]> {
         .try_into()
         .map_err(|_| AppError::Crypto("invalid key size".into()))
 }
-
-/// Characterization of the Bridge code lookup value (see the join audit in
-/// docs/layers/layer-4-join-audit.md). It asserts behaviour that is insecure
-/// today; a fix is expected to flip it.
-#[cfg(test)]
-mod join_characterization {
-    use super::*;
-
-    /// The lookup value depends on the code alone: no Bridge, installation or
-    /// per-query salt, and the code is always one of 10^8 decimal strings. Any
-    /// observer of the value can therefore recover the code offline.
-    #[test]
-    fn characterization_code_hash_is_unsalted_over_an_eight_digit_space() {
-        for _ in 0..64 {
-            let code = generate_code();
-            assert_eq!(code.len(), 8);
-            assert!(code.bytes().all(|byte| byte.is_ascii_digit()));
-        }
-        let code = "31415926";
-        let expected = blake3::hash(b"pastey:code:v1:31415926")
-            .to_hex()
-            .to_string();
-        assert_eq!(hash_code(code), expected, "only the code is hashed");
-        assert_eq!(hash_code(code), hash_code(code), "no per-call salt");
-    }
-}

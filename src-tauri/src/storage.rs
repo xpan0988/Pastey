@@ -14,10 +14,10 @@ use crate::{
     error::{AppError, AppResult},
     logging,
     models::{
-        BridgePairingMethod, BridgePairingRotationState, BridgePeerJoinMethod, BridgePeerLiveness,
-        BridgeRoomPeerInfo, LocalRole, PayloadType, RoomInfo, RoomItem, RoomItemDirection,
-        RoomItemStatus, RoomStatus, StoredBridgeDurableIdentity, StoredBridgePeerEndpoint,
-        StoredRoom, StoredRoomItem,
+        BridgePairingMethod, BridgePairingRotationState, BridgePairingState, BridgePeerJoinMethod,
+        BridgePeerLiveness, BridgeRoomPeerInfo, LocalRole, PayloadType, RoomInfo, RoomItem,
+        RoomItemDirection, RoomItemStatus, RoomStatus, StoredBridgeDurableIdentity,
+        StoredBridgePeerEndpoint, StoredRoom, StoredRoomItem,
     },
 };
 
@@ -220,6 +220,29 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             room_id TEXT PRIMARY KEY,
             address TEXT NOT NULL,
             updated_at INTEGER NOT NULL
+        );
+
+        -- The peer device a Bridge was paired with through the code-based
+        -- PAKE handshake: its HostRef and Ed25519 device key. Reconnect is
+        -- accepted only with a fresh signature by this key. A Bridge without
+        -- a pin (for example from before pairing existed) has no remote
+        -- authority until it is paired again.
+        CREATE TABLE IF NOT EXISTS bridge_peer_pins (
+            room_id TEXT PRIMARY KEY,
+            peer_host_ref TEXT NOT NULL,
+            peer_device_public_key TEXT NOT NULL,
+            paired_at INTEGER NOT NULL
+        );
+
+        -- One open pairing code per Bridge. `answered` counts the pairing
+        -- queries answered, each of which is one guess of the code; the window
+        -- closes after a bounded number, on success, or on expiry.
+        CREATE TABLE IF NOT EXISTS bridge_pairing_windows (
+            room_id TEXT PRIMARY KEY,
+            opened_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            answered INTEGER NOT NULL DEFAULT 0,
+            closed_at INTEGER
         );
 
         -- Folders this Host's own user authorized for authenticated Bridge
@@ -735,6 +758,124 @@ pub(crate) fn get_bridge_peer_address(
         .map_err(AppError::from)
 }
 
+/// The peer device a Bridge is pinned to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BridgePeerPin {
+    pub(crate) peer_host_ref: String,
+    pub(crate) peer_device_public_key: [u8; 32],
+}
+
+/// Pins a Bridge to the peer device proven in a completed pairing, replacing
+/// any earlier pin. Only a pairing handshake may call this.
+pub(crate) fn pin_bridge_peer(
+    paths: &AppPaths,
+    room_id: &str,
+    peer_host_ref: &str,
+    peer_device_public_key: &[u8; 32],
+) -> AppResult<()> {
+    let conn = connection(paths)?;
+    let current: i64 = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status != 'burned')
+            AND NOT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+        [room_id],
+        |row| row.get(0),
+    )?;
+    if current == 0 {
+        return Err(AppError::InvalidInput(
+            "That Bridge is no longer available.".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO bridge_peer_pins (room_id, peer_host_ref, peer_device_public_key, paired_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(room_id) DO UPDATE SET peer_host_ref = excluded.peer_host_ref,
+             peer_device_public_key = excluded.peer_device_public_key,
+             paired_at = excluded.paired_at",
+        params![
+            room_id,
+            peer_host_ref,
+            crypto::encode_key(peer_device_public_key),
+            now_ts()
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn bridge_peer_pin(paths: &AppPaths, room_id: &str) -> AppResult<Option<BridgePeerPin>> {
+    let row = connection(paths)?
+        .query_row(
+            "SELECT peer_host_ref, peer_device_public_key FROM bridge_peer_pins WHERE room_id = ?1
+               AND NOT EXISTS (SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+            [room_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    row.map(|(peer_host_ref, key)| {
+        Ok(BridgePeerPin {
+            peer_host_ref,
+            peer_device_public_key: crypto::decode_key(&key)?,
+        })
+    })
+    .transpose()
+}
+
+/// Opens (or reopens with a fresh budget) the pairing window of one Bridge.
+pub(crate) fn open_pairing_window(
+    paths: &AppPaths,
+    room_id: &str,
+    expires_at: i64,
+) -> AppResult<()> {
+    connection(paths)?.execute(
+        "INSERT INTO bridge_pairing_windows (room_id, opened_at, expires_at, answered, closed_at)
+         VALUES (?1, ?2, ?3, 0, NULL)
+         ON CONFLICT(room_id) DO UPDATE SET opened_at = excluded.opened_at,
+             expires_at = excluded.expires_at, answered = 0, closed_at = NULL",
+        params![room_id, now_ts(), expires_at],
+    )?;
+    Ok(())
+}
+
+/// Whether the Bridge's pairing code may still be guessed against.
+pub(crate) fn pairing_window_open(
+    paths: &AppPaths,
+    room_id: &str,
+    max_answers: i64,
+) -> AppResult<bool> {
+    Ok(connection(paths)?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bridge_pairing_windows
+             WHERE room_id = ?1 AND closed_at IS NULL AND expires_at > ?2 AND answered < ?3)
+           AND EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status = 'active')
+           AND NOT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
+        params![room_id, now_ts(), max_answers],
+        |row| row.get::<_, i64>(0),
+    )? == 1)
+}
+
+/// Spends one guess of the Bridge's pairing code. False once the window is
+/// closed, expired or out of budget; nothing may then be answered.
+pub(crate) fn spend_pairing_attempt(
+    paths: &AppPaths,
+    room_id: &str,
+    max_answers: i64,
+) -> AppResult<bool> {
+    if !pairing_window_open(paths, room_id, max_answers)? {
+        return Ok(false);
+    }
+    Ok(connection(paths)?.execute(
+        "UPDATE bridge_pairing_windows SET answered = answered + 1
+         WHERE room_id = ?1 AND closed_at IS NULL AND expires_at > ?2 AND answered < ?3",
+        params![room_id, now_ts(), max_answers],
+    )? == 1)
+}
+
+pub(crate) fn close_pairing_window(paths: &AppPaths, room_id: &str) -> AppResult<()> {
+    connection(paths)?.execute(
+        "UPDATE bridge_pairing_windows SET closed_at = ?2 WHERE room_id = ?1 AND closed_at IS NULL",
+        params![room_id, now_ts()],
+    )?;
+    Ok(())
+}
+
 /// Most folders a Host user may authorize for Bridge Search.
 pub(crate) const MAX_AUTHORIZED_SEARCH_FOLDERS: i64 = 16;
 
@@ -1142,6 +1283,33 @@ pub fn create_room(
     get_room_by_id(paths, &room.id)
 }
 
+/// Replaces the one-time pairing code of an existing Bridge.
+pub(crate) fn replace_room_code(
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    room_id: &str,
+    code: &str,
+) -> AppResult<()> {
+    let (wrapped_room_code, code_nonce) = crypto::wrap_bytes(code.as_bytes(), master_key)?;
+    let changed = connection(paths)?.execute(
+        "UPDATE rooms SET room_code_hash = ?1, wrapped_room_code = ?2, code_nonce = ?3
+         WHERE id = ?4 AND status != 'burned'
+           AND NOT EXISTS (SELECT 1 FROM burned_bridges WHERE room_id = ?4)",
+        params![
+            crypto::hash_code(code),
+            wrapped_room_code,
+            code_nonce,
+            room_id
+        ],
+    )?;
+    if changed != 1 {
+        return Err(AppError::InvalidInput(
+            "That Bridge is no longer available.".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn active_room_code_exists(paths: &AppPaths, code_hash: &str) -> AppResult<bool> {
     let conn = connection(paths)?;
     let exists = conn.query_row(
@@ -1266,6 +1434,9 @@ pub fn remove_departed_bridge_peer(
         tx.commit()?;
         return Ok(false);
     }
+    // The departed device is no longer this Bridge's peer: it may come back
+    // only by pairing again.
+    tx.execute("DELETE FROM bridge_peer_pins WHERE room_id = ?1", [room_id])?;
 
     let remaining_members = tx.query_row(
         "SELECT COUNT(*) FROM bridge_peers WHERE room_id = ?1 AND liveness IN ('connected', 'reconnecting', 'disconnected')",
@@ -2181,6 +2352,13 @@ pub fn cut_off_bridge_authority(paths: &AppPaths, room_id: &str) -> AppResult<bo
         "UPDATE rooms SET status = 'burned', room_code_hash = '', wrapped_room_code = '', code_nonce = '', peer_device_name = NULL, peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL, local_burned_at = ?1 WHERE id = ?2",
         params![now_ts(), room_id],
     )?;
+    // The pinned peer identity and any open pairing code are authority:
+    // neither may outlive the cutoff.
+    conn.execute("DELETE FROM bridge_peer_pins WHERE room_id = ?1", [room_id])?;
+    conn.execute(
+        "DELETE FROM bridge_pairing_windows WHERE room_id = ?1",
+        [room_id],
+    )?;
     Ok(true)
 }
 
@@ -2528,6 +2706,7 @@ pub fn room_to_info(room: StoredRoom, master_key: &[u8; 32]) -> AppResult<RoomIn
         local_burned_at: room.local_burned_at,
         peer_burned_at: room.peer_burned_at,
         peers: Vec::new(),
+        pairing_state: BridgePairingState::PairingRequired,
     })
 }
 
@@ -2551,6 +2730,13 @@ pub fn room_to_info_with_bridge_peers(
     }
     info.peer_connected = peers.iter().any(|peer| peer.connected);
     info.peers = peers;
+    info.pairing_state = if bridge_peer_pin(paths, &room_id)?.is_some() {
+        BridgePairingState::Paired
+    } else if pairing_window_open(paths, &room_id, crate::bridge_auth::PAIRING_MAX_ANSWERS)? {
+        BridgePairingState::AwaitingPeer
+    } else {
+        BridgePairingState::PairingRequired
+    };
     Ok(info)
 }
 
@@ -5117,6 +5303,99 @@ mod tests {
         );
         assert!(detached.is_err());
         let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
+    #[test]
+    fn a_pairing_code_answers_a_bounded_number_of_guesses_then_closes() {
+        let paths = test_paths("pairing-window");
+        init_database(&paths).unwrap();
+        let room = create_room(
+            &paths,
+            &[3u8; 32],
+            "12345678",
+            15,
+            LocalRole::Creator,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !spend_pairing_attempt(&paths, &room.id, 3).unwrap(),
+            "no window yet"
+        );
+        open_pairing_window(&paths, &room.id, now_ts() + 60).unwrap();
+        for _ in 0..3 {
+            assert!(spend_pairing_attempt(&paths, &room.id, 3).unwrap());
+        }
+        assert!(!spend_pairing_attempt(&paths, &room.id, 3).unwrap());
+        assert!(!pairing_window_open(&paths, &room.id, 3).unwrap());
+        // A fresh code is a fresh budget; success closes it.
+        open_pairing_window(&paths, &room.id, now_ts() + 60).unwrap();
+        assert!(spend_pairing_attempt(&paths, &room.id, 3).unwrap());
+        close_pairing_window(&paths, &room.id).unwrap();
+        assert!(!spend_pairing_attempt(&paths, &room.id, 3).unwrap());
+        // So does expiry.
+        open_pairing_window(&paths, &room.id, now_ts() - 1).unwrap();
+        assert!(!spend_pairing_attempt(&paths, &room.id, 3).unwrap());
+    }
+
+    #[test]
+    fn a_pinned_peer_identity_ends_with_burn_and_with_departure() {
+        let paths = test_paths("peer-pin");
+        init_database(&paths).unwrap();
+        let host_ref = crate::host_identity::HostRef::from_device_id("peer").unwrap();
+        let room = create_room(
+            &paths,
+            &[3u8; 32],
+            "12345678",
+            15,
+            LocalRole::Creator,
+            None,
+            None,
+        )
+        .unwrap();
+        pin_bridge_peer(&paths, &room.id, host_ref.as_str(), &[9u8; 32]).unwrap();
+        assert_eq!(
+            bridge_peer_pin(&paths, &room.id).unwrap(),
+            Some(BridgePeerPin {
+                peer_host_ref: host_ref.as_str().into(),
+                peer_device_public_key: [9u8; 32],
+            })
+        );
+        assert!(pin_bridge_peer(&paths, "no-such-bridge", host_ref.as_str(), &[9u8; 32]).is_err());
+
+        // An authenticated departure of the pinned peer removes the pin.
+        update_room_peer(
+            &paths,
+            &room.id,
+            Some("192.168.1.20"),
+            Some(5000),
+            Some("peer"),
+            Some(&crypto::encode_key(&[5u8; 32])),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        let session = list_bridge_peer_endpoints(&paths, &room.id).unwrap()[0]
+            .peer_session_id
+            .clone();
+        assert!(remove_departed_bridge_peer(&paths, &room.id, &session).unwrap());
+        assert_eq!(bridge_peer_pin(&paths, &room.id).unwrap(), None);
+
+        // The Burn cutoff removes the pin and any open code before cleanup.
+        pin_bridge_peer(&paths, &room.id, host_ref.as_str(), &[9u8; 32]).unwrap();
+        open_pairing_window(&paths, &room.id, now_ts() + 60).unwrap();
+        cut_off_bridge_authority(&paths, &room.id).unwrap();
+        assert_eq!(bridge_peer_pin(&paths, &room.id).unwrap(), None);
+        assert!(!pairing_window_open(&paths, &room.id, 20).unwrap());
+        let remaining: i64 = connection(&paths)
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM bridge_peer_pins) + (SELECT COUNT(*) FROM bridge_pairing_windows)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]

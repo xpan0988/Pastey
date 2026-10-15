@@ -138,6 +138,25 @@ test("new Bridge view consumes the real renderer-safe nearby discovery binding",
   assert.match(app, /requestNearbyJoin\(deviceId\)/);
 });
 
+test("a nearby join pairs only with the code the accepting device shows", () => {
+  const screen = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const app = readFileSync("src/App.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  // Accepting yields only a pending request; the code is typed, never received.
+  assert.match(bindings, /requestNearbyJoin\(deviceId: string\): Promise<NearbyJoinPending>/);
+  assert.match(screen, /onCompleteNearby\(nearbyPending\.requestId, nearbyCode\)/);
+  assert.match(app, /completeNearbyJoin\(requestId, code\)/);
+  assert.doesNotMatch(app, /room_code/);
+  // The accepting device shows its code until the requester has paired.
+  assert.match(app, /Enter \{acceptedPairing\.code\} on \{acceptedPairing\.deviceName\}/);
+});
+
+test("a Bridge without a verified device offers only explicit re-pairing", () => {
+  const panel = readFileSync("src/features/workspace/BridgeNetworkPanel.tsx", "utf8");
+  assert.match(panel, /openBridgePairing\(room\.id\)/);
+  assert.match(panel, /pairing === "pairing_required" \? "Pairing required"/);
+});
+
 test("nearby refresh deduplicates one physical device without mutating Bridge state", () => {
   const device: NearbyDevice = {
     device_id: "device-a",

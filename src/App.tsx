@@ -3,11 +3,13 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useEffect, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
 import { WorkspaceV2 } from "./features/workspace/WorkspaceV2";
+import { bridgeCode } from "./features/workspace/workspaceViewModel";
 import "./features/workspace/workspace-v2.css";
 import {
   acceptNearbyJoin,
   burnRoom,
   cancelTransfer,
+  completeNearbyJoin,
   createRoom,
   deleteTempFile,
   getConfig,
@@ -75,7 +77,7 @@ import { mergeTransferEvent } from "./lib/transferState";
 import { mergeRoomItems, reconcileRoomItems, reconcileRooms, reconcileValue } from "./lib/authoritativeSnapshots";
 import { disposeAll, ownAsyncDisposer } from "./lib/subscriptionLifecycle";
 import { chooseInitialBridgeId, reconcileSelectedBridgeId, visibleBridgeRooms } from "./lib/bridgeSelection";
-import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, RoomInfo, RoomItem } from "./lib/types";
+import type { AppConfig, FileTransferProgressEvent, JoinRequestPrompt, NearbyJoinPending, RoomInfo, RoomItem } from "./lib/types";
 
 type View =
   | { screen: "primary" }
@@ -141,6 +143,9 @@ function App() {
   const [transfers, setTransfers] = useState<Record<string, FileTransferProgressEvent>>({});
   const [scheduler, setScheduler] = useState<TransferSchedulerState>(() => createTransferSchedulerState());
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
+  /** The one-time code this device showed after accepting a nearby request,
+   * until the requester has paired with it. */
+  const [acceptedPairing, setAcceptedPairing] = useState<{ roomId: string; deviceName: string; code: string } | null>(null);
   const [joinRequestBusy, setJoinRequestBusy] = useState<string | null>(null);
   const [workspaceFocusRequest, setWorkspaceFocusRequest] = useState<{ target: "home" | "settings"; token: number }>({ target: "home", token: 0 });
   const [error, setError] = useState<string | null>(null);
@@ -1407,8 +1412,12 @@ function App() {
     await openRoom(room);
   }
 
-  async function handleJoinNearbyDevice(deviceId: string) {
-    const room = await requestNearbyJoin(deviceId);
+  async function handleJoinNearbyDevice(deviceId: string): Promise<NearbyJoinPending> {
+    return requestNearbyJoin(deviceId);
+  }
+
+  async function handleCompleteNearbyJoin(requestId: string, code: string) {
+    const room = await completeNearbyJoin(requestId, code);
     await handleConnectionJoined(room);
   }
 
@@ -1418,6 +1427,7 @@ function App() {
     try {
       const room = await acceptNearbyJoin(request.request_id);
       setJoinRequest(null);
+      setAcceptedPairing({ roomId: room.id, deviceName: request.device_name, code: bridgeCode(room) });
       await handleConnectionJoined(room);
     } catch (err) {
       setJoinRequest(null);
@@ -1489,6 +1499,17 @@ function App() {
           </div>
         </div>
       ) : null}
+      {acceptedPairing && !joinRequest && rooms.find((room) => room.id === acceptedPairing.roomId)?.pairing_state !== "paired" ? (
+        <div className="join-request-banner panel">
+          <div className="subtle-stack tight">
+            <strong>Enter {acceptedPairing.code} on {acceptedPairing.deviceName}.</strong>
+            <span className="muted">This one-time code is never sent over the network.</span>
+          </div>
+          <div className="row gap">
+            <button className="ghost-button" onClick={() => setAcceptedPairing(null)}>Done</button>
+          </div>
+        </div>
+      ) : null}
 
       <WorkspaceV2
         config={config}
@@ -1503,6 +1524,7 @@ function App() {
         onJoinBridge={handleJoinBridge}
         onListNearbyDevices={listNearbyDevices}
         onJoinNearbyDevice={handleJoinNearbyDevice}
+        onCompleteNearbyJoin={handleCompleteNearbyJoin}
         nearbyDiscoveryAvailable={hasTauriRuntime()}
         onOpenBridge={openRoom}
         onRefreshBridge={refreshCurrentRoom}

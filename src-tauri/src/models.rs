@@ -299,6 +299,19 @@ pub struct RoomInfo {
     pub peer_burned_at: Option<i64>,
     #[serde(default)]
     pub peers: Vec<BridgeRoomPeerInfo>,
+    #[serde(default)]
+    pub pairing_state: BridgePairingState,
+}
+
+/// Whether a Bridge has a verified peer device. Only a `Paired` Bridge can
+/// reconnect; an `AwaitingPeer` Bridge has an open one-time pairing code.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgePairingState {
+    Paired,
+    AwaitingPeer,
+    #[default]
+    PairingRequired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -506,25 +519,12 @@ pub struct StoredRoomItem {
     pub saved_path: Option<String>,
 }
 
+/// A nearby join the other device accepted. Its user now reads a one-time
+/// code from that device's screen.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DiscoveryRequest {
-    pub kind: String,
+#[serde(rename_all = "camelCase")]
+pub struct NearbyJoinPending {
     pub request_id: String,
-    pub room_code_hash: String,
-    #[serde(default)]
-    pub requester_device_id: Option<String>,
-    #[serde(default)]
-    pub expected_room_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DiscoveryResponse {
-    pub kind: String,
-    pub request_id: String,
-    pub room_id: String,
-    pub port: u16,
-    pub expires_at: i64,
-    pub transport_public_key: String,
     pub device_name: String,
 }
 
@@ -533,9 +533,12 @@ pub struct JoinRoomRequest {
     pub port: u16,
     pub device_name: String,
     pub transport_public_key: String,
-    /// Additive Phase 2 compatibility field. Older peers omit it.
+    /// The joiner's HostRef. Required: a join without it is refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ref: Option<String>,
+    /// Pairing or reconnect proof. A join without it is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::bridge_auth::JoinAuth>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -543,9 +546,11 @@ pub struct JoinRoomResponse {
     pub device_name: String,
     pub expires_at: i64,
     pub transport_public_key: String,
-    /// Additive Phase 2 compatibility field. Older peers omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ref: Option<String>,
+    /// The Host's signed acknowledgement of an authenticated join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<crate::bridge_auth::JoinAck>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

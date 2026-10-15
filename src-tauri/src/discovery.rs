@@ -23,10 +23,11 @@ use tokio::{
 };
 
 use crate::{
+    bridge_auth,
     error::{AppError, AppResult},
     host_runtime::{DiscoveryHandle, HostRuntime as AppState, NearbyHttpHandle},
     logging,
-    models::{DiscoveryRequest, DiscoveryResponse, JoinRequestPrompt, NearbyDevice},
+    models::{JoinRequestPrompt, NearbyDevice},
     storage,
 };
 
@@ -37,6 +38,7 @@ const JOIN_REQUEST_TIMEOUT_SECS: u64 = 30;
 const JOIN_REQUEST_REPLAY_TTL_SECS: i64 = 300;
 const JOIN_REQUEST_CONNECT_TIMEOUT_SECS: u64 = 5;
 const JOIN_REQUEST_EVENT: &str = "pastey://join-request";
+const MAX_PENDING_JOIN_REQUESTS: usize = 4;
 
 #[derive(Clone, Debug)]
 pub struct NearbyDeviceRecord {
@@ -105,18 +107,24 @@ pub struct NearbyJoinRequest {
     pub response_port: Option<u16>,
 }
 
+/// The answer to a nearby join request. It says only whether the other
+/// user accepted: the one-time code is shown on that device's screen and
+/// typed here, never sent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NearbyJoinResponse {
     pub kind: String,
     pub request_id: String,
     pub accepted: bool,
     pub message: Option<String>,
-    pub room_id: Option<String>,
-    pub room_code: Option<String>,
-    pub port: Option<u16>,
-    pub expires_at: Option<i64>,
-    pub transport_public_key: Option<String>,
     pub device_name: Option<String>,
+}
+
+/// A nearby request the other device accepted; this device's user must
+/// still enter the code shown there.
+#[derive(Clone, Debug)]
+pub struct AcceptedNearbyJoin {
+    pub source: SocketAddr,
+    pub expires_at: i64,
 }
 
 pub async fn ensure_service(state: Arc<AppState>) -> AppResult<()> {
@@ -575,16 +583,32 @@ fn is_private_or_overlay_ipv4(ip: Ipv4Addr) -> bool {
     is_device_ipv4(ip) && (ip.is_private() || shared)
 }
 
-/// Finds one Bridge's room server on a peer at an explicitly given address
-/// on another network, with the same request the LAN broadcast sends. Only a
-/// reply from an address the name resolved to, for exactly this request, is
-/// accepted.
-pub async fn discover_room_at(
-    address: &str,
-    room_code_hash: String,
-    requester_device_id: Option<String>,
-    expected_room_id: Option<String>,
-) -> AppResult<(SocketAddr, DiscoveryResponse)> {
+/// How long a LAN pairing or reconnect query waits for an answer.
+const LAN_DISCOVERY_WAIT: Duration = Duration::from_secs(5);
+const LAN_DISCOVERY_SENDS: usize = 3;
+
+/// Where a pairing or reconnect query goes, and whose answers are read.
+/// Every answer is still authenticated on its own; the source only narrows
+/// what is read.
+#[derive(Clone, Debug)]
+pub(crate) enum DiscoveryTargets {
+    /// This network's broadcast. Any device may answer.
+    Lan,
+    /// Exactly these addresses, and only answers from their IPs.
+    Unicast(Vec<SocketAddr>),
+}
+
+impl DiscoveryTargets {
+    /// The discovery service of one nearby device that accepted a request.
+    pub(crate) fn nearby(source: SocketAddr) -> Self {
+        Self::Unicast(vec![SocketAddr::new(source.ip(), DISCOVERY_PORT)])
+    }
+}
+
+/// Resolves a peer address the user gave (an overlay IP or name) to the
+/// private or overlay IPv4 addresses it names now. Every reconnect resolves
+/// it again; nothing is sent to any other address.
+pub(crate) async fn resolve_peer_targets(address: &str) -> AppResult<DiscoveryTargets> {
     let address = validate_peer_address(address)?;
     let targets = timeout(
         UNICAST_DISCOVERY_WAIT,
@@ -602,8 +626,6 @@ pub async fn discover_room_at(
             "The other device's name has no IPv4 address.".into(),
         ));
     }
-    // A name is only as private as what it resolves to, now: every
-    // reconnect resolves it again. Nothing is sent to any other address.
     let targets = targets
         .into_iter()
         .filter(|target| match target {
@@ -614,56 +636,127 @@ pub async fn discover_room_at(
     if targets.is_empty() {
         return Err(AppError::InvalidInput(PUBLIC_ADDRESS_REFUSAL.into()));
     }
-    discover_room_unicast(
-        &targets,
-        room_code_hash,
-        requester_device_id,
-        expected_room_id,
-        UNICAST_DISCOVERY_WAIT,
-    )
+    Ok(DiscoveryTargets::Unicast(targets))
+}
+
+/// Finds the Bridge whose open pairing code is `code`. Only an offer whose
+/// SPAKE2 key confirmation proves the same code is returned; anything else,
+/// from anyone, is ignored.
+pub(crate) async fn discover_pairing(
+    state: &Arc<AppState>,
+    code: &str,
+    targets: &DiscoveryTargets,
+) -> AppResult<(SocketAddr, bridge_auth::VerifiedPairOffer)> {
+    let mut attempt = bridge_auth::PairAttempt::new(code);
+    let request_id = attempt.request_id().to_string();
+    let payload = serde_json::to_vec(&attempt.query())?;
+    state
+        .bridge_auth
+        .lock()
+        .outgoing_pair_requests
+        .insert(request_id.clone());
+    let result = exchange(targets, &payload, |bytes| {
+        serde_json::from_slice::<bridge_auth::PairOffer>(bytes)
+            .ok()
+            .and_then(|offer| attempt.verify_offer(&offer))
+    })
+    .await;
+    state
+        .bridge_auth
+        .lock()
+        .outgoing_pair_requests
+        .remove(&request_id);
+    result
+}
+
+/// Finds a pinned Bridge's peer again. Only an offer signed by the pinned
+/// device key for this attempt's nonce is returned.
+pub(crate) async fn discover_reconnect(
+    attempt: &bridge_auth::ReconnectAttempt,
+    targets: &DiscoveryTargets,
+) -> AppResult<(SocketAddr, bridge_auth::VerifiedReconnectOffer)> {
+    let payload = serde_json::to_vec(&attempt.query())?;
+    exchange(targets, &payload, |bytes| {
+        serde_json::from_slice::<bridge_auth::ReconnectOffer>(bytes)
+            .ok()
+            .and_then(|offer| attempt.verify_offer(&offer))
+    })
     .await
 }
 
-async fn discover_room_unicast(
-    targets: &[SocketAddr],
-    room_code_hash: String,
-    requester_device_id: Option<String>,
-    expected_room_id: Option<String>,
+async fn exchange<T>(
+    targets: &DiscoveryTargets,
+    payload: &[u8],
+    accept: impl FnMut(&[u8]) -> Option<T>,
+) -> AppResult<(SocketAddr, T)> {
+    match targets {
+        DiscoveryTargets::Lan => {
+            exchange_with(
+                &[SocketAddr::from((Ipv4Addr::BROADCAST, DISCOVERY_PORT))],
+                true,
+                None,
+                payload,
+                LAN_DISCOVERY_WAIT,
+                LAN_DISCOVERY_SENDS,
+                accept,
+            )
+            .await
+        }
+        DiscoveryTargets::Unicast(addresses) => {
+            exchange_with(
+                addresses,
+                false,
+                Some(addresses),
+                payload,
+                UNICAST_DISCOVERY_WAIT,
+                UNICAST_DISCOVERY_SENDS,
+                accept,
+            )
+            .await
+        }
+    }
+}
+
+/// Sends one query (resending over a lossy path) and returns the first
+/// answer `accept` takes. `accept_from: None` reads answers from any source,
+/// as a broadcast must; the answer's own authentication then decides.
+async fn exchange_with<T>(
+    send_to: &[SocketAddr],
+    broadcast: bool,
+    accept_from: Option<&[SocketAddr]>,
+    payload: &[u8],
     wait: Duration,
-) -> AppResult<(SocketAddr, DiscoveryResponse)> {
+    sends: usize,
+    mut accept: impl FnMut(&[u8]) -> Option<T>,
+) -> AppResult<(SocketAddr, T)> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|error| AppError::Network(format!("unable to open discovery socket: {error}")))?;
-    let request = DiscoveryRequest {
-        kind: "discover_room".to_string(),
-        request_id: uuid::Uuid::new_v4().to_string(),
-        room_code_hash,
-        requester_device_id,
-        expected_room_id: expected_room_id.clone(),
-    };
-    let request_id = request.request_id.clone();
-    let payload = serde_json::to_vec(&request)?;
+    if broadcast {
+        socket.set_broadcast(true).map_err(|error| {
+            AppError::Network(format!("unable to enable discovery broadcast: {error}"))
+        })?;
+    }
     let deadline = tokio::time::Instant::now() + wait;
-    let resend_every = wait / UNICAST_DISCOVERY_SENDS as u32;
+    let resend_every = wait / sends.max(1) as u32;
     let mut next_send = tokio::time::Instant::now();
-    let mut sends = 0;
+    let mut sent = 0;
     let mut buffer = vec![0u8; 4096];
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return Err(AppError::Timeout(
-                "The other device did not answer. Check that it is running Pastey with this Bridge open and that both devices are on the same overlay network.".into(),
+                "The other device did not answer. Check the code, that Pastey is open on the other device, and, for another network, that both devices are on the same overlay network.".into(),
             ));
         }
-        // Resend over a lossy path; each reply must still match this request.
-        if sends < UNICAST_DISCOVERY_SENDS && now >= next_send {
-            for target in targets {
-                let _ = socket.send_to(&payload, target).await;
+        if sent < sends && now >= next_send {
+            for target in send_to {
+                let _ = socket.send_to(payload, target).await;
             }
-            sends += 1;
+            sent += 1;
             next_send = now + resend_every;
         }
-        let until = if sends < UNICAST_DISCOVERY_SENDS {
+        let until = if sent < sends {
             next_send.min(deadline)
         } else {
             deadline
@@ -674,68 +767,13 @@ async fn discover_room_unicast(
         };
         let (size, source) = received
             .map_err(|error| AppError::Network(format!("discovery receive failed: {error}")))?;
-        if !targets.iter().any(|target| target.ip() == source.ip()) {
-            continue;
-        }
-        let Ok(response) = serde_json::from_slice::<DiscoveryResponse>(&buffer[..size]) else {
-            continue;
-        };
-        if response.kind != "room_offer" || response.request_id != request_id {
-            continue;
-        }
-        if expected_room_id
-            .as_deref()
-            .is_some_and(|room_id| room_id != response.room_id)
+        if accept_from
+            .is_some_and(|allowed| !allowed.iter().any(|target| target.ip() == source.ip()))
         {
             continue;
         }
-        return Ok((source, response));
-    }
-}
-
-pub async fn discover_room(
-    room_code_hash: String,
-    requester_device_id: Option<String>,
-    expected_room_id: Option<String>,
-) -> AppResult<(SocketAddr, DiscoveryResponse)> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0))
-        .await
-        .map_err(|error| AppError::Network(format!("unable to open discovery socket: {error}")))?;
-    socket.set_broadcast(true).map_err(|error| {
-        AppError::Network(format!("unable to enable discovery broadcast: {error}"))
-    })?;
-
-    let request = DiscoveryRequest {
-        kind: "discover_room".to_string(),
-        request_id: uuid::Uuid::new_v4().to_string(),
-        room_code_hash,
-        requester_device_id,
-        expected_room_id,
-    };
-    let request_id = request.request_id.clone();
-    let payload = serde_json::to_vec(&request)?;
-
-    for _ in 0..3 {
-        socket
-            .send_to(&payload, ("255.255.255.255", DISCOVERY_PORT))
-            .await
-            .map_err(|error| {
-                AppError::Network(format!("unable to broadcast discovery: {error}"))
-            })?;
-        sleep(Duration::from_millis(150)).await;
-    }
-
-    let mut buffer = vec![0u8; 4096];
-    loop {
-        let response = timeout(Duration::from_secs(5), socket.recv_from(&mut buffer))
-            .await
-            .map_err(|_| AppError::Timeout("timed out while waiting for room discovery".into()))?
-            .map_err(|error| AppError::Network(format!("discovery receive failed: {error}")))?;
-
-        let (size, source) = response;
-        let payload: DiscoveryResponse = serde_json::from_slice(&buffer[..size])?;
-        if payload.kind == "room_offer" && payload.request_id == request_id {
-            return Ok((source, payload));
+        if let Some(found) = accept(&buffer[..size]) {
+            return Ok((source, found));
         }
     }
 }
@@ -754,53 +792,43 @@ async fn handle_discovery_packet(
     };
 
     match kind {
-        "discover_room" => handle_room_discovery(state, socket, value, source).await,
+        "pair_query" => handle_pair_query(state, socket, value, source).await,
+        "reconnect_query" => handle_reconnect_query(state, socket, value, source).await,
         "nearby_beacon" => handle_beacon(state, value, source),
         "join_request" => handle_join_request(state, value, source),
         _ => {}
     }
 }
 
-async fn handle_room_discovery(
+async fn handle_pair_query(
     state: Arc<AppState>,
     socket: &UdpSocket,
     value: Value,
     source: SocketAddr,
 ) {
-    let Ok(request) = serde_json::from_value::<DiscoveryRequest>(value) else {
+    let Ok(query) = serde_json::from_value::<bridge_auth::PairQuery>(value) else {
         return;
     };
-    if request.requester_device_id.as_deref() == Some(local_device_id(&state).as_str()) {
-        return;
+    for offer in bridge_auth::answer_pair_query(&state, &query) {
+        if let Ok(bytes) = serde_json::to_vec(&offer) {
+            let _ = socket.send_to(&bytes, source).await;
+        }
     }
+}
 
-    let response = {
-        let servers = state.active_servers.lock();
-        servers
-            .values()
-            .find(|server| {
-                server.room_code_hash == request.room_code_hash
-                    && request
-                        .expected_room_id
-                        .as_deref()
-                        .map_or(true, |room_id| server.room_id == room_id)
-            })
-            .map(|server| DiscoveryResponse {
-                kind: "room_offer".to_string(),
-                request_id: request.request_id.clone(),
-                room_id: server.room_id.clone(),
-                port: server.port,
-                expires_at: server.expires_at,
-                transport_public_key: server.transport_public_key(),
-                device_name: crate::transfer::device_name(),
-            })
+async fn handle_reconnect_query(
+    state: Arc<AppState>,
+    socket: &UdpSocket,
+    value: Value,
+    source: SocketAddr,
+) {
+    let Ok(query) = serde_json::from_value::<bridge_auth::ReconnectQuery>(value) else {
+        return;
     };
-
-    if let Some(response) = response {
-        let Ok(bytes) = serde_json::to_vec(&response) else {
-            return;
-        };
-        let _ = socket.send_to(&bytes, source).await;
+    if let Some(offer) = bridge_auth::answer_reconnect_query(&state, &query) {
+        if let Ok(bytes) = serde_json::to_vec(&offer) {
+            let _ = socket.send_to(&bytes, source).await;
+        }
     }
 }
 
@@ -865,6 +893,21 @@ async fn join_request_endpoint(
 fn surface_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source: SocketAddr) {
     if request.device_id == local_device_id(&state) {
         return;
+    }
+    {
+        // A prompt is a human gate, not authentication. Bound how many any
+        // one address, and all addresses together, can raise.
+        let now = storage::now_ts();
+        let mut pending = state.pending_join_requests.lock();
+        pending.retain(|_, request| request.expires_at > now);
+        if pending.len() >= MAX_PENDING_JOIN_REQUESTS
+            || pending
+                .values()
+                .any(|request| request.source.ip() == source.ip())
+        {
+            logging::write_transfer_line("[pastey antenna] event=join_request_rate_limited");
+            return;
+        }
     }
     if !state.outgoing_join_requests.lock().is_empty() {
         logging::write_transfer_line("[pastey antenna] event=simultaneous_join_detected");
@@ -1266,25 +1309,21 @@ mod tests {
         assert!(!json.contains("endpoint"));
     }
 
+    /// F10 regression: an acceptance carries no code, Bridge id, port or
+    /// key; the code is shown on the accepting device and typed here.
     #[test]
-    fn rejected_join_response_does_not_create_room_details() {
+    fn nearby_join_response_carries_no_code_or_session_material() {
         let response = NearbyJoinResponse {
             kind: "join_response".into(),
             request_id: "request".into(),
-            accepted: false,
-            message: Some("Join request rejected.".into()),
-            room_id: None,
-            room_code: None,
-            port: None,
-            expires_at: None,
-            transport_public_key: None,
+            accepted: true,
+            message: None,
             device_name: Some("MacBook Air".into()),
         };
-
-        assert!(!response.accepted);
-        assert!(response.room_id.is_none());
-        assert!(response.room_code.is_none());
-        assert!(response.transport_public_key.is_none());
+        let json = serde_json::to_string(&response).unwrap();
+        for field in ["room", "code", "port", "key", "expires"] {
+            assert!(!json.contains(field), "{field}");
+        }
     }
 
     #[test]
@@ -1488,94 +1527,129 @@ mod tests {
         }
     }
 
-    /// A stand-in for a peer's discovery service on this machine.
-    async fn responder(
-        reply: impl Fn(&DiscoveryRequest) -> Vec<DiscoveryResponse> + Send + 'static,
-    ) -> SocketAddr {
-        let socket = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = socket.local_addr().unwrap();
+    /// A Host and an attacker on one LAN, both answering every query.
+    async fn lan(
+        code: &'static str,
+        forged: impl Fn(&bridge_auth::PairQuery, &bridge_auth::PairOffer) -> Vec<bridge_auth::PairOffer>
+            + Send
+            + 'static,
+    ) -> (SocketAddr, String) {
+        let host = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let attacker = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = host.local_addr().unwrap();
+        let identity = crate::device_identity::DeviceIdentity::generate_for_test();
+        let transport_key = crate::crypto::encode_key(&crate::crypto::transport_public_key(
+            &crate::crypto::generate_transport_secret(),
+        ));
+        let host_ref = crate::host_identity::HostRef::from_device_id("lan-host").unwrap();
+        let genuine_key = transport_key.clone();
         tokio::spawn(async move {
             let mut buffer = vec![0u8; 4096];
-            while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
-                let Ok(request) = serde_json::from_slice::<DiscoveryRequest>(&buffer[..size])
+            while let Ok((size, source)) = host.recv_from(&mut buffer).await {
+                let Ok(query) = serde_json::from_slice::<bridge_auth::PairQuery>(&buffer[..size])
                 else {
                     continue;
                 };
-                for response in reply(&request) {
-                    let _ = socket
-                        .send_to(&serde_json::to_vec(&response).unwrap(), source)
+                let offer = bridge_auth::offer_for_test(
+                    &query,
+                    code,
+                    bridge_auth::OfferedRoom {
+                        room_id: "genuine-room",
+                        port: 40_000,
+                        expires_at: 0,
+                        transport_public_key: &transport_key,
+                        device_name: "Windows",
+                        host_ref: host_ref.as_str(),
+                    },
+                    &identity,
+                )
+                .unwrap();
+                // The attacker answers first, from its own address.
+                for fake in forged(&query, &offer) {
+                    let _ = attacker
+                        .send_to(&serde_json::to_vec(&fake).unwrap(), source)
                         .await;
                 }
+                let _ = host
+                    .send_to(&serde_json::to_vec(&offer).unwrap(), source)
+                    .await;
             }
         });
-        address
+        (address, genuine_key)
     }
 
-    fn offer(request_id: &str, room_id: &str) -> DiscoveryResponse {
-        DiscoveryResponse {
-            kind: "room_offer".into(),
-            request_id: request_id.into(),
-            room_id: room_id.into(),
-            port: 40_000,
-            expires_at: 0,
-            transport_public_key: "key".into(),
-            device_name: "Windows".into(),
-        }
+    async fn pair_like_a_broadcast(
+        code: &str,
+        target: SocketAddr,
+        wait: Duration,
+    ) -> AppResult<(SocketAddr, bridge_auth::VerifiedPairOffer)> {
+        let mut attempt = bridge_auth::PairAttempt::new(code);
+        let payload = serde_json::to_vec(&attempt.query()).unwrap();
+        // Read answers from any source, exactly as the LAN broadcast does.
+        exchange_with(&[target], false, None, &payload, wait, 2, |bytes| {
+            serde_json::from_slice::<bridge_auth::PairOffer>(bytes)
+                .ok()
+                .and_then(|offer| attempt.verify_offer(&offer))
+        })
+        .await
     }
 
+    /// F4 regression: on a LAN anyone may answer, but only an offer whose
+    /// key confirmation proves the code is taken. Forged, tampered and
+    /// misdirected offers from another device are ignored.
     #[tokio::test]
-    async fn unicast_discovery_accepts_only_the_exact_reply_for_the_expected_room() {
-        let target = responder(|request| {
-            vec![
-                // Noise first: another request, another room, another kind.
-                offer("some-other-request", "room-a"),
-                offer(&request.request_id, "room-b"),
-                DiscoveryResponse {
-                    kind: "nearby_beacon".into(),
-                    ..offer(&request.request_id, "room-a")
+    async fn a_forged_lan_offer_is_ignored_and_the_genuine_one_accepted() {
+        let attacker_identity = crate::device_identity::DeviceIdentity::generate_for_test();
+        let (host, genuine_key) = lan("24681357", move |query, genuine| {
+            let attacker_key = crate::crypto::encode_key(&[7u8; 32]);
+            let guessed = bridge_auth::offer_for_test(
+                query,
+                "11111111",
+                bridge_auth::OfferedRoom {
+                    room_id: "attacker-room",
+                    port: 1,
+                    expires_at: 0,
+                    transport_public_key: &attacker_key,
+                    device_name: "Windows",
+                    host_ref: genuine.host_ref.as_str(),
                 },
-                offer(&request.request_id, "room-a"),
+                &attacker_identity,
+            )
+            .unwrap();
+            vec![
+                // A guess at the code.
+                guessed,
+                // The genuine answer with the attacker's key and port.
+                bridge_auth::PairOffer {
+                    transport_public_key: attacker_key.clone(),
+                    port: 1,
+                    ..genuine.clone()
+                },
+                // The genuine answer pointed at another Bridge id.
+                bridge_auth::PairOffer {
+                    room_id: "attacker-room".into(),
+                    ..genuine.clone()
+                },
             ]
         })
         .await;
-        let (source, found) = discover_room_unicast(
-            &[target],
-            "hash".into(),
-            Some("requester".into()),
-            Some("room-a".into()),
-            Duration::from_secs(3),
-        )
-        .await
-        .unwrap();
-        assert_eq!(source.ip(), target.ip());
-        assert_eq!(found.room_id, "room-a");
+        let (source, verified) = pair_like_a_broadcast("24681357", host, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(source, host, "the answer taken is the Host's own");
+        assert_eq!(verified.offer.room_id, "genuine-room");
+        assert_eq!(verified.offer.transport_public_key, genuine_key);
+        assert_eq!(verified.offer.port, 40_000);
     }
 
+    /// With the wrong code nothing verifies, whoever answers.
     #[tokio::test]
-    async fn unicast_discovery_of_a_wrong_or_silent_host_times_out_truthfully() {
-        // The device answers, but for another Bridge only.
-        let wrong = responder(|request| vec![offer(&request.request_id, "another-bridge")]).await;
-        let error = discover_room_unicast(
-            &[wrong],
-            "hash".into(),
-            None,
-            Some("room-a".into()),
-            Duration::from_millis(600),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, AppError::Timeout(_)));
-        // Nothing answers at all.
-        let silent = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let error = discover_room_unicast(
-            &[silent.local_addr().unwrap()],
-            "hash".into(),
-            None,
-            None,
-            Duration::from_millis(600),
-        )
-        .await
-        .unwrap_err();
+    async fn pairing_with_a_wrong_code_finds_nothing_and_times_out_truthfully() {
+        let (host, _) = lan("24681357", |_, genuine| vec![genuine.clone()]).await;
+        let error = pair_like_a_broadcast("24681358", host, Duration::from_millis(800))
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(error, AppError::Timeout(_)));
     }
 
@@ -1585,55 +1659,36 @@ mod tests {
         // or overlay network, so nothing may be sent to what it resolves to.
         for address in ["8.8.8.8", "http://home-pc", "home-pc:1", "localhost"] {
             assert!(matches!(
-                discover_room_at(address, "hash".into(), None, None).await,
+                resolve_peer_targets(address).await,
                 Err(AppError::InvalidInput(_))
             ));
         }
     }
-}
-
-/// Characterization of the current room-query boundary (see the join audit
-/// in docs/layers/layer-4-join-audit.md). Each test asserts behaviour that is
-/// insecure today; a fix is expected to flip it.
-#[cfg(test)]
-mod join_characterization {
-    use super::*;
-    use crate::{
-        config::StoredConfig,
-        host_runtime::{
-            ActiveRoomServer, HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner,
-        },
-        storage::AppPaths,
-    };
 
     struct NoopEventSink;
 
-    impl HostEventSink for NoopEventSink {
-        fn emit(&self, _event: HostEvent) -> AppResult<()> {
+    impl crate::host_runtime::HostEventSink for NoopEventSink {
+        fn emit(&self, _event: crate::host_runtime::HostEvent) -> AppResult<()> {
             Ok(())
         }
     }
 
     struct NoopTaskSpawner;
 
-    impl RuntimeTaskSpawner for NoopTaskSpawner {
-        fn spawn(&self, _task: RuntimeTask) {}
+    impl crate::host_runtime::RuntimeTaskSpawner for NoopTaskSpawner {
+        fn spawn(&self, _task: crate::host_runtime::RuntimeTask) {}
     }
 
-    /// Anyone who presents the code lookup value learns the Bridge id, room
-    /// server port and transport key, which is everything `/join` needs.
-    /// Wrong guesses are neither throttled nor remembered.
-    #[tokio::test]
-    async fn characterization_room_query_answers_any_holder_of_the_code_hash() {
-        let root = std::env::temp_dir().join(format!(
-            "pastey-discovery-characterization-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let paths = AppPaths::new(root.clone(), root.join("logs"));
+    /// F10 regression: join prompts are a human gate, bounded per address
+    /// and in total.
+    #[test]
+    fn join_request_prompts_are_bounded_per_source_and_in_total() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-join-prompts-{}", uuid::Uuid::new_v4()));
+        let paths = crate::storage::AppPaths::new(root.clone(), root.join("logs"));
         paths.ensure_directories().unwrap();
         storage::init_database(&paths).unwrap();
-        let app_secret = [43u8; 32];
-        let config = StoredConfig {
+        let config = crate::config::StoredConfig {
             version: 5,
             default_expiry_minutes: 15,
             inbox_dir: None,
@@ -1644,8 +1699,8 @@ mod join_characterization {
             dev_tools_enabled: false,
             micro_flow_group_mode: "off".into(),
             shortcut: "test".into(),
-            app_secret: crate::crypto::encode_key(&app_secret),
-            device_id: "discovery-characterization".into(),
+            app_secret: crate::crypto::encode_key(&[44u8; 32]),
+            device_id: "prompt-host".into(),
         };
         let state = Arc::new(
             AppState::new(
@@ -1656,57 +1711,29 @@ mod join_characterization {
             )
             .unwrap(),
         );
-        let code_hash = crate::crypto::hash_code("12345678");
-        let transport_secret = crate::crypto::generate_transport_secret();
-        state.active_servers.lock().insert(
-            "characterized-room".into(),
-            ActiveRoomServer {
-                room_id: "characterized-room".into(),
-                room_code_hash: code_hash.clone(),
-                port: 4242,
-                expires_at: storage::now_ts() + 600,
-                transport_secret,
-                shutdown: None,
-            },
-        );
-
-        let responder = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let asker = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
-        let asker_addr = asker.local_addr().unwrap();
-        let query = |hash: String| {
-            serde_json::to_value(DiscoveryRequest {
-                kind: "discover_room".into(),
-                request_id: uuid::Uuid::new_v4().to_string(),
-                room_code_hash: hash,
-                // Any device id, or none: the asker is not identified.
-                requester_device_id: None,
-                expected_room_id: None,
-            })
-            .unwrap()
+        let request = |id: &str| NearbyJoinRequest {
+            kind: "join_request".into(),
+            request_id: id.into(),
+            device_id: format!("device-{id}"),
+            display_name: "Alice's MacBook".into(),
+            platform: "macOS".into(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            response_port: None,
         };
-
-        for wrong in ["00000000", "00000001", "00000002"] {
-            handle_room_discovery(
-                state.clone(),
-                &responder,
-                query(crate::crypto::hash_code(wrong)),
-                asker_addr,
-            )
-            .await;
-        }
-        handle_room_discovery(state.clone(), &responder, query(code_hash), asker_addr).await;
-
-        let mut buffer = vec![0u8; 4096];
-        let (size, _) = timeout(Duration::from_secs(2), asker.recv_from(&mut buffer))
-            .await
-            .expect("the matching query is still answered after wrong guesses")
-            .unwrap();
-        let offer: DiscoveryResponse = serde_json::from_slice(&buffer[..size]).unwrap();
-        assert_eq!(offer.room_id, "characterized-room");
-        assert_eq!(offer.port, 4242);
+        let from = |last: u8| SocketAddr::from(([192, 168, 1, last], 5000));
+        surface_join_request(state.clone(), request("a"), from(2));
+        surface_join_request(state.clone(), request("b"), from(2));
         assert_eq!(
-            offer.transport_public_key,
-            crate::crypto::encode_key(&crate::crypto::transport_public_key(&transport_secret))
+            state.pending_join_requests.lock().len(),
+            1,
+            "one per address"
+        );
+        for (index, last) in (3..10).enumerate() {
+            surface_join_request(state.clone(), request(&format!("c{index}")), from(last));
+        }
+        assert_eq!(
+            state.pending_join_requests.lock().len(),
+            MAX_PENDING_JOIN_REQUESTS
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -1,4 +1,4 @@
-import type { AppConfig, FileTransferProgressEvent, NearbyDevice, RoomInfo, RoomItem } from "../../lib/types";
+import type { AppConfig, FileTransferProgressEvent, NearbyDevice, NearbyJoinPending, RoomInfo, RoomItem } from "../../lib/types";
 import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferScheduler";
 
 export type WorkspaceRoute =
@@ -27,7 +27,10 @@ export interface WorkspaceV2Props {
   /** `address` reaches a device on another network (overlay IP or name). */
   onJoinBridge: (code: string, address?: string) => Promise<void>;
   onListNearbyDevices: () => Promise<NearbyDevice[]>;
-  onJoinNearbyDevice: (deviceId: string) => Promise<void>;
+  /** Asks a nearby device to start a Bridge; resolves once its user accepts. */
+  onJoinNearbyDevice: (deviceId: string) => Promise<NearbyJoinPending>;
+  /** Finishes a nearby join with the code the accepting device shows. */
+  onCompleteNearbyJoin: (requestId: string, code: string) => Promise<void>;
   nearbyDiscoveryAvailable: boolean;
   onOpenBridge: (room: RoomInfo) => Promise<void>;
   onRefreshBridge: () => Promise<void>;

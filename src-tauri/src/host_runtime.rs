@@ -82,10 +82,14 @@ pub struct HostRuntime {
     /// Consecutive failed liveness probes per Bridge peer session.
     pub(crate) bridge_liveness_failures: Mutex<HashMap<String, u8>>,
     pub(crate) bridge_reconnect_rotations: Mutex<HashSet<String>>,
+    /// Pairing and reconnect handshake state. Process-local.
+    pub(crate) bridge_auth: Mutex<crate::bridge_auth::BridgeAuthState>,
     pub nearby_devices: Mutex<HashMap<String, discovery::NearbyDeviceRecord>>,
     pub pending_join_requests: Mutex<HashMap<String, discovery::PendingJoinRequest>>,
     pub(crate) seen_nearby_join_requests: Mutex<HashMap<String, i64>>,
     pub outgoing_join_requests: Mutex<HashMap<String, discovery::OutgoingJoinRequest>>,
+    /// Nearby requests the other device accepted, awaiting its code here.
+    pub(crate) accepted_nearby_joins: Mutex<HashMap<String, discovery::AcceptedNearbyJoin>>,
     pub terminal_transfer_reasons: Mutex<HashMap<String, transfer::TerminalTransferReason>>,
     pub diagnostics_refresh: tokio::sync::Mutex<()>,
     pub latest_device_profile: Mutex<Option<diagnostics::DeviceProfile>>,
@@ -204,10 +208,12 @@ impl HostRuntime {
             bridge_liveness_failures: Mutex::new(HashMap::new()),
             verified_peer_devices: Mutex::new(Vec::new()),
             bridge_reconnect_rotations: Mutex::new(HashSet::new()),
+            bridge_auth: Mutex::new(crate::bridge_auth::BridgeAuthState::default()),
             nearby_devices: Mutex::new(HashMap::new()),
             pending_join_requests: Mutex::new(HashMap::new()),
             seen_nearby_join_requests: Mutex::new(HashMap::new()),
             outgoing_join_requests: Mutex::new(HashMap::new()),
+            accepted_nearby_joins: Mutex::new(HashMap::new()),
             terminal_transfer_reasons: Mutex::new(HashMap::new()),
             diagnostics_refresh: tokio::sync::Mutex::new(()),
             latest_device_profile: Mutex::new(None),
@@ -446,7 +452,6 @@ impl HostRuntime {
 
 pub struct ActiveRoomServer {
     pub room_id: String,
-    pub room_code_hash: String,
     pub port: u16,
     pub expires_at: i64,
     pub transport_secret: [u8; 32],
@@ -822,7 +827,6 @@ mod tests {
             room.id.clone(),
             ActiveRoomServer {
                 room_id: room.id.clone(),
-                room_code_hash: room.room_code_hash.clone(),
                 port: 8000,
                 expires_at: room.expires_at,
                 transport_secret: crate::crypto::random_key(),

@@ -120,7 +120,13 @@ pub async fn run_peer_link_benchmark(
         .peer_host
         .zip(room.peer_port)
         .ok_or_else(|| AppError::NotFound("Peer is not connected.".into()))?;
+    let peer_key = room
+        .peer_transport_public_key
+        .as_deref()
+        .ok_or_else(|| AppError::NotFound("Peer is not connected.".into()))?;
+    let signer = crate::bridge_auth::PeerRequestSigner::for_room(&state, &room_id, peer_key)?;
     run_peer_link_benchmark_at(
+        signer,
         format!("http://{peer_host}:{peer_port}/rooms/{room_id}/diagnostics"),
         Some(room_id),
         room.peer_device_name,
@@ -133,6 +139,7 @@ pub async fn run_peer_link_benchmark(
 }
 
 pub(crate) async fn run_peer_link_benchmark_for_endpoint(
+    signer: crate::bridge_auth::PeerRequestSigner,
     endpoint: BridgePeerTransferEndpoint,
     bridge_id: String,
     mode: BenchmarkMode,
@@ -141,6 +148,7 @@ pub(crate) async fn run_peer_link_benchmark_for_endpoint(
     sender_cpu_hint: Option<String>,
 ) -> AppResult<LinkBenchmarkResult> {
     run_peer_link_benchmark_at(
+        signer,
         format!(
             "http://{}:{}/rooms/{bridge_id}/diagnostics",
             endpoint.host, endpoint.port
@@ -156,6 +164,7 @@ pub(crate) async fn run_peer_link_benchmark_for_endpoint(
 }
 
 async fn run_peer_link_benchmark_at(
+    signer: crate::bridge_auth::PeerRequestSigner,
     base_url: String,
     peer_id: Option<String>,
     peer_name: Option<String>,
@@ -165,7 +174,9 @@ async fn run_peer_link_benchmark_at(
     sender_cpu_hint: Option<String>,
 ) -> AppResult<LinkBenchmarkResult> {
     let client = reqwest::Client::new();
-    let latency_ms = estimate_peer_latency(&client, &base_url).await.ok();
+    let latency_ms = estimate_peer_latency(&client, &signer, &base_url)
+        .await
+        .ok();
     let duration = benchmark_duration(duration_seconds);
     let window = effective_window(window_size);
     let url = match mode {
@@ -190,8 +201,9 @@ async fn run_peer_link_benchmark_at(
             let plaintext_bytes = plaintext_len_for_payload(mode, &payload)?;
             let client = client.clone();
             let url = url.clone();
+            let (request, _) = signer.apply(client.post(url), benchmark_route(mode), &payload);
             in_flight.push(async move {
-                let response = client.post(url).body(payload).send().await?;
+                let response = request.body(payload).send().await?;
                 if !response.status().is_success() {
                     return Err(AppError::Network("Peer benchmark chunk rejected.".into()));
                 }
@@ -323,13 +335,26 @@ async fn estimate_loopback_latency() -> AppResult<f64> {
     Ok(started.elapsed().as_secs_f64() * 1000.0)
 }
 
-async fn estimate_peer_latency(client: &reqwest::Client, base_url: &str) -> AppResult<f64> {
+async fn estimate_peer_latency(
+    client: &reqwest::Client,
+    signer: &crate::bridge_auth::PeerRequestSigner,
+    base_url: &str,
+) -> AppResult<f64> {
     let started = Instant::now();
-    let response = client.post(format!("{base_url}/ping")).send().await?;
+    let (request, _) = signer.apply(client.post(format!("{base_url}/ping")), "ping", b"");
+    let response = request.send().await?;
     if !response.status().is_success() {
         return Err(AppError::Network("Peer benchmark ping rejected.".into()));
     }
     Ok(started.elapsed().as_secs_f64() * 1000.0)
+}
+
+/// The authenticated route name of one benchmark mode.
+pub(crate) fn benchmark_route(mode: BenchmarkMode) -> &'static str {
+    match mode {
+        BenchmarkMode::RawMemory => "benchmark/raw",
+        BenchmarkMode::PasteyPipeline => "benchmark/pipeline",
+    }
 }
 
 fn benchmark_payload(mode: BenchmarkMode, chunk_index: u64) -> AppResult<Vec<u8>> {

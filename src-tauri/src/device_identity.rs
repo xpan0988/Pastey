@@ -33,6 +33,7 @@ use crate::{
 pub(crate) const DEVICE_ATTESTATION_SCHEMA: &str = "pastey-device-session-attestation-v1";
 const ATTESTATION_DOMAIN: &[u8] = b"pastey-device-session-attestation-v1\0";
 const FINGERPRINT_DOMAIN: &[u8] = b"pastey-device-identity-v1\0";
+const BRIDGE_AUTH_DOMAIN: &[u8] = b"pastey-bridge-auth-v1\0";
 
 /// This installation's signing identity.
 pub(crate) struct DeviceIdentity {
@@ -72,6 +73,51 @@ impl DeviceIdentity {
             signature: STANDARD.encode(self.key_pair.sign(&message).as_ref()),
         })
     }
+}
+
+impl DeviceIdentity {
+    /// A fresh identity that is never stored, for tests.
+    #[cfg(test)]
+    pub(crate) fn generate_for_test() -> Self {
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        Self {
+            key_pair: Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap(),
+        }
+    }
+
+    /// Signs one Bridge pairing or reconnect transcript. The Bridge
+    /// authentication domain keeps these signatures disjoint from session
+    /// attestations, and `purpose` keeps each handshake step disjoint.
+    pub(crate) fn sign_bridge_transcript(&self, purpose: &str, digest: &[u8; 32]) -> [u8; 64] {
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(
+            self.key_pair
+                .sign(&bridge_transcript_message(purpose, digest))
+                .as_ref(),
+        );
+        signature
+    }
+}
+
+/// Verifies a signature made by `DeviceIdentity::sign_bridge_transcript`.
+pub(crate) fn verify_bridge_transcript(
+    public_key: &[u8; 32],
+    purpose: &str,
+    digest: &[u8; 32],
+    signature: &[u8],
+) -> bool {
+    signature.len() == 64
+        && UnparsedPublicKey::new(&ED25519, public_key)
+            .verify(&bridge_transcript_message(purpose, digest), signature)
+            .is_ok()
+}
+
+fn bridge_transcript_message(purpose: &str, digest: &[u8; 32]) -> Vec<u8> {
+    let mut message = BRIDGE_AUTH_DOMAIN.to_vec();
+    message.extend_from_slice(&(purpose.len() as u64).to_be_bytes());
+    message.extend_from_slice(purpose.as_bytes());
+    message.extend_from_slice(digest);
+    message
 }
 
 /// A device's proof that it holds its identity key in one exact session.

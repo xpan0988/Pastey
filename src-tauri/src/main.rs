@@ -1,3 +1,4 @@
+mod bridge_auth;
 mod bridge_lifecycle;
 mod bridge_plan;
 mod bridge_plan_v2;
@@ -71,12 +72,12 @@ use crate::{
         bind_bridge_plan_to_session, burn_room, cancel_native_agent_task,
         cancel_native_v2_plan_attempt, cancel_remote_native_agent_task, cancel_transfer,
         check_for_updates, check_managed_worker_provider_health, close_developer_terminal,
-        compose_native_v2_plan, compose_natural_v2_candidate, confirm_capability_acquisition,
-        copy_last_error, copy_text_to_clipboard, create_composed_file_bridge_plan,
-        create_direct_file_transfer_bridge_plan, create_managed_worker_provider, create_room,
-        create_unattended_grant, delete_managed_worker_provider, delete_temp_file,
-        deny_developer_terminal, deny_native_invocation_review,
-        discard_native_agent_conflict_result, enter_developer_mode,
+        complete_nearby_join, compose_native_v2_plan, compose_natural_v2_candidate,
+        confirm_capability_acquisition, copy_last_error, copy_text_to_clipboard,
+        create_composed_file_bridge_plan, create_direct_file_transfer_bridge_plan,
+        create_managed_worker_provider, create_room, create_unattended_grant,
+        delete_managed_worker_provider, delete_temp_file, deny_developer_terminal,
+        deny_native_invocation_review, discard_native_agent_conflict_result, enter_developer_mode,
         get_bridge_node_list_projection, get_bridge_peer_address, get_config,
         get_developer_terminal_workspace, get_device_capabilities, get_device_identity,
         get_device_profile, get_file_transfer_metadata, get_last_benchmark_results,
@@ -88,8 +89,8 @@ use crate::{
         list_native_invocation_reviews, list_nearby_devices, list_received_room_control_events,
         list_remote_native_agent_capabilities, list_room_items, list_rooms, list_seen_peer_devices,
         list_trusted_devices, list_unattended_grants, log_frontend_diagnostic,
-        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_logs_folder,
-        pair_bridge_peer, pending_join_requests, present_device_identity,
+        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_bridge_pairing,
+        open_logs_folder, pair_bridge_peer, pending_join_requests, present_device_identity,
         propose_remote_native_codex_workspace_movement, reconcile_remote_native_agent_task,
         refresh_selected_peer_capabilities, reject_nearby_join, request_developer_terminal,
         request_nearby_join, resize_developer_terminal, respond_remote_native_decision,
@@ -193,6 +194,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             create_room,
+            open_bridge_pairing,
             join_room,
             join_room_at,
             get_device_identity,
@@ -209,6 +211,7 @@ fn main() {
             set_bridge_peer_address,
             list_nearby_devices,
             request_nearby_join,
+            complete_nearby_join,
             accept_nearby_join,
             reject_nearby_join,
             pending_join_requests,

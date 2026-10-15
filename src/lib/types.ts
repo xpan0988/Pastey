@@ -38,6 +38,18 @@ export interface RoomInfo {
   local_burned_at?: number | null;
   peer_burned_at?: number | null;
   peers?: RoomBridgePeerInfo[];
+  /** Whether this Bridge has a verified peer device. Only a paired Bridge
+   * reconnects; `awaiting_peer` has an open one-time code. */
+  pairing_state?: BridgePairingState;
+}
+
+export type BridgePairingState = "paired" | "awaiting_peer" | "pairing_required";
+
+/** A nearby device accepted; its screen now shows a one-time code to type
+ * here. Nothing secret was sent. */
+export interface NearbyJoinPending {
+  requestId: string;
+  deviceName: string;
 }
 
 export interface RoomBridgePeerInfo {

@@ -2826,7 +2826,46 @@ pub async fn create_room(
             None,
             None,
         )?;
+        open_pairing_window(&state.paths, &room.id)?;
         transfer::start_room_server(state.inner().clone(), &room.id).await?;
+        storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
+    })
+    .await
+}
+
+fn open_pairing_window(paths: &storage::AppPaths, room_id: &str) -> AppResult<()> {
+    storage::open_pairing_window(
+        paths,
+        room_id,
+        storage::now_ts() + crate::bridge_auth::PAIRING_WINDOW_SECS,
+    )
+}
+
+/// Shows a fresh one-time code for pairing this existing Bridge again, for
+/// example a Bridge from before pairing existed, or after the other device's
+/// identity changed. Until the other device enters it, the Bridge has no
+/// verified peer and cannot reconnect. The previous code stops working.
+#[tauri::command]
+pub async fn open_bridge_pairing(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let master_key = {
+            let config = state.config.read();
+            config::master_key(&config)?
+        };
+        let room = storage::get_room_by_id(&state.paths, &room_id)?;
+        if room.status == crate::models::RoomStatus::Burned {
+            return Err(AppError::InvalidInput("Bridge is burned.".into()));
+        }
+        let code = unique_room_code(&state.paths)?;
+        storage::replace_room_code(&state.paths, &master_key, &room_id, &code)?;
+        state.bridge_auth.lock().purge_room(&room_id);
+        storage::set_room_status(&state.paths, &room_id, crate::models::RoomStatus::Active)?;
+        open_pairing_window(&state.paths, &room_id)?;
+        transfer::start_room_server(state.inner().clone(), &room_id).await?;
+        let room = storage::get_room_by_id(&state.paths, &room_id)?;
         storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
     })
     .await
@@ -2836,23 +2875,19 @@ pub async fn create_room(
 pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<RoomInfo, String> {
     run_async(async move {
         let compact = normalize_code(&code)?;
-        let room_code_hash = crypto::hash_code(&compact);
-        let (source, discovered) = discovery::discover_room(
-            room_code_hash,
-            Some(discovery::local_device_id(state.inner())),
-            None,
-        )
-        .await?;
-        join_discovered_room(state.inner().clone(), &compact, source, discovered, None).await
+        let (source, verified) =
+            discovery::discover_pairing(state.inner(), &compact, &discovery::DiscoveryTargets::Lan)
+                .await?;
+        join_discovered_room(state.inner().clone(), &compact, source, verified, None).await
     })
     .await
 }
 
 /// Joins a Bridge whose creator is on another network, reached at an
 /// address the user gives (for example its Tailscale or WireGuard address).
-/// Only discovery is unicast: the Bridge code, room identity, transport key
-/// exchange and session binding are exactly those of a LAN join. The address
-/// is remembered for this Bridge's reconnects and grants nothing.
+/// Only discovery is unicast: the pairing handshake, session keys and session
+/// binding are exactly those of a LAN join. The address is remembered for
+/// this Bridge's reconnects and grants nothing.
 #[tauri::command]
 pub async fn join_room_at(
     code: String,
@@ -2862,19 +2897,14 @@ pub async fn join_room_at(
     run_async(async move {
         let compact = normalize_code(&code)?;
         let address = discovery::validate_peer_address(&address)?;
-        let room_code_hash = crypto::hash_code(&compact);
-        let (source, discovered) = discovery::discover_room_at(
-            &address,
-            room_code_hash,
-            Some(discovery::local_device_id(state.inner())),
-            None,
-        )
-        .await?;
+        let targets = discovery::resolve_peer_targets(&address).await?;
+        let (source, verified) =
+            discovery::discover_pairing(state.inner(), &compact, &targets).await?;
         join_discovered_room(
             state.inner().clone(),
             &compact,
             source,
-            discovered,
+            verified,
             Some(address),
         )
         .await
@@ -2882,17 +2912,24 @@ pub async fn join_room_at(
     .await
 }
 
+/// Completes pairing with a Host whose offer proved the same one-time code:
+/// sends this device's signed, code-confirmed `/join`, verifies the Host's
+/// signed acknowledgement, and pins the Host's HostRef and device key.
 async fn join_discovered_room(
     state: Arc<AppState>,
     compact: &str,
     source: std::net::SocketAddr,
-    discovered: crate::models::DiscoveryResponse,
+    verified: crate::bridge_auth::VerifiedPairOffer,
     peer_address: Option<String>,
 ) -> AppResult<RoomInfo> {
     let master_key = {
         let config = state.config.read();
         config::master_key(&config)?
     };
+    let offer = verified.offer.clone();
+    let peer_host_ref =
+        crate::host_identity::HostRef::parse_peer(offer.host_ref.clone(), &state.local_host_ref)?;
+    refuse_repairing_with_another_host(&state.paths, &offer.room_id, &peer_host_ref)?;
 
     let room = storage::create_room(
         &state.paths,
@@ -2900,41 +2937,65 @@ async fn join_discovered_room(
         compact,
         15,
         LocalRole::Joined,
-        Some(discovered.room_id.clone()),
-        Some(discovered.expires_at),
+        Some(offer.room_id.clone()),
+        Some(offer.expires_at),
     )?;
     transfer::start_room_server(state.clone(), &room.id).await?;
-    let response = transfer::announce_join(
-        state.clone(),
-        &room.id,
-        &source.ip().to_string(),
-        discovered.port,
-    )
-    .await?;
-    let peer_host_ref = response
-        .host_ref
-        .as_deref()
-        .map(|value| crate::host_identity::HostRef::parse_peer(value, &state.local_host_ref))
-        .transpose()?;
+    let identity = crate::device_identity::load_or_create(&state.paths, &master_key)?;
+    let mut request = transfer::local_join_request(&state, &room.id)?;
+    let digest = verified.authenticate_join(&identity, &mut request);
+    let response =
+        transfer::post_join(&source.ip().to_string(), offer.port, &room.id, &request).await?;
+    verified.verify_ack(&digest, &response)?;
 
+    storage::pin_bridge_peer(
+        &state.paths,
+        &room.id,
+        peer_host_ref.as_str(),
+        &verified.device_public_key,
+    )?;
     storage::update_room_peer(
         &state.paths,
         &room.id,
         Some(&source.ip().to_string()),
-        Some(discovered.port),
+        Some(offer.port),
         Some(&response.device_name),
-        Some(&discovered.transport_public_key),
+        Some(&offer.transport_public_key),
         crate::models::RoomStatus::Active,
     )?;
-    if let Some(host_ref) = peer_host_ref.as_ref() {
-        storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, host_ref.as_str())?;
-    }
+    storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, peer_host_ref.as_str())?;
     if let Some(address) = peer_address.as_deref() {
         storage::set_bridge_peer_address(&state.paths, &room.id, Some(address))?;
     }
 
     let updated = storage::get_room_by_id(&state.paths, &room.id)?;
     storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
+}
+
+/// A Host that knows a code can name any Bridge id in its offer. If this
+/// device already has that Bridge, only the same logical Host may pair it
+/// again, so a code for a new Bridge cannot take over an existing one.
+fn refuse_repairing_with_another_host(
+    paths: &storage::AppPaths,
+    room_id: &str,
+    peer_host_ref: &crate::host_identity::HostRef,
+) -> AppResult<()> {
+    if storage::get_room_by_id(paths, room_id).is_err() {
+        return Ok(());
+    }
+    let known = match storage::bridge_peer_pin(paths, room_id)? {
+        Some(pin) => Some(pin.peer_host_ref),
+        None => storage::list_bridge_peer_endpoints(paths, room_id)?
+            .into_iter()
+            .filter_map(|peer| peer.logical_host_ref)
+            .last(),
+    };
+    if known.is_some_and(|known| known != peer_host_ref.as_str()) {
+        return Err(AppError::InvalidInput(
+            "That code belongs to a different device than this Bridge's. Ask for a code on the Bridge's own device.".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The address this device uses to reach a Bridge's peer on another network,
@@ -2970,11 +3031,14 @@ pub fn list_nearby_devices(state: State<'_, Arc<AppState>>) -> Result<Vec<Nearby
     Ok(discovery::list_nearby_devices(&state))
 }
 
+/// Asks a nearby device to start a Bridge with this one. When its user
+/// accepts, that device shows a one-time code; nothing secret is sent.
+/// Pairing finishes with `complete_nearby_join` and the code typed here.
 #[tauri::command]
 pub async fn request_nearby_join(
     device_id: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<RoomInfo, String> {
+) -> Result<crate::models::NearbyJoinPending, String> {
     run_async(async move {
         let (source, response) =
             discovery::request_nearby_join(state.inner().clone(), &device_id).await?;
@@ -2986,80 +3050,66 @@ pub async fn request_nearby_join(
                     .unwrap_or_else(|| "Join request rejected.".into()),
             ));
         }
-
-        let room_code = response
-            .room_code
-            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
-        let room_id = response
-            .room_id
-            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
-        let expires_at = response
-            .expires_at
-            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
-        let port = response
-            .port
-            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
-        let transport_public_key = response
-            .transport_public_key
-            .ok_or_else(|| AppError::InvalidInput("Invalid join response.".into()))?;
-        let peer_device_name = response
+        let device_name = response
             .device_name
             .unwrap_or_else(|| "Nearby device".into());
-
-        let master_key = {
-            let config = state.config.read();
-            config::master_key(&config)?
-        };
-        let room = storage::create_room(
-            &state.paths,
-            &master_key,
-            &room_code,
-            15,
-            LocalRole::Joined,
-            Some(room_id),
-            Some(expires_at),
-        )?;
-        transfer::start_room_server(state.inner().clone(), &room.id).await?;
-        let join_response = transfer::announce_join(
-            state.inner().clone(),
-            &room.id,
-            &source.ip().to_string(),
-            port,
-        )
-        .await
-        .map_err(|_| {
-            logging::write_transfer_line("[pastey antenna] event=nearby_unreachable");
-            logging::write_transfer_line("[pastey antenna] event=blocked_network_suspected");
-            AppError::Network(
-                "Device found, but this network may block direct local connections.".into(),
-            )
-        })?;
-        let peer_host_ref = join_response
-            .host_ref
-            .as_deref()
-            .map(|value| crate::host_identity::HostRef::parse_peer(value, &state.local_host_ref))
-            .transpose()?;
-
-        storage::update_room_peer(
-            &state.paths,
-            &room.id,
-            Some(&source.ip().to_string()),
-            Some(port),
-            Some(&peer_device_name),
-            Some(&transport_public_key),
-            crate::models::RoomStatus::Active,
-        )?;
-        if let Some(host_ref) = peer_host_ref.as_ref() {
-            storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, host_ref.as_str())?;
-        }
-
-        logging::write_transfer_line("[pastey antenna] event=join_accepted");
-        let updated = storage::get_room_by_id(&state.paths, &room.id)?;
-        storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
+        let now = storage::now_ts();
+        let mut accepted = state.accepted_nearby_joins.lock();
+        accepted.retain(|_, join| join.expires_at > now);
+        accepted.insert(
+            response.request_id.clone(),
+            discovery::AcceptedNearbyJoin {
+                source,
+                expires_at: now + crate::bridge_auth::PAIRING_WINDOW_SECS,
+            },
+        );
+        logging::write_transfer_line("[pastey antenna] event=join_accepted_awaiting_code");
+        Ok(crate::models::NearbyJoinPending {
+            request_id: response.request_id,
+            device_name,
+        })
     })
     .await
 }
 
+/// Pairs with the nearby device that accepted `request_id`, using the code
+/// its screen shows. Discovery goes only to that device's address; the
+/// handshake is the same as joining by code.
+#[tauri::command]
+pub async fn complete_nearby_join(
+    request_id: String,
+    code: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let compact = normalize_code(&code)?;
+        let accepted = {
+            let now = storage::now_ts();
+            let mut accepted = state.accepted_nearby_joins.lock();
+            accepted.retain(|_, join| join.expires_at > now);
+            accepted
+                .get(&request_id)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound("Join request timed out.".into()))?
+        };
+        let (source, verified) = discovery::discover_pairing(
+            state.inner(),
+            &compact,
+            &discovery::DiscoveryTargets::nearby(accepted.source),
+        )
+        .await?;
+        let room =
+            join_discovered_room(state.inner().clone(), &compact, source, verified, None).await?;
+        state.accepted_nearby_joins.lock().remove(&request_id);
+        logging::write_transfer_line("[pastey antenna] event=join_accepted");
+        Ok(room)
+    })
+    .await
+}
+
+/// Accepts a nearby request: creates a Bridge with a fresh one-time code and
+/// tells the requester only that it was accepted. This device's user reads
+/// the code to the requester's user, who types it there.
 #[tauri::command]
 pub async fn accept_nearby_join(
     request_id: String,
@@ -3093,27 +3143,17 @@ pub async fn accept_nearby_join(
             None,
             None,
         )?;
-        let port = transfer::start_room_server(state.inner().clone(), &room.id).await?;
-        let transport_public_key = state
-            .active_servers
-            .lock()
-            .get(&room.id)
-            .map(|server| server.transport_public_key())
-            .ok_or_else(|| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+        open_pairing_window(&state.paths, &room.id)?;
+        transfer::start_room_server(state.inner().clone(), &room.id).await?;
         let response = discovery::NearbyJoinResponse {
             kind: "join_response".into(),
             request_id: request.request_id.clone(),
             accepted: true,
             message: None,
-            room_id: Some(room.id.clone()),
-            room_code: Some(code),
-            port: Some(port),
-            expires_at: Some(room.expires_at),
-            transport_public_key: Some(transport_public_key),
             device_name: Some(transfer::device_name()),
         };
         discovery::send_join_response(&request, &response).await?;
-        logging::write_transfer_line("[pastey antenna] event=join_accepted");
+        logging::write_transfer_line("[pastey antenna] event=join_accepted_code_shown");
         storage::room_to_info_with_bridge_peers(&state.paths, room, &master_key)
     })
     .await
@@ -3133,11 +3173,6 @@ pub async fn reject_nearby_join(
             request_id: request.request_id.clone(),
             accepted: false,
             message: Some("Join request rejected.".into()),
-            room_id: None,
-            room_code: None,
-            port: None,
-            expires_at: None,
-            transport_public_key: None,
             device_name: Some(transfer::device_name()),
         };
         discovery::send_join_response(&request, &response).await?;
@@ -5640,6 +5675,7 @@ pub(crate) fn purge_bridge_runtime_authority(
         .purge_bridge_authority(room_id)
         .err();
     state.room_control.lock().purge_room(room_id);
+    state.bridge_auth.lock().purge_room(room_id);
     state.purge_room(room_id);
 
     let mut candidates = state.bridge_plan_candidate_store.lock();
@@ -7984,5 +8020,47 @@ mod tests {
             )),
             "transport_disconnected"
         );
+    }
+
+    #[test]
+    fn a_code_cannot_redirect_an_existing_bridge_to_another_host() {
+        let root = std::env::temp_dir().join(format!("pastey-repair-{}", uuid::Uuid::new_v4()));
+        let paths = storage::AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let original = crate::host_identity::HostRef::from_device_id("original").unwrap();
+        let other = crate::host_identity::HostRef::from_device_id("other").unwrap();
+        // A Bridge this device does not have yet: any Host may pair it.
+        assert!(refuse_repairing_with_another_host(&paths, "new-bridge", &other).is_ok());
+
+        let room = storage::create_room(
+            &paths,
+            &[3u8; 32],
+            "12345678",
+            15,
+            LocalRole::Joined,
+            Some("existing".into()),
+            None,
+        )
+        .unwrap();
+        // Unpinned (from before pairing): bound to the HostRef last seen.
+        storage::update_room_peer(
+            &paths,
+            &room.id,
+            Some("192.168.1.20"),
+            Some(5000),
+            Some("peer"),
+            Some(&crypto::encode_key(&[5u8; 32])),
+            crate::models::RoomStatus::Active,
+        )
+        .unwrap();
+        storage::bind_legacy_room_peer_host_ref(&paths, &room.id, original.as_str()).unwrap();
+        assert!(refuse_repairing_with_another_host(&paths, &room.id, &original).is_ok());
+        assert!(refuse_repairing_with_another_host(&paths, &room.id, &other).is_err());
+        // Pinned: bound to the pinned HostRef.
+        storage::pin_bridge_peer(&paths, &room.id, original.as_str(), &[9u8; 32]).unwrap();
+        assert!(refuse_repairing_with_another_host(&paths, &room.id, &original).is_ok());
+        assert!(refuse_repairing_with_another_host(&paths, &room.id, &other).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

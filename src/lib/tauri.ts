@@ -14,6 +14,7 @@ import type {
   JoinRequestPrompt,
   LinkBenchmarkResult,
   NearbyDevice,
+  NearbyJoinPending,
   ReceivedRoomControlEvent,
   RoomControlDeliveryReceipt,
   RoomControlSessionContext,
@@ -580,8 +581,20 @@ export async function listNearbyDevices(): Promise<NearbyDevice[]> {
   return invoke("list_nearby_devices");
 }
 
-export async function requestNearbyJoin(deviceId: string): Promise<RoomInfo> {
+export async function requestNearbyJoin(deviceId: string): Promise<NearbyJoinPending> {
   return invoke("request_nearby_join", { deviceId });
+}
+
+/** Pairs with the nearby device that accepted, using the code its screen
+ * shows. */
+export async function completeNearbyJoin(requestId: string, code: string): Promise<RoomInfo> {
+  return invoke("complete_nearby_join", { requestId, code });
+}
+
+/** Shows a fresh one-time code for pairing this Bridge again. The previous
+ * code stops working. */
+export function openBridgePairing(roomId: string): Promise<RoomInfo> {
+  return invoke("open_bridge_pairing", { roomId });
 }
 
 export async function acceptNearbyJoin(requestId: string): Promise<RoomInfo> {

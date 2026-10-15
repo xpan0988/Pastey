@@ -2092,7 +2092,6 @@ mod tests {
             room.id.clone(),
             ActiveRoomServer {
                 room_id: room.id.clone(),
-                room_code_hash: room.room_code_hash.clone(),
                 port: 8_000,
                 expires_at: room.expires_at,
                 transport_secret: crate::crypto::random_key(),

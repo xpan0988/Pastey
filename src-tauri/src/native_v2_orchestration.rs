@@ -5129,7 +5129,6 @@ mod tests {
             "bridge-native-v2".into(),
             ActiveRoomServer {
                 room_id: "bridge-native-v2".into(),
-                room_code_hash: "test-room-code".into(),
                 port: 9,
                 expires_at: now + 3_600,
                 transport_secret: local_secret,
@@ -5146,14 +5145,20 @@ mod tests {
         let response_key = remote_public_key.clone();
         let router = axum::Router::new().route(
             "/rooms/:room_id/diagnostics/ping",
-            axum::routing::post(move || {
-                let transport_public_key = response_key.clone();
-                async move {
-                    axum::Json(serde_json::json!({
-                        "transportPublicKey": transport_public_key,
-                    }))
-                }
-            }),
+            axum::routing::post(
+                move |axum::extract::Path(room_id): axum::extract::Path<String>,
+                      headers: axum::http::HeaderMap| {
+                    let body = serde_json::json!({
+                        "transportPublicKey": response_key.clone(),
+                        "proof": crate::bridge_auth::ping_proof_for_test(
+                            &room_id,
+                            &remote_secret,
+                            &headers,
+                        ),
+                    });
+                    async move { axum::Json(body) }
+                },
+            ),
         );
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {

@@ -145,6 +145,51 @@ pub struct UpdateTransferWindowResult {
 pub(crate) struct RoomServerContext {
     pub(crate) state: Arc<AppState>,
     pub(crate) room_id: String,
+    /// Nonces of authenticated room requests this server accepted.
+    pub(crate) request_replay: Arc<parking_lot::Mutex<crate::bridge_auth::RequestReplayCache>>,
+}
+
+impl RoomServerContext {
+    pub(crate) fn new(state: Arc<AppState>, room_id: String) -> Self {
+        Self {
+            state,
+            room_id,
+            request_replay: Arc::default(),
+        }
+    }
+
+    /// Authenticates a signed request from this Bridge's current peer.
+    fn verify_peer_request(
+        &self,
+        headers: &HeaderMap,
+        route: &str,
+        body: &[u8],
+    ) -> Option<crate::bridge_auth::VerifiedPeerRequest> {
+        let secret = self
+            .state
+            .active_servers
+            .lock()
+            .get(&self.room_id)
+            .map(|server| server.transport_secret)?;
+        crate::bridge_auth::verify_peer_request(
+            &self.state.paths,
+            &self.room_id,
+            &secret,
+            headers,
+            route,
+            body,
+            &self.request_replay,
+        )
+        .ok()
+    }
+}
+
+fn peer_unauthenticated() -> Response {
+    transfer_error(
+        StatusCode::FORBIDDEN,
+        "peer_unauthenticated",
+        "Request is not from this Bridge's current peer.".into(),
+    )
 }
 
 #[derive(Clone)]
@@ -335,10 +380,7 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
             post(diagnostics_pipeline_benchmark_handler)
                 .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
         )
-        .with_state(RoomServerContext {
-            state: state.clone(),
-            room_id: room.id.clone(),
-        });
+        .with_state(RoomServerContext::new(state.clone(), room.id.clone()));
 
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
@@ -365,7 +407,6 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
         room_id.to_string(),
         ActiveRoomServer {
             room_id: room_id.to_string(),
-            room_code_hash: room.room_code_hash,
             port,
             expires_at: room.expires_at,
             transport_secret,
@@ -403,24 +444,37 @@ pub async fn stop_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<
     Ok(false)
 }
 
-pub async fn announce_join(
-    state: Arc<AppState>,
+/// The local half of a `/join`: this room server's port, key and HostRef.
+pub(crate) fn local_join_request(
+    state: &Arc<AppState>,
     room_id: &str,
+) -> AppResult<JoinRoomRequest> {
+    let snapshot = room_server_snapshot(state, room_id)?;
+    Ok(JoinRoomRequest {
+        port: snapshot.port,
+        device_name: device_name(),
+        transport_public_key: snapshot.transport_public_key,
+        host_ref: Some(state.local_host_ref.as_str().to_string()),
+        auth: None,
+    })
+}
+
+/// Posts an authenticated `/join` to a peer's room server.
+pub(crate) async fn post_join(
     peer_host: &str,
     peer_port: u16,
+    room_id: &str,
+    request: &JoinRoomRequest,
 ) -> AppResult<JoinRoomResponse> {
-    let snapshot = room_server_snapshot(&state, room_id)?;
-    let client = reqwest::Client::new();
-    let response = client
+    let response = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| AppError::Network(PEER_DISCONNECTED_MESSAGE.into()))?
         .post(format!(
             "http://{peer_host}:{peer_port}/rooms/{room_id}/join"
         ))
-        .json(&JoinRoomRequest {
-            port: snapshot.port,
-            device_name: device_name(),
-            transport_public_key: snapshot.transport_public_key,
-            host_ref: Some(state.local_host_ref.as_str().to_string()),
-        })
+        .json(request)
         .send()
         .await?;
 
@@ -803,6 +857,11 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             &snapshot.transport_secret,
             &receiver_public_key,
         )?;
+    let signer = crate::bridge_auth::PeerRequestSigner::new(
+        room_id,
+        &snapshot.transport_secret,
+        &endpoint.transport_public_key,
+    )?;
 
     let transfer_id = item.id.clone();
     let file_size = item.size_bytes;
@@ -1008,6 +1067,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
                     &state,
                     &client,
                     &base_url,
+                    &signer,
                     room_id,
                     item_id,
                     &transfer_id,
@@ -1021,7 +1081,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
     } else {
         loop {
             if cancel_token.is_cancelled() {
-                notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                notify_transfer_cancel(&client, &base_url, &signer, &transfer_id).await;
                 storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Cancelled)?;
                 finish_transfer_locally(
                     &state,
@@ -1033,7 +1093,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             }
 
             if let Some((status, message)) = sender_room_terminal_state(&state, room_id) {
-                notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+                notify_transfer_failed(&client, &base_url, &signer, &transfer_id, &message).await;
                 finish_sender_terminal(&state, &transfer_id, item_id, status, &message);
                 return Err(AppError::Network(message));
             }
@@ -1048,7 +1108,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             let is_final = chunk_index.checked_add(1) == Some(total_chunks);
             if bytes_read != chunk_size && !is_final {
                 let message = "Internal chunk size mismatch".to_string();
-                notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+                notify_transfer_failed(&client, &base_url, &signer, &transfer_id, &message).await;
                 dev_log_sender_final_error(
                     &transfer_id,
                     room_id,
@@ -1111,7 +1171,13 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
                                 if error.kind == ChunkSendFailureKind::Cancelled
                                     || cancel_token.is_cancelled()
                                 {
-                                    notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                                    notify_transfer_cancel(
+                                        &client,
+                                        &base_url,
+                                        &signer,
+                                        &transfer_id,
+                                    )
+                                    .await;
                                     let _ = storage::set_room_item_status(
                                         &state.paths,
                                         item_id,
@@ -1131,6 +1197,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
                                 notify_transfer_failed(
                                     &client,
                                     &base_url,
+                                    &signer,
                                     &transfer_id,
                                     &error.message,
                                 )
@@ -1174,7 +1241,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
                         if error.kind == ChunkSendFailureKind::Cancelled
                             || cancel_token.is_cancelled()
                         {
-                            notify_transfer_cancel(&client, &base_url, &transfer_id).await;
+                            notify_transfer_cancel(&client, &base_url, &signer, &transfer_id).await;
                             let _ = storage::set_room_item_status(
                                 &state.paths,
                                 item_id,
@@ -1189,8 +1256,14 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
                             return Err(AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into()));
                         }
 
-                        notify_transfer_failed(&client, &base_url, &transfer_id, &error.message)
-                            .await;
+                        notify_transfer_failed(
+                            &client,
+                            &base_url,
+                            &signer,
+                            &transfer_id,
+                            &error.message,
+                        )
+                        .await;
                         dev_log_sender_final_error(
                             &transfer_id,
                             room_id,
@@ -1251,7 +1324,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
     if let (Some(check), Some(expected)) = (&verified_check, &expected_source) {
         if !crate::safe_file_identity::source_still_matches(check, &expected.identity) {
             let message = "The selected file changed while it was being sent.".to_string();
-            notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+            notify_transfer_failed(&client, &base_url, &signer, &transfer_id, &message).await;
             fail_transfer(&state, &transfer_id, item_id, message.clone());
             return Err(AppError::InvalidInput(message));
         }
@@ -1259,7 +1332,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
 
     if chunk_index != total_chunks {
         let message = "Transfer metadata mismatch".to_string();
-        notify_transfer_failed(&client, &base_url, &transfer_id, &message).await;
+        notify_transfer_failed(&client, &base_url, &signer, &transfer_id, &message).await;
         dev_log_sender_final_error(
             &transfer_id,
             room_id,
@@ -1271,11 +1344,17 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         return Err(AppError::Network(message));
     }
 
-    let finish_response = client
-        .post(format!("{base_url}/transfers/{transfer_id}/finish"))
-        .json(&FileTransferFinishRequest {
-            item_id: item.id.clone(),
-        })
+    let finish_body = serde_json::to_vec(&FileTransferFinishRequest {
+        item_id: item.id.clone(),
+    })?;
+    let (finish_request, _) = signer.apply(
+        client.post(format!("{base_url}/transfers/{transfer_id}/finish")),
+        &format!("finish:{transfer_id}"),
+        &finish_body,
+    );
+    let finish_response = finish_request
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(finish_body)
         .send()
         .await;
     match finish_response {
@@ -1370,6 +1449,7 @@ async fn finish_sender_after_chunk_error(
     state: &Arc<AppState>,
     client: &reqwest::Client,
     base_url: &str,
+    signer: &crate::bridge_auth::PeerRequestSigner,
     room_id: &str,
     item_id: &str,
     transfer_id: &str,
@@ -1378,7 +1458,7 @@ async fn finish_sender_after_chunk_error(
     cancel_token: &CancellationToken,
 ) -> AppError {
     if error.kind == ChunkSendFailureKind::Cancelled || cancel_token.is_cancelled() {
-        notify_transfer_cancel(client, base_url, transfer_id).await;
+        notify_transfer_cancel(client, base_url, signer, transfer_id).await;
         let _ = storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Cancelled);
         finish_transfer_locally(
             state,
@@ -1389,7 +1469,7 @@ async fn finish_sender_after_chunk_error(
         return AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into());
     }
 
-    notify_transfer_failed(client, base_url, transfer_id, &error.message).await;
+    notify_transfer_failed(client, base_url, signer, transfer_id, &error.message).await;
     dev_log_sender_final_error(
         transfer_id,
         room_id,
@@ -2645,12 +2725,8 @@ pub async fn cancel_transfer(
             "receiver_cancelled",
         )
         .await;
-    } else if let Ok(room) = storage::get_room_by_id(&state.paths, &transfer.room_id) {
-        if let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) {
-            let client = reqwest::Client::new();
-            let base_url = format!("http://{peer_host}:{peer_port}/rooms/{}", transfer.room_id);
-            notify_transfer_cancel(&client, &base_url, transfer_id).await;
-        }
+    } else if let Some((base_url, signer)) = legacy_peer_route(&state, &transfer.room_id) {
+        notify_transfer_cancel(&reqwest::Client::new(), &base_url, &signer, transfer_id).await;
     }
     if matches!(transfer.kind, ActiveFileTransferKind::Sender { .. }) {
         logging::write_transfer_line(&format!(
@@ -2841,6 +2917,9 @@ fn room_server_snapshot(state: &Arc<AppState>, room_id: &str) -> AppResult<Activ
     })
 }
 
+/// Admits a peer only with proof: a pairing handshake against this Bridge's
+/// open one-time code, or a reconnect signed by the device this Bridge is
+/// pinned to. A join with neither is refused and changes nothing.
 async fn join_handler(
     AxumPath(room_id): AxumPath<String>,
     ConnectInfo(source): ConnectInfo<SocketAddr>,
@@ -2862,10 +2941,52 @@ async fn join_handler(
         .as_deref()
         .map(|value| crate::host_identity::HostRef::parse_peer(value, &ctx.state.local_host_ref))
         .transpose()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .ok_or(StatusCode::BAD_REQUEST)?;
 
     let snapshot = room_server_snapshot(&ctx.state, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let ack = match &request.auth {
+        Some(crate::bridge_auth::JoinAuth::Pair { .. }) => {
+            let admitted = crate::bridge_auth::accept_pair_join(
+                &ctx.state,
+                &room_id,
+                &snapshot.transport_public_key,
+                &request,
+            )
+            .map_err(|_| StatusCode::FORBIDDEN)?;
+            if admitted.retry {
+                return Ok(Json(JoinRoomResponse {
+                    device_name: device_name(),
+                    expires_at: room.expires_at,
+                    transport_public_key: snapshot.transport_public_key,
+                    host_ref: Some(ctx.state.local_host_ref.as_str().to_string()),
+                    auth: Some(admitted.ack),
+                }));
+            }
+            // One code admits one device, then it is spent.
+            storage::close_pairing_window(&ctx.state.paths, &room_id)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            storage::pin_bridge_peer(
+                &ctx.state.paths,
+                &room_id,
+                request_host_ref.as_str(),
+                &admitted.peer_device_public_key,
+            )
+            .map_err(|_| StatusCode::GONE)?;
+            admitted.ack
+        }
+        Some(crate::bridge_auth::JoinAuth::Reconnect { .. }) => {
+            crate::bridge_auth::accept_reconnect_join(
+                &ctx.state,
+                &room_id,
+                &snapshot.transport_public_key,
+                &request,
+            )
+            .map_err(|_| StatusCode::FORBIDDEN)?
+        }
+        None => return Err(StatusCode::FORBIDDEN),
+    };
     crate::room_control::clear_room_control_state(&ctx.state, &room_id);
     storage::update_room_peer(
         &ctx.state.paths,
@@ -2877,16 +2998,15 @@ async fn join_handler(
         RoomStatus::Active,
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if let Some(host_ref) = request_host_ref.as_ref() {
-        storage::bind_legacy_room_peer_host_ref(&ctx.state.paths, &room_id, host_ref.as_str())
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-    }
+    storage::bind_legacy_room_peer_host_ref(&ctx.state.paths, &room_id, request_host_ref.as_str())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     Ok(Json(JoinRoomResponse {
         device_name: device_name(),
         expires_at: room.expires_at,
         transport_public_key: snapshot.transport_public_key,
         host_ref: Some(ctx.state.local_host_ref.as_str().to_string()),
+        auth: Some(ack),
     }))
 }
 
@@ -2900,6 +3020,17 @@ async fn receive_item_handler(
     }
     if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
         return response;
+    }
+    // The wrapped key below is bound by X25519 to the named sender key, so
+    // naming the current peer's key is proof of being that peer.
+    if !crate::bridge_auth::is_current_peer_key(
+        &ctx.state.paths,
+        &room_id,
+        &upload.sender_public_key,
+    )
+    .unwrap_or(false)
+    {
+        return peer_unauthenticated();
     }
     if let Err(error) = storage::validate_file_size(upload.size_bytes) {
         return transfer_error(
@@ -3025,9 +3156,12 @@ async fn receive_item_handler(
     StatusCode::OK.into_response()
 }
 
+/// Liveness: answers only the current peer, with proof of this room
+/// server's key bound to the peer's nonce.
 async fn diagnostics_ping_handler(
     AxumPath(room_id): AxumPath<String>,
     State(ctx): State<RoomServerContext>,
+    headers: HeaderMap,
 ) -> Response {
     if room_id != ctx.room_id {
         return StatusCode::NOT_FOUND.into_response();
@@ -3035,6 +3169,9 @@ async fn diagnostics_ping_handler(
     if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
         return response;
     }
+    let Some(verified) = ctx.verify_peer_request(&headers, "ping", b"") else {
+        return peer_unauthenticated();
+    };
 
     let transport_public_key = {
         let servers = ctx.state.active_servers.lock();
@@ -3045,6 +3182,7 @@ async fn diagnostics_ping_handler(
     };
     Json(serde_json::json!({
         "transportPublicKey": transport_public_key,
+        "proof": verified.ping_proof(&room_id),
     }))
     .into_response()
 }
@@ -3052,11 +3190,13 @@ async fn diagnostics_ping_handler(
 async fn diagnostics_raw_benchmark_handler(
     AxumPath(room_id): AxumPath<String>,
     State(ctx): State<RoomServerContext>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     diagnostics_benchmark_handler(
         room_id,
         ctx,
+        &headers,
         crate::diagnostics::BenchmarkMode::RawMemory,
         body,
     )
@@ -3065,11 +3205,13 @@ async fn diagnostics_raw_benchmark_handler(
 async fn diagnostics_pipeline_benchmark_handler(
     AxumPath(room_id): AxumPath<String>,
     State(ctx): State<RoomServerContext>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     diagnostics_benchmark_handler(
         room_id,
         ctx,
+        &headers,
         crate::diagnostics::BenchmarkMode::PasteyPipeline,
         body,
     )
@@ -3078,6 +3220,7 @@ async fn diagnostics_pipeline_benchmark_handler(
 fn diagnostics_benchmark_handler(
     room_id: String,
     ctx: RoomServerContext,
+    headers: &HeaderMap,
     mode: crate::diagnostics::BenchmarkMode,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -3101,6 +3244,12 @@ fn diagnostics_benchmark_handler(
             )
         }
     };
+    if ctx
+        .verify_peer_request(headers, link_benchmark::benchmark_route(mode), &body)
+        .is_none()
+    {
+        return peer_unauthenticated();
+    }
     match link_benchmark::discard_benchmark_payload(mode, &body) {
         Ok(received_bytes) => Json(link_benchmark::BenchmarkDiscardResponse {
             received_bytes,
@@ -3136,6 +3285,28 @@ async fn start_file_transfer_handler(
     }
     if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
         return response;
+    }
+    // As for items: the session key is wrapped to the named sender key.
+    if !crate::bridge_auth::is_current_peer_key(
+        &ctx.state.paths,
+        &room_id,
+        &start.sender_public_key,
+    )
+    .unwrap_or(false)
+    {
+        return peer_unauthenticated();
+    }
+    if ctx
+        .state
+        .active_file_transfers
+        .lock()
+        .contains_key(&start.transfer_id)
+    {
+        return transfer_error(
+            StatusCode::CONFLICT,
+            "transfer_exists",
+            "Transfer is already active.".into(),
+        );
     }
     if let Err(error) = storage::validate_file_size(start.size_bytes) {
         return transfer_error(
@@ -3975,7 +4146,8 @@ async fn receive_file_chunk_handler(
 async fn finish_file_transfer_handler(
     AxumPath((room_id, transfer_id)): AxumPath<(String, String)>,
     State(ctx): State<RoomServerContext>,
-    Json(finish): Json<FileTransferFinishRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     dev_log_receiver_finalize(&transfer_id, &room_id, "finalize_start", "");
     if room_id != ctx.room_id {
@@ -3985,6 +4157,19 @@ async fn finish_file_transfer_handler(
             "Room not found on receiver.".into(),
         );
     }
+    if ctx
+        .verify_peer_request(&headers, &format!("finish:{transfer_id}"), &body)
+        .is_none()
+    {
+        return peer_unauthenticated();
+    }
+    let Ok(finish) = serde_json::from_slice::<FileTransferFinishRequest>(&body) else {
+        return transfer_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_transfer",
+            "Invalid file metadata".into(),
+        );
+    };
 
     let transfer = match ctx.state.active_file_transfers.lock().remove(&transfer_id) {
         Some(transfer) => transfer,
@@ -4383,7 +4568,8 @@ async fn finish_file_transfer_handler(
 async fn cancel_file_transfer_handler(
     AxumPath((room_id, transfer_id)): AxumPath<(String, String)>,
     State(ctx): State<RoomServerContext>,
-    request: Option<Json<TransferCancelRequest>>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     if room_id != ctx.room_id {
         return transfer_error(
@@ -4392,6 +4578,26 @@ async fn cancel_file_transfer_handler(
             "Room not found on receiver.".into(),
         );
     }
+    if ctx
+        .verify_peer_request(&headers, &format!("cancel:{transfer_id}"), &body)
+        .is_none()
+    {
+        return peer_unauthenticated();
+    }
+    let request = if body.is_empty() {
+        None
+    } else {
+        match serde_json::from_slice::<TransferCancelRequest>(&body) {
+            Ok(request) => Some(Json(request)),
+            Err(_) => {
+                return transfer_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Invalid cancel request.".into(),
+                )
+            }
+        }
+    };
     let Some(transfer) = ctx.state.active_file_transfers.lock().remove(&transfer_id) else {
         log_late_event_ignored(&transfer_id, &room_id, "cancel");
         return Json(TransferOkResponse { ok: true }).into_response();
@@ -5300,27 +5506,78 @@ fn map_receiver_write_error(error: &std::io::Error) -> (&'static str, &'static s
     }
 }
 
-async fn notify_transfer_cancel(client: &reqwest::Client, base_url: &str, transfer_id: &str) {
-    let _ = client
-        .post(format!("{base_url}/transfers/{transfer_id}/cancel"))
-        .send()
-        .await;
+/// Posts a signed cancel to the peer. A cancel is best effort: the peer
+/// accepts it only from this Bridge's current session.
+async fn post_transfer_cancel(
+    client: &reqwest::Client,
+    base_url: &str,
+    signer: &crate::bridge_auth::PeerRequestSigner,
+    transfer_id: &str,
+    body: Option<serde_json::Value>,
+) {
+    let body = body
+        .map(|body| serde_json::to_vec(&body).unwrap_or_default())
+        .unwrap_or_default();
+    let (request, _) = signer.apply(
+        client.post(format!("{base_url}/transfers/{transfer_id}/cancel")),
+        &format!("cancel:{transfer_id}"),
+        &body,
+    );
+    let request = if body.is_empty() {
+        request
+    } else {
+        request.header(header::CONTENT_TYPE, "application/json")
+    };
+    let _ = request.body(body).send().await;
+}
+
+async fn notify_transfer_cancel(
+    client: &reqwest::Client,
+    base_url: &str,
+    signer: &crate::bridge_auth::PeerRequestSigner,
+    transfer_id: &str,
+) {
+    post_transfer_cancel(client, base_url, signer, transfer_id, None).await;
 }
 
 async fn notify_transfer_failed(
     client: &reqwest::Client,
     base_url: &str,
+    signer: &crate::bridge_auth::PeerRequestSigner,
     transfer_id: &str,
     message: &str,
 ) {
-    let _ = client
-        .post(format!("{base_url}/transfers/{transfer_id}/cancel"))
-        .json(&serde_json::json!({
+    post_transfer_cancel(
+        client,
+        base_url,
+        signer,
+        transfer_id,
+        Some(serde_json::json!({
             "status": "failed",
             "message": message,
-        }))
-        .send()
-        .await;
+        })),
+    )
+    .await;
+}
+
+/// The legacy single-peer route of a room, with a signer for it.
+fn legacy_peer_route(
+    state: &Arc<AppState>,
+    room_id: &str,
+) -> Option<(String, crate::bridge_auth::PeerRequestSigner)> {
+    let room = storage::get_room_by_id(&state.paths, room_id).ok()?;
+    let (Some(peer_host), Some(peer_port), Some(peer_key)) = (
+        room.peer_host,
+        room.peer_port,
+        room.peer_transport_public_key,
+    ) else {
+        return None;
+    };
+    let signer = crate::bridge_auth::PeerRequestSigner::for_room(state, room_id, &peer_key).ok()?;
+    Some((
+        format!("http://{peer_host}:{peer_port}/rooms/{room_id}"),
+        signer,
+    ))
 }
 
 async fn notify_peer_transfer_terminal_reason(
@@ -5329,22 +5586,21 @@ async fn notify_peer_transfer_terminal_reason(
     transfer_id: &str,
     reason: &str,
 ) {
-    let Ok(room) = storage::get_room_by_id(&state.paths, room_id) else {
+    let Some((base_url, signer)) = legacy_peer_route(state, room_id) else {
         return;
     };
-    let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) else {
-        return;
-    };
-    let base_url = format!("http://{peer_host}:{peer_port}/rooms/{room_id}");
-    let _ = reqwest::Client::new()
-        .post(format!("{base_url}/transfers/{transfer_id}/cancel"))
-        .json(&serde_json::json!({
+    post_transfer_cancel(
+        &reqwest::Client::new(),
+        &base_url,
+        &signer,
+        transfer_id,
+        Some(serde_json::json!({
             "status": "failed",
             "message": terminal_reason_message(reason),
             "reason": reason,
-        }))
-        .send()
-        .await;
+        })),
+    )
+    .await;
 }
 
 async fn cancel_transfer_with_reason(
@@ -5373,12 +5629,8 @@ async fn cancel_transfer_with_reason(
         ));
         remove_active_receiver_part_file(&transfer.room_id, "active_part", part_path).await?;
         notify_peer_transfer_terminal_reason(&state, &transfer.room_id, transfer_id, reason).await;
-    } else if let Ok(room) = storage::get_room_by_id(&state.paths, &transfer.room_id) {
-        if let (Some(peer_host), Some(peer_port)) = (room.peer_host, room.peer_port) {
-            let client = reqwest::Client::new();
-            let base_url = format!("http://{peer_host}:{peer_port}/rooms/{}", transfer.room_id);
-            notify_transfer_cancel(&client, &base_url, transfer_id).await;
-        }
+    } else if let Some((base_url, signer)) = legacy_peer_route(&state, &transfer.room_id) {
+        notify_transfer_cancel(&reqwest::Client::new(), &base_url, &signer, transfer_id).await;
     }
     let _ =
         storage::set_room_item_status(&state.paths, &transfer.item_id, RoomItemStatus::Cancelled);
@@ -5470,6 +5722,8 @@ mod tests {
         .unwrap();
         assert_eq!(legacy_request.host_ref, None);
         assert_eq!(legacy_response.host_ref, None);
+        // Older peers still parse, but carry no proof; `/join` refuses them.
+        assert_eq!(legacy_request.auth, None);
 
         let current = JoinRoomRequest {
             port: 9000,
@@ -5481,6 +5735,7 @@ mod tests {
                     .as_str()
                     .to_string(),
             ),
+            auth: None,
         };
         assert!(serde_json::to_value(current)
             .unwrap()
@@ -6233,20 +6488,23 @@ mod tests {
     }
 }
 
-/// Characterization of the current Bridge join boundary (see the join audit
-/// in docs/layers/layer-4-join-audit.md). Each test asserts behaviour that is
-/// insecure today; a fix is expected to flip it.
+/// Regression tests for the Bridge join and room-request boundary (see
+/// docs/layers/layer-4-join-audit.md). The attacks the audit demonstrated
+/// against the unauthenticated join are each shown to be refused.
 #[cfg(test)]
-mod join_characterization {
+mod join_authentication {
     use super::*;
     use crate::{
+        bridge_auth::{self, JoinAuth, PairAttempt, PeerRequestSigner, ReconnectAttempt},
         config::StoredConfig,
+        device_identity::DeviceIdentity,
         host_runtime::{HostEvent, HostEventSink, RuntimeTask, RuntimeTaskSpawner},
-        models::{BridgePeerLiveness, LocalRole, RoomItemDirection},
+        models::{BridgePairingState, BridgePeerLiveness, LocalRole, RoomItemDirection},
         storage::AppPaths,
     };
 
-    const ROOM_ID: &str = "join-characterization-room";
+    const ROOM_ID: &str = "join-authentication-room";
+    const CODE: &str = "12345678";
 
     struct NoopEventSink;
 
@@ -6262,20 +6520,20 @@ mod join_characterization {
         fn spawn(&self, _task: RuntimeTask) {}
     }
 
-    /// One Host's Bridge room server on loopback, with the production join,
-    /// item and liveness handlers.
-    struct RoomServerFixture {
+    /// One Host's Bridge room server on loopback with the production
+    /// handlers, its Bridge holding an open pairing code.
+    struct HostFixture {
         state: Arc<AppState>,
         base_url: String,
-        server_public_key: [u8; 32],
+        server_public_key: String,
         shutdown: Option<oneshot::Sender<()>>,
         root: PathBuf,
     }
 
-    impl RoomServerFixture {
+    impl HostFixture {
         async fn new(label: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
-                "pastey-join-characterization-{label}-{}",
+                "pastey-join-authentication-{label}-{}",
                 uuid::Uuid::new_v4()
             ));
             let paths = AppPaths::new(root.clone(), root.join("logs"));
@@ -6285,13 +6543,14 @@ mod join_characterization {
             let room = storage::create_room(
                 &paths,
                 &app_secret,
-                "12345678",
+                CODE,
                 15,
                 LocalRole::Creator,
                 Some(ROOM_ID.into()),
                 Some(storage::now_ts() + 3_600),
             )
             .unwrap();
+            storage::open_pairing_window(&paths, ROOM_ID, storage::now_ts() + 600).unwrap();
             let config = StoredConfig {
                 version: 5,
                 default_expiry_minutes: 15,
@@ -6304,7 +6563,7 @@ mod join_characterization {
                 micro_flow_group_mode: "off".into(),
                 shortcut: "test".into(),
                 app_secret: crypto::encode_key(&app_secret),
-                device_id: format!("creator-{label}"),
+                device_id: format!("host-{label}"),
             };
             let state = Arc::new(
                 AppState::new(
@@ -6322,7 +6581,6 @@ mod join_characterization {
                 ROOM_ID.into(),
                 ActiveRoomServer {
                     room_id: ROOM_ID.into(),
-                    room_code_hash: room.room_code_hash.clone(),
                     port,
                     expires_at: room.expires_at,
                     transport_secret,
@@ -6333,13 +6591,26 @@ mod join_characterization {
                 .route("/rooms/:room_id/join", post(join_handler))
                 .route("/rooms/:room_id/items", post(receive_item_handler))
                 .route(
+                    "/rooms/:room_id/transfers/start",
+                    post(start_file_transfer_handler),
+                )
+                .route(
+                    "/rooms/:room_id/transfers/:transfer_id/finish",
+                    post(finish_file_transfer_handler),
+                )
+                .route(
+                    "/rooms/:room_id/transfers/:transfer_id/cancel",
+                    post(cancel_file_transfer_handler),
+                )
+                .route(
                     "/rooms/:room_id/diagnostics/ping",
                     post(diagnostics_ping_handler),
                 )
-                .with_state(RoomServerContext {
-                    state: state.clone(),
-                    room_id: ROOM_ID.into(),
-                });
+                .route(
+                    "/rooms/:room_id/diagnostics/benchmark/raw",
+                    post(diagnostics_raw_benchmark_handler),
+                )
+                .with_state(RoomServerContext::new(state.clone(), ROOM_ID.into()));
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
             tokio::spawn(async move {
                 let _ = axum::serve(
@@ -6354,33 +6625,40 @@ mod join_characterization {
             Self {
                 state,
                 base_url: format!("http://127.0.0.1:{port}/rooms/{ROOM_ID}"),
-                server_public_key: crypto::transport_public_key(&transport_secret),
+                server_public_key: crypto::encode_key(&crypto::transport_public_key(
+                    &transport_secret,
+                )),
                 shutdown: Some(shutdown_tx),
                 root,
             }
         }
 
-        async fn post_join(&self, transport_public_key: &str, host_ref: &str) -> StatusCode {
+        async fn post_join(&self, request: &JoinRoomRequest) -> reqwest::Response {
             reqwest::Client::new()
                 .post(format!("{}/join", self.base_url))
-                .json(&JoinRoomRequest {
-                    port: 9,
-                    device_name: "claimed name".into(),
-                    transport_public_key: transport_public_key.into(),
-                    host_ref: Some(host_ref.into()),
-                })
+                .json(request)
                 .send()
                 .await
                 .unwrap()
-                .status()
         }
 
-        fn peers(&self) -> Vec<crate::models::StoredBridgePeerEndpoint> {
-            storage::list_bridge_peer_endpoints(&self.state.paths, ROOM_ID).unwrap()
+        fn connected_peers(&self) -> Vec<crate::models::StoredBridgePeerEndpoint> {
+            storage::list_bridge_peer_endpoints(&self.state.paths, ROOM_ID)
+                .unwrap()
+                .into_iter()
+                .filter(|peer| peer.liveness == BridgePeerLiveness::Connected)
+                .collect()
+        }
+
+        fn pairing_state(&self) -> BridgePairingState {
+            let room = storage::get_room_by_id(&self.state.paths, ROOM_ID).unwrap();
+            storage::room_to_info_with_bridge_peers(&self.state.paths, room, &[41u8; 32])
+                .unwrap()
+                .pairing_state
         }
     }
 
-    impl Drop for RoomServerFixture {
+    impl Drop for HostFixture {
         fn drop(&mut self) {
             if let Some(shutdown) = self.shutdown.take() {
                 let _ = shutdown.send(());
@@ -6389,141 +6667,498 @@ mod join_characterization {
         }
     }
 
-    fn fresh_public_key() -> String {
-        crypto::encode_key(&crypto::transport_public_key(
-            &crypto::generate_transport_secret(),
-        ))
+    /// A joining device: its room-server key, device key and HostRef.
+    struct Joiner {
+        secret: [u8; 32],
+        identity: DeviceIdentity,
+        host_ref: String,
     }
 
-    fn host_ref(device_id: &str) -> String {
-        crate::host_identity::HostRef::from_device_id(device_id)
+    impl Joiner {
+        fn new(device_id: &str) -> Self {
+            Self {
+                secret: crypto::generate_transport_secret(),
+                identity: DeviceIdentity::generate_for_test(),
+                host_ref: crate::host_identity::HostRef::from_device_id(device_id)
+                    .unwrap()
+                    .as_str()
+                    .to_string(),
+            }
+        }
+
+        fn public_key(&self) -> String {
+            crypto::encode_key(&crypto::transport_public_key(&self.secret))
+        }
+
+        fn request(&self) -> JoinRoomRequest {
+            JoinRoomRequest {
+                port: 9,
+                device_name: "joiner".into(),
+                transport_public_key: self.public_key(),
+                host_ref: Some(self.host_ref.clone()),
+                auth: None,
+            }
+        }
+
+        fn signer(&self, host: &HostFixture) -> PeerRequestSigner {
+            PeerRequestSigner::new(ROOM_ID, &self.secret, &host.server_public_key).unwrap()
+        }
+
+        /// Runs the pairing handshake against `host`, as the product does
+        /// once discovery has delivered the offers.
+        async fn pair(
+            &self,
+            host: &HostFixture,
+            code: &str,
+        ) -> Option<(bridge_auth::VerifiedPairOffer, JoinRoomResponse)> {
+            let mut attempt = PairAttempt::new(code);
+            let verified = bridge_auth::answer_pair_query(&host.state, &attempt.query())
+                .iter()
+                .find_map(|offer| attempt.verify_offer(offer))?;
+            let mut request = self.request();
+            let digest = verified.authenticate_join(&self.identity, &mut request);
+            let response = host.post_join(&request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response: JoinRoomResponse = response.json().await.unwrap();
+            verified.verify_ack(&digest, &response).unwrap();
+            Some((verified, response))
+        }
+    }
+
+    #[tokio::test]
+    async fn pairing_with_the_code_admits_and_pins_exactly_that_device() {
+        let host = HostFixture::new("pair").await;
+        assert_eq!(host.pairing_state(), BridgePairingState::AwaitingPeer);
+        let joiner = Joiner::new("joiner");
+        let (verified, response) = joiner.pair(&host, CODE).await.expect("code pairs");
+        assert_eq!(response.transport_public_key, host.server_public_key);
+        assert_eq!(verified.offer.room_id, ROOM_ID);
+
+        let peers = host.connected_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].transport_public_key, Some(joiner.public_key()));
+        assert_eq!(peers[0].logical_host_ref, Some(joiner.host_ref.clone()));
+        let pin = storage::bridge_peer_pin(&host.state.paths, ROOM_ID)
             .unwrap()
-            .as_str()
-            .to_string()
-    }
-
-    /// `/join` proves neither knowledge of the Bridge code nor possession of
-    /// any earlier key: a second, unrelated join replaces the connected peer,
-    /// and the HostRef it claims is bound to the new session unverified.
-    #[tokio::test]
-    async fn characterization_join_without_proof_replaces_the_connected_peer() {
-        let fixture = RoomServerFixture::new("replace").await;
-        let first_key = fresh_public_key();
-        assert_eq!(
-            fixture.post_join(&first_key, &host_ref("first-peer")).await,
-            StatusCode::OK
-        );
-        let first = fixture.peers();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].liveness, BridgePeerLiveness::Connected);
-        assert_eq!(
-            first[0].transport_public_key.as_deref(),
-            Some(first_key.as_str())
-        );
-
-        // No code, no signature, no reference to the first session.
-        let second_key = fresh_public_key();
-        let claimed = host_ref("first-peer");
-        assert_eq!(
-            fixture.post_join(&second_key, &claimed).await,
-            StatusCode::OK
-        );
-
-        let peers = fixture.peers();
-        let connected = peers
-            .iter()
-            .filter(|peer| peer.liveness == BridgePeerLiveness::Connected)
-            .collect::<Vec<_>>();
-        assert_eq!(connected.len(), 1, "exactly one current peer remains");
-        assert_eq!(
-            connected[0].transport_public_key.as_deref(),
-            Some(second_key.as_str()),
-            "the unproven joiner is now the current peer"
-        );
-        assert_eq!(
-            connected[0].logical_host_ref.as_deref(),
-            Some(claimed.as_str()),
-            "the claimed HostRef is bound without verification"
-        );
-        let replaced = peers
-            .iter()
-            .find(|peer| peer.peer_session_id == first[0].peer_session_id)
             .unwrap();
-        assert_eq!(replaced.liveness, BridgePeerLiveness::Stale);
-        assert_eq!(replaced.transport_public_key, None);
+        assert_eq!(pin.peer_host_ref, joiner.host_ref);
+        assert_eq!(pin.peer_device_public_key, joiner.identity.public_key());
+        assert_eq!(host.pairing_state(), BridgePairingState::Paired);
     }
 
-    /// The ordinary item route unwraps with whatever sender key the request
-    /// names; it never checks that key against the Bridge's current peer.
+    /// F1 regression: a join with no proof is refused and replaces nothing.
     #[tokio::test]
-    async fn characterization_item_upload_from_a_non_member_key_is_stored() {
-        let fixture = RoomServerFixture::new("item").await;
-        let member_key = fresh_public_key();
+    async fn a_join_without_proof_is_refused_and_replaces_nothing() {
+        let host = HostFixture::new("no-proof").await;
+        let joiner = Joiner::new("joiner");
+        // Before any pairing as well as after it.
+        let intruder = Joiner::new("joiner");
         assert_eq!(
-            fixture.post_join(&member_key, &host_ref("member")).await,
-            StatusCode::OK
+            host.post_join(&intruder.request()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(host.connected_peers().is_empty());
+
+        joiner.pair(&host, CODE).await.expect("code pairs");
+        // The intruder even claims the paired device's HostRef.
+        assert_eq!(
+            host.post_join(&intruder.request()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let peers = host.connected_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].transport_public_key, Some(joiner.public_key()));
+    }
+
+    /// F2/F3 regression: a wrong code learns nothing, a spent code admits no
+    /// second device, and a code survives only a bounded number of guesses.
+    #[tokio::test]
+    async fn wrong_spent_and_overguessed_codes_admit_no_one() {
+        let host = HostFixture::new("guess").await;
+        let mut wrong = PairAttempt::new("87654321");
+        let offers = bridge_auth::answer_pair_query(&host.state, &wrong.query());
+        assert_eq!(
+            offers.len(),
+            1,
+            "every query is answered, and spends a guess"
+        );
+        assert!(wrong.verify_offer(&offers[0]).is_none());
+
+        let joiner = Joiner::new("joiner");
+        joiner.pair(&host, CODE).await.expect("code pairs");
+        let mut late = PairAttempt::new(CODE);
+        assert!(bridge_auth::answer_pair_query(&host.state, &late.query()).is_empty());
+        assert!(late.verify_offer(&offers[0]).is_none());
+
+        let fresh = HostFixture::new("budget").await;
+        for _ in 0..bridge_auth::PAIRING_MAX_ANSWERS {
+            let guess = PairAttempt::new("00000000");
+            assert_eq!(
+                bridge_auth::answer_pair_query(&fresh.state, &guess.query()).len(),
+                1
+            );
+        }
+        let right = PairAttempt::new(CODE);
+        assert!(
+            bridge_auth::answer_pair_query(&fresh.state, &right.query()).is_empty(),
+            "a code stops answering once its guess budget is spent"
+        );
+        assert_eq!(fresh.pairing_state(), BridgePairingState::PairingRequired);
+    }
+
+    /// A pairing join altered after signing, or replayed with another key or
+    /// from elsewhere, admits no one and moves nothing.
+    #[tokio::test]
+    async fn a_forged_or_replayed_pairing_join_is_refused() {
+        let host = HostFixture::new("forged").await;
+        let joiner = Joiner::new("joiner");
+        let mut attempt = PairAttempt::new(CODE);
+        let verified = bridge_auth::answer_pair_query(&host.state, &attempt.query())
+            .iter()
+            .find_map(|offer| attempt.verify_offer(offer))
+            .unwrap();
+        let mut request = joiner.request();
+        verified.authenticate_join(&joiner.identity, &mut request);
+
+        let mut altered = request.clone();
+        altered.transport_public_key = Joiner::new("other").public_key();
+        assert_eq!(
+            host.post_join(&altered).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // A refused proof spends the offer; the original cannot be used now.
+        assert_eq!(
+            host.post_join(&request).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(host.connected_peers().is_empty());
+
+        let (_, _) = joiner.pair(&host, CODE).await.expect("a new attempt pairs");
+        let mut forged = joiner.request();
+        forged.auth = Some(JoinAuth::Pair {
+            request_id: "made-up".into(),
+            device_public_key: STANDARD.encode(Joiner::new("x").identity.public_key()),
+            signature: STANDARD.encode([0u8; 64]),
+            confirm: "00".repeat(32),
+        });
+        assert_eq!(
+            host.post_join(&forged).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            host.connected_peers()[0].transport_public_key,
+            Some(joiner.public_key())
+        );
+    }
+
+    /// F6 regression: reconnect needs a fresh signature by the pinned device
+    /// over both nonces; a replay or another device key is refused.
+    #[tokio::test]
+    async fn reconnect_requires_fresh_proof_by_the_pinned_device() {
+        let host = HostFixture::new("reconnect").await;
+        let joiner = Joiner::new("joiner");
+        let (verified, _) = joiner.pair(&host, CODE).await.expect("code pairs");
+        let host_pin = storage::BridgePeerPin {
+            peer_host_ref: verified.offer.host_ref.clone(),
+            peer_device_public_key: verified.device_public_key,
+        };
+        let joiner_ref = crate::host_identity::HostRef::parse(joiner.host_ref.clone()).unwrap();
+
+        // The joiner restarted: new room-server key, same device.
+        let restarted = Joiner {
+            secret: crypto::generate_transport_secret(),
+            identity: joiner.identity,
+            host_ref: joiner.host_ref.clone(),
+        };
+        let attempt = ReconnectAttempt::new(ROOM_ID, &joiner_ref, host_pin.clone());
+        let offer = bridge_auth::answer_reconnect_query(&host.state, &attempt.query()).unwrap();
+        let offered = attempt
+            .verify_offer(&offer)
+            .expect("signed by the pinned Host");
+        let mut request = restarted.request();
+        let digest = attempt.authenticate_join(&restarted.identity, &offered, &mut request);
+        let response = host.post_join(&request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: JoinRoomResponse = response.json().await.unwrap();
+        attempt.verify_ack(&offered, &digest, &response).unwrap();
+        assert_eq!(
+            host.connected_peers()[0].transport_public_key,
+            Some(restarted.public_key())
         );
 
-        let outsider_secret = crypto::generate_transport_secret();
+        // The same proof again: its Host nonce is spent.
+        assert_eq!(
+            host.post_join(&request).await.status(),
+            StatusCode::FORBIDDEN
+        );
+
+        // Another device claiming the paired HostRef gets an offer (the
+        // HostRef is public) but cannot sign for the pinned key.
+        let impostor = Joiner::new("joiner");
+        let attempt = ReconnectAttempt::new(ROOM_ID, &joiner_ref, host_pin);
+        let offer = bridge_auth::answer_reconnect_query(&host.state, &attempt.query()).unwrap();
+        let offered = attempt.verify_offer(&offer).unwrap();
+        let mut request = impostor.request();
+        attempt.authenticate_join(&impostor.identity, &offered, &mut request);
+        assert_eq!(
+            host.post_join(&request).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            host.connected_peers()[0].transport_public_key,
+            Some(restarted.public_key())
+        );
+
+        // A reconnect offer is never made for a HostRef the Bridge is not
+        // pinned to.
+        let stranger = crate::host_identity::HostRef::from_device_id("stranger").unwrap();
+        let attempt = ReconnectAttempt::new(
+            ROOM_ID,
+            &stranger,
+            storage::BridgePeerPin {
+                peer_host_ref: verified.offer.host_ref.clone(),
+                peer_device_public_key: verified.device_public_key,
+            },
+        );
+        assert!(bridge_auth::answer_reconnect_query(&host.state, &attempt.query()).is_none());
+    }
+
+    /// Legacy fail-closed: a Bridge with a peer from before pairing existed
+    /// answers no reconnect and admits no join until it is paired again.
+    #[tokio::test]
+    async fn an_unpinned_legacy_bridge_admits_no_reconnect() {
+        let host = HostFixture::new("legacy").await;
+        storage::close_pairing_window(&host.state.paths, ROOM_ID).unwrap();
+        let legacy = Joiner::new("legacy-peer");
+        storage::update_room_peer(
+            &host.state.paths,
+            ROOM_ID,
+            Some("127.0.0.1"),
+            Some(9),
+            Some("legacy"),
+            Some(&legacy.public_key()),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        // What an upgrade restart leaves: membership without route or key.
+        storage::mark_rooms_left_on_startup(&host.state.paths).unwrap();
+        assert!(host.connected_peers().is_empty());
+        assert_eq!(host.pairing_state(), BridgePairingState::PairingRequired);
+        let item = item_upload(&legacy.secret, &host.server_public_key);
+        let status = reqwest::Client::new()
+            .post(format!("{}/items", host.base_url))
+            .json(&item)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let legacy_ref = crate::host_identity::HostRef::parse(legacy.host_ref.clone()).unwrap();
+        let attempt = ReconnectAttempt::new(
+            ROOM_ID,
+            &legacy_ref,
+            storage::BridgePeerPin {
+                peer_host_ref: host.state.local_host_ref.as_str().into(),
+                peer_device_public_key: [0u8; 32],
+            },
+        );
+        assert!(bridge_auth::answer_reconnect_query(&host.state, &attempt.query()).is_none());
+        assert_eq!(
+            host.post_join(&legacy.request()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            bridge_auth::answer_pair_query(&host.state, &PairAttempt::new(CODE).query()).is_empty()
+        );
+    }
+
+    fn item_upload(sender_secret: &[u8; 32], receiver_public: &str) -> RoomItemUpload {
         let session_key = crypto::random_key();
-        let (ciphertext, payload_nonce) =
-            crypto::encrypt_bytes(b"not from the member", &session_key).unwrap();
+        let (ciphertext, payload_nonce) = crypto::encrypt_bytes(b"hello", &session_key).unwrap();
         let (wrapped_session_key, transport_nonce, sender_public_key) =
             crypto::wrap_session_for_receiver(
                 &session_key,
-                &outsider_secret,
-                &fixture.server_public_key,
+                sender_secret,
+                &crypto::decode_key(receiver_public).unwrap(),
             )
             .unwrap();
-        assert_ne!(sender_public_key, member_key);
-        let upload = RoomItemUpload {
+        RoomItemUpload {
             item_id: uuid::Uuid::new_v4().to_string(),
             payload_type: PayloadType::Text,
             display_name: None,
             mime_type: None,
-            size_bytes: 19,
+            size_bytes: 5,
             created_at: storage::now_ts(),
             payload_nonce: crypto::encode_nonce(&payload_nonce),
             wrapped_session_key,
             transport_nonce,
             sender_public_key,
             encrypted_payload: STANDARD.encode(ciphertext),
-        };
-        let status = reqwest::Client::new()
-            .post(format!("{}/items", fixture.base_url))
-            .json(&upload)
+        }
+    }
+
+    /// F8 regression: items and file starts come only from the current peer.
+    #[tokio::test]
+    async fn items_and_file_starts_from_a_non_member_are_refused() {
+        let host = HostFixture::new("items").await;
+        let member = Joiner::new("member");
+        member.pair(&host, CODE).await.expect("code pairs");
+        let outsider = Joiner::new("outsider");
+        let client = reqwest::Client::new();
+
+        let rejected = item_upload(&outsider.secret, &host.server_public_key);
+        let status = client
+            .post(format!("{}/items", host.base_url))
+            .json(&rejected)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let accepted = item_upload(&member.secret, &host.server_public_key);
+        let status = client
+            .post(format!("{}/items", host.base_url))
+            .json(&accepted)
             .send()
             .await
             .unwrap()
             .status();
         assert_eq!(status, StatusCode::OK);
+        let items = storage::list_room_items(&host.state.paths, ROOM_ID).unwrap();
+        assert!(items.iter().any(
+            |item| item.id == accepted.item_id && item.direction == RoomItemDirection::Incoming
+        ));
+        assert!(!items.iter().any(|item| item.id == rejected.item_id));
 
-        let items = storage::list_room_items(&fixture.state.paths, ROOM_ID).unwrap();
-        assert!(
-            items
-                .iter()
-                .any(|item| item.id == upload.item_id
-                    && item.direction == RoomItemDirection::Incoming)
-        );
-    }
-
-    /// The liveness ping returns the server's transport public key to any
-    /// caller. Matching it proves reachability of something that knows a
-    /// public value, not possession of the matching secret.
-    #[tokio::test]
-    async fn characterization_liveness_ping_is_unauthenticated() {
-        let fixture = RoomServerFixture::new("ping").await;
-        let probe: serde_json::Value = reqwest::Client::new()
-            .post(format!("{}/diagnostics/ping", fixture.base_url))
+        let session_key = crypto::random_key();
+        let (wrapped_session_key, transport_nonce, sender_public_key) =
+            crypto::wrap_session_for_receiver(
+                &session_key,
+                &outsider.secret,
+                &crypto::decode_key(&host.server_public_key).unwrap(),
+            )
+            .unwrap();
+        let start = serde_json::json!({
+            "transfer_id": "outsider-transfer",
+            "item_id": "outsider-item",
+            "display_name": "x.bin",
+            "mime_type": null,
+            "size_bytes": 10,
+            "chunk_size": 10,
+            "total_chunks": 1,
+            "created_at": 0,
+            "wrapped_session_key": wrapped_session_key,
+            "transport_nonce": transport_nonce,
+            "sender_public_key": sender_public_key,
+        });
+        let status = client
+            .post(format!("{}/transfers/start", host.base_url))
+            .json(&start)
             .send()
             .await
             .unwrap()
-            .json()
-            .await
-            .unwrap();
+            .status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!host
+            .state
+            .active_file_transfers
+            .lock()
+            .contains_key("outsider-transfer"));
+    }
+
+    /// F9 regression: liveness answers only the current peer, proves the
+    /// room-server key, and refuses a replayed request.
+    #[tokio::test]
+    async fn ping_answers_only_the_current_peer_with_proof_of_its_key() {
+        let host = HostFixture::new("ping").await;
+        let member = Joiner::new("member");
+        member.pair(&host, CODE).await.expect("code pairs");
+        let client = reqwest::Client::new();
+        let url = format!("{}/diagnostics/ping", host.base_url);
+
+        let status = client.post(&url).send().await.unwrap().status();
+        assert_eq!(status, StatusCode::FORBIDDEN, "unsigned");
+        let outsider = Joiner::new("outsider").signer(&host);
+        let (request, _) = outsider.apply(client.post(&url), "ping", b"");
         assert_eq!(
-            probe["transportPublicKey"].as_str(),
-            Some(crypto::encode_key(&fixture.server_public_key).as_str())
+            request.send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let signer = member.signer(&host);
+        let signed = signer.sign("ping", b"");
+        let send = || {
+            client
+                .post(&url)
+                .header(bridge_auth::SENDER_KEY_HEADER, &signed.sender_key)
+                .header(bridge_auth::REQUEST_AUTH_HEADER, &signed.auth)
+                .send()
+        };
+        let response = send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(signer.ping_proof_matches(&signed.nonce, body["proof"].as_str().unwrap()));
+        assert_eq!(
+            send().await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "replay"
+        );
+    }
+
+    /// F12 and transfer control: cancel, finish and benchmarks need a
+    /// request signed by the current peer.
+    #[tokio::test]
+    async fn transfer_control_and_benchmarks_need_a_signed_peer_request() {
+        let host = HostFixture::new("control").await;
+        let member = Joiner::new("member");
+        member.pair(&host, CODE).await.expect("code pairs");
+        let client = reqwest::Client::new();
+        let signer = member.signer(&host);
+
+        let cancel = format!("{}/transfers/t1/cancel", host.base_url);
+        assert_eq!(
+            client.post(&cancel).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let (request, _) = signer.apply(client.post(&cancel), "cancel:t1", b"");
+        assert_eq!(request.send().await.unwrap().status(), StatusCode::OK);
+        // A signature for one transfer does not cancel another.
+        let (request, _) = signer.apply(
+            client.post(format!("{}/transfers/t2/cancel", host.base_url)),
+            "cancel:t1",
+            b"",
+        );
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let finish = format!("{}/transfers/t1/finish", host.base_url);
+        let body = br#"{"item_id":"i"}"#.to_vec();
+        let status = client
+            .post(&finish)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let benchmark = format!("{}/diagnostics/benchmark/raw", host.base_url);
+        let payload = vec![0x5au8; 1024];
+        let status = client
+            .post(&benchmark)
+            .body(payload.clone())
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (request, _) = signer.apply(client.post(&benchmark), "benchmark/raw", &payload);
+        assert_eq!(
+            request.body(payload).send().await.unwrap().status(),
+            StatusCode::OK
         );
     }
 }

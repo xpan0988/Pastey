@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { bridgeReachability, peerAddressProblem } from "../../lib/bridgeAddress";
-import { getBridgePeerAddress, presentDeviceIdentity, setBridgePeerAddress } from "../../lib/tauri";
-import { roomPeers } from "./workspaceViewModel";
+import { getBridgePeerAddress, openBridgePairing, presentDeviceIdentity, setBridgePeerAddress } from "../../lib/tauri";
+import { bridgeCode, roomPeers } from "./workspaceViewModel";
 import type { RoomInfo } from "../../lib/types";
 
 const REACHABILITY_COPY = {
@@ -14,13 +14,25 @@ const REACHABILITY_COPY = {
 /** Where this Bridge's other device can be reached when it is on another
  * network, for reconnects. The address grants nothing: the Bridge's own
  * identity and session keys still decide every connection. */
-export function BridgeNetworkPanel({ room }: { room: RoomInfo }) {
+export function BridgeNetworkPanel({ room, onPairingChanged }: { room: RoomInfo; onPairingChanged: () => Promise<void> }) {
   const [saved, setSaved] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const reachability = bridgeReachability(room);
+  const pairing = room.pairing_state ?? "pairing_required";
+
+  async function showNewCode() {
+    setBusy(true); setMessage(null);
+    try {
+      await openBridgePairing(room.id);
+      await onPairingChanged();
+      setMessage("Shown. On the other device, open New Bridge and enter the new code.");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Pastey could not create a new code.");
+    } finally { setBusy(false); }
+  }
   const peerHostRef = roomPeers(room).find((peer) => peer.hostRef)?.hostRef ?? null;
 
   async function showDevice() {
@@ -61,9 +73,16 @@ export function BridgeNetworkPanel({ room }: { room: RoomInfo }) {
 
   return <section className="v2-bridge-network" aria-label="Bridge network">
     <button type="button" className="v2-button" onClick={() => setOpen(!open)}>
-      <i className={`v2-dot ${reachability === "connected" ? "connected" : reachability === "reconnecting" ? "pending" : ""}`} /> {REACHABILITY_COPY[reachability]}{saved ? " · remote address set" : ""}
+      <i className={`v2-dot ${reachability === "connected" ? "connected" : reachability === "reconnecting" ? "pending" : ""}`} /> {pairing === "pairing_required" ? "Pairing required" : REACHABILITY_COPY[reachability]}{saved ? " · remote address set" : ""}
     </button>
     {open ? <div className="v2-task-open">
+      <strong>{pairing === "paired" ? "Paired device" : pairing === "awaiting_peer" ? "Waiting for the other device" : "Pairing required"}</strong>
+      <small>{pairing === "paired"
+        ? "This Bridge reconnects only to the device it was paired with, which proves its identity each time. Showing a new code lets another device take its place."
+        : pairing === "awaiting_peer"
+          ? `On the other device, open New Bridge and enter ${bridgeCode(room)}. The code works once and expires after 15 minutes.`
+          : "This Bridge has no verified device, so it cannot reconnect or receive anything. Show a new one-time code and enter it on the other device's New Bridge screen."}</small>
+      <footer><button type="button" className="v2-button" disabled={busy} onClick={() => void showNewCode()}>{pairing === "paired" ? "Pair another device" : "Show new code"}</button></footer>
       <strong>Reach the other device from another network</strong>
       <small>Its address on a private network you both use, such as Tailscale or WireGuard (for example home-pc.tail1234.ts.net or 100.x.y.z). Pastey tries it first when reconnecting, then this network. It gives the other device no permissions.</small>
       <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="home-pc.tail1234.ts.net" aria-label="Remote address for this Bridge" disabled={busy} />

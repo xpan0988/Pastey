@@ -29,6 +29,7 @@ const DISCONNECTED_AFTER_ATTEMPTS: u8 = 2;
 #[serde(rename_all = "camelCase")]
 struct BridgeLivenessProbe {
     transport_public_key: String,
+    proof: String,
 }
 
 /// One live, transport-proven remote Host session. Its route, endpoint, and
@@ -167,7 +168,13 @@ impl CurrentRemoteHostSession {
         state: Arc<AppState>,
     ) -> AppResult<LinkBenchmarkResult> {
         let endpoint = self.revalidate_transport_endpoint(&state).await?;
+        let signer = crate::bridge_auth::PeerRequestSigner::for_room(
+            &state,
+            &self.binding.bridge_id,
+            &endpoint.transport_public_key,
+        )?;
         let result = crate::link_benchmark::run_peer_link_benchmark_for_endpoint(
+            signer,
             endpoint,
             self.binding.bridge_id.clone(),
             BenchmarkMode::PasteyPipeline,
@@ -267,7 +274,7 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
                 continue;
             }
             let failure_key = format!("{}\n{}", room.id, peer.peer_session_id);
-            if probe_exact_peer(&room, &peer).await {
+            if probe_exact_peer(&state, &room, &peer).await {
                 state.bridge_liveness_failures.lock().remove(&failure_key);
                 continue;
             }
@@ -311,11 +318,16 @@ fn liveness_failure_confirmed(state: &AppState, failure_key: &str) -> bool {
     }
 }
 
-/// Performs the production Bridge liveness proof for one exact stored route.
-/// This is intentionally non-authorizing: callers may use it only to decide
-/// whether a `Connected` endpoint is current enough to attempt normal Bridge
-/// transport.
-async fn probe_exact_peer(room: &StoredRoom, peer: &StoredBridgePeerEndpoint) -> bool {
+/// Performs the production Bridge liveness proof for one exact stored route:
+/// a request signed for that peer, answered with proof that the peer holds
+/// the stored room-server key. This is intentionally non-authorizing: callers
+/// may use it only to decide whether a `Connected` endpoint is current enough
+/// to attempt normal Bridge transport.
+async fn probe_exact_peer(
+    state: &AppState,
+    room: &StoredRoom,
+    peer: &StoredBridgePeerEndpoint,
+) -> bool {
     let (Some(host), Some(port), Some(expected_key)) = (
         peer.endpoint_host.as_deref(),
         peer.endpoint_port,
@@ -323,25 +335,33 @@ async fn probe_exact_peer(room: &StoredRoom, peer: &StoredBridgePeerEndpoint) ->
     ) else {
         return false;
     };
+    let Ok(signer) = crate::bridge_auth::PeerRequestSigner::for_room(state, &room.id, expected_key)
+    else {
+        return false;
+    };
     let client = match reqwest::Client::builder().timeout(LIVENESS_TIMEOUT).build() {
         Ok(client) => client,
         Err(_) => return false,
     };
-    let response = match client
-        .post(format!(
+    let (request, nonce) = signer.apply(
+        client.post(format!(
             "http://{host}:{port}/rooms/{}/diagnostics/ping",
             room.id
-        ))
-        .send()
-        .await
-    {
+        )),
+        "ping",
+        b"",
+    );
+    let response = match request.send().await {
         Ok(response) if response.status().is_success() => response,
         _ => return false,
     };
     response
         .json::<BridgeLivenessProbe>()
         .await
-        .is_ok_and(|probe| probe.transport_public_key == expected_key)
+        .is_ok_and(|probe| {
+            probe.transport_public_key == expected_key
+                && signer.ping_proof_matches(&nonce, &probe.proof)
+        })
 }
 
 impl AppState {
@@ -376,7 +396,7 @@ impl AppState {
             .collect::<Vec<_>>();
         let mut live = Vec::new();
         for peer in candidates {
-            if probe_exact_peer(&room, &peer).await {
+            if probe_exact_peer(self, &room, &peer).await {
                 live.push(peer);
             }
         }
@@ -456,6 +476,11 @@ async fn reconnect_preserved_bridges(state: Arc<AppState>) -> AppResult<()> {
         {
             continue;
         }
+        // Only a Bridge pinned to a peer device can prove it is talking to
+        // that device again. An unpinned Bridge waits for explicit pairing.
+        if storage::bridge_peer_pin(&state.paths, &room.id)?.is_none() {
+            continue;
+        }
         storage::mark_bridge_reconnect_started(&state.paths, &room.id)?;
         if state.bridge_reconnect_rotations.lock().remove(&room.id) {
             let _ = transfer::stop_room_server(state.clone(), &room.id).await;
@@ -492,61 +517,56 @@ async fn reconnect_preserved_bridges(state: Arc<AppState>) -> AppResult<()> {
     Ok(())
 }
 
+/// Finds the pinned peer again and proves both sides' device keys over a
+/// fresh transcript. A changed key or HostRef is never accepted here.
 async fn reconnect_room(state: Arc<AppState>, room: &StoredRoom) -> AppResult<()> {
+    let pin = storage::bridge_peer_pin(&state.paths, &room.id)?.ok_or_else(|| {
+        AppError::InvalidInput("This Bridge must be paired again before it can reconnect.".into())
+    })?;
+    let attempt = crate::bridge_auth::ReconnectAttempt::new(&room.id, &state.local_host_ref, pin);
     // A peer on another network is looked for where the user said it is;
     // the LAN broadcast still finds a peer that came back to this network.
     let remembered = storage::get_bridge_peer_address(&state.paths, &room.id)?;
     let unicast = match remembered.as_deref() {
-        Some(address) => discovery::discover_room_at(
-            address,
-            room.room_code_hash.clone(),
-            Some(discovery::local_device_id(&state)),
-            Some(room.id.clone()),
-        )
-        .await
-        .ok(),
+        Some(address) => match discovery::resolve_peer_targets(address).await {
+            Ok(targets) => discovery::discover_reconnect(&attempt, &targets).await.ok(),
+            Err(_) => None,
+        },
         None => None,
     };
-    let (source, discovered) = match unicast {
+    let (source, verified) = match unicast {
         Some(found) => found,
-        None => {
-            discovery::discover_room(
-                room.room_code_hash.clone(),
-                Some(discovery::local_device_id(&state)),
-                Some(room.id.clone()),
-            )
-            .await?
-        }
+        None => discovery::discover_reconnect(&attempt, &discovery::DiscoveryTargets::Lan).await?,
     };
-    if discovered.room_id != room.id {
-        return Err(AppError::InvalidInput(
-            "Discovered Bridge identity does not match the preserved Bridge.".into(),
-        ));
-    }
-    let response = transfer::announce_join(
-        state.clone(),
-        &room.id,
+    let identity = {
+        let master_key = {
+            let config = state.config.read();
+            crate::config::master_key(&config)?
+        };
+        crate::device_identity::load_or_create(&state.paths, &master_key)?
+    };
+    let mut request = transfer::local_join_request(&state, &room.id)?;
+    let digest = attempt.authenticate_join(&identity, &verified, &mut request);
+    let response = transfer::post_join(
         &source.ip().to_string(),
-        discovered.port,
+        verified.offer.port,
+        &room.id,
+        &request,
     )
     .await?;
-    let peer_host_ref = response
-        .host_ref
-        .as_deref()
-        .map(|value| HostRef::parse_peer(value, &state.local_host_ref))
-        .transpose()?;
+    attempt.verify_ack(&verified, &digest, &response)?;
+    let peer_host_ref =
+        HostRef::parse_peer(verified.offer.host_ref.clone(), &state.local_host_ref)?;
     storage::update_room_peer(
         &state.paths,
         &room.id,
         Some(&source.ip().to_string()),
-        Some(discovered.port),
+        Some(verified.offer.port),
         Some(&response.device_name),
-        Some(&discovered.transport_public_key),
+        Some(&verified.offer.transport_public_key),
         RoomStatus::Active,
     )?;
-    if let Some(host_ref) = peer_host_ref.as_ref() {
-        storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, host_ref.as_str())?;
-    }
+    storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, peer_host_ref.as_str())?;
     Ok(())
 }
 
@@ -621,7 +641,6 @@ mod tests {
                 ROOM_ID.into(),
                 ActiveRoomServer {
                     room_id: ROOM_ID.into(),
-                    room_code_hash: room.room_code_hash.clone(),
                     port: 7,
                     expires_at: room.expires_at,
                     transport_secret: crate::crypto::random_key(),
@@ -632,7 +651,7 @@ mod tests {
             let remote_secret = crate::crypto::random_key();
             let remote_key =
                 crate::crypto::encode_key(&crate::crypto::transport_public_key(&remote_secret));
-            let (remote_port, remote_shutdown) = start_probe_server(remote_key.clone()).await;
+            let (remote_port, remote_shutdown) = start_probe_server(remote_secret).await;
             Self {
                 runtime,
                 room,
@@ -691,21 +710,39 @@ mod tests {
         }
     }
 
-    async fn start_probe_server(key: String) -> (u16, oneshot::Sender<()>) {
+    /// A remote room server's liveness route: proves `secret` for any
+    /// signed request, as the production route does for its current peer.
+    async fn start_probe_server(secret: [u8; 32]) -> (u16, oneshot::Sender<()>) {
+        let key = crate::crypto::encode_key(&crate::crypto::transport_public_key(&secret));
+        serve_ping(move |room_id, headers| {
+            serde_json::json!({
+                "transportPublicKey": key,
+                "proof": crate::bridge_auth::ping_proof_for_test(&room_id, &secret, &headers),
+            })
+        })
+        .await
+    }
+
+    async fn serve_ping(
+        answer: impl Fn(String, axum::http::HeaderMap) -> serde_json::Value
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    ) -> (u16, oneshot::Sender<()>) {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let router = axum::Router::new().route(
             "/rooms/:room_id/diagnostics/ping",
-            axum::routing::post(move || {
-                let transport_public_key = key.clone();
-                async move {
-                    axum::Json(serde_json::json!({
-                        "transportPublicKey": transport_public_key,
-                    }))
-                }
-            }),
+            axum::routing::post(
+                move |axum::extract::Path(room_id): axum::extract::Path<String>,
+                      headers: axum::http::HeaderMap| {
+                    let body = answer(room_id, headers);
+                    async move { axum::Json(body) }
+                },
+            ),
         );
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         tokio::spawn(async move {
@@ -806,67 +843,36 @@ mod tests {
         )));
     }
 
-    /// Characterization (see the join audit in docs/layers/layer-4-join-audit.md):
-    /// the liveness probe server below was given only the public key, never
-    /// the secret, yet the production probe accepts it as the exact peer.
+    /// F9 regression: a server that knows only the peer's public key, and
+    /// echoes it, no longer passes liveness. Proof of the secret is required.
     #[tokio::test]
-    async fn characterization_liveness_probe_accepts_an_echo_of_the_public_key() {
+    async fn liveness_probe_rejects_an_echo_of_the_public_key() {
         let fixture = ResolverFixture::new("echo-probe").await;
-        let peer = fixture.peer("echo-route", BridgePeerLiveness::Connected);
-        assert!(probe_exact_peer(&fixture.room, &peer).await);
+        let key = fixture.remote_key.clone();
+        let (port, shutdown) = serve_ping(
+            move |_, _| serde_json::json!({ "transportPublicKey": key, "proof": "00".repeat(32) }),
+        )
+        .await;
+        let mut peer = fixture.peer("echo-route", BridgePeerLiveness::Connected);
+        peer.endpoint_port = Some(port);
+        assert!(!probe_exact_peer(&fixture.runtime, &fixture.room, &peer).await);
+        let genuine = fixture.peer("genuine-route", BridgePeerLiveness::Connected);
+        assert!(probe_exact_peer(&fixture.runtime, &fixture.room, &genuine).await);
+        let _ = shutdown.send(());
     }
 
-    /// Characterization: after rediscovery, `reconnect_room` stores whatever
-    /// key the room offer carried and binds whatever HostRef the join reply
-    /// claimed. Nothing pins either to the previous session's peer.
+    /// F6 regression: a Bridge with no pinned peer device never runs the
+    /// reconnect exchange; it waits for explicit pairing.
     #[tokio::test]
-    async fn characterization_reconnect_rebinds_a_different_key_and_host_ref() {
-        let fixture = ResolverFixture::new("rebind").await;
-        let paths = &fixture.runtime.paths;
-        let original_key = crate::crypto::encode_key(&crate::crypto::random_key());
-        storage::update_room_peer(
-            paths,
-            ROOM_ID,
-            Some("192.168.1.20"),
-            Some(5000),
-            Some("peer"),
-            Some(&original_key),
-            RoomStatus::Active,
-        )
-        .unwrap();
-        storage::bind_legacy_room_peer_host_ref(paths, ROOM_ID, fixture.remote_host.as_str())
-            .unwrap();
-
-        // The storage steps `reconnect_room` performs after a rediscovery.
-        let other_key = crate::crypto::encode_key(&crate::crypto::random_key());
-        let other_host = HostRef::from_device_id("some-other-device").unwrap();
-        storage::update_room_peer(
-            paths,
-            ROOM_ID,
-            Some("192.168.1.99"),
-            Some(5001),
-            Some("peer"),
-            Some(&other_key),
-            RoomStatus::Active,
-        )
-        .unwrap();
-        storage::bind_legacy_room_peer_host_ref(paths, ROOM_ID, other_host.as_str()).unwrap();
-
-        let connected = storage::list_bridge_peer_endpoints(paths, ROOM_ID)
+    async fn an_unpinned_bridge_does_not_attempt_reconnect() {
+        let fixture = ResolverFixture::new("unpinned").await;
+        assert!(storage::bridge_peer_pin(&fixture.runtime.paths, ROOM_ID)
             .unwrap()
-            .into_iter()
-            .filter(|peer| peer.liveness == BridgePeerLiveness::Connected)
-            .collect::<Vec<_>>();
-        assert_eq!(connected.len(), 1);
-        assert_eq!(
-            connected[0].transport_public_key.as_deref(),
-            Some(other_key.as_str())
-        );
-        assert_eq!(
-            connected[0].logical_host_ref.as_deref(),
-            Some(other_host.as_str()),
-            "a different HostRef is accepted on reconnect"
-        );
+            .is_none());
+        let error = reconnect_room(fixture.runtime.clone(), &fixture.room)
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("paired again"));
     }
 
     #[tokio::test]
@@ -1018,7 +1024,6 @@ mod tests {
             ROOM_ID.into(),
             ActiveRoomServer {
                 room_id: ROOM_ID.into(),
-                room_code_hash: fixture.room.room_code_hash.clone(),
                 port: 8,
                 expires_at: fixture.room.expires_at,
                 transport_secret: crate::crypto::random_key(),
