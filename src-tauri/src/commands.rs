@@ -8063,4 +8063,44 @@ mod tests {
         assert!(refuse_repairing_with_another_host(&paths, &room.id, &other).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// Characterization (legacy re-pairing, joiner side): the continuity
+    /// check compares HostRefs, and a HostRef is computable by anyone from the
+    /// `device_id` every nearby beacon broadcasts. It guards against a
+    /// mistaken code, not against a device that claims the original HostRef.
+    #[test]
+    fn characterization_repairing_continuity_rests_on_a_claimable_host_ref() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-repair-claim-{}", uuid::Uuid::new_v4()));
+        let paths = storage::AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        let broadcast_device_id = "original-device-id";
+        let original = crate::host_identity::HostRef::from_device_id(broadcast_device_id).unwrap();
+        let room = storage::create_room(
+            &paths,
+            &[3u8; 32],
+            "12345678",
+            15,
+            LocalRole::Joined,
+            Some("legacy".into()),
+            None,
+        )
+        .unwrap();
+        storage::update_room_peer(
+            &paths,
+            &room.id,
+            Some("192.168.1.20"),
+            Some(5000),
+            Some("peer"),
+            Some(&crypto::encode_key(&[5u8; 32])),
+            crate::models::RoomStatus::Active,
+        )
+        .unwrap();
+        storage::bind_legacy_room_peer_host_ref(&paths, &room.id, original.as_str()).unwrap();
+        // An impostor that read the beacon derives the same HostRef.
+        let claimed = crate::host_identity::HostRef::from_device_id(broadcast_device_id).unwrap();
+        assert!(refuse_repairing_with_another_host(&paths, &room.id, &claimed).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -6595,6 +6595,10 @@ mod join_authentication {
                     post(start_file_transfer_handler),
                 )
                 .route(
+                    "/rooms/:room_id/transfers/:transfer_id/chunks",
+                    post(receive_file_chunk_handler),
+                )
+                .route(
                     "/rooms/:room_id/transfers/:transfer_id/finish",
                     post(finish_file_transfer_handler),
                 )
@@ -7160,5 +7164,200 @@ mod join_authentication {
             request.body(payload).send().await.unwrap().status(),
             StatusCode::OK
         );
+    }
+
+    /// Starts a 3-chunk, 4-bytes-per-chunk transfer from `member` and
+    /// returns its session key.
+    async fn start_small_transfer(
+        host: &HostFixture,
+        member: &Joiner,
+        transfer_id: &str,
+    ) -> [u8; 32] {
+        let session_key = crypto::random_key();
+        let (wrapped_session_key, transport_nonce, sender_public_key) =
+            crypto::wrap_session_for_receiver(
+                &session_key,
+                &member.secret,
+                &crypto::decode_key(&host.server_public_key).unwrap(),
+            )
+            .unwrap();
+        let start = serde_json::json!({
+            "transfer_id": transfer_id,
+            "item_id": format!("item-{transfer_id}"),
+            "display_name": format!("{transfer_id}.bin"),
+            "mime_type": null,
+            "size_bytes": 12,
+            "chunk_size": 4,
+            "total_chunks": 3,
+            "created_at": 0,
+            "wrapped_session_key": wrapped_session_key,
+            "transport_nonce": transport_nonce,
+            "sender_public_key": sender_public_key,
+        });
+        let status = reqwest::Client::new()
+            .post(format!("{}/transfers/start", host.base_url))
+            .json(&start)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::OK);
+        session_key
+    }
+
+    async fn post_chunk(
+        host: &HostFixture,
+        transfer_id: &str,
+        index: u64,
+        plaintext: &[u8],
+        key: &[u8; 32],
+        is_final: bool,
+    ) -> StatusCode {
+        let (ciphertext, nonce) = crypto::encrypt_bytes(plaintext, key).unwrap();
+        let frame =
+            crate::chunk_frame::encode_binary_chunk_frame(&crate::chunk_frame::BinaryChunkFrame {
+                chunk_index: index,
+                nonce,
+                ciphertext,
+                plaintext_size: plaintext.len() as u32,
+                is_final,
+            })
+            .unwrap();
+        reqwest::Client::new()
+            .post(format!("{}/transfers/{transfer_id}/chunks", host.base_url))
+            .header(CHUNK_PROTOCOL_HEADER, CHUNK_PROTOCOL_BINARY_V1)
+            .body(frame)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn files_under(root: &Path) -> Vec<Vec<u8>> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(files_under(&path));
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                found.push(bytes);
+            }
+        }
+        found
+    }
+
+    /// Characterization (remaining HTTP chunk limitation): a chunk's AEAD
+    /// does not bind its index or transfer, so an on-path attacker that
+    /// swaps two chunk bodies in flight produces a reordered file that the
+    /// receiver accepts and finishes. It cannot forge content.
+    #[tokio::test]
+    async fn characterization_chunk_bodies_are_not_bound_to_their_index() {
+        let host = HostFixture::new("reorder").await;
+        let member = Joiner::new("member");
+        member.pair(&host, CODE).await.expect("code pairs");
+        let key = start_small_transfer(&host, &member, "reorder").await;
+        // The sender meant AAAA BBBB CCCC; the bodies of 0 and 1 are swapped.
+        assert_eq!(
+            post_chunk(&host, "reorder", 0, b"BBBB", &key, false).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_chunk(&host, "reorder", 1, b"AAAA", &key, false).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_chunk(&host, "reorder", 2, b"CCCC", &key, true).await,
+            StatusCode::OK
+        );
+        let body = br#"{"item_id":"item-reorder"}"#.to_vec();
+        let (request, _) = member.signer(&host).apply(
+            reqwest::Client::new().post(format!("{}/transfers/reorder/finish", host.base_url)),
+            "finish:reorder",
+            &body,
+        );
+        let status = request
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, StatusCode::OK, "the reordered file is accepted");
+        assert!(files_under(&host.root)
+            .iter()
+            .any(|bytes| bytes.as_slice() == b"BBBBAAAACCCC"));
+    }
+
+    /// Characterization (remaining HTTP chunk limitation): the chunk route
+    /// is not peer-authenticated; one malformed request naming an active
+    /// transfer id ends that transfer. Transfer ids travel in clear URLs.
+    #[tokio::test]
+    async fn characterization_an_unsigned_malformed_chunk_ends_an_active_transfer() {
+        let host = HostFixture::new("chunk-dos").await;
+        let member = Joiner::new("member");
+        member.pair(&host, CODE).await.expect("code pairs");
+        start_small_transfer(&host, &member, "victim").await;
+        assert!(host
+            .state
+            .active_file_transfers
+            .lock()
+            .contains_key("victim"));
+        let status = reqwest::Client::new()
+            .post(format!("{}/transfers/victim/chunks", host.base_url))
+            .header(CHUNK_PROTOCOL_HEADER, CHUNK_PROTOCOL_BINARY_V1)
+            .body(vec![0u8; 16])
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(status.is_client_error());
+        assert!(
+            !host
+                .state
+                .active_file_transfers
+                .lock()
+                .contains_key("victim"),
+            "an outsider ended the transfer"
+        );
+    }
+
+    /// Characterization (legacy re-pairing): with no pin, the Host side of a
+    /// legacy Bridge admits whichever device presents the fresh code. It does
+    /// not authenticate the original device; the code typed by the user is
+    /// the only authenticator.
+    #[tokio::test]
+    async fn characterization_legacy_repairing_admits_any_device_holding_the_code() {
+        let host = HostFixture::new("legacy-repair").await;
+        let original = Joiner::new("original-device");
+        storage::update_room_peer(
+            &host.state.paths,
+            ROOM_ID,
+            Some("127.0.0.1"),
+            Some(9),
+            Some("original"),
+            Some(&original.public_key()),
+            RoomStatus::Active,
+        )
+        .unwrap();
+        storage::bind_legacy_room_peer_host_ref(&host.state.paths, ROOM_ID, &original.host_ref)
+            .unwrap();
+        storage::mark_rooms_left_on_startup(&host.state.paths).unwrap();
+        assert!(storage::bridge_peer_pin(&host.state.paths, ROOM_ID)
+            .unwrap()
+            .is_none());
+
+        let other = Joiner::new("a-different-device");
+        other
+            .pair(&host, CODE)
+            .await
+            .expect("any holder of the code pairs");
+        let pin = storage::bridge_peer_pin(&host.state.paths, ROOM_ID)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pin.peer_host_ref, other.host_ref);
+        assert_ne!(pin.peer_host_ref, original.host_ref);
     }
 }
