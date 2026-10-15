@@ -938,9 +938,11 @@ impl NativeCapabilityRegistryV1 {
         self.0
             .iter()
             .map(|adapter| {
+                let report = adapter.availability_report();
                 crate::peer_capabilities::native_agent_capability_fact(
                     adapter.capability_id(),
-                    adapter.availability(),
+                    report.state,
+                    report.reason,
                     adapter.supported_protocols(),
                 )
             })
@@ -962,6 +964,13 @@ pub(crate) struct NativeAgentCapabilityV1 {
     pub(crate) agent_id: String,
     pub(crate) display_name: String,
     pub(crate) state: NativeAgentCapabilityStateV1,
+    /// Why it is not available, as a reason code a peer may also see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+    /// What this Host's probe found, for this Host's own user only. Never
+    /// sent to a peer: it may name local paths and program output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -6800,10 +6809,15 @@ pub(crate) fn remote_native_capabilities(
             } else {
                 (capability_id, &GENERIC_NATIVE_INVOKE_PROTOCOLS)
             };
+            let state = projection.native_agent_state(capability_id, required);
             NativeAgentCapabilityV1 {
                 agent_id: capability_id.into(),
                 display_name: display_name.into(),
-                state: projection.native_agent_state(capability_id, required),
+                reason: (state != NativeAgentCapabilityStateV1::Available)
+                    .then(|| projection.native_agent_reason(capability_id))
+                    .flatten(),
+                state,
+                detail: None,
             }
         })
         .collect()
@@ -8050,7 +8064,9 @@ done
                 })
                 .collect::<Vec<_>>()
         };
-        let fact = crate::peer_capabilities::native_agent_capability_fact;
+        let fact = |id: &str, state: NativeAgentCapabilityStateV1, protocols: &[&str]| {
+            crate::peer_capabilities::native_agent_capability_fact(id, state, None, protocols)
+        };
         assert_eq!(
             state_of(vec![fact(
                 CODEX_CAPABILITY_ID,

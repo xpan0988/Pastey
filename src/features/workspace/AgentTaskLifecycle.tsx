@@ -163,7 +163,7 @@ export function nativeAgentDisplayName(agentId: string | null | undefined): stri
 /** A selected Host's advertised capability as the card presents it. */
 export type NativeAgentTargetAvailability =
   | { state: "checking" }
-  | { state: "available" | "incompatible" | "unavailable" }
+  | { state: "available" | "incompatible" | "unavailable"; reason?: string | null; detail?: string | null }
   | { state: "unknown"; message: string };
 
 export function nativeAgentTargetAvailability(
@@ -173,7 +173,9 @@ export function nativeAgentTargetAvailability(
   if (!observation || observation.state === "checking") return { state: "checking" };
   if (observation.state === "error") return { state: "unknown", message: observation.message };
   const capability = observation.capabilities.find((candidate) => candidate.agentId === agentId);
-  return { state: capability?.state ?? "unavailable" };
+  // A peer's detail never crosses the Bridge; only its reason code does.
+  const state = capability?.state ?? "unavailable";
+  return capability?.reason ? { state, reason: capability.reason } : { state };
 }
 
 export type RemoteNativeCapabilityObservation =

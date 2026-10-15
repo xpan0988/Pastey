@@ -284,7 +284,25 @@ function NativeAgentTaskCard({ roomId, peers }: { roomId: string; peers: ReturnT
 }
 
 function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {
-  return { state: codex?.state ?? "unavailable" };
+  return { state: codex?.state ?? "unavailable", reason: codex?.reason ?? null, detail: codex?.detail ?? null };
+}
+
+/** What to tell the user about an unusable Codex, by the layer that failed. */
+export function codexUnavailableCopy(reason: string | null | undefined, where: string): string {
+  switch (reason) {
+    case "native_agent_not_installed":
+      return `Codex is not installed on ${where}, or Pastey there cannot find the codex command. On ${where}, check that “codex --version” works in a new terminal; if Codex was installed after Pastey started, quit Pastey there and open it again.`;
+    case "native_agent_launch_failed":
+      return `Pastey on ${where} found Codex but could not start it. Reinstall or update Codex on ${where}, then check again.`;
+    case "native_agent_probe_failed":
+      return `Codex on ${where} exits with an error when Pastey checks it (“codex --version”). Run that in a new terminal on ${where} to see why; a Codex installed with npm also needs Node.js on PATH.`;
+    case "native_agent_probe_timeout":
+      return `Codex on ${where} did not answer in time. Check again; its first start can be slow.`;
+    case "native_agent_incompatible":
+      return `Codex is detected on ${where}, but its required native interface is incompatible. Update Codex on ${where}.`;
+    default:
+      return `Codex is unavailable on ${where}.`;
+  }
 }
 
 function availabilityCopy(availability: NativeAgentTargetAvailability, remoteName: string | null, workspaceIsLocal: boolean): string {
@@ -292,8 +310,12 @@ function availabilityCopy(availability: NativeAgentTargetAvailability, remoteNam
   switch (availability.state) {
     case "checking": return `Checking Codex on ${where}…`;
     case "unknown": return `Pastey could not check Codex on ${where}: ${availability.message}`;
-    case "incompatible": return `Codex is detected on ${where}, but its required native interface is incompatible.`;
-    case "unavailable": return `Codex is unavailable on ${where}.`;
+    case "incompatible":
+    case "unavailable": {
+      const reason = availability.reason ?? (availability.state === "incompatible" ? "native_agent_incompatible" : null);
+      const copy = codexUnavailableCopy(reason, where);
+      return availability.detail ? `${copy} (${availability.detail})` : copy;
+    }
     case "available":
       if (!remoteName) return "Codex is ready to use its native session.";
       return workspaceIsLocal

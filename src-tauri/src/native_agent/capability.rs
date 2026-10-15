@@ -204,6 +204,26 @@ pub(crate) trait NativeInvocationRunV1: Send {
 }
 
 /// A mature Host capability invoked through the Native Agent lifecycle.
+/// One availability observation: the state, a reason code that may be shared
+/// with peers (never a path or program output), and a detail for this Host's
+/// own user only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CapabilityAvailabilityV1 {
+    pub(crate) state: NativeAgentCapabilityStateV1,
+    pub(crate) reason: Option<&'static str>,
+    pub(crate) detail: Option<String>,
+}
+
+impl CapabilityAvailabilityV1 {
+    pub(crate) fn plain(state: NativeAgentCapabilityStateV1) -> Self {
+        Self {
+            state,
+            reason: None,
+            detail: None,
+        }
+    }
+}
+
 pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     fn capability_id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
@@ -224,11 +244,19 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
         }
     }
 
+    /// The availability with why, when the adapter can tell.
+    fn availability_report(&self) -> CapabilityAvailabilityV1 {
+        CapabilityAvailabilityV1::plain(self.availability())
+    }
+
     fn describe(&self) -> NativeAgentCapabilityV1 {
+        let report = self.availability_report();
         NativeAgentCapabilityV1 {
             agent_id: self.capability_id().into(),
             display_name: self.display_name().into(),
-            state: self.availability(),
+            state: report.state,
+            reason: report.reason.map(str::to_string),
+            detail: report.detail,
         }
     }
 

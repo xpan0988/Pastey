@@ -281,9 +281,21 @@ fn capability(
 
 /// The capability fact of one native capability: its availability and the
 /// exact Pastey protocols its Host supports for it.
+/// Reason codes a Host may give for an unusable native capability. Older
+/// peers that do not know a code treat it as plain unavailable.
+pub(crate) const NATIVE_AGENT_REASONS: [&str; 6] = [
+    REASON_NATIVE_AGENT_UNAVAILABLE,
+    REASON_NATIVE_AGENT_INCOMPATIBLE,
+    "native_agent_not_installed",
+    "native_agent_launch_failed",
+    "native_agent_probe_failed",
+    "native_agent_probe_timeout",
+];
+
 pub(crate) fn native_agent_capability_fact(
     capability_id: &str,
     state: crate::native_agent::NativeAgentCapabilityStateV1,
+    reason: Option<&str>,
     supported_protocols: &[&str],
 ) -> HostCapabilityFact {
     match state {
@@ -306,7 +318,12 @@ pub(crate) fn native_agent_capability_fact(
         crate::native_agent::NativeAgentCapabilityStateV1::Unavailable => capability_with_reason(
             capability_id,
             NATIVE_AGENT_EFFECT,
-            REASON_NATIVE_AGENT_UNAVAILABLE,
+            reason
+                .filter(|reason| {
+                    NATIVE_AGENT_REASONS.contains(reason)
+                        && *reason != REASON_NATIVE_AGENT_INCOMPATIBLE
+                })
+                .unwrap_or(REASON_NATIVE_AGENT_UNAVAILABLE),
         ),
     }
 }
@@ -355,6 +372,22 @@ impl PeerCapabilityProjection {
             .filter(|fact| fact.effect == NATIVE_AGENT_EFFECT)
             .map(|fact| fact.capability_id.as_str())
             .collect()
+    }
+
+    /// Why a native capability is not available, as a known reason code.
+    pub(crate) fn native_agent_reason(&self, capability_id: &str) -> Option<String> {
+        let fact = self
+            .capabilities
+            .iter()
+            .find(|fact| fact.capability_id == capability_id)?;
+        if fact.available {
+            // Advertised, but without a protocol this Host needs.
+            return Some(REASON_NATIVE_AGENT_INCOMPATIBLE.into());
+        }
+        fact.unavailable_reason
+            .as_deref()
+            .filter(|reason| NATIVE_AGENT_REASONS.contains(reason))
+            .map(str::to_string)
     }
 
     /// The observed state of one native capability for an operation using
@@ -637,6 +670,7 @@ mod tests {
         compatible.capabilities.push(native_agent_capability_fact(
             crate::native_agent::CODEX_CAPABILITY_ID,
             crate::native_agent::NativeAgentCapabilityStateV1::Available,
+            None,
             &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
         ));
         assert!(compatible
@@ -675,6 +709,7 @@ mod tests {
         incompatible.capabilities.push(native_agent_capability_fact(
             crate::native_agent::CODEX_CAPABILITY_ID,
             crate::native_agent::NativeAgentCapabilityStateV1::Incompatible,
+            None,
             &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
         ));
         assert!(incompatible
@@ -689,11 +724,49 @@ mod tests {
     }
 
     #[test]
+    fn a_native_agent_unavailable_reason_reaches_the_peer_as_a_known_code_only() {
+        let fact = |reason: Option<&str>| {
+            native_agent_capability_fact(
+                crate::native_agent::CODEX_CAPABILITY_ID,
+                crate::native_agent::NativeAgentCapabilityStateV1::Unavailable,
+                reason,
+                &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
+            )
+        };
+        assert_eq!(
+            fact(Some("native_agent_probe_failed"))
+                .unavailable_reason
+                .as_deref(),
+            Some("native_agent_probe_failed")
+        );
+        // Unknown text and the incompatible code never mislabel unavailable.
+        for reason in [
+            None,
+            Some("C:\\Users\\me\\codex.cmd"),
+            Some(REASON_NATIVE_AGENT_INCOMPATIBLE),
+        ] {
+            assert_eq!(
+                fact(reason).unavailable_reason.as_deref(),
+                Some(REASON_NATIVE_AGENT_UNAVAILABLE)
+            );
+        }
+        let mut projection = local_projection("peer".into(), 10);
+        projection
+            .capabilities
+            .push(fact(Some("native_agent_not_installed")));
+        assert_eq!(
+            projection.native_agent_reason(crate::native_agent::CODEX_CAPABILITY_ID),
+            Some("native_agent_not_installed".into())
+        );
+    }
+
+    #[test]
     fn native_agent_compatibility_observation_is_bound_to_the_current_session() {
         let mut projection = local_projection("old-session".into(), 10);
         projection.capabilities.push(native_agent_capability_fact(
             crate::native_agent::CODEX_CAPABILITY_ID,
             crate::native_agent::NativeAgentCapabilityStateV1::Available,
+            None,
             &crate::native_agent::WORKSPACE_MOVEMENT_PROTOCOLS,
         ));
         let mut store = PeerCapabilityStore::default();

@@ -38,9 +38,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1, NativeInvocationOutcomeV1,
-    NativeInvocationProgressV1, NativeInvocationRunV1, OpaqueCapabilityPayloadV1,
-    PreparedConversationV1, PreparedInvocationV1, StartedInvocationV1,
+    CapabilityAvailabilityV1, ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1,
+    NativeInvocationOutcomeV1, NativeInvocationProgressV1, NativeInvocationRunV1,
+    OpaqueCapabilityPayloadV1, PreparedConversationV1, PreparedInvocationV1, StartedInvocationV1,
 };
 use crate::error::{AppError, AppResult};
 use crate::native_agent::{
@@ -61,6 +61,17 @@ const INSTALLED_CODEX: &str = "codex";
 /// itself appends only `.exe`, so the shim is never found without this.
 #[cfg(any(windows, test))]
 const WINDOWS_CODEX_LAUNCHERS: [&str; 2] = ["codex.exe", "codex.cmd"];
+/// Peer-safe reasons Codex is not usable here. Each says which layer failed
+/// so the requesting device can tell its user what to do.
+pub(in crate::native_agent) const REASON_NOT_INSTALLED: &str = "native_agent_not_installed";
+pub(in crate::native_agent) const REASON_LAUNCH_FAILED: &str = "native_agent_launch_failed";
+pub(in crate::native_agent) const REASON_PROBE_FAILED: &str = "native_agent_probe_failed";
+pub(in crate::native_agent) const REASON_PROBE_TIMEOUT: &str = "native_agent_probe_timeout";
+pub(in crate::native_agent) const REASON_INCOMPATIBLE: &str = "native_agent_incompatible";
+/// Bound for stderr kept from one probe, and for the excerpt shown.
+const PROBE_STDERR_BYTES: u64 = 4096;
+const PROBE_STDERR_SHOWN: usize = 300;
+
 /// How long one read-only availability observation is reused. Execution
 /// always observes it again before opening a new native session.
 const AVAILABILITY_TTL: Duration = Duration::from_secs(30);
@@ -158,7 +169,7 @@ fn parse_input(input: &OpaqueCapabilityPayloadV1) -> AppResult<(CodexInvocationI
 struct CachedAvailabilityV1 {
     executable: PathBuf,
     observed_at: Instant,
-    state: NativeAgentCapabilityStateV1,
+    report: CapabilityAvailabilityV1,
 }
 
 #[derive(Default)]
@@ -182,49 +193,63 @@ fn cached_availability(
     executable: &Path,
     ttl: Duration,
 ) -> NativeAgentCapabilityStateV1 {
+    cached_report(cache, executable, ttl).state
+}
+
+fn cached_report(
+    cache: &AvailabilityCacheV1,
+    executable: &Path,
+    ttl: Duration,
+) -> CapabilityAvailabilityV1 {
     let stale = cache.lock().ok().and_then(|mut cache| {
         let cached = cache
             .observed
             .as_ref()
             .filter(|cached| cached.executable == executable)?;
-        let state = cached.state.clone();
+        let report = cached.report.clone();
         if cached.observed_at.elapsed() < ttl {
-            return Some((state, false));
+            return Some((report, false));
         }
         let refresh = !cache.refreshing;
         cache.refreshing = true;
-        Some((state, refresh))
+        Some((report, refresh))
     });
     match stale {
-        Some((state, refresh)) => {
+        Some((report, refresh)) => {
             if refresh {
                 let cache = cache.clone();
                 let executable = executable.to_path_buf();
                 thread::spawn(move || {
-                    observe_availability(&cache, &executable);
+                    observe_report(&cache, &executable);
                 });
             }
-            state
+            report
         }
-        None => observe_availability(cache, executable),
+        None => observe_report(cache, executable),
     }
 }
 
 /// Probes now, without holding the cache, and records the observation.
-fn observe_availability(
-    cache: &AvailabilityCacheV1,
-    executable: &Path,
-) -> NativeAgentCapabilityStateV1 {
-    let state = codex_compatibility_at(executable);
+fn observe_report(cache: &AvailabilityCacheV1, executable: &Path) -> CapabilityAvailabilityV1 {
+    let report = codex_probe_at(executable, PROBE_TIMEOUT);
+    // A local diagnostic line on each change; no path or program output.
+    crate::logging::write_transfer_line_if_changed(
+        "native_agent_codex_availability",
+        &format!(
+            "[pastey native-agent] event=codex_availability state={:?} reason={}",
+            report.state,
+            report.reason.unwrap_or("none")
+        ),
+    );
     if let Ok(mut cache) = cache.lock() {
         cache.observed = Some(CachedAvailabilityV1 {
             executable: executable.to_path_buf(),
             observed_at: Instant::now(),
-            state: state.clone(),
+            report: report.clone(),
         });
         cache.refreshing = false;
     }
-    state
+    report
 }
 
 /// Where one task stands with respect to its app-server.
@@ -474,19 +499,19 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
         cached_availability(&self.availability, &self.executable(), AVAILABILITY_TTL)
     }
 
+    fn availability_report(&self) -> CapabilityAvailabilityV1 {
+        cached_report(&self.availability, &self.executable(), AVAILABILITY_TTL)
+    }
+
     fn supported_protocols(&self) -> &'static [&'static str] {
         &WORKSPACE_MOVEMENT_PROTOCOLS
     }
 
     fn require_available(&self) -> AppResult<()> {
-        match self.availability() {
+        let report = self.availability_report();
+        match report.state {
             NativeAgentCapabilityStateV1::Available => Ok(()),
-            NativeAgentCapabilityStateV1::Incompatible => {
-                invalid("Codex is detected but its native app-server interface is incompatible.")
-            }
-            NativeAgentCapabilityStateV1::Unavailable => {
-                invalid("Codex native capability is unavailable.")
-            }
+            _ => invalid(codex_unavailable_summary(report.reason)),
         }
     }
 
@@ -733,20 +758,12 @@ impl CodexInvocationRunV1 {
             return Err(stopped());
         }
         // Execution-time compatibility, observed afresh.
-        match observe_availability(&self.availability, &self.executable) {
-            NativeAgentCapabilityStateV1::Available => {}
-            NativeAgentCapabilityStateV1::Incompatible => {
-                return Err(not_started(
-                    NativeTurnOutcomeV1::NotStarted,
-                    "Codex is installed, but its native app-server interface is incompatible.",
-                ))
-            }
-            NativeAgentCapabilityStateV1::Unavailable => {
-                return Err(not_started(
-                    NativeTurnOutcomeV1::NotStarted,
-                    "Codex is unavailable on this Host.",
-                ))
-            }
+        let report = observe_report(&self.availability, &self.executable);
+        if report.state != NativeAgentCapabilityStateV1::Available {
+            return Err(not_started(
+                NativeTurnOutcomeV1::NotStarted,
+                codex_unavailable_summary(report.reason),
+            ));
         }
         if self.slot.stop_requested() {
             return Err(stopped());
@@ -766,9 +783,9 @@ impl CodexInvocationRunV1 {
                 "The workspace changed before Codex could start, so nothing ran.",
             ));
         }
-        let launched = resolve_codex_program(&self.executable)
+        let launched = resolve_codex_launcher(&self.executable)
             .ok_or_else(|| AppError::InvalidInput("Codex is unavailable.".into()))
-            .and_then(|program| CodexAppServerV1::launch(&program, &self.workspace));
+            .and_then(|launcher| CodexAppServerV1::launch(&launcher, &self.workspace));
         let controller = match launched {
             Ok(controller) => Arc::new(controller),
             Err(_) => {
@@ -1019,22 +1036,83 @@ fn turn_start_ack_timeout() -> Duration {
     }
 }
 
-/// The program Pastey launches for a configured executable. Only the bare
-/// `codex` is resolved: elsewhere the OS searches PATH itself; on Windows
-/// Pastey searches it as a Windows shell would, without the current
-/// directory.
-fn resolve_codex_program(executable: &Path) -> Option<PathBuf> {
+/// The program Pastey launches for a configured executable, and the PATH
+/// it runs with when Pastey searched for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::native_agent) struct CodexLauncherV1 {
+    program: PathBuf,
+    /// The PATH used to find the launcher, also given to it: a launcher shim
+    /// such as npm's `codex.cmd` needs to find Node the same way.
+    search_path: Option<std::ffi::OsString>,
+}
+
+impl CodexLauncherV1 {
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        if let Some(path) = &self.search_path {
+            command.env("PATH", path);
+        }
+        command
+    }
+}
+
+/// Only the bare `codex` is resolved: elsewhere the OS searches PATH itself.
+/// On Windows Pastey searches it as a Windows shell would, without the
+/// current directory, over this process's PATH followed by the current user
+/// and system PATH read afresh. Pastey stays running in the tray, so its own
+/// PATH predates anything installed since it started.
+fn resolve_codex_launcher(executable: &Path) -> Option<CodexLauncherV1> {
     if executable != Path::new(INSTALLED_CODEX) {
-        return Some(executable.to_path_buf());
+        return Some(CodexLauncherV1 {
+            program: executable.to_path_buf(),
+            search_path: None,
+        });
     }
     #[cfg(windows)]
     {
-        find_launcher_on_path(&std::env::var_os("PATH")?, &WINDOWS_CODEX_LAUNCHERS)
+        let search_path = merge_search_path(
+            std::env::var_os("PATH"),
+            &windows_environment::fresh_path_entries(),
+        );
+        find_launcher_on_path(&search_path, &WINDOWS_CODEX_LAUNCHERS).map(|program| {
+            CodexLauncherV1 {
+                program,
+                search_path: Some(search_path),
+            }
+        })
     }
     #[cfg(not(windows))]
     {
-        Some(executable.to_path_buf())
+        Some(CodexLauncherV1 {
+            program: executable.to_path_buf(),
+            search_path: None,
+        })
     }
+}
+
+/// `first` followed by each entry of `fresh` it does not already contain.
+#[cfg(any(windows, test))]
+fn merge_search_path(
+    first: Option<std::ffi::OsString>,
+    fresh: &[std::ffi::OsString],
+) -> std::ffi::OsString {
+    let mut entries = first
+        .as_deref()
+        .map(|path| std::env::split_paths(path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let same = |left: &Path, right: &Path| {
+        left.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
+    };
+    for path in fresh {
+        for entry in std::env::split_paths(path) {
+            if !entry.as_os_str().is_empty() && !entries.iter().any(|known| same(known, &entry)) {
+                entries.push(entry);
+            }
+        }
+    }
+    std::env::join_paths(entries).unwrap_or_default()
 }
 
 /// The first launcher found searching absolute PATH directories in order,
@@ -1047,54 +1125,317 @@ fn find_launcher_on_path(path: &std::ffi::OsStr, launchers: &[&str]) -> Option<P
             launchers
                 .iter()
                 .map(|launcher| directory.join(launcher))
-                .find(|candidate| candidate.is_file())
+                .find(|candidate| launcher_exists(candidate))
         })
 }
 
-/// Whether a read-only probe exits successfully within its bound. `None`
-/// when it cannot be launched or does not exit in time (then it is killed).
-fn probe_succeeds(program: &Path, args: &[&str], timeout: Duration) -> Option<bool> {
-    let mut child = Command::new(program)
+/// A launcher file, or an entry that is present but cannot be followed. A
+/// Windows app execution alias (a packaged app's command in
+/// `%LOCALAPPDATA%\Microsoft\WindowsApps`) is a reparse point that
+/// `metadata` cannot open, so `is_file` is false for it although a shell
+/// runs it; its own entry still shows it is not a directory.
+#[cfg(any(windows, test))]
+fn launcher_exists(candidate: &Path) -> bool {
+    candidate.is_file()
+        || (std::fs::metadata(candidate).is_err()
+            && std::fs::symlink_metadata(candidate).is_ok_and(|entry| !entry.is_dir()))
+}
+
+/// The current user and system PATH as Windows would give a new process.
+#[cfg(windows)]
+mod windows_environment {
+    use std::{
+        ffi::{OsStr, OsString},
+        os::windows::ffi::{OsStrExt, OsStringExt},
+        ptr::null_mut,
+    };
+
+    use windows_sys::Win32::System::{
+        Environment::ExpandEnvironmentStringsW,
+        Registry::{
+            RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND,
+            RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        },
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    fn until_nul(buffer: &[u16]) -> &[u16] {
+        &buffer[..buffer
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(buffer.len())]
+    }
+
+    /// One string value, read raw and expanded here, so `%USERPROFILE%`-style
+    /// entries resolve whether the value is REG_SZ or REG_EXPAND_SZ.
+    fn read(root: HKEY, subkey: &str, name: &str) -> Option<OsString> {
+        let (subkey, name) = (wide(subkey), wide(name));
+        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+        let mut bytes = 0u32;
+        // SAFETY: valid NUL-terminated strings; a null buffer asks for the size.
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                name.as_ptr(),
+                flags,
+                null_mut(),
+                null_mut(),
+                &mut bytes,
+            )
+        };
+        if status != 0 || bytes == 0 {
+            return None;
+        }
+        let mut raw = vec![0u16; (bytes as usize).div_ceil(2) + 1];
+        let mut capacity = (raw.len() * 2) as u32;
+        // SAFETY: `raw` holds `capacity` bytes.
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                subkey.as_ptr(),
+                name.as_ptr(),
+                flags,
+                null_mut(),
+                raw.as_mut_ptr().cast(),
+                &mut capacity,
+            )
+        };
+        if status != 0 {
+            return None;
+        }
+        let raw = until_nul(&raw)
+            .iter()
+            .copied()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // SAFETY: `raw` is NUL-terminated; a null buffer asks for the size.
+        let needed = unsafe { ExpandEnvironmentStringsW(raw.as_ptr(), null_mut(), 0) };
+        if needed == 0 {
+            return None;
+        }
+        let mut expanded = vec![0u16; needed as usize];
+        // SAFETY: `expanded` holds `needed` UTF-16 units.
+        let written =
+            unsafe { ExpandEnvironmentStringsW(raw.as_ptr(), expanded.as_mut_ptr(), needed) };
+        (written != 0 && written <= needed).then(|| OsString::from_wide(until_nul(&expanded)))
+    }
+
+    /// System PATH first, then the user's: the order of a new logon.
+    pub(super) fn fresh_path_entries() -> Vec<OsString> {
+        [
+            (
+                HKEY_LOCAL_MACHINE,
+                "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+            ),
+            (HKEY_CURRENT_USER, "Environment"),
+        ]
+        .into_iter()
+        .filter_map(|(root, subkey)| read(root, subkey, "Path"))
+        .collect()
+    }
+}
+
+/// How one bounded probe process ended.
+enum ProbeRunV1 {
+    Exited {
+        success: bool,
+        code: Option<i32>,
+        stderr: String,
+    },
+    NotStarted {
+        not_found: bool,
+        error: String,
+    },
+    TimedOut,
+}
+
+/// Runs one read-only probe within its bound, keeping a little stderr. The
+/// probe is killed when it does not exit in time.
+fn run_probe(launcher: &CodexLauncherV1, args: &[&str], timeout: Duration) -> ProbeRunV1 {
+    let spawned = launcher
+        .command()
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            return ProbeRunV1::NotStarted {
+                not_found: error.kind() == io::ErrorKind::NotFound,
+                error: error.to_string(),
+            }
+        }
+    };
+    let (sender, receiver) = mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let mut kept = Vec::new();
+            let _ = stderr.take(PROBE_STDERR_BYTES).read_to_end(&mut kept);
+            let _ = sender.send(kept);
+        });
+    }
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Some(status.success()),
+            Ok(Some(status)) => {
+                // A launcher's own child may hold stderr open; do not wait on it.
+                let kept = receiver
+                    .recv_timeout(Duration::from_millis(500))
+                    .unwrap_or_default();
+                return ProbeRunV1::Exited {
+                    success: status.success(),
+                    code: status.code(),
+                    stderr: String::from_utf8_lossy(&kept).trim().to_string(),
+                };
+            }
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return ProbeRunV1::TimedOut;
             }
         }
     }
 }
 
-/// Read-only and bounded: two probe processes, no installation, no provider,
-/// model, credential or native session query.
-pub(in crate::native_agent) fn codex_compatibility_at(
-    executable: &Path,
-) -> NativeAgentCapabilityStateV1 {
-    let Some(program) = resolve_codex_program(executable) else {
-        return NativeAgentCapabilityStateV1::Unavailable;
-    };
-    if probe_succeeds(&program, &["--version"], PROBE_TIMEOUT) != Some(true) {
-        return NativeAgentCapabilityStateV1::Unavailable;
+fn shown_stderr(stderr: &str) -> String {
+    if stderr.is_empty() {
+        return String::new();
     }
-    if probe_succeeds(&program, &["app-server", "--help"], PROBE_TIMEOUT) == Some(true) {
-        NativeAgentCapabilityStateV1::Available
-    } else {
+    let excerpt = stderr
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(PROBE_STDERR_SHOWN)
+        .collect::<String>();
+    format!(": {excerpt}")
+}
+
+/// What a peer or a task card may say when Codex cannot be used here. It
+/// names the failing layer and the remedy, never a path.
+pub(in crate::native_agent) fn codex_unavailable_summary(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some(REASON_NOT_INSTALLED) => {
+            "Codex is not installed on this Host, or Pastey cannot find the `codex` command there."
+        }
+        Some(REASON_LAUNCH_FAILED) => "Codex was found on this Host but could not be started.",
+        Some(REASON_PROBE_FAILED) => {
+            "Codex on this Host exited with an error when Pastey checked it (`codex --version`)."
+        }
+        Some(REASON_PROBE_TIMEOUT) => "Codex on this Host did not answer in time.",
+        Some(REASON_INCOMPATIBLE) => {
+            "Codex is installed, but its native app-server interface is incompatible."
+        }
+        _ => "Codex is unavailable on this Host.",
+    }
+}
+
+fn unusable(
+    state: NativeAgentCapabilityStateV1,
+    reason: &'static str,
+    detail: String,
+) -> CapabilityAvailabilityV1 {
+    CapabilityAvailabilityV1 {
+        state,
+        reason: Some(reason),
+        detail: Some(detail),
+    }
+}
+
+/// Read-only and bounded: two probe processes, no installation, no provider,
+/// model, credential or native session query. Says which step failed.
+pub(in crate::native_agent) fn codex_probe_at(
+    executable: &Path,
+    timeout: Duration,
+) -> CapabilityAvailabilityV1 {
+    use NativeAgentCapabilityStateV1::{Available, Incompatible, Unavailable};
+    let Some(launcher) = resolve_codex_launcher(executable) else {
+        return unusable(
+            Unavailable,
+            REASON_NOT_INSTALLED,
+            "Pastey looked for codex.exe and codex.cmd in every folder on PATH, including the current user and system PATH, and found neither. Check that `codex --version` works in a new terminal.".into(),
+        );
+    };
+    let program = launcher.program.display();
+    match run_probe(&launcher, &["--version"], timeout) {
+        ProbeRunV1::NotStarted { not_found: true, .. } => {
+            return unusable(
+                Unavailable,
+                REASON_NOT_INSTALLED,
+                format!("`{program}` was not found on PATH. Check that `codex --version` works in a new terminal."),
+            )
+        }
+        ProbeRunV1::NotStarted { error, .. } => {
+            return unusable(
+                Unavailable,
+                REASON_LAUNCH_FAILED,
+                format!("Pastey found {program} but could not start it: {error}"),
+            )
+        }
+        ProbeRunV1::TimedOut => {
+            return unusable(
+                Unavailable,
+                REASON_PROBE_TIMEOUT,
+                format!("{program} --version did not finish within {} s.", timeout.as_secs()),
+            )
+        }
+        ProbeRunV1::Exited { success: false, code, stderr } => {
+            return unusable(
+                Unavailable,
+                REASON_PROBE_FAILED,
+                format!(
+                    "{program} --version exited with code {}{}",
+                    code.map_or_else(|| "unknown".into(), |code| code.to_string()),
+                    shown_stderr(&stderr)
+                ),
+            )
+        }
+        ProbeRunV1::Exited { success: true, .. } => {}
+    }
+    match run_probe(&launcher, &["app-server", "--help"], timeout) {
+        ProbeRunV1::Exited { success: true, .. } => CapabilityAvailabilityV1 {
+            state: Available,
+            reason: None,
+            detail: Some(format!("Using {program}.")),
+        },
         // Detection proves only the native product exists. The app-server
         // compatibility fact is deliberately limited to Pastey's fixed
         // initialize/thread/start/turn/start/observation/interrupt/shutdown
         // surface.
-        NativeAgentCapabilityStateV1::Incompatible
+        ProbeRunV1::TimedOut => unusable(
+            Unavailable,
+            REASON_PROBE_TIMEOUT,
+            format!("{program} app-server --help did not finish within {} s.", timeout.as_secs()),
+        ),
+        ProbeRunV1::Exited { stderr, .. } => unusable(
+            Incompatible,
+            REASON_INCOMPATIBLE,
+            format!(
+                "{program} runs, but `app-server` is not available in this version{}. Update Codex.",
+                shown_stderr(&stderr)
+            ),
+        ),
+        ProbeRunV1::NotStarted { error, .. } => unusable(
+            Unavailable,
+            REASON_LAUNCH_FAILED,
+            format!("{program} could not be started again: {error}"),
+        ),
     }
+}
+
+/// The state alone, for tests.
+#[cfg(test)]
+pub(in crate::native_agent) fn codex_compatibility_at(
+    executable: &Path,
+) -> NativeAgentCapabilityStateV1 {
+    codex_probe_at(executable, PROBE_TIMEOUT).state
 }
 
 /// One line of app-server stdout as Pastey observed it.
@@ -1464,12 +1805,13 @@ fn native_decision_review(
 }
 
 impl CodexAppServerV1 {
-    fn launch(program: &Path, workspace: &Path) -> AppResult<Self> {
+    fn launch(launcher: &CodexLauncherV1, workspace: &Path) -> AppResult<Self> {
         // Deliberately inherit the user's native Codex environment, including
         // authentication and any native configuration. Pastey owns none of it.
         // A plain (not `\\?\`) working directory: a Windows launcher shim runs
         // under cmd.exe, which cannot start in a verbatim path.
-        let mut child = Command::new(program)
+        let mut child = launcher
+            .command()
             .args(["app-server", "--stdio"])
             .current_dir(dunce::simplified(workspace))
             .stdin(Stdio::piped())
@@ -2531,15 +2873,12 @@ mod tests {
         std::fs::write(&hanging, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&hanging, std::fs::Permissions::from_mode(0o700)).unwrap();
         let started = Instant::now();
-        assert_eq!(
-            probe_succeeds(&hanging, &["--version"], Duration::from_millis(200)),
-            None
-        );
+        let hung = codex_probe_at(&hanging, Duration::from_millis(200));
+        assert_eq!(hung.state, NativeAgentCapabilityStateV1::Unavailable);
+        assert_eq!(hung.reason, Some(REASON_PROBE_TIMEOUT));
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(
-            probe_succeeds(&root.join("missing"), &["--version"], PROBE_TIMEOUT),
-            None
-        );
+        let missing = codex_probe_at(&root.join("missing"), PROBE_TIMEOUT);
+        assert_eq!(missing.reason, Some(REASON_NOT_INSTALLED));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2635,10 +2974,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Regression (Windows Codex availability): an entry that is present but
+    /// cannot be followed, as a Windows app execution alias is, counts as a
+    /// launcher. A dangling link stands in for the alias here.
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_that_cannot_be_followed_is_still_found() {
+        let root =
+            std::env::temp_dir().join(format!("pastey-codex-alias-{}", uuid::Uuid::new_v4()));
+        let aliases = root.join("WindowsApps");
+        std::fs::create_dir_all(&aliases).unwrap();
+        std::os::unix::fs::symlink(root.join("package-only"), aliases.join("codex.exe")).unwrap();
+        std::fs::create_dir_all(root.join("decoy").join("codex.exe")).unwrap();
+        assert!(
+            !aliases.join("codex.exe").is_file(),
+            "is_file alone misses it"
+        );
+        let path = std::env::join_paths([root.join("decoy"), aliases.clone()]).unwrap();
+        assert_eq!(
+            find_launcher_on_path(&path, &WINDOWS_CODEX_LAUNCHERS),
+            Some(aliases.join("codex.exe"))
+        );
+        assert!(!launcher_exists(&root.join("absent.exe")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression (Windows Codex availability): Pastey's own PATH comes first,
+    /// then entries of the fresh user and system PATH it lacks, each once.
+    #[test]
+    fn the_search_path_adds_fresh_entries_after_the_process_path() {
+        let os = |value: &str| std::ffi::OsString::from(value);
+        let joined = |entries: &[&str]| std::env::join_paths(entries).unwrap();
+        let merged = merge_search_path(
+            Some(joined(&["/usr/bin", "/opt/old"])),
+            &[
+                joined(&["/usr/bin", "/opt/new"]),
+                joined(&["/OPT/OLD/", "/home/u/npm"]),
+            ],
+        );
+        assert_eq!(
+            std::env::split_paths(&merged).collect::<Vec<_>>(),
+            ["/usr/bin", "/opt/old", "/opt/new", "/home/u/npm"]
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::env::split_paths(&merge_search_path(None, &[os("/a")])).collect::<Vec<_>>(),
+            vec![PathBuf::from("/a")]
+        );
+    }
+
+    /// Regression (Windows Codex availability): each layer that can fail has
+    /// its own reason and a detail with the remedy, instead of one
+    /// "unavailable".
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_names_the_layer_that_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("pastey-codex-layers-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = |name: &str, body: &str, mode: u32| {
+            let path = root.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let shim_without_node = script(
+            "codex-shim",
+            "echo \"'node' is not recognized as an internal or external command\" >&2; exit 1",
+            0o700,
+        );
+        let report = codex_probe_at(&shim_without_node, PROBE_TIMEOUT);
+        assert_eq!(report.state, NativeAgentCapabilityStateV1::Unavailable);
+        assert_eq!(report.reason, Some(REASON_PROBE_FAILED));
+        let detail = report.detail.unwrap();
+        assert!(detail.contains("exited with code 1"), "{detail}");
+        assert!(detail.contains("'node' is not recognized"), "{detail}");
+
+        let not_executable = script("codex-noexec", "exit 0", 0o600);
+        assert_eq!(
+            codex_probe_at(&not_executable, PROBE_TIMEOUT).reason,
+            Some(REASON_LAUNCH_FAILED)
+        );
+
+        let old = script(
+            "codex-old",
+            "if [ \"$1\" = app-server ]; then echo 'unrecognized subcommand' >&2; exit 2; fi; exit 0",
+            0o700,
+        );
+        let report = codex_probe_at(&old, PROBE_TIMEOUT);
+        assert_eq!(report.state, NativeAgentCapabilityStateV1::Incompatible);
+        assert_eq!(report.reason, Some(REASON_INCOMPATIBLE));
+        assert!(report.detail.unwrap().contains("unrecognized subcommand"));
+
+        let good = script("codex-good", "exit 0", 0o700);
+        let report = codex_probe_at(&good, PROBE_TIMEOUT);
+        assert_eq!(report.state, NativeAgentCapabilityStateV1::Available);
+        assert_eq!(report.reason, None);
+
+        // What a peer or task card is told never carries a path.
+        for reason in [
+            REASON_NOT_INSTALLED,
+            REASON_LAUNCH_FAILED,
+            REASON_PROBE_FAILED,
+            REASON_PROBE_TIMEOUT,
+            REASON_INCOMPATIBLE,
+        ] {
+            assert!(!codex_unavailable_summary(Some(reason)).contains('/'));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn only_the_installed_codex_name_is_resolved() {
         let fixture = Path::new("/fixture/codex-fixture");
-        assert_eq!(resolve_codex_program(fixture), Some(fixture.to_path_buf()));
+        assert_eq!(
+            resolve_codex_launcher(fixture),
+            Some(CodexLauncherV1 {
+                program: fixture.to_path_buf(),
+                search_path: None,
+            })
+        );
     }
 
     #[cfg(windows)]
@@ -2647,7 +3105,9 @@ mod tests {
         // Whatever this Windows Host has installed, resolution never yields
         // a bare name that process creation would search relative to the
         // current directory, and finds only `.exe` or `.cmd` launchers.
-        if let Some(program) = resolve_codex_program(Path::new(INSTALLED_CODEX)) {
+        if let Some(program) =
+            resolve_codex_launcher(Path::new(INSTALLED_CODEX)).map(|launcher| launcher.program)
+        {
             assert!(program.is_absolute());
             let name = program
                 .file_name()

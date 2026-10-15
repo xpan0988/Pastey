@@ -173,6 +173,10 @@ export interface NativeAgentCapability {
   agentId: string;
   displayName: string;
   state: "available" | "incompatible" | "unavailable";
+  /** Why it is not available, when the Host can tell (a reason code). */
+  reason?: string | null;
+  /** This device only: what its probe found, possibly naming local paths. */
+  detail?: string | null;
 }
 
 export type NativeAgentTaskState = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";

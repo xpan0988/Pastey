@@ -161,6 +161,16 @@ test("a Bridge without a verified device offers only explicit re-pairing", () =>
   assert.match(panel, /pairing === "pairing_required" \? "Pairing required"/);
 });
 
+test("Codex availability names the failing layer and keeps local detail local", () => {
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  for (const reason of ["native_agent_not_installed", "native_agent_launch_failed", "native_agent_probe_failed", "native_agent_probe_timeout", "native_agent_incompatible"]) {
+    assert.match(card, new RegExp(`case "${reason}"`));
+  }
+  assert.match(lifecycle, /\{ state, reason: capability\.reason \}/);
+  assert.doesNotMatch(lifecycle, /detail: capability/);
+});
+
 test("nearby refresh deduplicates one physical device without mutating Bridge state", () => {
   const device: NearbyDevice = {
     device_id: "device-a",
