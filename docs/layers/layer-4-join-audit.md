@@ -1,6 +1,6 @@
 # Layer 4 — Bridge join and reconnect audit (2026-10)
 
-Status: audit of commit `eaf2e1e`. Nothing in this document is fixed yet. [Layer 4](layer-4-bridge.md) remains the authoritative description of Bridge behaviour; this document records how its join, reconnect and peer-identity boundaries hold up against an adversary, and what the fix should be. Delete or shrink it once the fixes land and the Layer 4 document describes the new handshake.
+Status: audit of commit `eaf2e1e` (sections 1–6, kept as found), followed by the Stage 1 remediation (section 7) that implements option A. [Layer 4](layer-4-bridge.md) and the [reference](../reference.md#bridge-authentication-facts) are the authoritative description of the current behaviour.
 
 Evidence labels: **Source** (read in code at the cited line), **Test** (a `characterization_*` test asserts the behaviour), **Estimate** (reasoned, not measured). No finding here was observed on a physical network.
 
@@ -132,24 +132,44 @@ Option A. It is the only option where the 8-digit code is actually a password: p
 
 The nearby flow needs a separate decision, because it has no code the requester types. Either the acceptor shows the code and the requester enters it (then use Option A), or both screens show a SAS. The current approach of sending the code in a clear UDP reply cannot be made safe against an on-path attacker.
 
-## 6. Characterization tests
+## 6. Characterization tests (superseded)
 
-Each test asserts today's insecure behaviour and is named `characterization_*`, so a fix flips it. All bind only 127.0.0.1 and send nothing to the LAN.
+The audit added seven `characterization_*` tests that asserted the insecure behaviour; F4, F5, F10, F11 and F12 were confirmed from source only. The remediation replaced each test with a regression test asserting that the attack is refused, and added tests for the source-only findings (section 7).
 
-| Test | Finding |
-|---|---|
-| `transfer::join_characterization::characterization_join_without_proof_replaces_the_connected_peer` | F1, F7 |
-| `transfer::join_characterization::characterization_item_upload_from_a_non_member_key_is_stored` | F8 |
-| `transfer::join_characterization::characterization_liveness_ping_is_unauthenticated` | F9 |
-| `discovery::join_characterization::characterization_room_query_answers_any_holder_of_the_code_hash` | F3 |
-| `crypto::join_characterization::characterization_code_hash_is_unsalted_over_an_eight_digit_space` | F2 |
-| `bridge_lifecycle::tests::characterization_reconnect_rebinds_a_different_key_and_host_ref` | F6 |
-| `bridge_lifecycle::tests::characterization_liveness_probe_accepts_an_echo_of_the_public_key` | F9 |
+## 7. Remediation (Stage 1)
 
-F4, F5, F10, F11 and F12 are confirmed from source only.
+Option A is implemented in `src-tauri/src/bridge_auth.rs` with SPAKE2 from RustCrypto's `spake2` 0.4 (Ed25519 group). It is wired into discovery, `/join`, reconnect, the room routes and the renderer. Both devices must run the new version; an older peer can neither pair nor reconnect, which fails closed.
 
-Run (the tests bind local TCP/UDP ports):
+Decisions applied:
+- **Existing Bridges** are not trusted on upgrade: without a pin they do not reconnect, and they keep their local data. Startup recovery already clears every legacy route and key. A user re-pairs by showing a new code ("Show new code" in the Bridge network panel) and entering it on the other device. A code for an existing local Bridge is accepted only from the same logical Host as that Bridge's last known or pinned peer.
+- **Nearby**: the accepting device shows a fresh one-time code and the requester types it. The acceptance carries no secret.
+
+| # | Status | How | Evidence (all local tests, loopback) |
+|---|---|---|---|
+| F1 | Fixed | `/join` requires a pairing proof (SPAKE2 key confirmation plus device signature) or a reconnect proof (pinned-key signature over both nonces); otherwise 403 and nothing changes | `transfer::join_authentication::a_join_without_proof_is_refused_and_replaces_nothing`, `a_forged_or_replayed_pairing_join_is_refused`, `pairing_with_the_code_admits_and_pins_exactly_that_device` |
+| F2 | Fixed | No code-derived value is sent; the query carries a randomized SPAKE2 message only. `hash_code` remains as a local uniqueness index | `bridge_auth::tests::a_pair_query_carries_nothing_derived_from_the_code_alone` |
+| F3 | Fixed | Each answered query is one guess. A code answers 20 queries, expires after 15 minutes, and closes on success. Room-id lookup by hash no longer exists | `transfer::join_authentication::wrong_spent_and_overguessed_codes_admit_no_one`, `storage::tests::a_pairing_code_answers_a_bounded_number_of_guesses_then_closes` |
+| F4 | Fixed | A LAN answer is taken only if its key confirmation proves the code (or, for reconnect, the pinned key signed it); a joiner evaluates at most 16 offers per attempt | `discovery::tests::a_forged_lan_offer_is_ignored_and_the_genuine_one_accepted`, `pairing_with_a_wrong_code_finds_nothing_and_times_out_truthfully`, `bridge_auth::tests::a_pairing_attempt_stops_evaluating_after_its_offer_budget` |
+| F5 | Fixed | The joiner requires the `/join` reply's key and HostRef to equal the confirmed offer's and verifies the Host's signature and confirmation | `VerifiedPairOffer::verify_ack`, exercised by every pairing test |
+| F6 | Fixed | Reconnect needs a fresh signature by the pinned device key; replay and other keys are refused; unpinned Bridges do not reconnect | `transfer::join_authentication::reconnect_requires_fresh_proof_by_the_pinned_device`, `an_unpinned_legacy_bridge_admits_no_reconnect`, `bridge_lifecycle::tests::an_unpinned_bridge_does_not_attempt_reconnect` |
+| F7 | Mitigated | HostRef is still derived from `device_id` and still a claim, but it is signed into the pairing transcript and pinned together with the device key; reconnect must present the same pair | pairing and reconnect tests above |
+| F8 | Fixed | `/items` and `/transfers/start` require the sender key to be the single connected peer's | `transfer::join_authentication::items_and_file_starts_from_a_non_member_are_refused` |
+| F9 | Fixed | Liveness is a signed request answered with a MAC proving the room-server key, only for the current peer | `bridge_lifecycle::tests::liveness_probe_rejects_an_echo_of_the_public_key`, `transfer::join_authentication::ping_answers_only_the_current_peer_with_proof_of_its_key` |
+| F10 | Fixed | The acceptance carries no secret; the code is typed. Prompts are limited per address and in total. The prompt is still self-described, but accepting it admits no one by itself | `discovery::tests::nearby_join_response_carries_no_code_or_session_material`, `join_request_prompts_are_bounded_per_source_and_in_total` |
+| F11 | Open (metadata) | Room-server HTTP stays plaintext. The Bridge id is no longer a capability, but on-path observers see metadata | — |
+| F12 | Fixed | Benchmark routes, transfer finish and cancel require a signed, single-use peer request | `transfer::join_authentication::transfer_control_and_benchmarks_need_a_signed_peer_request` |
+
+Burn and departure: the Burn authority cutoff deletes the pin and any open code before other cleanup, and an authenticated departure deletes the pin (`storage::tests::a_pinned_peer_identity_ends_with_burn_and_with_departure`). Native Agent authority is unchanged: it is still bound to the exact current `HostSessionBinding`, so re-pairing or reconnecting never revives an earlier binding.
+
+Remaining risks (not fixed in Stage 1):
+- **On-path availability and metadata.** An attacker on the path sees Bridge ids, transfer ids and sizes. It can make a transfer fail by sending a garbage chunk to a transfer id it saw. Chunk AEAD does not bind the chunk index, so an on-path attacker could also reorder chunks within one transfer, though it cannot forge content. Encrypting the transport (Stage 3 QUIC) or binding the chunk index as AEAD associated data would close this.
+- **Pairing denial of service.** Anyone who can reach UDP 48392 can spend a code's 20 guesses or crowd the 16 offers a joiner evaluates. The user then shows a new code. Guessing success stays below 2·10⁻⁷ per code.
+- **Self-described HostRef and nearby prompt.** A paired device can claim any HostRef at pairing, so the user's code entry decides which device is trusted. The nearby prompt's device name is unauthenticated.
+- **Device identity rotation** (`rotate_device_identity`) breaks pinned reconnect until the Bridge is paired again. This is intended, and it is not yet explained in the UI.
+- **Not validated on physical devices.** Everything above is local, in-process or loopback tests. Two-device LAN, overlay and nearby flows have not been run.
+
+Run the focused suites (they bind loopback TCP/UDP ports):
 
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey characterization
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- bridge_auth join_authentication discovery:: bridge_lifecycle:: storage::tests::a_p commands::tests::a_code
 ```

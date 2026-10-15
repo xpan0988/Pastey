@@ -36,6 +36,7 @@ This document owns concrete identifiers, bounds, configuration facts, and source
 | Capability-acquisition confirmation | `CapabilityAcquisitionRequestV1` / `confirm_capability_acquisition`: validated durable `HostRef`, one bounded semantic `capabilityId` (`[A-Za-z0-9._:-]`, 1–128 bytes), bounded renderer-safe display text, and only `confirmed` or `cancelled`. Valid semantic acquisition IDs include `runtime.java`, `tool.cmake`, `sdk.android`, and `model.whisper`; membership in the fixed-probe vocabulary is not required. Confirmed means consent to a future Host-side continuation only; it does not install, acquire, probe, bind, authorize, or mutate capability/Plan/topology/Host selection/Developer Mode state. Generic capability acquisition/install behavior is not implemented. Source: `src-tauri/src/capability_acquisition_confirmation.rs`. |
 | Bridge NodeList projection | `pastey-bridge-node-list-v1` |
 | Room Control route | `pastey-bridge-control-route-v1` |
+| Bridge authentication (pairing, reconnect, room requests) | `pastey-bridge-auth-v1` — `src-tauri/src/bridge_auth.rs` |
 
 ## Native-v2 commands
 
@@ -191,6 +192,27 @@ Accepted production endpoints must use HTTPS and valid bounded model/config valu
 
 Minimum Real Provider Conformance is implemented for the exact generic OpenAI-compatible request profile: strict response-model identity, bounded failure classification, cancellation-aware transport, and one-call streaming assembly. A supported external provider/model still means that exact configuration and model has recorded Pastey conformance acceptance; no compatible provider, health observation, or configuration alone claims a Managed E2E `PASS`.
 
+## Bridge authentication facts
+
+Protocol `pastey-bridge-auth-v1` (`src-tauri/src/bridge_auth.rs`). Discovery messages travel as JSON over UDP port 48392; `/join` and the authenticated room routes over the room server's HTTP port.
+
+| Message / route | Carries | Authenticated by |
+| --- | --- | --- |
+| `pair_query` | `request_id`, SPAKE2 message A | nothing (contains nothing checkable offline) |
+| `pair_offer` | SPAKE2 message B, Bridge id, port, expiry, transport key, device name, HostRef, Ed25519 device key, `confirm` | key confirmation under the SPAKE2 key over the whole offer |
+| `/join` with `auth.mode = "pair"` | joiner transport key, port, name, HostRef, device key, signature, `confirm` | SPAKE2 key confirmation plus the joiner's device signature over the offer and join transcript |
+| `/join` reply with `auth` | Host signature and `confirm` | the Host's device key confirmed in the offer, plus key confirmation |
+| `reconnect_query` | Bridge id, requester HostRef, 32-byte nonce | nothing; answered only for the pinned HostRef |
+| `reconnect_offer` | port, expiry, transport key, HostRef, single-use 32-byte Host nonce, signature | the pinned device key over both nonces and the offer |
+| `/join` with `auth.mode = "reconnect"` | both nonces, signature | the pinned device key over both nonces and both transport keys |
+| `diagnostics/ping`, `diagnostics/benchmark/{raw,pipeline}`, `transfers/{id}/finish`, `transfers/{id}/cancel` | headers `x-pastey-sender-key` and `x-pastey-request-auth: v1.<unix seconds>.<32 hex nonce>.<mac>` | keyed BLAKE3 MAC under HKDF of the X25519 agreement between both current room-server keys, over sender and receiver keys, Bridge id, route, time, nonce and body hash; the sender key must be the Bridge's single connected peer |
+| `items`, `transfers/start` | `sender_public_key` and an X25519-wrapped key | the sender key must be the Bridge's single connected peer |
+| `control-events` | encrypted Room Control envelope | unchanged (see Room Control) |
+
+Bounds: a pairing code answers at most 20 pairing queries and expires after 15 minutes; one success closes it. A joiner evaluates at most 16 offers per attempt. A pending pairing lasts 120 s; a reconnect nonce 60 s, at most 16 per Bridge. Request timestamps may differ by 120 s; each room server remembers at most 4,096 request nonces. Nearby join prompts: one pending per source address, four in total.
+
+Storage: `bridge_peer_pins` (Bridge id → peer HostRef and device key) and `bridge_pairing_windows` (open time, expiry, answered count, close time). Both are deleted at the Burn authority cutoff; an authenticated departure deletes the pin. `RoomInfo.pairing_state` is `paired`, `awaiting_peer` or `pairing_required`. Commands: `open_bridge_pairing` (fresh code for an existing Bridge), `request_nearby_join` (returns a pending request), `complete_nearby_join` (request id and code).
+
 ## Developer Terminal protocol and bounds
 
 Protocol family/version: `developer_terminal` / `pastey-developer-terminal-v0`.
@@ -229,6 +251,7 @@ The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is
 | NodeList/capability/confirmation boundaries | Rust `diagnostics`, `commands`, `peer_capabilities`, `capability_probe`, and `capability_acquisition_confirmation` tests; frontend integration tests |
 | Effects/results | Rust `effect_authority`, `managed_resources`, `execution_world`, `network_broker`, and `managed_execution` tests; opt-in native Windows `windows_execution_world` integration test |
 | Layer 4 and transfer | `scripts/run-layer4-validation-matrix.mjs`, `scripts/run-transfer-planner-tests.mjs`, Rust transport/protocol tests |
+| Bridge pairing, reconnect and room-request authentication | Rust `bridge_auth`, `transfer::join_authentication`, `discovery`, `bridge_lifecycle`, `storage` and `commands` tests |
 | Developer Terminal | Rust terminal/HostRuntime tests plus native physical platform checks |
 | Native Agent task/session/movement and conflict recovery | Rust `native_agent`, `commands`, `room_control`, `transfer`, `storage`, and `host_runtime` tests, including the test-only two-Host pair harness; renderer types/lifecycle in `src/lib/tauri.ts` and `src/features/workspace/AgentTaskLifecycle.tsx` |
 | Native capability neutrality, ownership, and executor admission | Rust `native_agent::tests::pair_harness` (`fake.longjob.v1` capability pair; direct and received-workspace admission scenarios); `peer_capabilities` and `room_control` opaque-boundary tests; `npm run test:frontend-integration` for the Review projection and banner |
