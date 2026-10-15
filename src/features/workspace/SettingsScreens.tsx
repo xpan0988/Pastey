@@ -19,6 +19,7 @@ import {
 import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot } from "../../lib/tauri";
 import type { AppConfig, RoomInfo } from "../../lib/types";
 import { bridgeCode } from "./workspaceViewModel";
+import { KnownDevicesSettings } from "./KnownDevicesSettings";
 import { UnattendedAccessSettings } from "./UnattendedAccessSettings";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
@@ -74,6 +75,7 @@ export function SettingsOverview({ config, onNavigate, onConfigChange }: Setting
             <SettingsRow title="Developer Mode admission" description="Separate human approval for this terminal session." value="Always required" status="ready" />
           </SettingsGroup>
           <SharedSearchFolders />
+          <KnownDevicesSettings />
           <UnattendedAccessSettings />
           <SettingsGroup title="Discovery"><SettingsRow title="Local network discovery" description="Current discovery state is Host-owned." value="Not projected" /></SettingsGroup>
           <SettingsGroup title="Tasks">

@@ -28,7 +28,8 @@ export interface WorkspaceV2Props {
   onJoinBridge: (code: string, address?: string) => Promise<void>;
   onListNearbyDevices: () => Promise<NearbyDevice[]>;
   /** Asks a nearby device to start a Bridge; resolves once its user accepts. */
-  onJoinNearbyDevice: (deviceId: string) => Promise<NearbyJoinPending>;
+  /** Resolves to the code step, or null when a device paired before connected. */
+  onJoinNearbyDevice: (deviceId: string) => Promise<NearbyJoinPending | null>;
   /** Finishes a nearby join with the code the accepting device shows. */
   onCompleteNearbyJoin: (requestId: string, code: string) => Promise<void>;
   nearbyDiscoveryAvailable: boolean;

@@ -52,6 +52,20 @@ export interface NearbyJoinPending {
   deviceName: string;
 }
 
+/** A device paired before connects at once; any other needs its code. */
+export type NearbyJoinOutcome =
+  | { status: "connected"; room: RoomInfo }
+  | ({ status: "code_required" } & NearbyJoinPending);
+
+/** A device paired by code that can start a Bridge again without one. */
+export interface KnownDevice {
+  fingerprint: string;
+  displayFingerprint: string;
+  label: string;
+  firstPairedAt: number;
+  lastPairedAt: number;
+}
+
 export interface RoomBridgePeerInfo {
   peerSessionId: string;
   hostRef?: string | null;
@@ -233,6 +247,8 @@ export interface NearbyDevice {
   capabilities: string[];
   last_seen_seconds_ago: number;
   compatible: boolean;
+  /** Paired with this device before. A hint only; connecting proves it. */
+  known?: boolean;
 }
 
 export interface JoinRequestPrompt {

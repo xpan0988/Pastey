@@ -142,8 +142,9 @@ test("a nearby join pairs only with the code the accepting device shows", () => 
   const screen = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
   const app = readFileSync("src/App.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
-  // Accepting yields only a pending request; the code is typed, never received.
-  assert.match(bindings, /requestNearbyJoin\(deviceId: string\): Promise<NearbyJoinPending>/);
+  // Accepting yields a code step (or a proven known device); the code is
+  // typed, never received.
+  assert.match(bindings, /requestNearbyJoin\(deviceId: string\): Promise<NearbyJoinOutcome>/);
   assert.match(screen, /onCompleteNearby\(nearbyPending\.requestId, nearbyCode\)/);
   assert.match(app, /completeNearbyJoin\(requestId, code\)/);
   assert.doesNotMatch(app, /room_code/);
@@ -169,6 +170,18 @@ test("Codex availability names the failing layer and keeps local detail local", 
   }
   assert.match(lifecycle, /\{ state, reason: capability\.reason \}/);
   assert.doesNotMatch(lifecycle, /detail: capability/);
+});
+
+test("a device paired before connects from Nearby without a code and can be forgotten", () => {
+  const screen = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const app = readFileSync("src/App.tsx", "utf8");
+  const settings = readFileSync("src/features/workspace/KnownDevicesSettings.tsx", "utf8");
+  assert.match(screen, /device\.availability === "Available" \|\| device\.known === true/);
+  assert.match(screen, /device\.known \? "Connect" : "Join"/);
+  assert.match(app, /outcome\.status === "connected"/);
+  assert.match(app, /pastey:\/\/known-device-connect/);
+  assert.match(settings, /forgetKnownDevice\(device\.fingerprint\)/);
+  assert.match(settings, /Other devices on the network always need a code/);
 });
 
 test("nearby refresh deduplicates one physical device without mutating Bridge state", () => {

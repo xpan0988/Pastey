@@ -363,6 +363,10 @@ pub struct NearbyDevice {
     pub capabilities: Vec<String>,
     pub last_seen_seconds_ago: u64,
     pub compatible: bool,
+    /// A device this one paired with before (by its beacon's HostRef). A
+    /// hint for the list only: connecting still proves the identity key.
+    #[serde(default)]
+    pub known: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -519,13 +523,31 @@ pub struct StoredRoomItem {
     pub saved_path: Option<String>,
 }
 
-/// A nearby join the other device accepted. Its user now reads a one-time
-/// code from that device's screen.
+/// A remembered device, as this device's user sees it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NearbyJoinPending {
-    pub request_id: String,
-    pub device_name: String,
+pub struct KnownDeviceView {
+    pub fingerprint: String,
+    pub display_fingerprint: String,
+    pub label: String,
+    pub first_paired_at: i64,
+    pub last_paired_at: i64,
+}
+
+/// What a nearby join led to: connected already (a device paired before
+/// proved its key), or waiting for the code the other device shows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NearbyJoinOutcome {
+    Connected {
+        room: Box<RoomInfo>,
+    },
+    CodeRequired {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "deviceName")]
+        device_name: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

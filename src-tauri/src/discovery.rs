@@ -105,6 +105,9 @@ pub struct NearbyJoinRequest {
     pub app_version: String,
     #[serde(default)]
     pub response_port: Option<u16>,
+    /// Present when the requester paired with this device before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<bridge_auth::KnownConnectProof>,
 }
 
 /// The answer to a nearby join request. It says only whether the other
@@ -117,6 +120,14 @@ pub struct NearbyJoinResponse {
     pub accepted: bool,
     pub message: Option<String>,
     pub device_name: Option<String>,
+    /// For a verified known device: the new Bridge's signed offer, which
+    /// the requester completes with its identity key. Never a code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_offer: Option<bridge_auth::ReconnectOffer>,
+    /// With `known_offer`: the Bridge's display code, so both devices show
+    /// the same name. No pairing code is open for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_label: Option<String>,
 }
 
 /// A nearby request the other device accepted; this device's user must
@@ -366,6 +377,15 @@ pub fn list_nearby_devices(state: &Arc<AppState>) -> Vec<NearbyDevice> {
             device
         })
         .collect::<Vec<_>>();
+    for device in &mut devices {
+        device.known = crate::host_identity::HostRef::from_device_id(&device.device_id)
+            .ok()
+            .and_then(|host_ref| {
+                storage::known_device_for_host_ref(&state.paths, host_ref.as_str()).ok()
+            })
+            .flatten()
+            .is_some();
+    }
     devices.sort_by(|left, right| left.display_name.cmp(&right.display_name));
     devices
 }
@@ -373,6 +393,8 @@ pub fn list_nearby_devices(state: &Arc<AppState>) -> Vec<NearbyDevice> {
 pub async fn request_nearby_join(
     state: Arc<AppState>,
     device_id: &str,
+    request_id: String,
+    known: Option<bridge_auth::KnownConnectProof>,
 ) -> AppResult<(SocketAddr, NearbyJoinResponse)> {
     expire_nearby_devices(&state);
     let record = state
@@ -382,7 +404,9 @@ pub async fn request_nearby_join(
         .cloned()
         .ok_or_else(|| AppError::NotFound("No nearby Pastey devices found.".into()))?;
 
-    if record.device.availability != "Available" {
+    // A device with a Bridge already is Busy to new devices, but a device it
+    // paired with before may start another Bridge with it.
+    if record.device.availability != "Available" && known.is_none() {
         return Err(AppError::InvalidInput("Device is busy.".into()));
     }
 
@@ -395,12 +419,13 @@ pub async fn request_nearby_join(
         .port();
     let request = NearbyJoinRequest {
         kind: "join_request".into(),
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id,
         device_id: local_device_id(&state),
         display_name: crate::transfer::device_name(),
         platform: platform_name().into(),
         app_version: env!("CARGO_PKG_VERSION").into(),
         response_port: Some(response_port),
+        known,
     };
     state
         .outgoing_join_requests
@@ -481,18 +506,22 @@ pub async fn send_join_response(
     request: &PendingJoinRequest,
     response: &NearbyJoinResponse,
 ) -> AppResult<()> {
+    send_join_response_to(request.source, response).await
+}
+
+pub async fn send_join_response_to(
+    target: SocketAddr,
+    response: &NearbyJoinResponse,
+) -> AppResult<()> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
         .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?;
     let payload = serde_json::to_vec(response)?;
-    socket
-        .send_to(&payload, request.source)
-        .await
-        .map_err(|_| {
-            AppError::Network(
-                "Device found, but this network may block direct local connections.".into(),
-            )
-        })?;
+    socket.send_to(&payload, target).await.map_err(|_| {
+        AppError::Network(
+            "Device found, but this network may block direct local connections.".into(),
+        )
+    })?;
     Ok(())
 }
 
@@ -871,7 +900,23 @@ fn handle_join_request(state: Arc<AppState>, value: Value, source: SocketAddr) {
         return;
     };
     let response_port = request.response_port.unwrap_or(source.port());
-    surface_join_request(state, request, SocketAddr::new(source.ip(), response_port));
+    route_join_request(state, request, SocketAddr::new(source.ip(), response_port));
+}
+
+/// A request from a device that proves it paired with this one before
+/// connects without a prompt; anything else asks this device's user.
+fn route_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source: SocketAddr) {
+    if request.known.is_none() {
+        surface_join_request(state, request, source);
+        return;
+    }
+    let task_state = state.clone();
+    state.spawn(async move {
+        if !crate::commands::accept_known_device_connect(task_state.clone(), &request, source).await
+        {
+            surface_join_request(task_state, request, source);
+        }
+    });
 }
 
 async fn join_request_endpoint(
@@ -883,7 +928,7 @@ async fn join_request_endpoint(
         "[pastey antenna] event=join_request_endpoint_hit source={source}"
     ));
     let response_port = request.response_port.unwrap_or(source.port());
-    surface_join_request(state, request, SocketAddr::new(source.ip(), response_port));
+    route_join_request(state, request, SocketAddr::new(source.ip(), response_port));
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({ "ok": true })),
@@ -949,6 +994,17 @@ fn surface_join_request(state: Arc<AppState>, request: NearbyJoinRequest, source
     ));
     let _ = state.emit(JOIN_REQUEST_EVENT, &prompt);
     logging::write_transfer_line("[pastey antenna] event=join_request_emitted_to_ui");
+}
+
+/// Claims a nearby request id once, as the prompt path does.
+pub(crate) fn claim_join_request_id(state: &Arc<AppState>, request_id: &str) -> bool {
+    let now = storage::now_ts();
+    claim_nearby_join_request(
+        &mut state.seen_nearby_join_requests.lock(),
+        request_id,
+        now,
+        now + JOIN_REQUEST_REPLAY_TTL_SECS,
+    )
 }
 
 fn claim_nearby_join_request(
@@ -1043,6 +1099,7 @@ fn upsert_nearby_device(
         capabilities: beacon.capabilities,
         last_seen_seconds_ago: 0,
         compatible,
+        known: false,
     };
 
     records.insert(
@@ -1300,6 +1357,7 @@ mod tests {
             capabilities: vec!["large_file".into()],
             last_seen_seconds_ago: 0,
             compatible: true,
+            known: false,
         };
 
         let json = serde_json::to_string(&device).unwrap();
@@ -1319,6 +1377,8 @@ mod tests {
             accepted: true,
             message: None,
             device_name: Some("MacBook Air".into()),
+            known_offer: None,
+            bridge_label: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         for field in ["room", "code", "port", "key", "expires"] {
@@ -1719,6 +1779,7 @@ mod tests {
             platform: "macOS".into(),
             app_version: env!("CARGO_PKG_VERSION").into(),
             response_port: None,
+            known: None,
         };
         let from = |last: u8| SocketAddr::from(([192, 168, 1, last], 5000));
         surface_join_request(state.clone(), request("a"), from(2));

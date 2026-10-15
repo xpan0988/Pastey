@@ -141,7 +141,9 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   async function joinNearbyDevice(deviceId: string) {
     setMessage(null);
     try {
-      return await props.onJoinNearbyDevice(deviceId);
+      const pending = await props.onJoinNearbyDevice(deviceId);
+      if (!pending) setRoute("bridge");
+      return pending;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Pastey could not join this nearby device.");
       throw error;

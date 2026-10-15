@@ -3005,6 +3005,15 @@ async fn join_handler(
                 &admitted.peer_device_public_key,
             )
             .map_err(|_| StatusCode::GONE)?;
+            // The code proved this device's key: remember it, so it can start
+            // another Bridge with this one without a code.
+            storage::remember_known_device(
+                &ctx.state.paths,
+                &admitted.peer_device_public_key,
+                request_host_ref.as_str(),
+                &request.device_name,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             admitted.ack
         }
         Some(crate::bridge_auth::JoinAuth::Reconnect { .. }) => {
@@ -7659,5 +7668,330 @@ mod join_authentication {
         assert!(files_under(&receiver.root.join("inbox"))
             .iter()
             .any(|bytes| *bytes == content));
+    }
+
+    fn host_device_key(host: &HostFixture) -> [u8; 32] {
+        crate::device_identity::load_or_create(&host.state.paths, &[41u8; 32])
+            .unwrap()
+            .public_key()
+    }
+
+    fn known_request(
+        joiner_device_id: &str,
+        proof: Option<bridge_auth::KnownConnectProof>,
+        request_id: &str,
+    ) -> crate::discovery::NearbyJoinRequest {
+        crate::discovery::NearbyJoinRequest {
+            kind: "join_request".into(),
+            request_id: request_id.into(),
+            device_id: joiner_device_id.into(),
+            display_name: "joiner".into(),
+            platform: "macOS".into(),
+            app_version: env!("CARGO_PKG_VERSION").into(),
+            response_port: None,
+            known: proof,
+        }
+    }
+
+    /// A code pairing remembers the device whose key the code proved.
+    #[tokio::test]
+    async fn a_device_paired_by_code_is_remembered() {
+        let host = HostFixture::new("remember").await;
+        let joiner = Joiner::new("remembered-device");
+        assert!(storage::list_known_devices(&host.state.paths)
+            .unwrap()
+            .is_empty());
+        joiner.pair(&host, CODE).await.expect("code pairs");
+        let known = storage::known_device(&host.state.paths, &joiner.identity.public_key())
+            .unwrap()
+            .expect("remembered");
+        assert_eq!(known.peer_host_ref, joiner.host_ref);
+    }
+
+    /// Trusted LAN: a remembered device starts a new Bridge by proving its
+    /// key, with no code and no prompt; the receiver pins the new Bridge to
+    /// that key and answers with an offer only that key can complete.
+    #[tokio::test]
+    async fn a_known_device_opens_a_new_bridge_by_proving_its_key() {
+        let host = HostFixture::new("known-connect").await;
+        let joiner = Joiner::new("known-device");
+        joiner.pair(&host, CODE).await.expect("first trust by code");
+        let joiner_ref = crate::host_identity::HostRef::parse(joiner.host_ref.clone()).unwrap();
+
+        let (proof, nonce) = bridge_auth::sign_known_connect(
+            &joiner.identity,
+            "known-request-1",
+            &joiner_ref,
+            host.state.local_host_ref.as_str(),
+        );
+        let reply = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let rooms_before = storage::list_rooms(&host.state.paths).unwrap().len();
+        assert!(
+            crate::commands::accept_known_device_connect(
+                host.state.clone(),
+                &known_request("known-device", Some(proof), "known-request-1"),
+                reply.local_addr().unwrap(),
+            )
+            .await
+        );
+        assert!(
+            host.state.pending_join_requests.lock().is_empty(),
+            "no prompt"
+        );
+        let mut buffer = vec![0u8; 4096];
+        let (size, _) = tokio::time::timeout(Duration::from_secs(3), reply.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let response: crate::discovery::NearbyJoinResponse =
+            serde_json::from_slice(&buffer[..size]).unwrap();
+        assert!(response.accepted);
+        let offer = response.known_offer.expect("signed offer");
+        let rooms = storage::list_rooms(&host.state.paths).unwrap();
+        assert_eq!(rooms.len(), rooms_before + 1);
+        let pin = storage::bridge_peer_pin(&host.state.paths, &offer.room_id)
+            .unwrap()
+            .expect("new Bridge pinned to the known device");
+        assert_eq!(pin.peer_device_public_key, joiner.identity.public_key());
+        assert!(!storage::pairing_window_open(&host.state.paths, &offer.room_id, 20).unwrap());
+
+        // The requester accepts only an offer signed by the remembered key.
+        let host_pin = storage::BridgePeerPin {
+            peer_host_ref: host.state.local_host_ref.as_str().into(),
+            peer_device_public_key: host_device_key(&host),
+        };
+        let attempt = ReconnectAttempt::for_known_connect(
+            "known-request-1",
+            &offer.room_id,
+            nonce,
+            &joiner_ref,
+            host_pin.clone(),
+        );
+        assert!(attempt.verify_offer(&offer).is_some());
+        let wrong_nonce = ReconnectAttempt::for_known_connect(
+            "known-request-1",
+            &offer.room_id,
+            [9u8; 32],
+            &joiner_ref,
+            host_pin,
+        );
+        assert!(wrong_nonce.verify_offer(&offer).is_none());
+    }
+
+    /// The join that completes a known connect is the pinned-key reconnect
+    /// handshake; here it runs against a Bridge pinned the way
+    /// `accept_known_device_connect` pins a new one.
+    #[tokio::test]
+    async fn a_known_connect_completes_through_the_pinned_key_handshake() {
+        let host = HostFixture::new("known-join").await;
+        let joiner = Joiner::new("known-device");
+        let joiner_ref = crate::host_identity::HostRef::parse(joiner.host_ref.clone()).unwrap();
+        storage::remember_known_device(
+            &host.state.paths,
+            &joiner.identity.public_key(),
+            &joiner.host_ref,
+            "joiner",
+        )
+        .unwrap();
+        storage::close_pairing_window(&host.state.paths, ROOM_ID).unwrap();
+        storage::pin_bridge_peer(
+            &host.state.paths,
+            ROOM_ID,
+            &joiner.host_ref,
+            &joiner.identity.public_key(),
+        )
+        .unwrap();
+        let (proof, nonce) = bridge_auth::sign_known_connect(
+            &joiner.identity,
+            "known-request-2",
+            &joiner_ref,
+            host.state.local_host_ref.as_str(),
+        );
+        let known = bridge_auth::verify_known_connect(
+            &host.state,
+            "known-request-2",
+            "known-device",
+            &proof,
+        )
+        .unwrap();
+        let query = bridge_auth::known_connect_query(
+            "known-request-2",
+            ROOM_ID,
+            &known.peer_host_ref,
+            &proof,
+        );
+        let offer = bridge_auth::answer_reconnect_query(&host.state, &query).unwrap();
+        let attempt = ReconnectAttempt::for_known_connect(
+            "known-request-2",
+            ROOM_ID,
+            nonce,
+            &joiner_ref,
+            storage::BridgePeerPin {
+                peer_host_ref: host.state.local_host_ref.as_str().into(),
+                peer_device_public_key: host_device_key(&host),
+            },
+        );
+        let offered = attempt.verify_offer(&offer).unwrap();
+        let mut request = joiner.request();
+        let digest = attempt.authenticate_join(&joiner.identity, &offered, &mut request);
+        let response = host.post_join(&request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: JoinRoomResponse = response.json().await.unwrap();
+        attempt.verify_ack(&offered, &digest, &response).unwrap();
+        assert_eq!(
+            host.connected_peers()[0].transport_public_key,
+            Some(joiner.public_key())
+        );
+    }
+
+    /// Nothing but a remembered device's own fresh proof skips the prompt.
+    #[tokio::test]
+    async fn an_unproven_known_connect_falls_back_to_the_prompt() {
+        let host = HostFixture::new("known-refused").await;
+        let joiner = Joiner::new("known-device");
+        joiner.pair(&host, CODE).await.expect("first trust by code");
+        let joiner_ref = crate::host_identity::HostRef::parse(joiner.host_ref.clone()).unwrap();
+        let target = host.state.local_host_ref.as_str().to_string();
+        let reply = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let source = reply.local_addr().unwrap();
+        let rooms_before = storage::list_rooms(&host.state.paths).unwrap().len();
+
+        // A device never paired, even one claiming the paired HostRef.
+        let stranger = Joiner::new("known-device");
+        let (proof, _) =
+            bridge_auth::sign_known_connect(&stranger.identity, "r1", &joiner_ref, &target);
+        assert!(
+            !crate::commands::accept_known_device_connect(
+                host.state.clone(),
+                &known_request("known-device", Some(proof), "r1"),
+                source
+            )
+            .await
+        );
+        // The known key, but claiming another device id.
+        let (proof, _) =
+            bridge_auth::sign_known_connect(&joiner.identity, "r2", &joiner_ref, &target);
+        assert!(
+            !crate::commands::accept_known_device_connect(
+                host.state.clone(),
+                &known_request("someone-else", Some(proof), "r2"),
+                source
+            )
+            .await
+        );
+        // Signed for another Host.
+        let (proof, _) = bridge_auth::sign_known_connect(
+            &joiner.identity,
+            "r3",
+            &joiner_ref,
+            crate::host_identity::HostRef::from_device_id("other-host")
+                .unwrap()
+                .as_str(),
+        );
+        assert!(
+            !crate::commands::accept_known_device_connect(
+                host.state.clone(),
+                &known_request("known-device", Some(proof), "r3"),
+                source
+            )
+            .await
+        );
+        // Signed for one request id, sent with another.
+        let (proof, _) =
+            bridge_auth::sign_known_connect(&joiner.identity, "r4", &joiner_ref, &target);
+        assert!(
+            !crate::commands::accept_known_device_connect(
+                host.state.clone(),
+                &known_request("known-device", Some(proof.clone()), "r5"),
+                source
+            )
+            .await
+        );
+        // Too old.
+        let mut stale = proof;
+        stale.issued_at -= 600;
+        assert!(
+            bridge_auth::verify_known_connect(&host.state, "r4", "known-device", &stale).is_none()
+        );
+        assert_eq!(
+            storage::list_rooms(&host.state.paths).unwrap().len(),
+            rooms_before
+        );
+
+        // A replay of an accepted request opens nothing more.
+        let (proof, _) =
+            bridge_auth::sign_known_connect(&joiner.identity, "r6", &joiner_ref, &target);
+        let request = known_request("known-device", Some(proof), "r6");
+        assert!(
+            crate::commands::accept_known_device_connect(host.state.clone(), &request, source)
+                .await
+        );
+        assert!(
+            crate::commands::accept_known_device_connect(host.state.clone(), &request, source)
+                .await
+        );
+        assert_eq!(
+            storage::list_rooms(&host.state.paths).unwrap().len(),
+            rooms_before + 1
+        );
+
+        // A forgotten device is no longer known.
+        storage::forget_known_device(&host.state.paths, &joiner.identity.public_key()).unwrap();
+        let (proof, _) =
+            bridge_auth::sign_known_connect(&joiner.identity, "r7", &joiner_ref, &target);
+        assert!(
+            !crate::commands::accept_known_device_connect(
+                host.state.clone(),
+                &known_request("known-device", Some(proof), "r7"),
+                source
+            )
+            .await
+        );
+    }
+
+    /// Forgetting a device revokes it everywhere: its Bridges lose their pin
+    /// and current session, and do not reconnect until paired again.
+    #[tokio::test]
+    async fn forgetting_a_device_ends_its_bridges_until_paired_again() {
+        let host = HostFixture::new("forget").await;
+        let joiner = Joiner::new("forgotten-device");
+        joiner.pair(&host, CODE).await.expect("code pairs");
+        assert_eq!(host.connected_peers().len(), 1);
+        let rooms =
+            storage::forget_known_device(&host.state.paths, &joiner.identity.public_key()).unwrap();
+        assert_eq!(rooms, vec![ROOM_ID.to_string()]);
+        storage::end_bridge_peer_sessions(&host.state.paths, ROOM_ID).unwrap();
+        assert!(host.connected_peers().is_empty());
+        assert_eq!(host.pairing_state(), BridgePairingState::PairingRequired);
+        let joiner_ref = crate::host_identity::HostRef::parse(joiner.host_ref.clone()).unwrap();
+        let attempt = ReconnectAttempt::new(
+            ROOM_ID,
+            &joiner_ref,
+            storage::BridgePeerPin {
+                peer_host_ref: host.state.local_host_ref.as_str().into(),
+                peer_device_public_key: host_device_key(&host),
+            },
+        );
+        assert!(bridge_auth::answer_reconnect_query(&host.state, &attempt.query()).is_none());
+        assert!(storage::list_known_devices(&host.state.paths)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A new key paired for the same HostRef (for example after the other
+    /// device replaced its identity) supersedes the old one.
+    #[test]
+    fn a_new_key_for_the_same_host_replaces_the_remembered_one() {
+        let root = std::env::temp_dir().join(format!("pastey-known-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths::new(root.clone(), root.join("logs"));
+        paths.ensure_directories().unwrap();
+        storage::init_database(&paths).unwrap();
+        storage::remember_known_device(&paths, &[1u8; 32], "host:a", "laptop").unwrap();
+        storage::remember_known_device(&paths, &[2u8; 32], "host:a", "laptop").unwrap();
+        storage::remember_known_device(&paths, &[3u8; 32], "host:b", "desktop").unwrap();
+        assert!(storage::known_device(&paths, &[1u8; 32]).unwrap().is_none());
+        assert!(storage::known_device(&paths, &[2u8; 32]).unwrap().is_some());
+        assert_eq!(storage::list_known_devices(&paths).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

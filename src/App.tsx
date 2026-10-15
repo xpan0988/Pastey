@@ -145,6 +145,8 @@ function App() {
   const [joinRequest, setJoinRequest] = useState<JoinRequestPrompt | null>(null);
   /** The one-time code this device showed after accepting a nearby request,
    * until the requester has paired with it. */
+  /** A device paired before started a Bridge with this one, without a code. */
+  const [knownConnect, setKnownConnect] = useState<string | null>(null);
   const [acceptedPairing, setAcceptedPairing] = useState<{ roomId: string; deviceName: string; code: string } | null>(null);
   const [joinRequestBusy, setJoinRequestBusy] = useState<string | null>(null);
   const [workspaceFocusRequest, setWorkspaceFocusRequest] = useState<{ target: "home" | "settings"; token: number }>({ target: "home", token: 0 });
@@ -344,6 +346,10 @@ function App() {
       })),
       ownAsyncDisposer(listen<JoinRequestPrompt>("pastey://join-request", (event) => {
         setJoinRequest(event.payload);
+      })),
+      ownAsyncDisposer(listen<{ roomId: string; deviceName: string }>("pastey://known-device-connect", (event) => {
+        setKnownConnect(event.payload.deviceName);
+        void refreshRooms();
       })),
     ];
 
@@ -1412,8 +1418,15 @@ function App() {
     await openRoom(room);
   }
 
-  async function handleJoinNearbyDevice(deviceId: string): Promise<NearbyJoinPending> {
-    return requestNearbyJoin(deviceId);
+  /** Resolves to the code step, or to null when a device paired before
+   * connected at once. */
+  async function handleJoinNearbyDevice(deviceId: string): Promise<NearbyJoinPending | null> {
+    const outcome = await requestNearbyJoin(deviceId);
+    if (outcome.status === "connected") {
+      await handleConnectionJoined(outcome.room);
+      return null;
+    }
+    return { requestId: outcome.requestId, deviceName: outcome.deviceName };
   }
 
   async function handleCompleteNearbyJoin(requestId: string, code: string) {
@@ -1496,6 +1509,17 @@ function App() {
             <button className="ghost-button" disabled={joinRequestBusy !== null} onClick={() => void handleRejectJoinRequest(joinRequest)}>
               Reject
             </button>
+          </div>
+        </div>
+      ) : null}
+      {knownConnect && !joinRequest ? (
+        <div className="join-request-banner panel">
+          <div className="subtle-stack tight">
+            <strong>{knownConnect} started a new Bridge with this device.</strong>
+            <span className="muted">You paired with it before, so no code was needed. Forget it in Settings to stop this.</span>
+          </div>
+          <div className="row gap">
+            <button className="ghost-button" onClick={() => setKnownConnect(null)}>OK</button>
           </div>
         </div>
       ) : null}

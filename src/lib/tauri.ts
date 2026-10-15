@@ -14,7 +14,8 @@ import type {
   JoinRequestPrompt,
   LinkBenchmarkResult,
   NearbyDevice,
-  NearbyJoinPending,
+  KnownDevice,
+  NearbyJoinOutcome,
   ReceivedRoomControlEvent,
   RoomControlDeliveryReceipt,
   RoomControlSessionContext,
@@ -585,8 +586,18 @@ export async function listNearbyDevices(): Promise<NearbyDevice[]> {
   return invoke("list_nearby_devices");
 }
 
-export async function requestNearbyJoin(deviceId: string): Promise<NearbyJoinPending> {
+export async function requestNearbyJoin(deviceId: string): Promise<NearbyJoinOutcome> {
   return invoke("request_nearby_join", { deviceId });
+}
+
+export function listKnownDevices(): Promise<KnownDevice[]> {
+  return invoke("list_known_devices");
+}
+
+/** Stops trusting a device: it needs a code again, and its Bridges end
+ * their sessions until paired again. */
+export function forgetKnownDevice(fingerprint: string): Promise<KnownDevice[]> {
+  return invoke("forget_known_device", { fingerprint });
 }
 
 /** Pairs with the nearby device that accepted, using the code its screen

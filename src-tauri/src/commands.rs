@@ -2959,6 +2959,12 @@ async fn join_discovered_room(
     verified.verify_ack(&digest, &response)?;
 
     establish_fresh_peer_trust(&state, &room.id, &verified.device_public_key)?;
+    storage::remember_known_device(
+        &state.paths,
+        &verified.device_public_key,
+        peer_host_ref.as_str(),
+        &response.device_name,
+    )?;
     storage::pin_bridge_peer(
         &state.paths,
         &room.id,
@@ -3120,14 +3126,39 @@ pub fn list_nearby_devices(state: State<'_, Arc<AppState>>) -> Result<Vec<Nearby
 /// Asks a nearby device to start a Bridge with this one. When its user
 /// accepts, that device shows a one-time code; nothing secret is sent.
 /// Pairing finishes with `complete_nearby_join` and the code typed here.
+/// Asks a nearby device to start a Bridge with this one. A device this one
+/// paired with before connects at once by proving both identity keys; any
+/// other device's user is asked, and on Accept shows a one-time code that
+/// is typed here (`complete_nearby_join`). Nothing secret is sent.
 #[tauri::command]
 pub async fn request_nearby_join(
     device_id: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<crate::models::NearbyJoinPending, String> {
+) -> Result<crate::models::NearbyJoinOutcome, String> {
     run_async(async move {
-        let (source, response) =
-            discovery::request_nearby_join(state.inner().clone(), &device_id).await?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let target_host_ref = crate::host_identity::HostRef::from_device_id(&device_id)?;
+        let known = storage::known_device_for_host_ref(&state.paths, target_host_ref.as_str())?;
+        let signed = match &known {
+            Some(_) => {
+                let identity = local_device_identity(&state)?;
+                Some(crate::bridge_auth::sign_known_connect(
+                    &identity,
+                    &request_id,
+                    &state.local_host_ref,
+                    target_host_ref.as_str(),
+                ))
+            }
+            None => None,
+        };
+        let (proof, nonce) = signed.unzip();
+        let (source, response) = discovery::request_nearby_join(
+            state.inner().clone(),
+            &device_id,
+            request_id.clone(),
+            proof,
+        )
+        .await?;
         if !response.accepted {
             logging::write_transfer_line("[pastey antenna] event=join_rejected");
             return Err(AppError::InvalidInput(
@@ -3135,6 +3166,24 @@ pub async fn request_nearby_join(
                     .message
                     .unwrap_or_else(|| "Join request rejected.".into()),
             ));
+        }
+        if let (Some(known), Some(nonce), Some(offer)) =
+            (known, nonce, response.known_offer.as_ref())
+        {
+            let room = complete_known_connect(
+                state.inner().clone(),
+                &request_id,
+                nonce,
+                known,
+                offer,
+                response.bridge_label.as_deref(),
+                source,
+            )
+            .await?;
+            logging::write_transfer_line("[pastey antenna] event=known_device_connected");
+            return Ok(crate::models::NearbyJoinOutcome::Connected {
+                room: Box::new(room),
+            });
         }
         let device_name = response
             .device_name
@@ -3150,12 +3199,253 @@ pub async fn request_nearby_join(
             },
         );
         logging::write_transfer_line("[pastey antenna] event=join_accepted_awaiting_code");
-        Ok(crate::models::NearbyJoinPending {
+        Ok(crate::models::NearbyJoinOutcome::CodeRequired {
             request_id: response.request_id,
             device_name,
         })
     })
     .await
+}
+
+/// The requester's half of a known-device connect: the offer must be signed
+/// by the remembered key for this request's nonce; then this device joins
+/// with its own identity proof, exactly as a reconnect does.
+async fn complete_known_connect(
+    state: Arc<AppState>,
+    request_id: &str,
+    nonce: [u8; 32],
+    known: storage::KnownBridgeDevice,
+    offer: &crate::bridge_auth::ReconnectOffer,
+    bridge_label: Option<&str>,
+    source: std::net::SocketAddr,
+) -> AppResult<RoomInfo> {
+    let pin = storage::BridgePeerPin {
+        peer_host_ref: known.peer_host_ref.clone(),
+        peer_device_public_key: known.device_public_key,
+    };
+    let attempt = crate::bridge_auth::ReconnectAttempt::for_known_connect(
+        request_id,
+        &offer.room_id,
+        nonce,
+        &state.local_host_ref,
+        pin.clone(),
+    );
+    let verified = attempt.verify_offer(offer).ok_or_else(|| {
+        AppError::InvalidInput(
+            "The other device could not prove it is the device paired before. Pair it with a code."
+                .into(),
+        )
+    })?;
+    check_pairing_target(&state.paths, &offer.room_id, None)?;
+    let master_key = {
+        let config = state.config.read();
+        config::master_key(&config)?
+    };
+    let label = match bridge_label {
+        Some(label) if normalize_code(label).is_ok() => label.to_string(),
+        _ => unique_room_code(&state.paths)?,
+    };
+    let room = storage::create_room(
+        &state.paths,
+        &master_key,
+        &label,
+        15,
+        LocalRole::Joined,
+        Some(offer.room_id.clone()),
+        Some(offer.expires_at),
+    )?;
+    transfer::start_room_server(state.clone(), &room.id).await?;
+    storage::pin_bridge_peer(
+        &state.paths,
+        &room.id,
+        &pin.peer_host_ref,
+        &pin.peer_device_public_key,
+    )?;
+    let identity = local_device_identity(&state)?;
+    let mut request = transfer::local_join_request(&state, &room.id)?;
+    let digest = attempt.authenticate_join(&identity, &verified, &mut request);
+    let response =
+        transfer::post_join(&source.ip().to_string(), offer.port, &room.id, &request).await?;
+    attempt.verify_ack(&verified, &digest, &response)?;
+    storage::update_room_peer(
+        &state.paths,
+        &room.id,
+        Some(&source.ip().to_string()),
+        Some(offer.port),
+        Some(&response.device_name),
+        Some(&offer.transport_public_key),
+        crate::models::RoomStatus::Active,
+    )?;
+    storage::bind_legacy_room_peer_host_ref(&state.paths, &room.id, &pin.peer_host_ref)?;
+    storage::remember_known_device(
+        &state.paths,
+        &pin.peer_device_public_key,
+        &pin.peer_host_ref,
+        &response.device_name,
+    )?;
+    let updated = storage::get_room_by_id(&state.paths, &room.id)?;
+    storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
+}
+
+/// How long an automatically created Bridge waits for the known device to
+/// finish joining before it is removed again.
+const KNOWN_CONNECT_JOIN_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The receiver's half of a known-device connect. Returns false when the
+/// request does not prove a remembered device, so it is shown to this
+/// device's user as an ordinary request instead.
+pub(crate) async fn accept_known_device_connect(
+    state: Arc<AppState>,
+    request: &discovery::NearbyJoinRequest,
+    source: std::net::SocketAddr,
+) -> bool {
+    let Some(proof) = request.known.as_ref() else {
+        return false;
+    };
+    let Some(known) = crate::bridge_auth::verify_known_connect(
+        &state,
+        &request.request_id,
+        &request.device_id,
+        proof,
+    ) else {
+        logging::write_transfer_line("[pastey antenna] event=known_connect_unverified");
+        return false;
+    };
+    // Verified, so a replayed copy is dropped rather than shown.
+    if !discovery::claim_join_request_id(&state, &request.request_id) {
+        return true;
+    }
+    if let Err(error) =
+        open_known_device_bridge(state.clone(), request, proof, &known, source).await
+    {
+        logging::write_error_line(&format!(
+            "[pastey antenna] event=known_connect_failed error={:?}",
+            error.message()
+        ));
+    }
+    true
+}
+
+async fn open_known_device_bridge(
+    state: Arc<AppState>,
+    request: &discovery::NearbyJoinRequest,
+    proof: &crate::bridge_auth::KnownConnectProof,
+    known: &storage::KnownBridgeDevice,
+    source: std::net::SocketAddr,
+) -> AppResult<()> {
+    let master_key = {
+        let config = state.config.read();
+        config::master_key(&config)?
+    };
+    let code = unique_room_code(&state.paths)?;
+    let expiry_minutes = state.config.read().default_expiry_minutes;
+    // No pairing code is opened: only the pinned device can join, by
+    // proving its key over the offer below.
+    let room = storage::create_room(
+        &state.paths,
+        &master_key,
+        &code,
+        expiry_minutes,
+        LocalRole::Creator,
+        None,
+        None,
+    )?;
+    storage::pin_bridge_peer(
+        &state.paths,
+        &room.id,
+        &known.peer_host_ref,
+        &known.device_public_key,
+    )?;
+    transfer::start_room_server(state.clone(), &room.id).await?;
+    let query = crate::bridge_auth::known_connect_query(
+        &request.request_id,
+        &room.id,
+        &known.peer_host_ref,
+        proof,
+    );
+    let offer = crate::bridge_auth::answer_reconnect_query(&state, &query)
+        .ok_or_else(|| AppError::InvalidInput("The Bridge could not be offered.".into()))?;
+    let response = discovery::NearbyJoinResponse {
+        kind: "join_response".into(),
+        request_id: request.request_id.clone(),
+        accepted: true,
+        message: None,
+        device_name: Some(transfer::device_name()),
+        known_offer: Some(offer),
+        bridge_label: Some(code),
+    };
+    discovery::send_join_response_to(source, &response).await?;
+    let _ = state.emit(
+        "pastey://known-device-connect",
+        &serde_json::json!({ "roomId": room.id, "deviceName": known.label }),
+    );
+    // A Bridge the known device never joins does not linger.
+    let room_id = room.id.clone();
+    let cleanup = state.clone();
+    state.spawn(async move {
+        tokio::time::sleep(KNOWN_CONNECT_JOIN_WAIT).await;
+        let joined = storage::list_bridge_peer_endpoints(&cleanup.paths, &room_id)
+            .map(|peers| !peers.is_empty())
+            .unwrap_or(true);
+        if !joined {
+            let _ = burn_bridge_scope(cleanup, &room_id, true).await;
+        }
+    });
+    Ok(())
+}
+
+/// Devices this one paired with by code and still trusts.
+#[tauri::command]
+pub fn list_known_devices(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::models::KnownDeviceView>, String> {
+    storage::list_known_devices(&state.paths)
+        .map(|devices| devices.iter().map(known_device_view).collect())
+        .map_err(|error| error.message())
+}
+
+fn known_device_view(device: &storage::KnownBridgeDevice) -> crate::models::KnownDeviceView {
+    let fingerprint = crate::device_identity::fingerprint(&device.device_public_key);
+    crate::models::KnownDeviceView {
+        display_fingerprint: crate::device_identity::display_fingerprint(&fingerprint),
+        fingerprint,
+        label: device.label.clone(),
+        first_paired_at: device.first_paired_at,
+        last_paired_at: device.last_paired_at,
+    }
+}
+
+/// Stops trusting a device: it can no longer connect without a code, and
+/// every Bridge pinned to it ends its current session and must be paired
+/// again. Bridge history stays.
+#[tauri::command]
+pub fn forget_known_device(
+    fingerprint: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::models::KnownDeviceView>, String> {
+    (|| -> AppResult<Vec<crate::models::KnownDeviceView>> {
+        let device = storage::list_known_devices(&state.paths)?
+            .into_iter()
+            .find(|device| {
+                crate::device_identity::fingerprint(&device.device_public_key) == fingerprint
+            })
+            .ok_or_else(|| AppError::NotFound("That device is not remembered.".into()))?;
+        let rooms = storage::forget_known_device(&state.paths, &device.device_public_key)?;
+        for room_id in rooms {
+            let purge = purge_bridge_runtime_authority(state.inner(), &room_id);
+            state
+                .native_agents
+                .lock()
+                .readmit_bridge_after_fresh_trust(&room_id);
+            purge?;
+            storage::end_bridge_peer_sessions(&state.paths, &room_id)?;
+        }
+        Ok(storage::list_known_devices(&state.paths)?
+            .iter()
+            .map(known_device_view)
+            .collect())
+    })()
+    .map_err(|error| error.message())
 }
 
 /// Pairs with the nearby device that accepted `request_id`, using the code
@@ -3244,6 +3534,8 @@ pub async fn accept_nearby_join(
             accepted: true,
             message: None,
             device_name: Some(transfer::device_name()),
+            known_offer: None,
+            bridge_label: None,
         };
         discovery::send_join_response(&request, &response).await?;
         logging::write_transfer_line("[pastey antenna] event=join_accepted_code_shown");
@@ -3267,6 +3559,8 @@ pub async fn reject_nearby_join(
             accepted: false,
             message: Some("Join request rejected.".into()),
             device_name: Some(transfer::device_name()),
+            known_offer: None,
+            bridge_label: None,
         };
         discovery::send_join_response(&request, &response).await?;
         logging::write_transfer_line("[pastey antenna] event=join_rejected");

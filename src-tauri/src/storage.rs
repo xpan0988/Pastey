@@ -234,6 +234,18 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             paired_at INTEGER NOT NULL
         );
 
+        -- Devices this one has paired with by code. A remembered device may
+        -- start a new Bridge again by proving its identity key, without a
+        -- code; forgetting it (revoked_at) also ends its pinned Bridges.
+        CREATE TABLE IF NOT EXISTS known_bridge_devices (
+            device_public_key TEXT PRIMARY KEY,
+            peer_host_ref TEXT NOT NULL,
+            label TEXT NOT NULL,
+            first_paired_at INTEGER NOT NULL,
+            last_paired_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+
         -- One open pairing code per Bridge. `answered` counts the pairing
         -- queries answered, each of which is one guess of the code; the window
         -- closes after a bounded number, on success, or on expiry.
@@ -817,6 +829,168 @@ pub(crate) fn bridge_peer_pin(paths: &AppPaths, room_id: &str) -> AppResult<Opti
         })
     })
     .transpose()
+}
+
+/// A device paired by code that this one still trusts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KnownBridgeDevice {
+    pub(crate) device_public_key: [u8; 32],
+    pub(crate) peer_host_ref: String,
+    pub(crate) label: String,
+    pub(crate) first_paired_at: i64,
+    pub(crate) last_paired_at: i64,
+}
+
+/// Remembers a device whose key a code pairing just proved. A device that
+/// claims the same HostRef with an earlier key no longer counts as known:
+/// this only removes trust, it never grants any.
+pub(crate) fn remember_known_device(
+    paths: &AppPaths,
+    device_public_key: &[u8; 32],
+    peer_host_ref: &str,
+    label: &str,
+) -> AppResult<()> {
+    let key = crypto::encode_key(device_public_key);
+    let now = now_ts();
+    let label = label.chars().take(64).collect::<String>();
+    let mut conn = connection(paths)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE known_bridge_devices SET revoked_at = ?1
+         WHERE peer_host_ref = ?2 AND device_public_key != ?3 AND revoked_at IS NULL",
+        params![now, peer_host_ref, key],
+    )?;
+    tx.execute(
+        "INSERT INTO known_bridge_devices
+             (device_public_key, peer_host_ref, label, first_paired_at, last_paired_at, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, ?4, NULL)
+         ON CONFLICT(device_public_key) DO UPDATE SET peer_host_ref = excluded.peer_host_ref,
+             label = excluded.label, last_paired_at = excluded.last_paired_at, revoked_at = NULL",
+        params![key, peer_host_ref, label, now],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn known_device_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, String, String, i64, i64)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
+}
+
+fn known_device_from_parts(
+    (key, peer_host_ref, label, first_paired_at, last_paired_at): (
+        String,
+        String,
+        String,
+        i64,
+        i64,
+    ),
+) -> AppResult<KnownBridgeDevice> {
+    Ok(KnownBridgeDevice {
+        device_public_key: crypto::decode_key(&key)?,
+        peer_host_ref,
+        label,
+        first_paired_at,
+        last_paired_at,
+    })
+}
+
+pub(crate) fn list_known_devices(paths: &AppPaths) -> AppResult<Vec<KnownBridgeDevice>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(
+        "SELECT device_public_key, peer_host_ref, label, first_paired_at, last_paired_at
+         FROM known_bridge_devices WHERE revoked_at IS NULL ORDER BY last_paired_at DESC",
+    )?;
+    let rows = statement
+        .query_map([], known_device_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    rows.into_iter().map(known_device_from_parts).collect()
+}
+
+/// The trusted device with this key, if it is still trusted.
+pub(crate) fn known_device(
+    paths: &AppPaths,
+    device_public_key: &[u8; 32],
+) -> AppResult<Option<KnownBridgeDevice>> {
+    connection(paths)?
+        .query_row(
+            "SELECT device_public_key, peer_host_ref, label, first_paired_at, last_paired_at
+             FROM known_bridge_devices WHERE device_public_key = ?1 AND revoked_at IS NULL",
+            [crypto::encode_key(device_public_key)],
+            known_device_from_row,
+        )
+        .optional()?
+        .map(known_device_from_parts)
+        .transpose()
+}
+
+/// The trusted device that claims this HostRef. A hint only: whoever uses
+/// it must still prove the key.
+pub(crate) fn known_device_for_host_ref(
+    paths: &AppPaths,
+    peer_host_ref: &str,
+) -> AppResult<Option<KnownBridgeDevice>> {
+    connection(paths)?
+        .query_row(
+            "SELECT device_public_key, peer_host_ref, label, first_paired_at, last_paired_at
+             FROM known_bridge_devices WHERE peer_host_ref = ?1 AND revoked_at IS NULL
+             ORDER BY last_paired_at DESC LIMIT 1",
+            [peer_host_ref],
+            known_device_from_row,
+        )
+        .optional()?
+        .map(known_device_from_parts)
+        .transpose()
+}
+
+/// Stops trusting a device: it is no longer known, and every Bridge pinned
+/// to its key loses the pin. Returns those Bridges so their live sessions
+/// can be ended too.
+pub(crate) fn forget_known_device(
+    paths: &AppPaths,
+    device_public_key: &[u8; 32],
+) -> AppResult<Vec<String>> {
+    let key = crypto::encode_key(device_public_key);
+    let mut conn = connection(paths)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE known_bridge_devices SET revoked_at = ?1 WHERE device_public_key = ?2 AND revoked_at IS NULL",
+        params![now_ts(), key],
+    )?;
+    let rooms = tx
+        .prepare("SELECT room_id FROM bridge_peer_pins WHERE peer_device_public_key = ?1")?
+        .query_map([&key], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    tx.execute(
+        "DELETE FROM bridge_peer_pins WHERE peer_device_public_key = ?1",
+        [&key],
+    )?;
+    tx.commit()?;
+    Ok(rooms)
+}
+
+/// Ends a Bridge's current peer sessions without removing membership: the
+/// route and key are cleared, as at startup, so nothing routes until a new
+/// authenticated session exists.
+pub(crate) fn end_bridge_peer_sessions(paths: &AppPaths, room_id: &str) -> AppResult<()> {
+    let conn = connection(paths)?;
+    conn.execute(
+        "UPDATE rooms SET peer_host = NULL, peer_port = NULL, peer_transport_public_key = NULL WHERE id = ?1",
+        [room_id],
+    )?;
+    conn.execute(
+        "UPDATE bridge_peers SET liveness = 'disconnected', endpoint_host = NULL, endpoint_port = NULL, transport_public_key = NULL, updated_at = ?2
+         WHERE room_id = ?1 AND liveness IN ('connected', 'reconnecting')",
+        params![room_id, now_ts()],
+    )?;
+    Ok(())
 }
 
 /// Opens (or reopens with a fresh budget) the pairing window of one Bridge.

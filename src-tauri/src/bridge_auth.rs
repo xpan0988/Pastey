@@ -76,6 +76,9 @@ const SIGN_PAIR_HOST: &str = "pair-host";
 const SIGN_RECONNECT_OFFER: &str = "reconnect-offer";
 const SIGN_RECONNECT_JOIN: &str = "reconnect-join";
 const SIGN_RECONNECT_ACK: &str = "reconnect-ack";
+const SIGN_KNOWN_CONNECT: &str = "known-connect-request";
+/// Accepted age of a known-device connect request.
+const KNOWN_CONNECT_SKEW_SECS: i64 = 120;
 
 /// A pairing query: SPAKE2 message A for one attempt. Contains nothing
 /// derived from the code that could be tested offline.
@@ -130,6 +133,21 @@ pub struct ReconnectOffer {
     pub device_name: String,
     pub host_ref: String,
     pub server_nonce: String,
+    pub signature: String,
+}
+
+/// A device that paired with the receiver before asks to start a new
+/// Bridge, signing with the identity key the receiver remembers. Bound to
+/// the request, both Hosts, a time and a nonce, so it cannot be replayed or
+/// redirected. The nonce becomes the client nonce of the reconnect-style
+/// handshake that completes the join.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct KnownConnectProof {
+    pub device_public_key: String,
+    pub target_host_ref: String,
+    pub issued_at: i64,
+    pub nonce: String,
     pub signature: String,
 }
 
@@ -1048,6 +1066,25 @@ pub(crate) struct VerifiedReconnectOffer {
 }
 
 impl ReconnectAttempt {
+    /// Completes a known-device connect: the Bridge id comes from the
+    /// receiver's offer, which must be signed by the remembered key for this
+    /// request's nonce.
+    pub(crate) fn for_known_connect(
+        request_id: &str,
+        room_id: &str,
+        nonce: [u8; 32],
+        local_host_ref: &HostRef,
+        pin: BridgePeerPin,
+    ) -> Self {
+        Self {
+            request_id: request_id.to_string(),
+            room_id: room_id.to_string(),
+            nonce,
+            local_host_ref: local_host_ref.as_str().to_string(),
+            pin,
+        }
+    }
+
     pub(crate) fn new(room_id: &str, local_host_ref: &HostRef, pin: BridgePeerPin) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -1152,6 +1189,116 @@ impl ReconnectAttempt {
             return Err(refused());
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Known devices
+// ---------------------------------------------------------------------------
+
+fn known_connect_digest(
+    request_id: &str,
+    requester_host_ref: &str,
+    target_host_ref: &str,
+    device_public_key: &str,
+    issued_at: i64,
+    nonce: &str,
+) -> [u8; 32] {
+    transcript(
+        "known-connect-request",
+        &[
+            request_id.as_bytes(),
+            requester_host_ref.as_bytes(),
+            target_host_ref.as_bytes(),
+            device_public_key.as_bytes(),
+            &issued_at.to_be_bytes(),
+            nonce.as_bytes(),
+        ],
+    )
+}
+
+/// This device's request to a device it remembers. Returns the proof and
+/// the nonce that the completing handshake reuses.
+pub(crate) fn sign_known_connect(
+    identity: &DeviceIdentity,
+    request_id: &str,
+    local_host_ref: &HostRef,
+    target_host_ref: &str,
+) -> (KnownConnectProof, [u8; 32]) {
+    let nonce = random_32();
+    let encoded_nonce = STANDARD.encode(nonce);
+    let device_public_key = STANDARD.encode(identity.public_key());
+    let issued_at = storage::now_ts();
+    let digest = known_connect_digest(
+        request_id,
+        local_host_ref.as_str(),
+        target_host_ref,
+        &device_public_key,
+        issued_at,
+        &encoded_nonce,
+    );
+    (
+        KnownConnectProof {
+            device_public_key,
+            target_host_ref: target_host_ref.to_string(),
+            issued_at,
+            nonce: encoded_nonce,
+            signature: STANDARD
+                .encode(identity.sign_bridge_transcript(SIGN_KNOWN_CONNECT, &digest)),
+        },
+        nonce,
+    )
+}
+
+/// The remembered device that signed `proof` for this exact request to
+/// this Host, or `None`. The request id's single use is enforced by the
+/// caller's nearby replay guard.
+pub(crate) fn verify_known_connect(
+    state: &AppState,
+    request_id: &str,
+    requester_device_id: &str,
+    proof: &KnownConnectProof,
+) -> Option<storage::KnownBridgeDevice> {
+    if proof.target_host_ref != state.local_host_ref.as_str()
+        || (storage::now_ts() - proof.issued_at).abs() > KNOWN_CONNECT_SKEW_SECS
+        || decode_32(&proof.nonce).is_none()
+    {
+        return None;
+    }
+    let key = decode_32(&proof.device_public_key)?;
+    let known = storage::known_device(&state.paths, &key).ok()??;
+    let requester_host_ref = HostRef::from_device_id(requester_device_id).ok()?;
+    if known.peer_host_ref != requester_host_ref.as_str() {
+        return None;
+    }
+    let digest = known_connect_digest(
+        request_id,
+        requester_host_ref.as_str(),
+        &proof.target_host_ref,
+        &proof.device_public_key,
+        proof.issued_at,
+        &proof.nonce,
+    );
+    let signature = STANDARD.decode(&proof.signature).ok()?;
+    device_identity::verify_bridge_transcript(&key, SIGN_KNOWN_CONNECT, &digest, &signature)
+        .then_some(known)
+}
+
+/// The reconnect query a known-device request stands for, so the receiver
+/// answers it with the same signed, single-use offer as a reconnect.
+pub(crate) fn known_connect_query(
+    request_id: &str,
+    room_id: &str,
+    requester_host_ref: &str,
+    proof: &KnownConnectProof,
+) -> ReconnectQuery {
+    ReconnectQuery {
+        kind: "reconnect_query".into(),
+        protocol: PROTOCOL.into(),
+        request_id: request_id.into(),
+        room_id: room_id.into(),
+        requester_host_ref: requester_host_ref.into(),
+        nonce: proof.nonce.clone(),
     }
 }
 
