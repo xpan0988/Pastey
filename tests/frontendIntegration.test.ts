@@ -154,6 +154,10 @@ test("a nearby join pairs only with the code the accepting device shows", () => 
 test("a Bridge without a verified device offers only explicit re-pairing", () => {
   const panel = readFileSync("src/features/workspace/BridgeNetworkPanel.tsx", "utf8");
   assert.match(panel, /openBridgePairing\(room\.id\)/);
+  // The other device's code re-pairs exactly this Bridge, never through New Bridge.
+  assert.match(panel, /repairBridge\(room\.id, pairCode\)/);
+  assert.match(panel, /Only the code decides which device is trusted/);
+  assert.doesNotMatch(panel, /same (other )?device/i);
   assert.match(panel, /pairing === "pairing_required" \? "Pairing required"/);
 });
 

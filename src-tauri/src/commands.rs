@@ -2878,7 +2878,15 @@ pub async fn join_room(code: String, state: State<'_, Arc<AppState>>) -> Result<
         let (source, verified) =
             discovery::discover_pairing(state.inner(), &compact, &discovery::DiscoveryTargets::Lan)
                 .await?;
-        join_discovered_room(state.inner().clone(), &compact, source, verified, None).await
+        join_discovered_room(
+            state.inner().clone(),
+            &compact,
+            source,
+            verified,
+            None,
+            None,
+        )
+        .await
     })
     .await
 }
@@ -2906,6 +2914,7 @@ pub async fn join_room_at(
             source,
             verified,
             Some(address),
+            None,
         )
         .await
     })
@@ -2921,6 +2930,7 @@ async fn join_discovered_room(
     source: std::net::SocketAddr,
     verified: crate::bridge_auth::VerifiedPairOffer,
     peer_address: Option<String>,
+    expected_room_id: Option<&str>,
 ) -> AppResult<RoomInfo> {
     let master_key = {
         let config = state.config.read();
@@ -2929,7 +2939,7 @@ async fn join_discovered_room(
     let offer = verified.offer.clone();
     let peer_host_ref =
         crate::host_identity::HostRef::parse_peer(offer.host_ref.clone(), &state.local_host_ref)?;
-    refuse_repairing_with_another_host(&state.paths, &offer.room_id, &peer_host_ref)?;
+    check_pairing_target(&state.paths, &offer.room_id, expected_room_id)?;
 
     let room = storage::create_room(
         &state.paths,
@@ -2948,6 +2958,7 @@ async fn join_discovered_room(
         transfer::post_join(&source.ip().to_string(), offer.port, &room.id, &request).await?;
     verified.verify_ack(&digest, &response)?;
 
+    establish_fresh_peer_trust(&state, &room.id, &verified.device_public_key)?;
     storage::pin_bridge_peer(
         &state.paths,
         &room.id,
@@ -2972,30 +2983,105 @@ async fn join_discovered_room(
     storage::room_to_info_with_bridge_peers(&state.paths, updated, &master_key)
 }
 
-/// A Host that knows a code can name any Bridge id in its offer. If this
-/// device already has that Bridge, only the same logical Host may pair it
-/// again, so a code for a new Bridge cannot take over an existing one.
-fn refuse_repairing_with_another_host(
+/// Which Bridge a code may pair. A Host that knows a code can name any Bridge
+/// id in its offer, so a code entered on New Bridge may only create a Bridge
+/// this device does not have; pairing an existing Bridge again is accepted
+/// only through that Bridge's own re-pair action, for exactly its id.
+fn check_pairing_target(
     paths: &storage::AppPaths,
-    room_id: &str,
-    peer_host_ref: &crate::host_identity::HostRef,
+    offered_room_id: &str,
+    expected_room_id: Option<&str>,
 ) -> AppResult<()> {
-    if storage::get_room_by_id(paths, room_id).is_err() {
+    match expected_room_id {
+        Some(expected) if expected != offered_room_id => Err(AppError::InvalidInput(
+            "That code is for a different Bridge.".into(),
+        )),
+        Some(_) => Ok(()),
+        None if storage::get_room_by_id(paths, offered_room_id).is_ok() => {
+            Err(AppError::InvalidInput(
+                "This device already has that Bridge. Open it and enter the code in its network panel to pair it again.".into(),
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Pairing that pins a device key other than the Bridge's current pin
+/// (including a Bridge with no pin, such as one from before pairing existed)
+/// is fresh trust: nothing earned by an earlier, unverified or different
+/// device carries over. Bridge-scoped runtime authority, Native Agent tasks,
+/// conversations and retained results, and folders shared with the Bridge
+/// are removed; Bridge history (items, Plans) and the device-key-bound
+/// unattended permissions stay. Re-pairing the same pinned device changes
+/// nothing.
+pub(crate) fn establish_fresh_peer_trust(
+    state: &Arc<AppState>,
+    room_id: &str,
+    device_public_key: &[u8; 32],
+) -> AppResult<()> {
+    if storage::bridge_peer_pin(&state.paths, room_id)?
+        .is_some_and(|pin| pin.peer_device_public_key == *device_public_key)
+    {
         return Ok(());
     }
-    let known = match storage::bridge_peer_pin(paths, room_id)? {
-        Some(pin) => Some(pin.peer_host_ref),
-        None => storage::list_bridge_peer_endpoints(paths, room_id)?
-            .into_iter()
-            .filter_map(|peer| peer.logical_host_ref)
-            .last(),
-    };
-    if known.is_some_and(|known| known != peer_host_ref.as_str()) {
-        return Err(AppError::InvalidInput(
-            "That code belongs to a different device than this Bridge's. Ask for a code on the Bridge's own device.".into(),
-        ));
-    }
+    let runtime = purge_bridge_runtime_authority(state, room_id);
+    state
+        .native_agents
+        .lock()
+        .readmit_bridge_after_fresh_trust(room_id);
+    runtime?;
+    crate::native_agent::purge_durable_bridge_state(&state.paths, room_id)?;
+    storage::delete_bridge_authorized_search_folders(&state.paths, room_id)?;
     Ok(())
+}
+
+/// Pairs this existing Bridge again with the code shown on the other device,
+/// for example a Bridge from before pairing existed. The code must belong to
+/// this Bridge. The remembered address is tried first, then this network.
+#[tauri::command]
+pub async fn repair_bridge(
+    room_id: String,
+    code: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<RoomInfo, String> {
+    run_async(async move {
+        let compact = normalize_code(&code)?;
+        let room = storage::get_room_by_id(&state.paths, &room_id)?;
+        if room.status == crate::models::RoomStatus::Burned {
+            return Err(AppError::InvalidInput("Bridge is burned.".into()));
+        }
+        let remembered = storage::get_bridge_peer_address(&state.paths, &room_id)?;
+        let unicast = match remembered.as_deref() {
+            Some(address) => match discovery::resolve_peer_targets(address).await {
+                Ok(targets) => discovery::discover_pairing(state.inner(), &compact, &targets)
+                    .await
+                    .ok(),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let (source, verified) = match unicast {
+            Some(found) => found,
+            None => {
+                discovery::discover_pairing(
+                    state.inner(),
+                    &compact,
+                    &discovery::DiscoveryTargets::Lan,
+                )
+                .await?
+            }
+        };
+        join_discovered_room(
+            state.inner().clone(),
+            &compact,
+            source,
+            verified,
+            None,
+            Some(&room_id),
+        )
+        .await
+    })
+    .await
 }
 
 /// The address this device uses to reach a Bridge's peer on another network,
@@ -3098,8 +3184,15 @@ pub async fn complete_nearby_join(
             &discovery::DiscoveryTargets::nearby(accepted.source),
         )
         .await?;
-        let room =
-            join_discovered_room(state.inner().clone(), &compact, source, verified, None).await?;
+        let room = join_discovered_room(
+            state.inner().clone(),
+            &compact,
+            source,
+            verified,
+            None,
+            None,
+        )
+        .await?;
         state.accepted_nearby_joins.lock().remove(&request_id);
         logging::write_transfer_line("[pastey antenna] event=join_accepted");
         Ok(room)
@@ -8023,17 +8116,15 @@ mod tests {
     }
 
     #[test]
-    fn a_code_cannot_redirect_an_existing_bridge_to_another_host() {
+    fn a_code_pairs_an_existing_bridge_only_through_its_own_repair_action() {
         let root = std::env::temp_dir().join(format!("pastey-repair-{}", uuid::Uuid::new_v4()));
         let paths = storage::AppPaths::new(root.clone(), root.join("logs"));
         paths.ensure_directories().unwrap();
         storage::init_database(&paths).unwrap();
-        let original = crate::host_identity::HostRef::from_device_id("original").unwrap();
-        let other = crate::host_identity::HostRef::from_device_id("other").unwrap();
-        // A Bridge this device does not have yet: any Host may pair it.
-        assert!(refuse_repairing_with_another_host(&paths, "new-bridge", &other).is_ok());
+        // New Bridge: any Bridge this device does not have yet.
+        assert!(check_pairing_target(&paths, "new-bridge", None).is_ok());
 
-        let room = storage::create_room(
+        storage::create_room(
             &paths,
             &[3u8; 32],
             "12345678",
@@ -8043,64 +8134,12 @@ mod tests {
             None,
         )
         .unwrap();
-        // Unpinned (from before pairing): bound to the HostRef last seen.
-        storage::update_room_peer(
-            &paths,
-            &room.id,
-            Some("192.168.1.20"),
-            Some(5000),
-            Some("peer"),
-            Some(&crypto::encode_key(&[5u8; 32])),
-            crate::models::RoomStatus::Active,
-        )
-        .unwrap();
-        storage::bind_legacy_room_peer_host_ref(&paths, &room.id, original.as_str()).unwrap();
-        assert!(refuse_repairing_with_another_host(&paths, &room.id, &original).is_ok());
-        assert!(refuse_repairing_with_another_host(&paths, &room.id, &other).is_err());
-        // Pinned: bound to the pinned HostRef.
-        storage::pin_bridge_peer(&paths, &room.id, original.as_str(), &[9u8; 32]).unwrap();
-        assert!(refuse_repairing_with_another_host(&paths, &room.id, &original).is_ok());
-        assert!(refuse_repairing_with_another_host(&paths, &room.id, &other).is_err());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// Characterization (legacy re-pairing, joiner side): the continuity
-    /// check compares HostRefs, and a HostRef is computable by anyone from the
-    /// `device_id` every nearby beacon broadcasts. It guards against a
-    /// mistaken code, not against a device that claims the original HostRef.
-    #[test]
-    fn characterization_repairing_continuity_rests_on_a_claimable_host_ref() {
-        let root =
-            std::env::temp_dir().join(format!("pastey-repair-claim-{}", uuid::Uuid::new_v4()));
-        let paths = storage::AppPaths::new(root.clone(), root.join("logs"));
-        paths.ensure_directories().unwrap();
-        storage::init_database(&paths).unwrap();
-        let broadcast_device_id = "original-device-id";
-        let original = crate::host_identity::HostRef::from_device_id(broadcast_device_id).unwrap();
-        let room = storage::create_room(
-            &paths,
-            &[3u8; 32],
-            "12345678",
-            15,
-            LocalRole::Joined,
-            Some("legacy".into()),
-            None,
-        )
-        .unwrap();
-        storage::update_room_peer(
-            &paths,
-            &room.id,
-            Some("192.168.1.20"),
-            Some(5000),
-            Some("peer"),
-            Some(&crypto::encode_key(&[5u8; 32])),
-            crate::models::RoomStatus::Active,
-        )
-        .unwrap();
-        storage::bind_legacy_room_peer_host_ref(&paths, &room.id, original.as_str()).unwrap();
-        // An impostor that read the beacon derives the same HostRef.
-        let claimed = crate::host_identity::HostRef::from_device_id(broadcast_device_id).unwrap();
-        assert!(refuse_repairing_with_another_host(&paths, &room.id, &claimed).is_ok());
+        // A code from New Bridge cannot take over an existing Bridge, whatever
+        // HostRef the offering Host claims.
+        assert!(check_pairing_target(&paths, "existing", None).is_err());
+        // The Bridge's own re-pair action accepts a code for exactly it.
+        assert!(check_pairing_target(&paths, "existing", Some("existing")).is_ok());
+        assert!(check_pairing_target(&paths, "another", Some("existing")).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 }

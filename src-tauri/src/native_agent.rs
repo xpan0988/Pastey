@@ -5470,6 +5470,13 @@ impl NativeAgentServiceV1 {
     /// Revokes only authority derived through one Bridge. The bridge marker is
     /// installed before native cancellation and cleanup so a late observer or
     /// remote fact cannot recreate a deleted envelope.
+    /// After `purge_bridge_authority` for a Bridge that continues with a
+    /// newly trusted peer (not a Burn): the Bridge may admit new work again.
+    /// Nothing from before the purge comes back.
+    pub(crate) fn readmit_bridge_after_fresh_trust(&mut self, bridge_id: &str) {
+        self.revoked_bridges.remove(bridge_id);
+    }
+
     pub(crate) fn purge_bridge_authority(&mut self, bridge_id: &str) -> AppResult<()> {
         self.revoked_bridges.insert(bridge_id.to_owned());
         self.pending_reviews

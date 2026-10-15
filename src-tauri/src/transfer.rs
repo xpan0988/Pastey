@@ -2989,6 +2989,12 @@ async fn join_handler(
                     auth: Some(admitted.ack),
                 }));
             }
+            crate::commands::establish_fresh_peer_trust(
+                &ctx.state,
+                &room_id,
+                &admitted.peer_device_public_key,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
             // One code admits one device, then it is spent.
             storage::close_pairing_window(&ctx.state.paths, &room_id)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -7480,12 +7486,47 @@ mod join_authentication {
             .any(|bytes| bytes.as_slice() == b"AAAABBBBCCCC"));
     }
 
-    /// Characterization (legacy re-pairing): with no pin, the Host side of a
-    /// legacy Bridge admits whichever device presents the fresh code. It does
-    /// not authenticate the original device; the code typed by the user is
-    /// the only authenticator.
+    fn share_folder_with_bridge(host: &HostFixture) {
+        let folder = host.root.join("shared");
+        std::fs::create_dir_all(&folder).unwrap();
+        storage::add_authorized_search_folder(
+            &host.state.paths,
+            &storage::StoredAuthorizedSearchFolder {
+                folder_id: uuid::Uuid::new_v4().to_string(),
+                canonical_path: folder.display().to_string(),
+                display_name: "shared".into(),
+                created_at: storage::now_ts(),
+                bridge_id: Some(ROOM_ID.into()),
+            },
+        )
+        .unwrap();
+        storage::save_native_agent_conversation(
+            &host.state.paths,
+            "conversation-1",
+            Some(ROOM_ID),
+            "{}",
+        )
+        .unwrap();
+    }
+
+    fn bridge_authority_count(host: &HostFixture) -> usize {
+        let shares = storage::list_authorized_search_folders(&host.state.paths)
+            .unwrap()
+            .into_iter()
+            .filter(|folder| folder.bridge_id.as_deref() == Some(ROOM_ID))
+            .count();
+        let conversations =
+            storage::get_native_agent_conversation(&host.state.paths, "conversation-1")
+                .unwrap()
+                .map_or(0, |_| 1);
+        shares + conversations
+    }
+
+    /// Decision 1: a legacy Bridge (no verified device key) re-pairs only as
+    /// fresh trust. The code holder is admitted, but nothing granted under
+    /// the old, unverified peer carries over; Bridge history stays.
     #[tokio::test]
-    async fn characterization_legacy_repairing_admits_any_device_holding_the_code() {
+    async fn legacy_repairing_is_fresh_trust_and_inherits_no_remote_authority() {
         let host = HostFixture::new("legacy-repair").await;
         let original = Joiner::new("original-device");
         storage::update_room_peer(
@@ -7500,21 +7541,58 @@ mod join_authentication {
         .unwrap();
         storage::bind_legacy_room_peer_host_ref(&host.state.paths, ROOM_ID, &original.host_ref)
             .unwrap();
+        storage::persist_incoming_item(
+            &host.state.paths,
+            &[41u8; 32],
+            ROOM_ID,
+            "history-item",
+            PayloadType::Text,
+            b"kept",
+            None,
+            None,
+            storage::now_ts(),
+            None,
+        )
+        .unwrap();
         storage::mark_rooms_left_on_startup(&host.state.paths).unwrap();
-        assert!(storage::bridge_peer_pin(&host.state.paths, ROOM_ID)
-            .unwrap()
-            .is_none());
+        share_folder_with_bridge(&host);
+        assert_eq!(bridge_authority_count(&host), 2);
 
-        let other = Joiner::new("a-different-device");
-        other
+        let repairing = Joiner::new("original-device");
+        repairing
             .pair(&host, CODE)
             .await
-            .expect("any holder of the code pairs");
+            .expect("the code holder pairs");
         let pin = storage::bridge_peer_pin(&host.state.paths, ROOM_ID)
             .unwrap()
             .unwrap();
-        assert_eq!(pin.peer_host_ref, other.host_ref);
-        assert_ne!(pin.peer_host_ref, original.host_ref);
+        assert_eq!(pin.peer_device_public_key, repairing.identity.public_key());
+        assert_eq!(bridge_authority_count(&host), 0, "nothing inherited");
+        assert!(storage::list_room_items(&host.state.paths, ROOM_ID)
+            .unwrap()
+            .iter()
+            .any(|item| item.id == "history-item"));
+
+        // Pairing the same verified device again is not fresh trust.
+        share_folder_with_bridge(&host);
+        storage::open_pairing_window(&host.state.paths, ROOM_ID, storage::now_ts() + 600).unwrap();
+        repairing
+            .pair(&host, CODE)
+            .await
+            .expect("the same device pairs again");
+        assert_eq!(
+            bridge_authority_count(&host),
+            2,
+            "same key keeps its grants"
+        );
+
+        // A different device is fresh trust again.
+        storage::open_pairing_window(&host.state.paths, ROOM_ID, storage::now_ts() + 600).unwrap();
+        Joiner::new("someone-else")
+            .pair(&host, CODE)
+            .await
+            .expect("a new code holder pairs");
+        assert_eq!(bridge_authority_count(&host), 0);
     }
 
     /// The production sender and receiver agree end to end: chunks bound to

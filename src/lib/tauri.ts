@@ -597,6 +597,14 @@ export function openBridgePairing(roomId: string): Promise<RoomInfo> {
   return invoke("open_bridge_pairing", { roomId });
 }
 
+/** Pairs this existing Bridge again with the code shown on the other
+ * device. The code must belong to this Bridge. Pairing a device other than
+ * the one this Bridge last verified is fresh trust: nothing granted before
+ * carries over. */
+export function repairBridge(roomId: string, code: string): Promise<RoomInfo> {
+  return invoke("repair_bridge", { roomId, code });
+}
+
 export async function acceptNearbyJoin(requestId: string): Promise<RoomInfo> {
   return invoke("accept_nearby_join", { requestId });
 }
