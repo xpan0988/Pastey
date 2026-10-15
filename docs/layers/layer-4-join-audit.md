@@ -141,7 +141,7 @@ The audit added seven `characterization_*` tests that asserted the insecure beha
 Option A is implemented in `src-tauri/src/bridge_auth.rs` with SPAKE2 from RustCrypto's `spake2` 0.4 (Ed25519 group). It is wired into discovery, `/join`, reconnect, the room routes and the renderer. Both devices must run the new version; an older peer can neither pair nor reconnect, which fails closed.
 
 Decisions applied:
-- **Existing Bridges** are not trusted on upgrade: without a pin they do not reconnect, and they keep their local data. Startup recovery already clears every legacy route and key. A user re-pairs by showing a new code ("Show new code" in the Bridge network panel) and entering it on the other device. The joining side refuses a code whose offer names a different HostRef than that Bridge's last known or pinned peer. This guards against a mistaken code only: a HostRef is not cryptographic, and the Host side does not check it (section 8).
+- **Existing Bridges** are not trusted on upgrade: without a pin they do not reconnect, and they keep their local data. Startup recovery already clears every legacy route and key. A user re-pairs by showing a new code ("Show new code" in the Bridge network panel) and entering it on the other device. (Superseded in section 8: an existing Bridge now re-pairs only through its own `repair_bridge` action, and pairing any new device key is fresh trust.)
 - **Nearby**: the accepting device shows a fresh one-time code and the requester types it. The acceptance carries no secret.
 
 | # | Status | How | Evidence (all local tests, loopback) |
@@ -181,12 +181,11 @@ What re-pairing proves is that the other device knows the fresh one-time code sh
 - **Host side** (the device showing the code): it admits any device that completes pairing with the code, whatever HostRef it claims. Test: `transfer::join_authentication::characterization_legacy_repairing_admits_any_device_holding_the_code`.
 - **Joining side** (the device typing the code): `refuse_repairing_with_another_host` compares the offer's HostRef with the Bridge's last known peer HostRef. Anyone who heard a beacon can compute that HostRef, so the check only stops a code typed by mistake for another Bridge's Host. Test: `commands::tests::characterization_repairing_continuity_rests_on_a_claimable_host_ref`.
 
-Options before Stage 3; none is implemented:
-1. Show both devices' identity fingerprints after a re-pair and ask the user to confirm they match. The fingerprint display already exists for unattended access. This is the only option that authenticates the original *physical* device without prior state.
-2. Make the Host side apply the same HostRef continuity check as the joining side. This is cheap and symmetric, but still not cryptographic.
-3. Treat a legacy Bridge as new: drop its peer history and pair from scratch. This is the simplest honest model, at the cost of continuity.
-
-Stage 3 must not pin an iroh `EndpointId` to a legacy Bridge's peer until one of these is decided. Otherwise the reachability pin inherits the weaker of the two guarantees.
+**Resolved (post-Stage-2 closure):**
+- A Bridge with no verified device key pairs again only by explicit fresh trust. Pairing any device key other than the current pin removes the Bridge's runtime authority, Native Agent tasks, Reviews, conversations and retained results, and its shared folders; it keeps items and Plans.
+- The joining side's HostRef continuity check is removed. In its place, a code entered under New Bridge is refused if it names a Bridge this device already has, and an existing Bridge is paired only through its own `repair_bridge` action, for exactly its id.
+- Nothing claims to identify the original physical device; the user giving the code to a device decides.
+- Regression tests: `transfer::join_authentication::legacy_repairing_is_fresh_trust_and_inherits_no_remote_authority` and `commands::tests::a_code_pairs_an_existing_bridge_only_through_its_own_repair_action`. They replace the two characterization tests above.
 
 ### HTTP chunk authentication: remaining limitations
 
@@ -194,10 +193,16 @@ The room server authenticates who may start, finish and cancel a transfer (secti
 - **Kill a transfer.** One unsigned, malformed `POST /transfers/{id}/chunks` naming an active transfer id makes the receiver fail and drop that transfer. Transfer ids are visible in clear URLs. Test: `characterization_an_unsigned_malformed_chunk_ends_an_active_transfer`.
 - **Reorder content.** A chunk's AEAD (ChaCha20-Poly1305, random nonce, no associated data) binds neither its index nor its transfer. A party that swaps two chunk bodies in flight produces a reordered file, which the receiver accepts, and the signed finish succeeds, because finish checks sizes and counts but not a whole-file digest. Content cannot be forged or read, and chunks from another transfer fail to decrypt, because each transfer has its own key. Test: `characterization_chunk_bodies_are_not_bound_to_their_index`.
 
-Fixes, each local and small, but changing the chunk wire format:
-- put `(transfer id, chunk index, is_final, plaintext size)` into the AEAD associated data;
-- verify a sender-supplied BLAKE3 digest of the plaintext at finish;
-- make decrypt or decode failures from an unauthenticated chunk reject only that request, without failing the transfer.
+**Resolved (post-Stage-2 closure):**
+- Chunk AEAD associated data now binds transfer id, chunk index, total chunks, plaintext size and the final flag.
+- The signed finish carries the BLAKE3 of the whole plaintext, which the receiver verifies before finalizing.
+- Chunk requests that fail before or during decryption are refused without failing the transfer.
+- Regression tests replace the characterizations:
+  - `a_chunk_body_moved_to_another_index_is_rejected`
+  - `unauthenticated_chunk_traffic_does_not_end_a_transfer`
+  - `a_file_whose_digest_does_not_match_is_not_finalized`
+  - `a_real_file_transfer_round_trips_with_bound_chunks_and_a_verified_digest`, which runs the production sender against the production receiver
+- What remains for an on-path party is delay, drop and metadata.
 
 Moving Bridge traffic onto QUIC (Stage 3) would stop on-path parties seeing or touching the HTTP layer. These fixes still matter for LAN and overlay routes, which stay on TCP.
 

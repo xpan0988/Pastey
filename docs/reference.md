@@ -211,7 +211,19 @@ Protocol `pastey-bridge-auth-v1` (`src-tauri/src/bridge_auth.rs`). Discovery mes
 
 Bounds: a pairing code answers at most 20 pairing queries and expires after 15 minutes; one success closes it. A joiner evaluates at most 16 offers per attempt. A pending pairing lasts 120 s; a reconnect nonce 60 s, at most 16 per Bridge. Request timestamps may differ by 120 s; each room server remembers at most 4,096 request nonces. Nearby join prompts: one pending per source address, four in total.
 
-Storage: `bridge_peer_pins` (Bridge id → peer HostRef and device key) and `bridge_pairing_windows` (open time, expiry, answered count, close time). Both are deleted at the Burn authority cutoff; an authenticated departure deletes the pin. `RoomInfo.pairing_state` is `paired`, `awaiting_peer` or `pairing_required`. Commands: `open_bridge_pairing` (fresh code for an existing Bridge), `request_nearby_join` (returns a pending request), `complete_nearby_join` (request id and code).
+Transfer integrity:
+- **Chunk binding:** each chunk is ChaCha20-Poly1305 under the transfer's session key, with associated data `pastey-transfer-chunk-v2\0` ‖ len(transfer id) ‖ transfer id ‖ chunk index ‖ total chunks ‖ plaintext size (big-endian u64 each) ‖ final flag (1 byte). The format is defined in `src-tauri/src/chunk_frame.rs`.
+- **Final digest:** the signed `finish` request carries `plaintext_blake3`, the BLAKE3 of the whole plaintext; the receiver re-reads the assembled file and finalizes only on a match.
+- **Unauthenticated chunks:** a chunk request that fails before or during decryption is refused alone and never ends the transfer. Only an authenticated inconsistency or a local write failure fails it.
+
+Fresh trust: pairing a device key other than the Bridge's current pin runs `establish_fresh_peer_trust` (`src-tauri/src/commands.rs`) before pinning. It removes:
+- Bridge-scoped runtime authority (`purge_bridge_runtime_authority`, after which the Bridge is re-admitted for new work);
+- durable Native Agent Bridge state (`purge_durable_bridge_state`);
+- `authorized_search_folders` rows for the Bridge.
+
+A code entered under New Bridge, nearby or overlay join is refused if it names a Bridge this device already has. `repair_bridge` (Bridge id and code) pairs exactly that Bridge again, trying the remembered address first and then the LAN.
+
+Storage: `bridge_peer_pins` (Bridge id → peer HostRef and device key) and `bridge_pairing_windows` (open time, expiry, answered count, close time). Both are deleted at the Burn authority cutoff; an authenticated departure deletes the pin. `RoomInfo.pairing_state` is `paired`, `awaiting_peer` or `pairing_required`. Commands: `open_bridge_pairing` (fresh code for an existing Bridge), `repair_bridge` (pair an existing Bridge with the other device's code), `request_nearby_join` (returns a pending request), `complete_nearby_join` (request id and code).
 
 ## Developer Terminal protocol and bounds
 

@@ -120,9 +120,18 @@ The test-only `native_agent::tests::pair_harness` scenarios use Requester Host A
 
 The remaining Phase 2 gate is a Native Agent physical multi-device procedure and recorded Mac ↔ Windows evidence before claiming movement reliability across actual devices. It must exercise a connected remote Host, explicit requester movement review, the executing Host's Accept and Deny, encrypted outbound and return transfer, stale/replaced-session rejection, interruption and restart behavior, cancellation races, replay rejection, source-change conflict retention, and recovery presentation. Keep recorded evidence non-secret: never include provider credentials, native session identifiers, Host paths, grants, ObjectRefs, or raw Agent/terminal content.
 
-## Manual two-device smoke
+## Mac ↔ Windows physical acceptance
 
-With packaged builds on two supported desktops, a manual Bridge smoke may exercise ordinary transfer and lifecycle behavior: connect two Hosts, restart one Host and verify fresh sessions reject old routes, exercise ordinary text/file transfer and explicit departure, and Burn locally without claiming a remote Burn. This is not a replacement for Native Agent physical validation.
+The consolidated physical procedure is [Mac ↔ Windows acceptance](platform/mac-windows-acceptance.md). It replaces the earlier manual two-device smoke and covers:
+- secure pairing;
+- LAN Bridge operation;
+- reconnection;
+- representative Agent and file workflows;
+- overlay reach;
+- Burn;
+- native P2P traversal measurements with the isolated `tools/net-probe` (iroh is not in the app).
+
+Each step stays untested until it is recorded on real devices.
 
 ## Developer Terminal physical checks
 
