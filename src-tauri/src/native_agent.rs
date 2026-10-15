@@ -10772,9 +10772,16 @@ done
         fs::create_dir_all(&workspace).unwrap();
         let file = workspace.join("pastey-native-agent-acceptance.txt");
         // A local task's native approvals are never answerable from Pastey,
-        // so this run asks for none.
+        // so this run asks for none and may write only its disposable
+        // workspace.
         #[cfg(unix)]
-        let codex = installed_codex_with(&root, &["approval_policy=\"never\""]);
+        let codex = installed_codex_with(
+            &root,
+            &[
+                "approval_policy=\"never\"",
+                "sandbox_mode=\"workspace-write\"",
+            ],
+        );
         #[cfg(not(unix))]
         let codex = capability::codex::installed_codex_program()
             .expect("an installed Codex")
@@ -10808,9 +10815,13 @@ done
             wait_for_live_terminal(&service, &second.task_id).state,
             NativeAgentTaskStateV1::Completed
         );
+        // Whether the model ends the file with a newline is its choice.
         assert_eq!(
-            fs::read_to_string(&file).unwrap(),
-            "first native turn\nsecond native turn\n"
+            fs::read_to_string(&file)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["first native turn", "second native turn"]
         );
         service.shutdown();
         let _ = fs::remove_dir_all(root);

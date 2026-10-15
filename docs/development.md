@@ -124,7 +124,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_codex -- 
 
 - `installed_codex_is_discovered_with_its_backend` reports which installation Pastey selects.
 - `installed_codex_runs_a_bridge_task_with_its_requesters_approval` runs a Bridge task from a verified requesting device under a read-only sandbox, so the write needs that requester's native approval through `submit_native_decision`.
-- `installed_codex_modifies_a_disposable_original_workspace_and_reuses_its_session` runs two local turns in one session. It runs with `approval_policy="never"`, because a local task's native approvals cannot be answered from Pastey.
+- `installed_codex_modifies_a_disposable_original_workspace_and_reuses_its_session` runs two local turns in one session. It runs with `approval_policy="never"` and `sandbox_mode="workspace-write"`, because a local task's native approvals cannot be answered from Pastey.
 
 The last two pass their settings through Codex's own `-c` flag for that run only; the user's configuration is unchanged. They work in disposable folders.
 
