@@ -163,7 +163,7 @@ export function nativeAgentDisplayName(agentId: string | null | undefined): stri
 /** A selected Host's advertised capability as the card presents it. */
 export type NativeAgentTargetAvailability =
   | { state: "checking" }
-  | { state: "available" | "incompatible" | "unavailable"; reason?: string | null; detail?: string | null }
+  | { state: "available" | "incompatible" | "unavailable"; reason?: string | null; detail?: string | null; backend?: "cli" | "desktop" | null }
   | { state: "unknown"; message: string };
 
 export function nativeAgentTargetAvailability(

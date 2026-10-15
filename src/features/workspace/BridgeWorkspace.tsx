@@ -284,7 +284,7 @@ function NativeAgentTaskCard({ roomId, peers }: { roomId: string; peers: ReturnT
 }
 
 function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {
-  return { state: codex?.state ?? "unavailable", reason: codex?.reason ?? null, detail: codex?.detail ?? null };
+  return { state: codex?.state ?? "unavailable", reason: codex?.reason ?? null, detail: codex?.detail ?? null, backend: codex?.backend ?? null };
 }
 
 /** What to tell the user about an unusable Codex, by the layer that failed. */
@@ -317,7 +317,11 @@ function availabilityCopy(availability: NativeAgentTargetAvailability, remoteNam
       return availability.detail ? `${copy} (${availability.detail})` : copy;
     }
     case "available":
-      if (!remoteName) return "Codex is ready to use its native session.";
+      if (!remoteName) {
+        return availability.backend === "desktop"
+          ? "Codex from the ChatGPT desktop app is ready to use its native session. No separate Codex CLI is needed."
+          : "Codex is ready to use its native session.";
+      }
       return workspaceIsLocal
         ? `Codex is available on ${where}. Pastey will review sending this workspace there and returning its result.`
         : `Codex is available on ${where}. It runs in an existing workspace there after ${where} accepts; no files move.`;

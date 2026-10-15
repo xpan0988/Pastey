@@ -971,6 +971,9 @@ pub(crate) struct NativeAgentCapabilityV1 {
     /// sent to a peer: it may name local paths and program output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
+    /// This Host only: which installation provides it (`cli` or `desktop`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) backend: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3568,15 +3571,6 @@ impl NativeAgentServiceV1 {
             return Err(error);
         }
         self.movement_status(movement_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn start_codex_task(
-        &mut self,
-        workspace: &Path,
-        task: &str,
-    ) -> AppResult<NativeAgentTaskStatusV1> {
-        self.start_codex_conversation_task(workspace, task, false)
     }
 
     /// Continues this Host user's Codex conversation in `workspace` (or
@@ -6818,6 +6812,7 @@ pub(crate) fn remote_native_capabilities(
                     .flatten(),
                 state,
                 detail: None,
+                backend: None,
             }
         })
         .collect()
@@ -10514,12 +10509,30 @@ done
         panic!("fixture native Agent did not release its workspace")
     }
 
+    /// Live runs use the user's own model settings, which may reason for
+    /// minutes; each change of state or pending request is printed.
     fn wait_for_live_terminal(
         service: &NativeAgentServiceV1,
         task_id: &str,
     ) -> NativeAgentTaskStatusV1 {
-        for _ in 0..720 {
+        let started = std::time::Instant::now();
+        let mut last = String::new();
+        while started.elapsed() < Duration::from_secs(600) {
             let status = service.task_status(task_id).unwrap();
+            let summary = format!(
+                "state={:?} code={:?} decisions={:?}",
+                status.state,
+                status.code,
+                status
+                    .native_decisions
+                    .iter()
+                    .map(|review| (&review.kind, &review.state))
+                    .collect::<Vec<_>>()
+            );
+            if summary != last {
+                eprintln!("[live {:>4}s] {summary}", started.elapsed().as_secs());
+                last = summary;
+            }
             if status.state != NativeAgentTaskStateV1::Running {
                 return status;
             }
@@ -10758,9 +10771,18 @@ done
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).unwrap();
         let file = workspace.join("pastey-native-agent-acceptance.txt");
+        // A local task's native approvals are never answerable from Pastey,
+        // so this run asks for none.
+        #[cfg(unix)]
+        let codex = installed_codex_with(&root, &["approval_policy=\"never\""]);
+        #[cfg(not(unix))]
+        let codex = capability::codex::installed_codex_program()
+            .expect("an installed Codex")
+            .0;
         let mut service = NativeAgentServiceV1::default();
         let first = service
-            .start_codex_task(
+            .start_codex_task_with_executable(
+                &codex,
                 &workspace,
                 "Create pastey-native-agent-acceptance.txt in this workspace containing exactly `first native turn`. Do not only describe the change; make it.",
             )
@@ -10775,7 +10797,8 @@ done
             "first native turn"
         );
         let second = service
-            .start_codex_task(
+            .start_codex_task_with_executable(
+                &codex,
                 &workspace,
                 "In the file you created in the preceding turn, append exactly one new line: `second native turn`. Make the edit now.",
             )
@@ -10791,6 +10814,131 @@ done
         );
         service.shutdown();
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// D1 live: what this Host's real installations offer. On a Mac with
+    /// only the desktop app, the bundled Codex is found and named.
+    #[test]
+    #[ignore = "observes this Host's real Codex installations"]
+    fn installed_codex_is_discovered_with_its_backend() {
+        let report = capability::codex::codex_probe_at(Path::new("codex"), Duration::from_secs(30));
+        eprintln!(
+            "installed Codex: state={:?} backend={:?} reason={:?} detail={:?}",
+            report.state, report.backend, report.reason, report.detail
+        );
+        assert_eq!(report.state, NativeCapabilityStateForTest::Available);
+    }
+
+    use NativeAgentCapabilityStateV1 as NativeCapabilityStateForTest;
+
+    /// A live launcher for the installed Codex with configuration values
+    /// overridden for this run through Codex's own `-c` flag; the user's
+    /// configuration is not touched.
+    #[cfg(unix)]
+    fn installed_codex_with(root: &Path, overrides: &[&str]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let (program, backend) =
+            capability::codex::installed_codex_program().expect("an installed Codex");
+        eprintln!("live run uses the {backend} backend: {}", program.display());
+        let overrides: String = overrides
+            .iter()
+            .map(|value| format!(" -c '{value}'"))
+            .collect();
+        let wrapper = root.join("codex-live");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexec '{}'{overrides} \"$@\"\n",
+                program.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        wrapper
+    }
+
+    /// D1 live, product path: a Bridge task from a verified requesting
+    /// device runs on the installed Codex (on a Mac with only the desktop
+    /// app, its bundled Codex) under the user's own approval policy. Each
+    /// native approval is shown to and decided by that requester through
+    /// `submit_native_decision`, and the result comes back as the task's.
+    #[test]
+    #[ignore = "requires an installed, authenticated Codex app-server"]
+    fn installed_codex_runs_a_bridge_task_with_its_requesters_approval() {
+        let mut h = unattended_fixture();
+        // A read-only sandbox that may ask: the write cannot happen without
+        // the requester's native approval.
+        #[cfg(unix)]
+        let codex = installed_codex_with(
+            &h.root,
+            &[
+                "approval_policy=\"on-request\"",
+                "sandbox_mode=\"read-only\"",
+            ],
+        );
+        #[cfg(not(unix))]
+        let codex = capability::codex::installed_codex_program()
+            .expect("an installed Codex")
+            .0;
+        h.service.codex.use_executable(&codex);
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s-live");
+        h.trust_and_grant(&device, 24, 5);
+        let workspace = h.workspace.clone();
+        h.invoke(
+            &binding,
+            Some(&device),
+            "task-live",
+            &workspace,
+            "Using a single shell command, create a file named pastey-live.txt in this workspace containing exactly `desktop codex`. Then reply with the word done.",
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let mut approved = 0;
+        let terminal =
+            loop {
+                assert!(
+                    started.elapsed() < Duration::from_secs(600),
+                    "no bounded outcome"
+                );
+                let status = h.service.task_status("task-live").unwrap();
+                if status.state != NativeAgentTaskStateV1::Running {
+                    break status;
+                }
+                if let Some(review) = status.native_decisions.iter().find(|review| {
+                    review.state == NativeDecisionStateV1::Pending && review.can_accept
+                }) {
+                    eprintln!(
+                        "[live {:>4}s] requester approves {:?}: {:?}",
+                        started.elapsed().as_secs(),
+                        review.kind,
+                        review.content
+                    );
+                    let review = review.clone();
+                    h.decide(
+                        &binding,
+                        Some(&device),
+                        "task-live",
+                        &review,
+                        NativeDecisionV1::Accept,
+                    )
+                    .unwrap();
+                    approved += 1;
+                }
+                thread::sleep(Duration::from_millis(250));
+            };
+        eprintln!(
+            "terminal: state={:?} code={:?} result={:?} approvals={approved}",
+            terminal.state, terminal.code, terminal.result
+        );
+        assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+        #[cfg(unix)]
+        assert!(approved > 0, "the run asked for no native approval");
+        assert_eq!(
+            fs::read_to_string(workspace.join("pastey-live.txt"))
+                .unwrap()
+                .trim(),
+            "desktop codex"
+        );
     }
 
     #[test]

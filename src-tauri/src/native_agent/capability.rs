@@ -212,6 +212,9 @@ pub(crate) struct CapabilityAvailabilityV1 {
     pub(crate) state: NativeAgentCapabilityStateV1,
     pub(crate) reason: Option<&'static str>,
     pub(crate) detail: Option<String>,
+    /// Which installation provides it, when there can be several (for Codex:
+    /// `cli` on PATH or `desktop`, the one bundled with the desktop app).
+    pub(crate) backend: Option<&'static str>,
 }
 
 impl CapabilityAvailabilityV1 {
@@ -220,6 +223,7 @@ impl CapabilityAvailabilityV1 {
             state,
             reason: None,
             detail: None,
+            backend: None,
         }
     }
 }
@@ -257,6 +261,7 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
             state: report.state,
             reason: report.reason.map(str::to_string),
             detail: report.detail,
+            backend: report.backend.map(str::to_string),
         }
     }
 

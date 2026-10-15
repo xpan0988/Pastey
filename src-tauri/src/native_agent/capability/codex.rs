@@ -172,6 +172,13 @@ struct CachedAvailabilityV1 {
     report: CapabilityAvailabilityV1,
 }
 
+/// Which installation a launched Codex comes from.
+pub(in crate::native_agent) const BACKEND_CLI: &str = "cli";
+pub(in crate::native_agent) const BACKEND_DESKTOP: &str = "desktop";
+const BACKEND_CONFIGURED: &str = "configured";
+/// The layout manifest the desktop app ships next to its bundled Codex.
+const DESKTOP_CODEX_MANIFEST: &str = "codex-package.json";
+
 #[derive(Default)]
 struct AvailabilityCacheStateV1 {
     observed: Option<CachedAvailabilityV1>,
@@ -231,14 +238,23 @@ fn cached_report(
 
 /// Probes now, without holding the cache, and records the observation.
 fn observe_report(cache: &AvailabilityCacheV1, executable: &Path) -> CapabilityAvailabilityV1 {
-    let report = codex_probe_at(executable, PROBE_TIMEOUT);
+    observe_selection(cache, executable).0
+}
+
+/// Probes now and returns the observation with the launcher it chose.
+fn observe_selection(
+    cache: &AvailabilityCacheV1,
+    executable: &Path,
+) -> (CapabilityAvailabilityV1, Option<CodexLauncherV1>) {
+    let (report, launcher) = codex_probe_selecting(executable, PROBE_TIMEOUT);
     // A local diagnostic line on each change; no path or program output.
     crate::logging::write_transfer_line_if_changed(
         "native_agent_codex_availability",
         &format!(
-            "[pastey native-agent] event=codex_availability state={:?} reason={}",
+            "[pastey native-agent] event=codex_availability state={:?} reason={} backend={}",
             report.state,
-            report.reason.unwrap_or("none")
+            report.reason.unwrap_or("none"),
+            report.backend.unwrap_or("none")
         ),
     );
     if let Ok(mut cache) = cache.lock() {
@@ -249,7 +265,7 @@ fn observe_report(cache: &AvailabilityCacheV1, executable: &Path) -> CapabilityA
         });
         cache.refreshing = false;
     }
-    report
+    (report, launcher)
 }
 
 /// Where one task stands with respect to its app-server.
@@ -757,14 +773,18 @@ impl CodexInvocationRunV1 {
         if self.slot.stop_requested() {
             return Err(stopped());
         }
-        // Execution-time compatibility, observed afresh.
-        let report = observe_report(&self.availability, &self.executable);
-        if report.state != NativeAgentCapabilityStateV1::Available {
-            return Err(not_started(
-                NativeTurnOutcomeV1::NotStarted,
-                codex_unavailable_summary(report.reason),
-            ));
-        }
+        // Execution-time compatibility, observed afresh, and the exact
+        // installation it found is the one launched.
+        let (report, launcher) = observe_selection(&self.availability, &self.executable);
+        let launcher = match (report.state, launcher) {
+            (NativeAgentCapabilityStateV1::Available, Some(launcher)) => launcher,
+            _ => {
+                return Err(not_started(
+                    NativeTurnOutcomeV1::NotStarted,
+                    codex_unavailable_summary(report.reason),
+                ))
+            }
+        };
         if self.slot.stop_requested() {
             return Err(stopped());
         }
@@ -783,9 +803,7 @@ impl CodexInvocationRunV1 {
                 "The workspace changed before Codex could start, so nothing ran.",
             ));
         }
-        let launched = resolve_codex_launcher(&self.executable)
-            .ok_or_else(|| AppError::InvalidInput("Codex is unavailable.".into()))
-            .and_then(|launcher| CodexAppServerV1::launch(&launcher, &self.workspace));
+        let launched = CodexAppServerV1::launch(&launcher, &self.workspace);
         let controller = match launched {
             Ok(controller) => Arc::new(controller),
             Err(_) => {
@@ -1044,6 +1062,10 @@ pub(in crate::native_agent) struct CodexLauncherV1 {
     /// The PATH used to find the launcher, also given to it: a launcher shim
     /// such as npm's `codex.cmd` needs to find Node the same way.
     search_path: Option<std::ffi::OsString>,
+    /// `cli`, `desktop` or `configured`.
+    backend: &'static str,
+    /// The version a desktop app's manifest declares.
+    version: Option<String>,
 }
 
 impl CodexLauncherV1 {
@@ -1054,39 +1076,248 @@ impl CodexLauncherV1 {
         }
         command
     }
+
+    fn describe(&self) -> String {
+        match (self.backend, &self.version) {
+            (BACKEND_DESKTOP, Some(version)) => format!(
+                "the Codex bundled with the desktop app ({version}) at {}",
+                self.program.display()
+            ),
+            (BACKEND_DESKTOP, None) => format!(
+                "the Codex bundled with the desktop app at {}",
+                self.program.display()
+            ),
+            _ => self.program.display().to_string(),
+        }
+    }
 }
 
-/// Only the bare `codex` is resolved: elsewhere the OS searches PATH itself.
-/// On Windows Pastey searches it as a Windows shell would, without the
-/// current directory, over this process's PATH followed by the current user
-/// and system PATH read afresh. Pastey stays running in the tray, so its own
-/// PATH predates anything installed since it started.
-fn resolve_codex_launcher(executable: &Path) -> Option<CodexLauncherV1> {
+/// Every installation that may provide Codex, in order: a configured
+/// executable alone; otherwise the `codex` command on PATH, then the Codex
+/// bundled with an installed desktop app.
+fn resolve_codex_launchers(executable: &Path) -> Vec<CodexLauncherV1> {
     if executable != Path::new(INSTALLED_CODEX) {
-        return Some(CodexLauncherV1 {
+        return vec![CodexLauncherV1 {
             program: executable.to_path_buf(),
             search_path: None,
-        });
+            backend: BACKEND_CONFIGURED,
+            version: None,
+        }];
     }
+    let mut launchers = Vec::new();
     #[cfg(windows)]
     {
         let search_path = merge_search_path(
             std::env::var_os("PATH"),
             &windows_environment::fresh_path_entries(),
         );
-        find_launcher_on_path(&search_path, &WINDOWS_CODEX_LAUNCHERS).map(|program| {
-            CodexLauncherV1 {
+        if let Some(program) = find_launcher_on_path(&search_path, &WINDOWS_CODEX_LAUNCHERS) {
+            launchers.push(CodexLauncherV1 {
                 program,
                 search_path: Some(search_path),
-            }
-        })
+                backend: BACKEND_CLI,
+                version: None,
+            });
+        }
     }
     #[cfg(not(windows))]
+    launchers.push(CodexLauncherV1 {
+        program: executable.to_path_buf(),
+        search_path: None,
+        backend: BACKEND_CLI,
+        version: None,
+    });
+    launchers.extend(
+        desktop_codex_cli_dirs()
+            .iter()
+            .filter_map(|cli_dir| desktop_codex_launcher(cli_dir)),
+    );
+    launchers
+}
+
+/// The first resolved installation, for tests.
+#[cfg(all(test, windows))]
+fn resolve_codex_launcher(executable: &Path) -> Option<CodexLauncherV1> {
+    resolve_codex_launchers(executable).into_iter().next()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopCodexManifestV1 {
+    layout_version: u32,
+    version: String,
+    entrypoint: String,
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+/// The Codex a desktop app bundles in `cli_dir`, as its layout manifest
+/// declares it. The entrypoint must be a relative path inside `cli_dir`;
+/// nothing outside the app's own folder is ever launched.
+fn desktop_codex_launcher(cli_dir: &Path) -> Option<CodexLauncherV1> {
+    let text = std::fs::read_to_string(cli_dir.join(DESKTOP_CODEX_MANIFEST)).ok()?;
+    let manifest: DesktopCodexManifestV1 = serde_json::from_str(&text).ok()?;
+    if manifest.layout_version != 1
+        || manifest
+            .variant
+            .as_deref()
+            .is_some_and(|variant| variant != "codex")
     {
-        Some(CodexLauncherV1 {
-            program: executable.to_path_buf(),
-            search_path: None,
-        })
+        return None;
+    }
+    let entrypoint = Path::new(&manifest.entrypoint);
+    if entrypoint.is_absolute()
+        || entrypoint
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = cli_dir.canonicalize().ok()?;
+    let program = root.join(entrypoint).canonicalize().ok()?;
+    if !program.starts_with(&root) || !program.is_file() {
+        return None;
+    }
+    Some(CodexLauncherV1 {
+        program,
+        search_path: None,
+        backend: BACKEND_DESKTOP,
+        version: Some(manifest.version.chars().take(64).collect()),
+    })
+}
+
+/// Folders where an installed desktop app keeps its bundled Codex. Only
+/// fixed, user- or system-wide application locations are examined; a path
+/// is used only if its layout manifest is valid.
+fn desktop_codex_cli_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        let mut roots = vec![PathBuf::from("/Applications")];
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join("Applications"));
+        }
+        for root in roots {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            let mut apps = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "app"))
+                .collect::<Vec<_>>();
+            apps.sort();
+            dirs.extend(
+                apps.into_iter()
+                    .map(|app| app.join("Contents").join("Resources").join("codex-cli"))
+                    .filter(|dir| dir.join(DESKTOP_CODEX_MANIFEST).is_file()),
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        dirs.extend(windows_desktop::codex_cli_dirs());
+    }
+    dirs
+}
+
+/// Windows desktop installs: per-user programs and packaged (MSIX) apps.
+/// Unverified on a Windows Host: the layout is assumed to match macOS's
+/// `codex-cli/codex-package.json`; anything else is simply not found.
+#[cfg(windows)]
+mod windows_desktop {
+    use std::{
+        os::windows::process::CommandExt,
+        path::{Path, PathBuf},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const PACKAGE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// `codex-cli` folders with a manifest, at most `depth` levels below.
+    fn find(root: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            if path
+                .file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("codex-cli"))
+                && path.join(super::DESKTOP_CODEX_MANIFEST).is_file()
+            {
+                found.push(path);
+            } else {
+                find(&path, depth - 1, found);
+            }
+        }
+    }
+
+    /// Install folders of packaged apps from OpenAI, by the official
+    /// `Get-AppxPackage` cmdlet. Bounded; nothing on failure.
+    fn package_install_locations() -> Vec<PathBuf> {
+        let Ok(mut child) = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Get-AppxPackage | Where-Object { $_.Name -match 'OpenAI|ChatGPT|Codex' } | ForEach-Object { $_.InstallLocation }",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        else {
+            return Vec::new();
+        };
+        let deadline = Instant::now() + PACKAGE_QUERY_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Vec::new();
+                }
+            }
+        }
+        let Ok(output) = child.wait_with_output() else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .collect()
+    }
+
+    pub(super) fn codex_cli_dirs() -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(PathBuf::from(local).join("Programs"));
+        }
+        roots.extend(package_install_locations());
+        let mut found = Vec::new();
+        for root in roots {
+            find(&root, 5, &mut found);
+        }
+        found.sort();
+        found.dedup();
+        found
     }
 }
 
@@ -1346,88 +1577,159 @@ fn unusable(
         state,
         reason: Some(reason),
         detail: Some(detail),
+        backend: None,
     }
 }
 
-/// Read-only and bounded: two probe processes, no installation, no provider,
-/// model, credential or native session query. Says which step failed.
+/// Read-only and bounded: two probe processes per installation, no
+/// installation, provider, model, credential or native session query. The
+/// first usable installation wins; otherwise the most telling failure.
+#[cfg(test)]
 pub(in crate::native_agent) fn codex_probe_at(
     executable: &Path,
     timeout: Duration,
 ) -> CapabilityAvailabilityV1 {
+    codex_probe_selecting(executable, timeout).0
+}
+
+fn codex_probe_selecting(
+    executable: &Path,
+    timeout: Duration,
+) -> (CapabilityAvailabilityV1, Option<CodexLauncherV1>) {
+    select_launcher(resolve_codex_launchers(executable), timeout)
+}
+
+fn select_launcher(
+    launchers: Vec<CodexLauncherV1>,
+    timeout: Duration,
+) -> (CapabilityAvailabilityV1, Option<CodexLauncherV1>) {
+    let mut failures = Vec::new();
+    for launcher in launchers {
+        let report = probe_launcher(&launcher, timeout);
+        if report.state == NativeAgentCapabilityStateV1::Available {
+            return (report, Some(launcher));
+        }
+        failures.push(report);
+    }
+    // An installation that exists but fails says more than one not found.
+    let telling = failures
+        .iter()
+        .position(|report| report.reason != Some(REASON_NOT_INSTALLED));
+    let report = match telling {
+        Some(index) => failures.swap_remove(index),
+        None => unusable(
+            NativeAgentCapabilityStateV1::Unavailable,
+            REASON_NOT_INSTALLED,
+            NOT_INSTALLED_DETAIL.into(),
+        ),
+    };
+    (report, None)
+}
+
+#[cfg(target_os = "macos")]
+const NOT_INSTALLED_DETAIL: &str = "Pastey found no `codex` command on PATH and no desktop app with a bundled Codex in /Applications or ~/Applications. Install the ChatGPT desktop app with Codex, or the Codex CLI.";
+#[cfg(windows)]
+const NOT_INSTALLED_DETAIL: &str = "Pastey looked for codex.exe and codex.cmd in every folder on PATH, including the current user and system PATH, and for a desktop app with a bundled Codex, and found neither. Check that `codex --version` works in a new terminal, or run scripts/diagnose-windows-codex.ps1.";
+#[cfg(not(any(target_os = "macos", windows)))]
+const NOT_INSTALLED_DETAIL: &str =
+    "Pastey found no `codex` command on PATH. Install the Codex CLI.";
+
+fn with_backend(
+    mut report: CapabilityAvailabilityV1,
+    launcher: &CodexLauncherV1,
+) -> CapabilityAvailabilityV1 {
+    report.backend = match launcher.backend {
+        BACKEND_DESKTOP => Some(BACKEND_DESKTOP),
+        BACKEND_CLI => Some(BACKEND_CLI),
+        _ => None,
+    };
+    report
+}
+
+fn probe_launcher(launcher: &CodexLauncherV1, timeout: Duration) -> CapabilityAvailabilityV1 {
     use NativeAgentCapabilityStateV1::{Available, Incompatible, Unavailable};
-    let Some(launcher) = resolve_codex_launcher(executable) else {
-        return unusable(
+    let program = launcher.describe();
+    let report = match run_probe(launcher, &["--version"], timeout) {
+        ProbeRunV1::NotStarted {
+            not_found: true, ..
+        } => unusable(
             Unavailable,
             REASON_NOT_INSTALLED,
-            "Pastey looked for codex.exe and codex.cmd in every folder on PATH, including the current user and system PATH, and found neither. Check that `codex --version` works in a new terminal.".into(),
-        );
-    };
-    let program = launcher.program.display();
-    match run_probe(&launcher, &["--version"], timeout) {
-        ProbeRunV1::NotStarted { not_found: true, .. } => {
-            return unusable(
-                Unavailable,
-                REASON_NOT_INSTALLED,
-                format!("`{program}` was not found on PATH. Check that `codex --version` works in a new terminal."),
-            )
-        }
-        ProbeRunV1::NotStarted { error, .. } => {
-            return unusable(
-                Unavailable,
-                REASON_LAUNCH_FAILED,
-                format!("Pastey found {program} but could not start it: {error}"),
-            )
-        }
-        ProbeRunV1::TimedOut => {
-            return unusable(
-                Unavailable,
-                REASON_PROBE_TIMEOUT,
-                format!("{program} --version did not finish within {} s.", timeout.as_secs()),
-            )
-        }
-        ProbeRunV1::Exited { success: false, code, stderr } => {
-            return unusable(
-                Unavailable,
-                REASON_PROBE_FAILED,
-                format!(
-                    "{program} --version exited with code {}{}",
-                    code.map_or_else(|| "unknown".into(), |code| code.to_string()),
-                    shown_stderr(&stderr)
-                ),
-            )
-        }
-        ProbeRunV1::Exited { success: true, .. } => {}
-    }
-    match run_probe(&launcher, &["app-server", "--help"], timeout) {
-        ProbeRunV1::Exited { success: true, .. } => CapabilityAvailabilityV1 {
-            state: Available,
-            reason: None,
-            detail: Some(format!("Using {program}.")),
-        },
-        // Detection proves only the native product exists. The app-server
-        // compatibility fact is deliberately limited to Pastey's fixed
-        // initialize/thread/start/turn/start/observation/interrupt/shutdown
-        // surface.
-        ProbeRunV1::TimedOut => unusable(
-            Unavailable,
-            REASON_PROBE_TIMEOUT,
-            format!("{program} app-server --help did not finish within {} s.", timeout.as_secs()),
-        ),
-        ProbeRunV1::Exited { stderr, .. } => unusable(
-            Incompatible,
-            REASON_INCOMPATIBLE,
             format!(
-                "{program} runs, but `app-server` is not available in this version{}. Update Codex.",
-                shown_stderr(&stderr)
+                "`{program}` was not found. Check that `codex --version` works in a new terminal."
             ),
         ),
         ProbeRunV1::NotStarted { error, .. } => unusable(
             Unavailable,
             REASON_LAUNCH_FAILED,
-            format!("{program} could not be started again: {error}"),
+            format!("Pastey found {program} but could not start it: {error}"),
         ),
-    }
+        ProbeRunV1::TimedOut => unusable(
+            Unavailable,
+            REASON_PROBE_TIMEOUT,
+            format!(
+                "{program} --version did not finish within {} s.",
+                timeout.as_secs()
+            ),
+        ),
+        ProbeRunV1::Exited {
+            success: false,
+            code,
+            stderr,
+        } => unusable(
+            Unavailable,
+            REASON_PROBE_FAILED,
+            format!(
+                "{program} --version exited with code {}{}",
+                code.map_or_else(|| "unknown".into(), |code| code.to_string()),
+                shown_stderr(&stderr)
+            ),
+        ),
+        ProbeRunV1::Exited { success: true, .. } => {
+            match run_probe(launcher, &["app-server", "--help"], timeout) {
+                ProbeRunV1::Exited { success: true, .. } => CapabilityAvailabilityV1 {
+                    state: Available,
+                    reason: None,
+                    detail: Some(format!("Using {program}.")),
+                    backend: None,
+                },
+                // Detection proves only the native product exists. The
+                // app-server compatibility fact is deliberately limited to
+                // Pastey's fixed initialize/thread/start/turn/start/
+                // observation/interrupt/shutdown surface.
+                ProbeRunV1::TimedOut => unusable(
+                    Unavailable,
+                    REASON_PROBE_TIMEOUT,
+                    format!(
+                        "{program} app-server --help did not finish within {} s.",
+                        timeout.as_secs()
+                    ),
+                ),
+                ProbeRunV1::Exited { stderr, .. } => unusable(
+                    Incompatible,
+                    REASON_INCOMPATIBLE,
+                    format!(
+                        "{program} runs, but `app-server` is not available in this version{}. Update Codex.",
+                        shown_stderr(&stderr)
+                    ),
+                ),
+                ProbeRunV1::NotStarted { error, .. } => unusable(
+                    Unavailable,
+                    REASON_LAUNCH_FAILED,
+                    format!("{program} could not be started again: {error}"),
+                ),
+            }
+        }
+    };
+    with_backend(report, launcher)
+}
+
+/// The installation this Host would launch for `codex`, for live tests.
+#[cfg(test)]
+pub(in crate::native_agent) fn installed_codex_program() -> Option<(PathBuf, &'static str)> {
+    codex_probe_selecting(Path::new(INSTALLED_CODEX), Duration::from_secs(30))
+        .1
+        .map(|launcher| (launcher.program, launcher.backend))
 }
 
 /// The state alone, for tests.
@@ -3087,15 +3389,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// D1: a desktop app's bundled Codex is found only through its layout
+    /// manifest, and only inside the app's own `codex-cli` folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_desktop_codex_is_found_only_through_a_valid_layout_manifest() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("pastey-desktop-codex-{}", uuid::Uuid::new_v4()));
+        let cli = root.join("ChatGPT.app/Contents/Resources/codex-cli");
+        std::fs::create_dir_all(cli.join("bin")).unwrap();
+        let entry = cli.join("bin/codex");
+        std::fs::write(&entry, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(root.join("outside"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), cli.join("bin/escape")).unwrap();
+        let manifest = |layout: u32, entrypoint: &str, variant: &str| {
+            std::fs::write(
+                cli.join(DESKTOP_CODEX_MANIFEST),
+                format!(r#"{{"layoutVersion":{layout},"version":"0.162.0","target":"aarch64-apple-darwin","variant":"{variant}","entrypoint":"{entrypoint}","resourcesDir":"codex-resources","pathDir":"codex-path"}}"#),
+            )
+            .unwrap();
+            desktop_codex_launcher(&cli)
+        };
+        let found = manifest(1, "bin/codex", "codex").expect("valid layout");
+        assert_eq!(found.program, entry.canonicalize().unwrap());
+        assert_eq!(found.backend, BACKEND_DESKTOP);
+        assert_eq!(found.version.as_deref(), Some("0.162.0"));
+        assert!(found.search_path.is_none());
+        for (layout, entrypoint, variant) in [
+            (2, "bin/codex", "codex"),
+            (1, "bin/codex", "something-else"),
+            (1, "../outside", "codex"),
+            (1, "/bin/sh", "codex"),
+            (1, "bin/escape", "codex"),
+            (1, "bin/missing", "codex"),
+        ] {
+            assert!(
+                manifest(layout, entrypoint, variant).is_none(),
+                "{entrypoint}"
+            );
+        }
+        std::fs::write(cli.join(DESKTOP_CODEX_MANIFEST), "not json").unwrap();
+        assert!(desktop_codex_launcher(&cli).is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// D1: the first usable installation is chosen and reported by kind; a
+    /// desktop install that is present but broken is reported over a missing
+    /// CLI.
+    #[cfg(unix)]
+    #[test]
+    fn the_first_usable_installation_is_chosen_and_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("pastey-codex-select-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = root.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        let launcher = |program: PathBuf, backend: &'static str| CodexLauncherV1 {
+            program,
+            search_path: None,
+            backend,
+            version: Some("0.162.0".into()),
+        };
+        let missing_cli = launcher(root.join("no-codex-here"), BACKEND_CLI);
+        let desktop = launcher(script("desktop", "exit 0"), BACKEND_DESKTOP);
+        let (report, chosen) =
+            select_launcher(vec![missing_cli.clone(), desktop.clone()], PROBE_TIMEOUT);
+        assert_eq!(report.state, NativeAgentCapabilityStateV1::Available);
+        assert_eq!(report.backend, Some(BACKEND_DESKTOP));
+        assert!(report
+            .detail
+            .unwrap()
+            .contains("bundled with the desktop app (0.162.0)"));
+        assert_eq!(chosen, Some(desktop));
+
+        let cli = launcher(script("cli", "exit 0"), BACKEND_CLI);
+        let (report, chosen) =
+            select_launcher(vec![cli.clone(), missing_cli.clone()], PROBE_TIMEOUT);
+        assert_eq!(report.backend, Some(BACKEND_CLI));
+        assert_eq!(chosen, Some(cli));
+
+        let broken = launcher(script("broken", "echo broken >&2; exit 3"), BACKEND_DESKTOP);
+        let (report, chosen) = select_launcher(vec![missing_cli.clone(), broken], PROBE_TIMEOUT);
+        assert_eq!(report.reason, Some(REASON_PROBE_FAILED));
+        assert_eq!(report.backend, Some(BACKEND_DESKTOP));
+        assert!(chosen.is_none());
+
+        let (report, chosen) = select_launcher(vec![missing_cli], PROBE_TIMEOUT);
+        assert_eq!(report.reason, Some(REASON_NOT_INSTALLED));
+        assert!(chosen.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn only_the_installed_codex_name_is_resolved() {
         let fixture = Path::new("/fixture/codex-fixture");
         assert_eq!(
-            resolve_codex_launcher(fixture),
-            Some(CodexLauncherV1 {
+            resolve_codex_launchers(fixture),
+            vec![CodexLauncherV1 {
                 program: fixture.to_path_buf(),
                 search_path: None,
-            })
+                backend: BACKEND_CONFIGURED,
+                version: None,
+            }]
         );
     }
 

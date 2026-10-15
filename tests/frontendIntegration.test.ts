@@ -162,6 +162,12 @@ test("a Bridge without a verified device offers only explicit re-pairing", () =>
   assert.match(panel, /pairing === "pairing_required" \? "Pairing required"/);
 });
 
+test("the local Codex card says when the desktop app's Codex is used", () => {
+  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(card, /availability\.backend === "desktop"/);
+  assert.match(card, /No separate Codex CLI is needed/);
+});
+
 test("Codex availability names the failing layer and keeps local detail local", () => {
   const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");

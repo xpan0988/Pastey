@@ -178,6 +178,9 @@ export interface NativeAgentCapability {
   reason?: string | null;
   /** This device only: what its probe found, possibly naming local paths. */
   detail?: string | null;
+  /** This device only: the installation in use, `cli` or `desktop` (the
+   * Codex bundled with the ChatGPT desktop app). */
+  backend?: "cli" | "desktop" | null;
 }
 
 export type NativeAgentTaskState = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
