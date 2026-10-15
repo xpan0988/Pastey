@@ -23,6 +23,11 @@ The current development changes belong in `Unreleased`. Each release archives th
 - A Codex turn blocked on a native approval or question is shown as running and waiting for a native approval, on both Hosts, instead of plain running. Stop interrupts the turn.
 - Codex command and file-change approvals of a task started from another device are shown on that device, with the exact command, folder and stated reason, or the exact file changes, as plain text. Its user can Approve once or Deny each one; the executing device checks that the decision comes from the same device that started the task, in the current session, for exactly what was shown, and gives Codex that one answer. Pastey never approves for a session, never answers on its own or because of an unattended permission, and never answers permission requests, questions or forms, which still wait until stopped. Requests that cannot be shown completely and safely cannot be approved.
 - Selecting a remote device in the Codex task card now shows that device's own advertised Codex availability, with Check again, instead of this device's.
+- Codex works with only the ChatGPT desktop app installed. Pastey finds the Codex that the app bundles, through the app's own layout manifest, and starts it as its own app-server, with the user's existing Codex sign-in and configuration. No separate CLI install and no API key are needed.
+  - A Codex CLI on PATH is still preferred when it works; otherwise the first working desktop app is used.
+  - The task card says which one is in use.
+  - Pastey's sessions are separate from the app's own: they appear in its history, but approvals stay in Pastey.
+  - Verified end to end on a Mac with the desktop app, with a real task. On Windows, desktop discovery is unit-tested and cross-compiled only; `scripts/diagnose-windows-codex.ps1` now also reports a bundled desktop Codex.
 
 ### Changed
 

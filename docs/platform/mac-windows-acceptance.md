@@ -91,6 +91,7 @@ After each step, send one text and the small file both ways.
 | # | Do | Expect |
 |---|---|---|
 | E0 | On Windows, check that `codex --version` works in a new terminal. In Pastey on the Mac, select Windows in the Codex card. | "Codex is available on <Windows>". If not, the card names the failing layer. Run `powershell -ExecutionPolicy Bypass -File .\scripts\diagnose-windows-codex.ps1` on Windows and record its report: it masks the user name, but review it before sharing. |
+| E0a | Only if the ChatGPT desktop app with Codex is installed on Windows. Run the diagnosis script and record its "Codex bundled with a desktop app" section. Then, with no Codex CLI on PATH (or in a Windows account without one), open Pastey's Codex card on Windows and choose Check again. Run E1 once. | The section shows a manifest with `layoutVersion=1`, an existing entrypoint, a working `--version`, and `app-server` help. The card says Codex from the ChatGPT desktop app is ready. E1 completes. If the card instead says not installed or incompatible, record its text and the script's report. |
 | E1 | From the Mac, start a small Codex task on Windows. | Windows shows the executor Review. Accept runs it; the reply returns to the Mac card. |
 | E2 | Repeat and choose Deny. | Nothing runs; the Mac shows that it did not start. |
 | E3 | Workspace movement: propose with a small folder, approve on the Mac, Accept on Windows. | The workspace lands, Codex runs, the result returns and applies, and the Mac's original folder is unchanged until it is applied. |

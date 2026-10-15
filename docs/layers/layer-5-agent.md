@@ -127,6 +127,40 @@ directories, preferring `codex.exe` over the npm `codex.cmd` shim within each;
 the app-server is started in a non-verbatim working directory and shut down by
 closing its stdin, which also ends it behind the shim.
 
+Pastey uses either backend, and a separate CLI install is not required when the
+ChatGPT desktop app with Codex is installed:
+
+- **CLI (`cli`):** `codex` on PATH, as above.
+- **Desktop (`desktop`):** the Codex the desktop app bundles, found only through
+  the app's `codex-cli/codex-package.json` layout manifest.
+  - The manifest must have `layoutVersion` 1 and, if it names one, variant
+    `codex`.
+  - Its `entrypoint` must be relative and stay inside that folder after
+    resolving links.
+  - macOS looks in `/Applications/*.app` and `~/Applications/*.app` under
+    `Contents/Resources/codex-cli`.
+  - Windows looks in the install location of OpenAI, ChatGPT or Codex app
+    packages and in `%LOCALAPPDATA%\Programs`, up to five folders deep.
+
+Pastey runs that executable exactly as it runs the CLI: the same probes, the
+same `app-server` over stdio, and the user's own `~/.codex` configuration and
+sign-in, which both backends share. It never reads the app's credentials,
+changes its files, or talks to the app's own running app-server. Each new
+session re-resolves the path, so an app update that moves it is followed.
+
+Pastey tries the CLI first, then each desktop app, and uses the first one whose
+probes pass. If none passes, it reports the first real failure (for example a
+desktop Codex without `app-server` is `incompatible`), and reports
+`native_agent_not_installed` only when neither was found. An explicitly
+configured executable is used alone. The capability names the backend in use;
+the backend is local, and peers see only availability.
+
+The desktop backend is a separate process from the desktop app. It shares
+history, configuration and sign-in with the app, but not the app's running
+turns or approvals. Pastey's sessions appear in the app's history (as
+originator "Pastey"), but the app cannot answer their approvals; Pastey's own
+rules above apply.
+
 ### Native completion and consequence recovery
 
 Pastey persists only its outer task and movement facts: immutable correlation, Host-private Bridge binding, execution status, exact result snapshot/digest, and requester apply state. Agent execution, result capture, encrypted Return, conflict retention, result Apply, and movement completion are separate facts. A completed Agent task stays `Completed` if capture, Return, retention, Apply, or explicit recovery abandonment later fails. Recovery, Return retry, cancellation, and Burn never authorize a second Agent turn. Restart does not recreate a native process, session, or turn. Unproved Bridge-bound execution becomes interrupted/reconciliation-required, while a task still awaiting executor Review never started and becomes a definite non-start; an unbound local task that cannot be reconciled becomes terminal `failed` with `native_agent_interrupted_on_restart` and its unreachable envelope is removed.
