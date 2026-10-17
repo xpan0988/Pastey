@@ -23,6 +23,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 - A Codex turn blocked on a native approval or question is shown as running and waiting for a native approval, on both Hosts, instead of plain running. Stop interrupts the turn.
 - Codex command and file-change approvals of a task started from another device are shown on that device, with the exact command, folder and stated reason, or the exact file changes, as plain text. Its user can Approve once or Deny each one; the executing device checks that the decision comes from the same device that started the task, in the current session, for exactly what was shown, and gives Codex that one answer. Pastey never approves for a session, never answers on its own or because of an unattended permission, and never answers permission requests, questions or forms, which still wait until stopped. Requests that cannot be shown completely and safely cannot be approved.
 - Selecting a remote device in the Codex task card now shows that device's own advertised Codex availability, with Check again, instead of this device's.
+- See the Claude Code and Codex sessions on another of your devices, from the new "Agent sessions" card in a Bridge: choose the device, filter by agent, text or recent activity, and open one session for a report.
+  - The report shows its status and how it is known, how its last turn ended, what it did, the folder's Git state, and what is not known.
+  - The other device must allow it first, under Settings → Session reading: one trusted device, one folder, one Bridge, for up to 30 days, revocable. Trusting a device does not allow it.
+  - It never sends folder paths or whole conversations. Short excerpts are sent only if allowed.
+  - Reading never starts or changes a session.
+  - Verified between two separate device states in automated tests. Not yet run between a real Mac and a real Windows PC: see the acceptance procedure.
 - A discovered Claude Code session can be continued with a new prompt, through a local command for now. Pastey uses Claude Code's own background resume, which continues the session only when no other Claude Code process has it open (otherwise Claude Code makes a copy, which Pastey stops and reports as an unknown outcome).
   - Pastey also checks Claude Code's active sessions right before starting and refuses while any process holds the session.
   - The task shows running, waiting for an approval that Claude Code's own window must answer, completed with the agent's reply, stopped, or unknown. Nothing is sent twice.

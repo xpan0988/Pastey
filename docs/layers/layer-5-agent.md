@@ -313,6 +313,32 @@ Pastey can find the Claude Code and Codex sessions that already exist on this Ho
   - The agent's replies are labelled `agent_claim`, and the snapshot states that the work they describe is not verified.
 - **Choosing a session.** Provider, text (title, workspace folder name, branch) and recency narrow the list. One match is `unique`; several are `ambiguous` and returned as candidates, newest first. Pastey never picks among them.
 
+### Remote session reading
+
+From one device, the user can see the Claude Code and Codex sessions on another connected device without that device's windows. The sessions card in the Bridge workspace is labelled "Agent sessions"; the user picks the device. The answer is read only. Wire facts are in the [reference](../reference.md#remote-native-session-reading-facts).
+
+- **Permission.** The device that holds the sessions decides, under Settings → Session reading. Its user lets one trusted device, connected on one Bridge now, read the sessions of one folder for 1 hour to 30 days, with or without short excerpts.
+  - Trusting a device grants nothing.
+  - No Room Control event creates, extends or revokes a permission.
+  - A permission never authorizes execution.
+  - Revoking the permission or the device, Burn, or moving the folder ends it.
+- **Asking.** The query names the Host and optional filters: provider, text, recent activity and one shared folder. It travels over the exact current peer session.
+  - The Host checks the device identity proven in that session against its permissions.
+  - It runs the same discovery as locally, only in the permitted folders.
+  - It answers without folder paths. Titles, statements and excerpts lose any path-like text, and changed files are named only relative to the folder.
+  - Excerpts are sent only when permitted, and never as whole transcripts.
+- **Showing.** The card lists candidates, newest first, with provider, folder name, branch, origin and last activity. Several matches are shown as candidates, and Pastey never picks one. For the chosen session it shows:
+  - the status, explained from its basis;
+  - the live source and when it was checked;
+  - how the last recorded turn ended;
+  - activity counts and changed files;
+  - Git facts about the folder now;
+  - the evidence, split into facts, inferences and unknowns;
+  - when shared, recent excerpts, with replies labelled as the agent's own account.
+
+  A session is never shown as running or done because of its last message.
+- **Windows.** Discovery uses the plain form of a canonical Windows path for Claude Code's folder name and for Codex's `cwd` filter, and for relative changed files. Codex's live state comes from a `Win32_Process` query for `codex.exe`. None of this has run on a Windows machine yet; see the [acceptance procedure](../platform/mac-windows-acceptance.md).
+
 ### Native session continuation
 
 This Host's user can continue one discovered **Claude Code** session with a new prompt (`continue_native_session`, adapter `agent.coding.claude_code` in `src-tauri/src/native_agent/capability/claude_code.rs`). The task runs on the ordinary Native Agent lifecycle: task identity, local admission, one invocation per session (exclusivity), status, Stop, restart handling and release.
@@ -546,7 +572,7 @@ Distributed delivery failure remains unable to prove remote native-process termi
 | Can today | Intentionally unavailable or incomplete |
 | --- | --- |
 | Host-native Codex capability discovery/invocation and Host-private native sessions | Generic capability acquisition/install behavior; Agent integration does not authorize installation |
-| Read-only, local discovery and inspection of existing Claude Code and Codex sessions in Host-named workspaces, with live state from provider sources; local continuation of an unheld Claude Code session through `claude --bg --resume` | Discovery or continuation from a Bridge peer; continuing a discovered Codex thread; attaching to a running turn |
+| Read-only, local discovery and inspection of existing Claude Code and Codex sessions in Host-named workspaces, with live state from provider sources; remote read-only discovery and inspection from a trusted device holding a Host-local session read permission, with minimal disclosure; local continuation of an unheld Claude Code session through `claude --bg --resume` | Continuation from a Bridge peer; continuing a discovered Codex thread; attaching to a running turn; Mac ↔ Windows physical validation of remote reading |
 | Capability-neutral native lifecycle with adapter dispatch by capability ID, opaque bounded input/output, and generic invoke-v2 (exercised by a test-only adapter) | Product UI for invoke-v2 or for any non-Codex native capability |
 | Native Agent local original-workspace execution and direct remote invocation for a workspace already on the selected Host | Automatic or invisible topology mutation; remote movement remains visible and consented |
 | Native executor admission: immutable Local/Bridge task ownership, Bridge-bound cancel, and a one-shot, process-local Accept/Deny executor Review for every remote invocation and received workspace | Configurable admission policy, stored grants, per-peer allowlists, or "always allow" |

@@ -134,6 +134,8 @@ Read-only session discovery has a live check against this Host's real Claude Cod
 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_sessions_are_discovered_and_inspected_read_only -- --ignored --nocapture
 ```
 
+Remote session reading has a deterministic two-Host check without sockets. In it, the Mac's query passes the Windows Host's Room Control validator, Windows resolves the Mac's permission from its own storage and answers from a real Claude Code store, and the answer passes the Mac's validator into its outstanding query. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey native_session_pair_tests`. It does not exercise the HTTP transport, a running app, or Windows.
+
 Claude Code session continuation has a live check. It uses the installed, signed-in Claude Code and a little of its quota. In `src-tauri/target/claude-s2-live` it creates a fresh session, continues it through Pastey's Native Agent lifecycle, and then shows that a session a foreground run holds is refused without anything being sent:
 
 ```bash

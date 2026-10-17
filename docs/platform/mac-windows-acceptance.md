@@ -144,6 +144,26 @@ These are the decision bars for a later production integration. They are measure
 | H1 | Burn the Bridge on the Mac. | It disappears from the Mac. Windows shows the peer departed. Windows keeps its own copy and history, cannot reconnect, and needs a new pairing. |
 | H2 | On Windows, Burn its copy. | The Bridge is removed; files saved to the Inbox remain. |
 
+## I. Remote session reading (Windows sessions seen from the Mac)
+
+Prerequisites:
+- B1 or B4 done; the Mac trusted on Windows as in E6.
+- On Windows, a folder (for example `C:\Users\<you>\Projects\Demo`) with at least one Claude Code session and, if Codex is installed, one Codex thread.
+  - Make a Claude Code session by running `claude` there once and asking one question.
+  - Make a Codex thread with `codex` or the ChatGPT desktop app in that folder.
+
+| # | Do | Expect |
+|---|---|---|
+| I1 | On the Mac, Bridge → Agent sessions → choose Windows → Look for sessions, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. |
+| I2 | On Windows, Settings → Session reading: choose the Mac, the Demo folder, 1 day, excerpts off → Allow reading. Then repeat I1 on the Mac. | Windows's sessions in Demo are listed, with folder name "Demo" and no Windows path anywhere. Claude Code sessions show "Last turn ended" or "Running". A Codex thread shows "Unknown" while the ChatGPT desktop app or a `codex` terminal runs on Windows. Record what each row says. |
+| I3 | On the Mac, open one Claude Code session. | The report shows status, live source (`claude agents --json`), last turn, counts, changed files relative to Demo, Git facts, and facts, inferences and unknowns. It says Windows shares statuses only: no prompt or reply text. |
+| I4 | On Windows, start a Claude Code turn in that session (`claude --resume <id>` in Demo, or the desktop app). While it runs, look again from the Mac and open it. | It shows "Running" while the turn runs, and "Last turn ended" after it. The report never claims done while running. |
+| I5 | On Windows, revoke the permission, or revoke the Mac under trusted devices. Look again from the Mac. | Back to "has not allowed". |
+| I6 | On Windows, allow again with excerpts on. Open the session from the Mac. | Up to 4 short excerpts, replies labelled as the agent's own account, any path shown as `<path>`. |
+| I7 | Burn the Bridge on either side, pair again, and look from the Mac. | "Has not allowed": permissions do not survive Burn. |
+
+Record which rows passed. Do not paste session titles, prompts or paths into the record.
+
 ## Record
 
 Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
@@ -157,6 +177,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Steps passed | |
 | Steps failed (step, what happened, time) | |
 | Steps not run, and why | |
+| Remote session reading (I1–I7) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
 | Net-probe summary (part F) | |

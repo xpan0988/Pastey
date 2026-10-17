@@ -99,6 +99,8 @@ The Native Agent control payloads are `NativeAgentInvokeV1` (Codex's original in
 - `native_agent.retry_result_return`
 - `native_agent.device_identity`
 - `native_agent.decision`
+- `native_agent.session_query`
+- `native_agent.session_response`
 
 `NativeAgentStatusV1.status.nativeDecisions` carries at most 3 `NativeDecisionReviewV1` of a running task (`reviewRef`, `kind` `command_execution` | `file_change` | `unsupported`, `state` `pending` | `submitted` | `resolved`, `submitted`, `canAccept`, `canDecline`, `unavailableReason`, `content`, `contentDigest`, `requestedAt`, `expiresAt`); a status of any other state carries none. Each review's `content` (command, cwd, reason, network host/protocol, file changes with path, change, `moveTo` and diff) is native, untrusted display text bounded to 10 KiB, and is the only other subtree exempt from the field-name check, after `validate_status` checked its bound and that `contentDigest` is exactly its digest. `native_agent.decision` carries `NativeAgentDecisionV1` (`decisionId`, `taskId`, `targetHostRef`, `reviewRef`, `contentDigest`, `decision` `accept` | `decline`) and no content; its replay key is task, review and attempt. See Layer 5 for who may decide and when.
 
@@ -171,6 +173,37 @@ Bounds:
 - Codex reads are paged: 50 threads or turns per page, and up to 15 pages of 20 items, smaller when a page exceeds the 1 MiB line bound. Each request has 20 s.
 - At most 200 sessions are returned per provider.
 
+### Remote native session reading facts
+
+A requester asks one exact current Bridge Host about its native sessions with `native_agent.session_query`. The Host answers with `native_agent.session_response` on the same session. Both payloads use schema `pastey-native-session-v1` and reject unknown fields. The replay keys are `native-session-query:<requestId>` and `native-session-response:<requestId>`.
+
+**Query.** It has these fields:
+- `requestId`, `targetHostRef`, and `operation` (`discover` or `inspect`);
+- optional `provider`, `text` (at most 200 characters, one line), `activeWithinSecs` and `scopeRef` (`scope:` followed by 16 hex characters);
+- `sessionId`, which an inspection must name together with `provider`.
+
+**Authority.** The Host resolves the asker from the exact current peer session and the device identity proven in it (`verified_peer_device_for`). It answers only for workspaces that device holds an active **session read permission** for.
+- The permission lives in the Host-local `session_read_grants` table (`src-tauri/src/session_read_access.rs`).
+- It binds the trusted device key, the Bridge, the peer HostRef, this Host and one canonical shareable workspace, and lasts 1 hour to 30 days.
+- It is active only while unrevoked and unexpired, the device is still trusted, and the Bridge is neither burned nor removed. A moved workspace drops out.
+- At most 32 are active.
+- Only the Host's local commands create, list or revoke permissions (`create_session_read_grant`, `list_session_read_grants`, `revoke_session_read_grant`). Trusting a device creates none. They are separate from unattended execution permissions, which they never satisfy.
+- Burn deletes a Bridge's permissions.
+- The Host answers one query per Bridge at a time; another gets `busy`.
+
+**Answer.** It carries `requestId`, `sourceHostRef`, `outcome` (`ok`, `not_authorized`, `not_found`, `busy` or `unavailable`), and the device's `scopes` (`scopeRef`, folder `label`, `shareExcerpts`). It also carries either `discovery` or `snapshot`.
+- **Minimal disclosure:**
+  - no folder path: a workspace appears only as its folder name and `scopeRef`;
+  - path-like text in statements and titles becomes `<path>`;
+  - titles are at most 80 characters;
+  - at most 50 sessions are sent, and `truncated` says when more matched, with the answer kept within 48 KiB;
+  - changed files appear only relative to the workspace, at most 20, and files outside it are only counted (`changedElsewhere`);
+  - `recent` holds at most 4 excerpts of 300 characters, only when a permission for that folder allows excerpts (`excerptsShared`), never whole transcripts.
+- **Statuses** are the same as local discovery's: live state from a live source, history only for a stopped session.
+- **Requester checks.** The requester accepts an answer only for a query it has outstanding (`register`, 60 s), on the same Bridge, from the Host it asked, once.
+
+The requester's commands are `discover_remote_native_sessions(roomId, targetHostRef, provider?, text?, activeWithinSecs?, scopeRef?)` and `inspect_remote_native_session(roomId, targetHostRef, provider, sessionId)`. Each waits up to 30 s.
+
 ### Native Agent source map
 
 | Boundary | Primary source |
@@ -180,6 +213,7 @@ Bounds:
 | Adapter seam, opaque capability payload, Codex adapter, and test-only `fake.longjob.v1` adapter | `src-tauri/src/native_agent/capability.rs`, `src-tauri/src/native_agent/capability/codex.rs`, `src-tauri/src/native_agent/capability/fake_longjob.rs` |
 | Read-only native session discovery and inspection (Claude Code, Codex) | `src-tauri/src/native_agent/sessions.rs`, `src-tauri/src/native_agent/sessions/claude.rs`, `src-tauri/src/native_agent/sessions/codex.rs`; Codex history reader and holder scan in `src-tauri/src/native_agent/capability/codex.rs` |
 | Local Claude Code session continuation (`agent.coding.claude_code`) | `src-tauri/src/native_agent/capability/claude_code.rs` |
+| Remote session reading: permissions, wire types, minimal disclosure, Room Control kinds and requester wait | `src-tauri/src/session_read_access.rs`, `src-tauri/src/native_agent/sessions/remote.rs`, `src-tauri/src/room_control.rs` (`native_agent.session_query` / `session_response`), `src-tauri/src/bridge_lifecycle.rs` (`request_native_sessions`); UI in `src/features/workspace/NativeSessionsCard.tsx`, `src/features/workspace/SessionReadingSettings.tsx`, `src/lib/nativeSessions.ts` |
 | Test-only deterministic requester/executor pair and external Agent-turn ledger | `src-tauri/src/native_agent_pair_harness.rs` |
 | Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/main.rs` |
 | Native Agent Room Control envelope, validation, replay/session handling | `src-tauri/src/room_control.rs` |
