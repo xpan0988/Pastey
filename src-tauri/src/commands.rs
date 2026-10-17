@@ -903,6 +903,56 @@ pub async fn inspect_native_session(
     .map_err(|error| error.message())
 }
 
+/// Continues one existing native session that this Host's user chose, with a
+/// new prompt, through the provider's own resume mechanism. Only Claude Code
+/// sessions, and only one that discovery shows nothing holds: Claude Code's
+/// `--bg --resume` continues it under its own id only when no process holds
+/// it. Codex threads are refused: no Codex interface shows that a desktop app
+/// or terminal does not have a thread open. Local only. The task then follows
+/// the ordinary Native Agent status, cancel and recovery commands.
+#[tauri::command]
+pub async fn continue_native_session(
+    request: crate::native_agent::sessions::NativeSessionContinueV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    use crate::native_agent::sessions::{ResumeVerdictV1, PROVIDER_CLAUDE_CODE, PROVIDER_CODEX};
+    if request.provider == PROVIDER_CODEX {
+        return Err("Continuing a discovered Codex thread is not supported: no Codex interface shows that a desktop app or terminal does not have it open, so two writers could not be ruled out.".into());
+    }
+    if request.provider != PROVIDER_CLAUDE_CODE {
+        return Err("Unknown native Agent provider.".into());
+    }
+    let workspaces =
+        crate::native_agent::sessions::authorized_workspaces(&state.paths, &request.workspaces)
+            .map_err(|error| error.message())?;
+    let (claude, codex) = state.native_agents.lock().session_sources(&workspaces);
+    let session_id = request.session_id.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        crate::native_agent::sessions::inspect(
+            &claude,
+            &codex,
+            &workspaces,
+            PROVIDER_CLAUDE_CODE,
+            &session_id,
+        )
+    })
+    .await
+    .map_err(|_| "Session inspection stopped unexpectedly.".to_string())?
+    .map_err(|error| error.message())?;
+    if snapshot.session.resume.verdict != ResumeVerdictV1::Safe {
+        return Err(format!(
+            "This session cannot be continued safely now: {}.",
+            snapshot.session.resume.reasons.join("; ")
+        ));
+    }
+    let workspace = std::path::PathBuf::from(&snapshot.session.workspace);
+    state
+        .native_agents
+        .lock()
+        .start_claude_session_task(&workspace, &request.session_id, &request.prompt)
+        .map_err(|error| error.message())
+}
+
 /// The native capabilities one exact current Bridge Host advertises, from a
 /// fresh observation over the existing capability query. Like the local
 /// list, it is a fact for presentation only: it selects no Host and grants

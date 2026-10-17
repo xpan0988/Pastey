@@ -13,7 +13,7 @@
 //! taken as the current state, and an agent's own claim of completion is
 //! reported as a claim, not as proof.
 
-mod claude;
+pub(in crate::native_agent) mod claude;
 mod codex;
 
 use std::{
@@ -234,6 +234,15 @@ pub(crate) struct NativeSessionInspectV1 {
     pub(crate) workspaces: Vec<String>,
     pub(crate) provider: String,
     pub(crate) session_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeSessionContinueV1 {
+    pub(crate) workspaces: Vec<String>,
+    pub(crate) provider: String,
+    pub(crate) session_id: String,
+    pub(crate) prompt: String,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

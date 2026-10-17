@@ -938,6 +938,8 @@ impl NativeCapabilityRegistryV1 {
     ) -> Vec<crate::peer_capabilities::HostCapabilityFact> {
         self.0
             .iter()
+            // Local-only capabilities are not described to peers at all.
+            .filter(|adapter| !adapter.supported_protocols().is_empty())
             .map(|adapter| {
                 let report = adapter.availability_report();
                 crate::peer_capabilities::native_agent_capability_fact(
@@ -1066,7 +1068,15 @@ pub(crate) struct NativeAgentServiceV1 {
 impl Default for NativeAgentServiceV1 {
     fn default() -> Self {
         let codex = Arc::new(CodexNativeAdapterV1::default());
-        Self::with_adapters(codex.clone(), vec![codex])
+        #[cfg_attr(test, allow(unused_mut))]
+        let mut adapters: Vec<Arc<dyn NativeCapabilityAdapterV1>> = vec![codex.clone()];
+        // Claude Code session continuation (local only). Tests register it
+        // explicitly with a fixture, never the installed `claude`.
+        #[cfg(not(test))]
+        adapters.push(Arc::new(
+            capability::claude_code::ClaudeCodeNativeAdapterV1::default(),
+        ));
+        Self::with_adapters(codex, adapters)
     }
 }
 
@@ -3744,6 +3754,23 @@ impl NativeAgentServiceV1 {
         self.start_local_invocation(CODEX_CAPABILITY_ID, task_id, &input)
     }
 
+    /// Continues one existing Claude Code session that this Host's user
+    /// chose, in its canonical workspace, with `prompt`. Local only; the
+    /// adapter refuses while any process holds the session.
+    pub(crate) fn start_claude_session_task(
+        &mut self,
+        workspace: &Path,
+        session_id: &str,
+        prompt: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let input = capability::claude_code::continue_input(session_id, workspace, prompt)?;
+        self.start_local_invocation(
+            capability::claude_code::CLAUDE_CODE_CAPABILITY_ID,
+            &format!("native-agent:{}", Uuid::new_v4()),
+            &input,
+        )
+    }
+
     /// An invocation by this Host's own user, admitted by the same policy as
     /// a remote one. A replay keeps the existing task identity rules.
     fn start_local_invocation(
@@ -3978,7 +4005,15 @@ impl NativeAgentServiceV1 {
         continuation: NativeInvocationContinuationV1,
         now: i64,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        self.adapter(capability_id)?.require_available()?;
+        let adapter = self.adapter(capability_id)?;
+        // A capability that advertises no peer protocol is local to this
+        // Host: no Bridge peer invokes it, whatever it names.
+        if matches!(principal, NativeInvocationPrincipalV1::Remote(_))
+            && adapter.supported_protocols().is_empty()
+        {
+            return invalid("This native capability is local to its Host.");
+        }
+        adapter.require_available()?;
         match (admission::decide(&principal), principal) {
             (NativeAdmissionDecisionV1::Allow, _) => match continuation {
                 NativeInvocationContinuationV1::Direct => {

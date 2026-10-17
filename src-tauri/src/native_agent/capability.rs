@@ -22,6 +22,9 @@ use super::{
 };
 use crate::error::{AppError, AppResult};
 
+// Registered only in product builds; its tests are Unix-only.
+#[cfg_attr(all(test, not(unix)), allow(dead_code))]
+pub(super) mod claude_code;
 pub(super) mod codex;
 #[cfg(test)]
 pub(super) mod fake_longjob;

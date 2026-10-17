@@ -84,12 +84,7 @@ impl ClaudeSessionSourceV1 {
     }
 
     fn project_dir(&self, workspace: &Path) -> Option<PathBuf> {
-        let encoded: String = workspace
-            .to_string_lossy()
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        Some(self.config_dir.as_ref()?.join("projects").join(encoded))
+        Some(project_dir(self.config_dir.as_ref()?, workspace))
     }
 
     fn live_registry(&self) -> LiveRegistryV1 {
@@ -410,27 +405,36 @@ struct TranscriptV1 {
     complete: bool,
 }
 
+impl TranscriptV1 {
+    fn empty() -> Self {
+        Self {
+            cwd: None,
+            git_branch: None,
+            entrypoint: None,
+            first_at_ms: None,
+            last_at_ms: None,
+            custom_title: None,
+            first_prompt: None,
+            last_prompt: None,
+            last_turn: LastTurnObservationV1 {
+                outcome: LastTurnV1::None,
+                at_ms: None,
+                source: "transcript".into(),
+            },
+            activity: ActivitySummaryV1::default(),
+            recent: VecDeque::new(),
+            complete: true,
+        }
+    }
+}
+
 fn read_transcript(path: &Path) -> Option<TranscriptV1> {
     let file = fs::File::open(path).ok()?;
     let size = file.metadata().ok()?.len();
     let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
     let mut transcript = TranscriptV1 {
-        cwd: None,
-        git_branch: None,
-        entrypoint: None,
-        first_at_ms: None,
-        last_at_ms: None,
-        custom_title: None,
-        first_prompt: None,
-        last_prompt: None,
-        last_turn: LastTurnObservationV1 {
-            outcome: LastTurnV1::None,
-            at_ms: None,
-            source: "transcript".into(),
-        },
-        activity: ActivitySummaryV1::default(),
-        recent: VecDeque::new(),
         complete: size <= MAX_TRANSCRIPT_BYTES,
+        ..TranscriptV1::empty()
     };
     let mut ai_title = None;
     let mut command_ids = HashSet::new();
@@ -639,8 +643,131 @@ fn modified_ms(path: &Path) -> Option<u64> {
     Some(modified.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64)
 }
 
+/// `CLAUDE_CONFIG_DIR`, or `~/.claude`.
+pub(in crate::native_agent) fn claude_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+}
+
+/// Claude Code's folder for one workspace's sessions.
+pub(in crate::native_agent) fn project_dir(config_dir: &Path, workspace: &Path) -> PathBuf {
+    let encoded: String = workspace
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    config_dir.join("projects").join(encoded)
+}
+
+/// The directory a transcript records its session ran in.
+pub(in crate::native_agent) fn transcript_cwd(path: &Path) -> Option<String> {
+    read_transcript(path)?.cwd
+}
+
+/// How the turn Pastey asked for ended, from the transcript: the first
+/// main-chain user prompt exactly equal to `prompt` recorded at or after
+/// `since_ms`, then the last main-chain entry after it, and the agent's
+/// final reply text after it. `None` while the prompt is not recorded.
+pub(in crate::native_agent) fn turn_after_prompt(
+    path: &Path,
+    prompt: &str,
+    since_ms: u64,
+) -> Option<(LastTurnV1, Option<String>)> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file.take(MAX_TRANSCRIPT_BYTES));
+    let mut found = false;
+    let mut after = 0usize;
+    let mut scratch = TranscriptV1::empty();
+    let mut reply = None;
+    let mut ids = HashSet::new();
+    let mut changed = Vec::new();
+    for line in reader.split(b'\n') {
+        let Ok(line) = line else { break };
+        let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(kind, "user" | "assistant")
+            || entry.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        {
+            continue;
+        }
+        let at = entry
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_time_ms);
+        if !found {
+            let text = entry_text(&entry);
+            if kind == "user"
+                && text.trim() == prompt.trim()
+                && at.is_some_and(|at| at + 1000 >= since_ms)
+            {
+                found = true;
+            }
+            continue;
+        }
+        after += 1;
+        observe_turn_entry(&mut scratch, &entry, kind, at, &mut ids, &mut changed);
+        if kind == "assistant" {
+            let text = entry_text(&entry);
+            if !text.trim().is_empty() {
+                reply = Some(text);
+            }
+        }
+    }
+    found.then(|| {
+        let outcome = if after == 0 {
+            LastTurnV1::InProgress
+        } else {
+            scratch.last_turn.outcome
+        };
+        (outcome, reply)
+    })
+}
+
+fn entry_text(entry: &Value) -> String {
+    match entry.pointer("/message/content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// A session's status in Claude Code's live registry: `Ok(None)` when no
+/// process holds it, `Err` when the registry cannot be read.
+pub(in crate::native_agent) fn live_status(
+    cli: &Path,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    let mut command = Command::new(cli);
+    command.args(["agents", "--json"]);
+    let output = super::bounded_output(command, LIVE_TIMEOUT)
+        .ok_or_else(|| "`claude agents --json` failed or timed out".to_string())?;
+    let Value::Array(entries) = serde_json::from_slice::<Value>(&output)
+        .map_err(|_| "`claude agents --json` did not return a list".to_string())?
+    else {
+        return Err("`claude agents --json` did not return a list".into());
+    };
+    Ok(entries
+        .iter()
+        .find(|entry| entry.get("sessionId").and_then(Value::as_str) == Some(session_id))
+        .map(|entry| {
+            entry
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned()
+        }))
+}
+
 /// A Claude Code session id: a UUID.
-fn valid_session_id(id: &str) -> bool {
+pub(in crate::native_agent) fn valid_session_id(id: &str) -> bool {
     id.len() == 36
         && id.char_indices().all(|(index, c)| {
             if [8, 13, 18, 23].contains(&index) {
@@ -653,7 +780,7 @@ fn valid_session_id(id: &str) -> bool {
 
 /// The `claude` executable: on PATH, in `~/.local/bin`, or (macOS) the one
 /// the Claude desktop app keeps for its Code sessions.
-fn find_cli() -> Option<PathBuf> {
+pub(in crate::native_agent) fn find_cli() -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) {
         &["claude.exe", "claude.cmd"]
     } else {
