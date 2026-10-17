@@ -141,12 +141,14 @@ Native sessions are Host-private. The Codex adapter keeps its app-server session
 
 ### Native session discovery facts
 
-Two local Tauri commands. They are not Room Control events, and no Bridge peer reaches them.
+Three local Tauri commands. They are not Room Control events, and no Bridge peer reaches them.
 
 - `discover_native_sessions(query)`:
   - **Query:** `workspaces` (1 to 8 shareable folders), optional `provider` (`claude_code` or `codex`), optional `text`, optional `activeWithinSecs`. Unknown fields are refused.
   - **Result:** `observedAtMs`; per provider `historyReadable`, `liveSource` and `note`; `sessions`, newest activity first; `resolution` (`unique`, `ambiguous` or `none`), with `sessionId` only when unique.
 - `inspect_native_session(request)`: `workspaces`, `provider` and `sessionId`. It answers only for a session whose recorded directory is one of the workspaces. Session ids must be a UUID (Claude Code) or `[A-Za-z0-9-]{1,64}` (Codex).
+
+- `continue_native_session(request)`: `workspaces`, `provider`, `sessionId` and `prompt`. It accepts only `claude_code`, and only a session whose resume verdict is `safe`; otherwise it refuses with the reasons. Discovered Codex threads are refused. It returns the Native Agent task status of capability `agent.coding.claude_code`, which then follows `get_native_agent_task_status` and `cancel_native_agent_task`. That capability advertises no peer protocol, is not among the capability facts sent to peers, and Core refuses any Bridge invocation of it.
 
 Each session carries:
 - `provider`, `sessionId`, `workspace`, `title` (at most 120 characters);
@@ -177,6 +179,7 @@ Bounds:
 | Native executor admission policy, pending executor Review, and renderer-safe Review projection | `src-tauri/src/native_agent/admission.rs` |
 | Adapter seam, opaque capability payload, Codex adapter, and test-only `fake.longjob.v1` adapter | `src-tauri/src/native_agent/capability.rs`, `src-tauri/src/native_agent/capability/codex.rs`, `src-tauri/src/native_agent/capability/fake_longjob.rs` |
 | Read-only native session discovery and inspection (Claude Code, Codex) | `src-tauri/src/native_agent/sessions.rs`, `src-tauri/src/native_agent/sessions/claude.rs`, `src-tauri/src/native_agent/sessions/codex.rs`; Codex history reader and holder scan in `src-tauri/src/native_agent/capability/codex.rs` |
+| Local Claude Code session continuation (`agent.coding.claude_code`) | `src-tauri/src/native_agent/capability/claude_code.rs` |
 | Test-only deterministic requester/executor pair and external Agent-turn ledger | `src-tauri/src/native_agent_pair_harness.rs` |
 | Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/main.rs` |
 | Native Agent Room Control envelope, validation, replay/session handling | `src-tauri/src/room_control.rs` |

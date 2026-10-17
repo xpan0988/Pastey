@@ -313,7 +313,30 @@ Pastey can find the Claude Code and Codex sessions that already exist on this Ho
   - The agent's replies are labelled `agent_claim`, and the snapshot states that the work they describe is not verified.
 - **Choosing a session.** Provider, text (title, workspace folder name, branch) and recency narrow the list. One match is `unique`; several are `ambiguous` and returned as candidates, newest first. Pastey never picks among them.
 
-Continuing a discovered session and observing a running turn are separate questions; see [codex-session-probe](../../tools/codex-session-probe/README.md) and the S2/S3 notes there.
+### Native session continuation
+
+This Host's user can continue one discovered **Claude Code** session with a new prompt (`continue_native_session`, adapter `agent.coding.claude_code` in `src-tauri/src/native_agent/capability/claude_code.rs`). The task runs on the ordinary Native Agent lifecycle: task identity, local admission, one invocation per session (exclusivity), status, Stop, restart handling and release.
+
+- **Mechanism.** Only Claude Code's own `claude --bg --resume <id> -- <prompt>`.
+  - Measured on Claude Code 2.1.292: it continues the session under its own id only when no Claude Code process holds it. When a background or foreground process holds it, it starts a copy and says so, and the original is unchanged.
+  - A headless `claude -p --resume`, by contrast, wrote a held session concurrently: its history branched.
+  - Pastey passes the prompt and nothing else, because a resumed background session given other options is also copied.
+- **Checks.**
+  - The command first requires discovery's resume verdict `safe`.
+  - The adapter then checks again, immediately before launching, that the transcript is the workspace's and that `claude agents --json` lists no process holding the session. Otherwise nothing is sent (`native_agent_start_failed`, with the reason).
+- **Outcomes.**
+  - Continuing under the same id is followed through the registry (`busy`, then `idle`) and the transcript.
+  - The task completes only when the transcript records a normal end of turn after Pastey's prompt. The agent's final reply becomes the task output.
+  - Pastey then runs `claude stop` (the conversation is kept), so the session is free again.
+  - If Claude Code started a copy, Pastey stops the copy and the outcome is unknown: the copy may have begun the prompt.
+  - An answer Pastey does not understand, or no answer in time, is also unknown.
+  - A refusal before launch (for example an untrusted workspace) is a definite non-start.
+  - Nothing is ever sent twice.
+- **Approvals.** The session keeps its own permission settings. A registry status other than `busy` or `idle` is shown as waiting for a native decision. Pastey never answers it; Claude Code's own clients do (`claude attach`). Stop runs `claude stop`.
+- **Local only.** The adapter advertises no peer protocol and is left out of the capability facts sent to peers. Core refuses a Bridge invocation of any capability without peer protocols, so reading or discovering a session never gives a peer write control of it.
+- **Codex threads are not continued.** No Codex interface shows that a desktop app or terminal does not have a thread open, and the app-server has no cross-process lease. Pastey continues only its own Codex conversations (above); the command refuses discovered Codex threads.
+
+Observing or taking over a turn that is already running is research only; see [native-session-handoff](../../tools/native-session-handoff/README.md).
 
 ## Managed execution path
 
@@ -523,7 +546,7 @@ Distributed delivery failure remains unable to prove remote native-process termi
 | Can today | Intentionally unavailable or incomplete |
 | --- | --- |
 | Host-native Codex capability discovery/invocation and Host-private native sessions | Generic capability acquisition/install behavior; Agent integration does not authorize installation |
-| Read-only, local discovery and inspection of existing Claude Code and Codex sessions in Host-named workspaces, with live state from provider sources | Discovery from a Bridge peer; continuing a discovered session; attaching to a running turn |
+| Read-only, local discovery and inspection of existing Claude Code and Codex sessions in Host-named workspaces, with live state from provider sources; local continuation of an unheld Claude Code session through `claude --bg --resume` | Discovery or continuation from a Bridge peer; continuing a discovered Codex thread; attaching to a running turn |
 | Capability-neutral native lifecycle with adapter dispatch by capability ID, opaque bounded input/output, and generic invoke-v2 (exercised by a test-only adapter) | Product UI for invoke-v2 or for any non-Codex native capability |
 | Native Agent local original-workspace execution and direct remote invocation for a workspace already on the selected Host | Automatic or invisible topology mutation; remote movement remains visible and consented |
 | Native executor admission: immutable Local/Bridge task ownership, Bridge-bound cancel, and a one-shot, process-local Accept/Deny executor Review for every remote invocation and received workspace | Configurable admission policy, stored grants, per-peer allowlists, or "always allow" |

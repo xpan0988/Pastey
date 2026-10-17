@@ -23,6 +23,13 @@ The current development changes belong in `Unreleased`. Each release archives th
 - A Codex turn blocked on a native approval or question is shown as running and waiting for a native approval, on both Hosts, instead of plain running. Stop interrupts the turn.
 - Codex command and file-change approvals of a task started from another device are shown on that device, with the exact command, folder and stated reason, or the exact file changes, as plain text. Its user can Approve once or Deny each one; the executing device checks that the decision comes from the same device that started the task, in the current session, for exactly what was shown, and gives Codex that one answer. Pastey never approves for a session, never answers on its own or because of an unattended permission, and never answers permission requests, questions or forms, which still wait until stopped. Requests that cannot be shown completely and safely cannot be approved.
 - Selecting a remote device in the Codex task card now shows that device's own advertised Codex availability, with Check again, instead of this device's.
+- A discovered Claude Code session can be continued with a new prompt, through a local command for now. Pastey uses Claude Code's own background resume, which continues the session only when no other Claude Code process has it open (otherwise Claude Code makes a copy, which Pastey stops and reports as an unknown outcome).
+  - Pastey also checks Claude Code's active sessions right before starting and refuses while any process holds the session.
+  - The task shows running, waiting for an approval that Claude Code's own window must answer, completed with the agent's reply, stopped, or unknown. Nothing is sent twice.
+  - When the turn ends, Pastey releases the session so the desktop app or terminal can use it again.
+  - Other devices cannot use it.
+  - Codex threads found this way are not continued: Codex cannot show that its desktop app does not have a thread open.
+  - Verified on a Mac with Claude Code 2.1.292.
 - Read-only discovery of existing Claude Code and Codex sessions on this device, through two local commands for now (no screen yet).
   - Pastey lists the sessions in the workspaces you name: Claude Code from the desktop app or the CLI, and Codex threads from either.
   - Each session shows its workspace, origin and last activity, and whether it runs now, from Claude Code's own active-session list or, for Codex, only when no Codex process could hold it. Otherwise it says unknown.
