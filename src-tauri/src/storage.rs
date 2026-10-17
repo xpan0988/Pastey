@@ -208,6 +208,22 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             revoked_at INTEGER
         );
 
+        -- Host-local permissions for one trusted device to read native
+        -- session summaries in one workspace over one Bridge. Separate from
+        -- unattended grants: reading never authorizes execution.
+        CREATE TABLE IF NOT EXISTS session_read_grants (
+            grant_id TEXT PRIMARY KEY,
+            device_fingerprint TEXT NOT NULL,
+            bridge_id TEXT NOT NULL,
+            peer_host_ref TEXT NOT NULL,
+            local_host_ref TEXT NOT NULL,
+            workspace TEXT NOT NULL,
+            share_excerpts INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS unattended_grant_uses (
             task_id TEXT PRIMARY KEY,
             grant_id TEXT NOT NULL,
@@ -709,6 +725,175 @@ pub(crate) fn revoke_unattended_grant(paths: &AppPaths, grant_id: &str) -> AppRe
         "UPDATE unattended_grants SET revoked_at = ?2 WHERE grant_id = ?1 AND revoked_at IS NULL",
         params![grant_id, now_ts()],
     )? > 0)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredSessionReadGrant {
+    pub(crate) grant_id: String,
+    pub(crate) device_fingerprint: String,
+    pub(crate) bridge_id: String,
+    pub(crate) peer_host_ref: String,
+    pub(crate) local_host_ref: String,
+    pub(crate) workspace: String,
+    pub(crate) share_excerpts: bool,
+    pub(crate) created_at: i64,
+    pub(crate) expires_at: i64,
+    pub(crate) revoked_at: Option<i64>,
+}
+
+pub(crate) const MAX_ACTIVE_SESSION_READ_GRANTS: i64 = 32;
+
+const SESSION_READ_COLUMNS: &str = "g.grant_id, g.device_fingerprint, g.bridge_id, g.peer_host_ref,
+    g.local_host_ref, g.workspace, g.share_excerpts, g.created_at, g.expires_at, g.revoked_at";
+
+const SESSION_READ_IS_ACTIVE: &str = "g.revoked_at IS NULL AND g.expires_at > ?1
+    AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = g.device_fingerprint AND d.revoked_at IS NULL)
+    AND EXISTS (SELECT 1 FROM rooms r WHERE r.id = g.bridge_id AND r.status != 'burned')
+    AND NOT EXISTS (SELECT 1 FROM burned_bridges b WHERE b.room_id = g.bridge_id)";
+
+fn row_to_session_read_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSessionReadGrant> {
+    Ok(StoredSessionReadGrant {
+        grant_id: row.get(0)?,
+        device_fingerprint: row.get(1)?,
+        bridge_id: row.get(2)?,
+        peer_host_ref: row.get(3)?,
+        local_host_ref: row.get(4)?,
+        workspace: row.get(5)?,
+        share_excerpts: row.get::<_, i64>(6)? != 0,
+        created_at: row.get(7)?,
+        expires_at: row.get(8)?,
+        revoked_at: row.get(9)?,
+    })
+}
+
+/// Creates one session read permission. The device must be trusted and the
+/// Bridge live; the caller has already checked everything else Host-locally.
+pub(crate) fn insert_session_read_grant(
+    paths: &AppPaths,
+    grant: &StoredSessionReadGrant,
+) -> AppResult<()> {
+    let mut conn = connection(paths)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let active: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM session_read_grants g WHERE {SESSION_READ_IS_ACTIVE}"),
+        [now_ts()],
+        |row| row.get(0),
+    )?;
+    if active >= MAX_ACTIVE_SESSION_READ_GRANTS {
+        return Err(AppError::InvalidInput(
+            "Revoke a session reading permission before adding another.".into(),
+        ));
+    }
+    let allowed: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM trusted_devices WHERE fingerprint = ?1 AND revoked_at IS NULL)
+            AND EXISTS(SELECT 1 FROM rooms WHERE id = ?2 AND status != 'burned')
+            AND NOT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?2)",
+        params![&grant.device_fingerprint, &grant.bridge_id],
+        |row| row.get(0),
+    )?;
+    if allowed == 0 {
+        return Err(AppError::InvalidInput(
+            "That device or Bridge is no longer available for a session reading permission.".into(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO session_read_grants (grant_id, device_fingerprint, bridge_id, peer_host_ref,
+            local_host_ref, workspace, share_excerpts, created_at, expires_at, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            &grant.grant_id,
+            &grant.device_fingerprint,
+            &grant.bridge_id,
+            &grant.peer_host_ref,
+            &grant.local_host_ref,
+            &grant.workspace,
+            i64::from(grant.share_excerpts),
+            grant.created_at,
+            grant.expires_at
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn list_session_read_grants(paths: &AppPaths) -> AppResult<Vec<StoredSessionReadGrant>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {SESSION_READ_COLUMNS} FROM session_read_grants g ORDER BY g.created_at DESC, g.grant_id"
+    ))?;
+    let grants = statement
+        .query_map([], row_to_session_read_grant)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(grants)
+}
+
+pub(crate) fn session_read_grant_is_active(
+    paths: &AppPaths,
+    grant_id: &str,
+    now: i64,
+) -> AppResult<bool> {
+    let active: i64 = connection(paths)?.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM session_read_grants g WHERE g.grant_id = ?2 AND {SESSION_READ_IS_ACTIVE})"),
+        params![now, grant_id],
+        |row| row.get(0),
+    )?;
+    Ok(active != 0)
+}
+
+/// Active session read permissions of exactly this device key, Bridge, peer
+/// and Host.
+pub(crate) fn active_session_read_grants(
+    paths: &AppPaths,
+    device_fingerprint: &str,
+    device_public_key: &str,
+    bridge_id: &str,
+    peer_host_ref: &str,
+    local_host_ref: &str,
+    now: i64,
+) -> AppResult<Vec<StoredSessionReadGrant>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {SESSION_READ_COLUMNS} FROM session_read_grants g
+         WHERE {SESSION_READ_IS_ACTIVE}
+           AND g.device_fingerprint = ?2 AND g.bridge_id = ?3 AND g.peer_host_ref = ?4
+           AND g.local_host_ref = ?5
+           AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = ?2 AND d.public_key = ?6)
+         ORDER BY g.created_at, g.grant_id"
+    ))?;
+    let grants = statement
+        .query_map(
+            params![
+                now,
+                device_fingerprint,
+                bridge_id,
+                peer_host_ref,
+                local_host_ref,
+                device_public_key
+            ],
+            row_to_session_read_grant,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(grants)
+}
+
+pub(crate) fn revoke_session_read_grant(paths: &AppPaths, grant_id: &str) -> AppResult<bool> {
+    Ok(connection(paths)?.execute(
+        "UPDATE session_read_grants SET revoked_at = ?2 WHERE grant_id = ?1 AND revoked_at IS NULL",
+        params![grant_id, now_ts()],
+    )? > 0)
+}
+
+/// Burn: a Bridge's session read permissions end with it.
+pub(crate) fn delete_bridge_session_read_grants(
+    paths: &AppPaths,
+    bridge_id: &str,
+) -> AppResult<()> {
+    connection(paths)?.execute(
+        "DELETE FROM session_read_grants WHERE bridge_id = ?1",
+        [bridge_id],
+    )?;
+    Ok(())
 }
 
 /// Burn: a Bridge's grants end with it.
@@ -2558,6 +2743,7 @@ pub fn finalize_burned_room(
     delete_bridge_authorized_search_folders(paths, room_id)?;
     set_bridge_peer_address(paths, room_id, None)?;
     delete_bridge_unattended_grants(paths, room_id)?;
+    delete_bridge_session_read_grants(paths, room_id)?;
     let conn = connection(paths)?;
     delete_room_files(paths, room_id, effective_inbox_dir)?;
     conn.execute("DELETE FROM room_items WHERE room_id = ?1", [room_id])?;

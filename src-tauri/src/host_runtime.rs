@@ -108,6 +108,9 @@ pub struct HostRuntime {
     /// Receiver-local Search grants. They are process-local only.
     pub(crate) bridge_plan_protocol_authority: Mutex<bridge_plan::ProtocolSearchAuthorityStore>,
     pub(crate) peer_capabilities: Mutex<peer_capabilities::PeerCapabilityStore>,
+    /// This side's outstanding remote native session queries. Process-local.
+    pub(crate) native_session_queries:
+        Mutex<crate::native_agent::sessions::remote::PendingSessionQueriesV1>,
     pub(crate) host_admission: HostAdmissionService,
     pub(crate) managed_objects: Mutex<managed_objects::ManagedObjectBindingService>,
     /// Managed-effect contracts, control state, and evidence. No live
@@ -229,6 +232,7 @@ impl HostRuntime {
                 bridge_plan::ProtocolSearchAuthorityStore::default(),
             ),
             peer_capabilities: Mutex::new(peer_capabilities::PeerCapabilityStore::default()),
+            native_session_queries: Mutex::new(Default::default()),
             host_admission: HostAdmissionService::new(local_host_ref.clone()),
             managed_objects: Mutex::new(managed_objects::ManagedObjectBindingService::new(
                 local_host_ref,

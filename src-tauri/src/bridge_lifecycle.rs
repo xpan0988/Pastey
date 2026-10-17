@@ -161,6 +161,77 @@ impl CurrentRemoteHostSession {
         ))
     }
 
+    /// Asks this exact current remote Host about its native sessions (read
+    /// only) and waits for its answer. The Host answers only for workspaces
+    /// this device holds a session read permission for there.
+    pub(crate) async fn request_native_sessions(
+        &self,
+        state: Arc<AppState>,
+        mut query: crate::native_agent::sessions::remote::RemoteSessionQueryV1,
+    ) -> AppResult<crate::native_agent::sessions::remote::RemoteSessionResponseV1> {
+        let current = self.revalidate(&state).await?;
+        let context = room_control::room_control_session_context_for_peer(
+            &state,
+            &current.binding.bridge_id,
+            &current.binding.peer_route_ref,
+        )?;
+        if context.local_session_ref != current.binding.local_session_ref
+            || context.peer_session_ref != current.binding.peer_session_ref
+            || context.peer_route_ref != current.binding.peer_route_ref
+        {
+            return Err(AppError::InvalidInput(
+                "Current remote Host control session changed.".into(),
+            ));
+        }
+        query.schema_version = crate::native_agent::sessions::remote::NATIVE_SESSION_SCHEMA.into();
+        query.request_id = uuid::Uuid::new_v4().to_string();
+        query.target_host_ref = current.binding.peer_host_ref.as_str().to_owned();
+        crate::native_agent::sessions::remote::validate_query(&query)?;
+        state.native_session_queries.lock().register(
+            &query.request_id,
+            &current.binding.bridge_id,
+            current.binding.peer_host_ref.as_str(),
+        );
+        let event = room_control::native_agent_event(
+            "native_agent.session_query",
+            serde_json::to_value(&query)?,
+            &context,
+        )?;
+        if let Err(error) = room_control::send_room_control_event(
+            state.clone(),
+            &current.binding.bridge_id,
+            event,
+            Some(room_control::selected_peer_route(
+                &current.binding.bridge_id,
+                &current.binding.peer_route_ref,
+            )),
+        )
+        .await
+        {
+            state
+                .native_session_queries
+                .lock()
+                .forget(&query.request_id);
+            return Err(error);
+        }
+        // Up to 30 s: discovery on the Host reads two providers' histories.
+        for _ in 0..1200 {
+            let answer = state.native_session_queries.lock().take(&query.request_id);
+            if let Some(answer) = answer {
+                self.revalidate(&state).await?;
+                return Ok(answer);
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        state
+            .native_session_queries
+            .lock()
+            .forget(&query.request_id);
+        Err(AppError::Timeout(
+            "The remote Host did not answer about its sessions in time.".into(),
+        ))
+    }
+
     /// Reuses the existing in-memory Pastey pipeline benchmark while keeping
     /// endpoint and transport-key freshness inside the current-session owner.
     pub(crate) async fn run_pipeline_benchmark(

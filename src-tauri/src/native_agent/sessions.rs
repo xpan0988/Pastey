@@ -15,6 +15,7 @@
 
 pub(in crate::native_agent) mod claude;
 mod codex;
+pub(crate) mod remote;
 
 use std::{
     path::{Path, PathBuf},
@@ -254,7 +255,7 @@ pub(crate) struct ProviderObservationV1 {
     pub(crate) note: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ResolutionOutcomeV1 {
     /// Exactly one session matches.

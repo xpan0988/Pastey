@@ -953,6 +953,126 @@ pub async fn continue_native_session(
         .map_err(|error| error.message())
 }
 
+/// Finds the native sessions on one exact current Bridge Host, read only. The
+/// Host answers only for workspaces its own user permitted this device to
+/// read, and sends statuses, titles, counts and evidence, not transcripts.
+#[tauri::command]
+pub async fn discover_remote_native_sessions(
+    room_id: String,
+    target_host_ref: String,
+    provider: Option<String>,
+    text: Option<String>,
+    active_within_secs: Option<u64>,
+    scope_ref: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::remote::RemoteSessionResponseV1, String> {
+    use crate::native_agent::sessions::remote::{RemoteSessionOperationV1, RemoteSessionQueryV1};
+    remote_native_session_query(
+        &room_id,
+        &target_host_ref,
+        RemoteSessionQueryV1 {
+            schema_version: String::new(),
+            request_id: String::new(),
+            target_host_ref: String::new(),
+            operation: RemoteSessionOperationV1::Discover,
+            provider,
+            text,
+            active_within_secs,
+            scope_ref,
+            session_id: None,
+        },
+        &state,
+    )
+    .await
+}
+
+/// A status report on one session of one exact current Bridge Host, read
+/// only and with the same minimal disclosure as discovery.
+#[tauri::command]
+pub async fn inspect_remote_native_session(
+    room_id: String,
+    target_host_ref: String,
+    provider: String,
+    session_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::remote::RemoteSessionResponseV1, String> {
+    use crate::native_agent::sessions::remote::{RemoteSessionOperationV1, RemoteSessionQueryV1};
+    remote_native_session_query(
+        &room_id,
+        &target_host_ref,
+        RemoteSessionQueryV1 {
+            schema_version: String::new(),
+            request_id: String::new(),
+            target_host_ref: String::new(),
+            operation: RemoteSessionOperationV1::Inspect,
+            provider: Some(provider),
+            text: None,
+            active_within_secs: None,
+            scope_ref: None,
+            session_id: Some(session_id),
+        },
+        &state,
+    )
+    .await
+}
+
+async fn remote_native_session_query(
+    room_id: &str,
+    target_host_ref: &str,
+    query: crate::native_agent::sessions::remote::RemoteSessionQueryV1,
+    state: &State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::remote::RemoteSessionResponseV1, String> {
+    let target = crate::host_identity::HostRef::parse_peer(
+        target_host_ref.to_owned(),
+        &state.local_host_ref,
+    )
+    .map_err(|error| error.message())?;
+    let session = state
+        .resolve_current_remote_host_session(room_id, &target)
+        .await
+        .map_err(|error| error.message())?;
+    session
+        .request_native_sessions(state.inner().clone(), query)
+        .await
+        .map_err(|error| error.message())
+}
+
+/// This Host's session read permissions, for its own user.
+#[tauri::command]
+pub fn list_session_read_grants(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::session_read_access::SessionReadGrantViewV1>, String> {
+    crate::session_read_access::grants(&state.paths, storage::now_ts())
+        .map_err(|error| error.message())
+}
+
+/// Lets one trusted device, connected on one Bridge now, read native session
+/// summaries in one folder of this Host. Local only.
+#[tauri::command]
+pub fn create_session_read_grant(
+    request: crate::session_read_access::CreateSessionReadGrantV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::session_read_access::SessionReadGrantViewV1, String> {
+    let current = crate::host_runtime::current_verified_peer_devices(&state);
+    crate::session_read_access::create_grant(
+        &state.paths,
+        &state.local_host_ref,
+        &current,
+        &request,
+        storage::now_ts(),
+    )
+    .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn revoke_session_read_grant(
+    grant_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    crate::session_read_access::revoke_grant(&state.paths, &grant_id)
+        .map_err(|error| error.message())
+}
+
 /// The native capabilities one exact current Bridge Host advertises, from a
 /// fresh observation over the existing capability query. Like the local
 /// list, it is a fact for presentation only: it selects no Host and grants

@@ -93,6 +93,8 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "native_agent.retry_result_return",
     "native_agent.device_identity",
     "native_agent.decision",
+    "native_agent.session_query",
+    "native_agent.session_response",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
@@ -2016,6 +2018,159 @@ pub async fn receive_room_control_event_handler(
                     }
                 });
             }
+            "native_agent.session_query" => {
+                use crate::native_agent::sessions::remote;
+                let query: remote::RemoteSessionQueryV1 = match serde_json::from_value(payload) {
+                    Ok(query) if remote::validate_query(&query).is_ok() => query,
+                    _ => {
+                        return control_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_native_agent",
+                            "Invalid native session query.",
+                        )
+                    }
+                };
+                // The asking principal is the exact authenticated current
+                // peer session and the device identity proven in it.
+                let binding = match crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::FORBIDDEN,
+                            "host_mismatch",
+                            "Native session query has no bound peer Host.",
+                        )
+                    }
+                };
+                if query.target_host_ref != ctx.state.local_host_ref.as_str() {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native session query targets another Host.",
+                    );
+                }
+                let response_context = match room_control_session_context_for_peer(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) {
+                    Ok(context) => context,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::GONE,
+                            "host_binding_unavailable",
+                            "Native session response route is unavailable.",
+                        )
+                    }
+                };
+                // Only workspaces this device's Host-local permissions name.
+                let scopes = crate::host_runtime::verified_peer_device_for(&ctx.state, &binding)
+                    .map(|device| {
+                        crate::session_read_access::authorized_scopes(
+                            &ctx.state.paths,
+                            &device,
+                            &binding,
+                            storage::now_ts(),
+                        )
+                        .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let local_host_ref = ctx.state.local_host_ref.as_str().to_owned();
+                let answer_state = ctx.state.clone();
+                let answer_room = room_id.clone();
+                let answer_route =
+                    selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
+                ctx.state.spawn(async move {
+                    let answer = match remote::begin_answer(&answer_room) {
+                        None => remote::busy(&query, &local_host_ref),
+                        Some(guard) => {
+                            let workspaces: Vec<_> =
+                                scopes.iter().map(|scope| scope.workspace.clone()).collect();
+                            let (claude, codex) = answer_state
+                                .native_agents
+                                .lock()
+                                .session_sources(&workspaces);
+                            let blocking_host = local_host_ref.clone();
+                            let blocking_query = query.clone();
+                            let answer = tokio::task::spawn_blocking(move || {
+                                remote::answer(
+                                    &blocking_query,
+                                    &scopes,
+                                    &claude,
+                                    &codex,
+                                    &blocking_host,
+                                )
+                            })
+                            .await;
+                            drop(guard);
+                            match answer {
+                                Ok(answer) => answer,
+                                Err(_) => remote::busy(&query, &local_host_ref),
+                            }
+                        }
+                    };
+                    let event = serde_json::to_value(answer)
+                        .map_err(AppError::from)
+                        .and_then(|payload| {
+                            native_agent_event(
+                                "native_agent.session_response",
+                                payload,
+                                &response_context,
+                            )
+                        });
+                    if let Ok(event) = event {
+                        let _ = send_room_control_event(
+                            answer_state,
+                            &answer_room,
+                            event,
+                            Some(answer_route),
+                        )
+                        .await;
+                    }
+                });
+            }
+            "native_agent.session_response" => {
+                use crate::native_agent::sessions::remote;
+                let answer: remote::RemoteSessionResponseV1 = match serde_json::from_value(payload)
+                {
+                    Ok(answer) if remote::validate_response(&answer).is_ok() => answer,
+                    _ => {
+                        return control_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_native_agent",
+                            "Invalid native session answer.",
+                        )
+                    }
+                };
+                let Ok(binding) = crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) else {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native session answer has no bound peer Host.",
+                    );
+                };
+                if ctx
+                    .state
+                    .native_session_queries
+                    .lock()
+                    .record(&room_id, binding.peer_host_ref.as_str(), answer)
+                    .is_err()
+                {
+                    return control_error(
+                        StatusCode::FORBIDDEN,
+                        "host_mismatch",
+                        "Native session answer does not match an outstanding query.",
+                    );
+                }
+            }
             "native_agent.reconciliation" => {
                 let fact: crate::native_agent::NativeAgentReconciliationV1 =
                     match serde_json::from_value(payload) {
@@ -2979,6 +3134,22 @@ fn validate_control_event(
                     fact.movement_id.clone().unwrap_or_default(),
                     canonical_safe_fact_digest(&fact)?
                 )
+            }
+            "native_agent.session_query" => {
+                let query = serde_json::from_value::<
+                    crate::native_agent::sessions::remote::RemoteSessionQueryV1,
+                >(Value::Object(payload.clone()))
+                .map_err(AppError::from)?;
+                crate::native_agent::sessions::remote::validate_query(&query)?;
+                format!("native-session-query:{}", query.request_id)
+            }
+            "native_agent.session_response" => {
+                let response = serde_json::from_value::<
+                    crate::native_agent::sessions::remote::RemoteSessionResponseV1,
+                >(Value::Object(payload.clone()))
+                .map_err(AppError::from)?;
+                crate::native_agent::sessions::remote::validate_response(&response)?;
+                format!("native-session-response:{}", response.request_id)
             }
             _ => {
                 return Err(AppError::InvalidInput(
@@ -4165,7 +4336,8 @@ mod tests {
     #[test]
     fn native_capabilities_share_the_fixed_native_agent_event_family() {
         // A new native capability adds no event kind: every capability uses
-        // these, and only these, Native Agent events.
+        // these, and only these, Native Agent events. The two session kinds
+        // are read-only session discovery, not a capability.
         let native = ALLOWED_EVENT_KINDS
             .iter()
             .copied()
@@ -4187,6 +4359,8 @@ mod tests {
                 // The requesting user's decision on a native request; Core
                 // relays it to whichever capability raised the request.
                 "native_agent.decision",
+                "native_agent.session_query",
+                "native_agent.session_response",
             ]
         );
     }
@@ -4747,4 +4921,137 @@ mod tests {
         };
         assert!(error.contains("review expiry"));
     }
+
+    fn session_answer() -> crate::native_agent::sessions::remote::RemoteSessionResponseV1 {
+        use crate::native_agent::sessions::remote::*;
+        use crate::native_agent::sessions::*;
+        let session = RemoteSessionV1 {
+            provider: PROVIDER_CLAUDE_CODE.into(),
+            session_id: "77777777-7777-4777-8777-777777777777".into(),
+            scope_ref: "scope:0123456789abcdef".into(),
+            workspace_label: "Pastey".into(),
+            title: Some("Fix the transfer retry bug".into()),
+            origin: "desktop".into(),
+            created_at_ms: Some(1),
+            last_activity_at_ms: Some(2),
+            git_branch: Some("main".into()),
+            live: RemoteLiveV1 {
+                state: LiveStateV1::NotRunning,
+                source: "claude agents --json".into(),
+                observed_at_ms: 3,
+                detail: None,
+            },
+            last_turn: RemoteLastTurnV1 {
+                outcome: LastTurnV1::Completed,
+                at_ms: Some(2),
+                source: "transcript".into(),
+            },
+            status: SessionStatusV1::Completed,
+            status_basis: EvidenceBasisV1::Fact,
+            resume: RemoteResumeV1 {
+                verdict: ResumeVerdictV1::Safe,
+                reasons: vec!["no process holds it".into()],
+            },
+        };
+        RemoteSessionResponseV1 {
+            schema_version: NATIVE_SESSION_SCHEMA.into(),
+            request_id: "req-1".into(),
+            source_host_ref: "host:windows".into(),
+            outcome: RemoteSessionOutcomeV1::Ok,
+            scopes: vec![RemoteScopeV1 {
+                scope_ref: "scope:0123456789abcdef".into(),
+                label: "Pastey".into(),
+                share_excerpts: true,
+            }],
+            discovery: None,
+            snapshot: Some(RemoteSnapshotV1 {
+                session,
+                activity: RemoteActivityV1 {
+                    user_turns: 1,
+                    commands: 2,
+                    failed_commands: 1,
+                    changed_files: vec!["src/lib.rs".into()],
+                    ..Default::default()
+                },
+                history_complete: true,
+                excerpts_shared: true,
+                recent: vec![RemoteEntryV1 {
+                    role: "agent_claim".into(),
+                    at_ms: Some(2),
+                    text: "Done; tests pass.".into(),
+                }],
+                workspace: RemoteWorkspaceV1 {
+                    exists: true,
+                    git_branch: Some("main".into()),
+                    uncommitted_paths: Some(0),
+                    ..Default::default()
+                },
+                evidence: vec![RemoteEvidenceV1 {
+                    basis: EvidenceBasisV1::Unknown,
+                    statement: "Whether the work the agent describes was done is not verified."
+                        .into(),
+                    source: "agent reply".into(),
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn native_session_query_and_answer_are_typed_session_bound_native_events() {
+        use crate::native_agent::sessions::remote::*;
+        let query = RemoteSessionQueryV1 {
+            schema_version: NATIVE_SESSION_SCHEMA.into(),
+            request_id: "req-1".into(),
+            target_host_ref: "host:windows".into(),
+            operation: RemoteSessionOperationV1::Inspect,
+            provider: Some("claude_code".into()),
+            text: None,
+            active_within_secs: None,
+            scope_ref: None,
+            session_id: Some("77777777-7777-4777-8777-777777777777".into()),
+        };
+        let validated = validate_native(native_event(
+            "native_agent.session_query",
+            serde_json::to_value(&query).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(
+            validated.request_id.as_deref(),
+            Some("native-session-query:req-1")
+        );
+        let answer = serde_json::to_value(session_answer()).unwrap();
+        let validated = validate_native(native_event(
+            "native_agent.session_response",
+            answer.clone(),
+        ))
+        .unwrap();
+        assert_eq!(
+            validated.request_id.as_deref(),
+            Some("native-session-response:req-1")
+        );
+
+        // Unknown fields, an inspection without its session, excerpts the
+        // answer says were not shared, and unsafe fields are all refused.
+        let mut extra = serde_json::to_value(&query).unwrap();
+        extra["transcript"] = serde_json::json!("all of it");
+        assert!(validate_native(native_event("native_agent.session_query", extra)).is_err());
+        let mut no_session = query.clone();
+        no_session.session_id = None;
+        assert!(validate_native(native_event(
+            "native_agent.session_query",
+            serde_json::to_value(&no_session).unwrap()
+        ))
+        .is_err());
+        let mut withheld = answer.clone();
+        withheld["snapshot"]["excerptsShared"] = serde_json::json!(false);
+        assert!(validate_native(native_event("native_agent.session_response", withheld)).is_err());
+        let mut unsafe_answer = answer;
+        unsafe_answer["snapshot"]["workspace"]["path"] = serde_json::json!("/Users/me/Pastey");
+        assert!(
+            validate_native(native_event("native_agent.session_response", unsafe_answer)).is_err()
+        );
+    }
 }
+
+#[cfg(all(test, unix))]
+mod native_session_pair_tests;
