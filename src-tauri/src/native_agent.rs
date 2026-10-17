@@ -24,6 +24,7 @@ use crate::host_identity::HostSessionBinding;
 
 mod admission;
 mod capability;
+pub(crate) mod sessions;
 pub(crate) use admission::NativeInvocationReviewV1;
 use admission::{
     NativeAdmissionDecisionV1, NativeInvocationContinuationV1, NativeInvocationPrincipalV1,
@@ -1630,6 +1631,28 @@ impl NativeAgentServiceV1 {
                 crate::storage::update_native_agent_observed_task_if_present(paths, task_id, &task);
         }
     }
+    /// Session discovery's sources for `workspaces`, taken under the service
+    /// lock and used after the caller releases it: discovery launches
+    /// bounded read-only processes. Pastey's own live Codex sessions count
+    /// as possible holders of their workspace's threads.
+    pub(crate) fn session_sources(
+        &self,
+        workspaces: &[PathBuf],
+    ) -> (
+        sessions::ClaudeSessionSourceV1,
+        sessions::CodexSessionSourceV1,
+    ) {
+        let pastey_live = workspaces
+            .iter()
+            .filter(|workspace| self.codex.has_session(workspace))
+            .cloned()
+            .collect();
+        (
+            sessions::ClaudeSessionSourceV1::installed(),
+            sessions::CodexSessionSourceV1::new(self.codex.executable(), pastey_live),
+        )
+    }
+
     /// The registered adapters, for observation after the caller has
     /// released the service lock.
     pub(crate) fn capability_registry(&self) -> NativeCapabilityRegistryV1 {

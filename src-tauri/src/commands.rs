@@ -858,6 +858,51 @@ pub fn list_native_agent_capabilities(
     Ok(registry.capabilities())
 }
 
+/// Finds the Claude Code and Codex sessions that already exist on this Host
+/// in the workspaces this Host's user names, with their live state and
+/// evidence. Read only: nothing is started, resumed, changed or stopped.
+/// Local only; no Bridge peer reaches it.
+#[tauri::command]
+pub async fn discover_native_sessions(
+    query: crate::native_agent::sessions::NativeSessionQueryV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::NativeSessionDiscoveryV1, String> {
+    let workspaces =
+        crate::native_agent::sessions::authorized_workspaces(&state.paths, &query.workspaces)
+            .map_err(|error| error.message())?;
+    let (claude, codex) = state.native_agents.lock().session_sources(&workspaces);
+    tokio::task::spawn_blocking(move || {
+        crate::native_agent::sessions::discover(&claude, &codex, &workspaces, &query)
+    })
+    .await
+    .map_err(|_| "Session discovery stopped unexpectedly.".to_string())
+}
+
+/// A status report on one discovered session, only if it belongs to one of
+/// the named workspaces. Read only and local only, like discovery.
+#[tauri::command]
+pub async fn inspect_native_session(
+    request: crate::native_agent::sessions::NativeSessionInspectV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::NativeSessionSnapshotV1, String> {
+    let workspaces =
+        crate::native_agent::sessions::authorized_workspaces(&state.paths, &request.workspaces)
+            .map_err(|error| error.message())?;
+    let (claude, codex) = state.native_agents.lock().session_sources(&workspaces);
+    tokio::task::spawn_blocking(move || {
+        crate::native_agent::sessions::inspect(
+            &claude,
+            &codex,
+            &workspaces,
+            &request.provider,
+            &request.session_id,
+        )
+    })
+    .await
+    .map_err(|_| "Session inspection stopped unexpectedly.".to_string())?
+    .map_err(|error| error.message())
+}
+
 /// The native capabilities one exact current Bridge Host advertises, from a
 /// fresh observation over the existing capability query. Like the local
 /// list, it is a fact for presentation only: it selects no Host and grants

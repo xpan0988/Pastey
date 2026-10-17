@@ -390,14 +390,15 @@ impl CodexNativeAdapterV1 {
         }
     }
 
-    fn executable(&self) -> PathBuf {
+    pub(in crate::native_agent) fn executable(&self) -> PathBuf {
         self.executable
             .lock()
             .map(|path| path.clone())
             .unwrap_or_else(|_| PathBuf::from(INSTALLED_CODEX))
     }
 
-    /// Workspace movement only: whether a Host-private session exists.
+    /// Whether a Host-private session exists in a workspace (workspace
+    /// movement, and session discovery's holder check).
     pub(in crate::native_agent) fn has_session(&self, workspace: &Path) -> bool {
         self.sessions.lock().is_ok_and(|sessions| {
             sessions
@@ -2638,6 +2639,219 @@ impl Drop for CodexAppServerV1 {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// Read-only access to Codex's persisted thread history through its own
+/// app-server (session discovery). It starts, resumes, interrupts and
+/// changes nothing: it allows only the listing and reading methods below,
+/// and its app-server is Pastey's own child, separate from any app-server a
+/// desktop app or terminal runs.
+pub(in crate::native_agent) struct CodexHistoryReaderV1 {
+    server: CodexAppServerV1,
+    next_id: std::sync::atomic::AtomicU64,
+    backend: Option<&'static str>,
+}
+
+/// Methods the history reader may send. Nothing that starts or changes a
+/// thread or turn is allowed.
+const HISTORY_METHODS: [&str; 3] = ["thread/list", "thread/turns/list", "thread/items/list"];
+const HISTORY_RPC_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Why a read failed: its answer exceeded the line bound, or anything else.
+pub(in crate::native_agent) enum HistoryReadErrorV1 {
+    Oversized,
+    Failed(String),
+}
+
+impl CodexHistoryReaderV1 {
+    /// Opens a reader on the Codex this adapter would launch (CLI or desktop
+    /// app), working in `cwd`.
+    pub(in crate::native_agent) fn open(executable: &Path, cwd: &Path) -> AppResult<Self> {
+        let (report, launcher) = codex_probe_selecting(executable, PROBE_TIMEOUT);
+        let launcher = launcher.ok_or_else(|| {
+            AppError::InvalidInput(codex_unavailable_summary(report.reason).into())
+        })?;
+        Ok(Self {
+            server: CodexAppServerV1::launch(&launcher, cwd)?,
+            // Above the fixed ids of Pastey's own task requests.
+            next_id: std::sync::atomic::AtomicU64::new(100),
+            backend: report.backend,
+        })
+    }
+
+    pub(in crate::native_agent) fn backend(&self) -> Option<&'static str> {
+        self.backend
+    }
+
+    pub(in crate::native_agent) fn request(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HistoryReadErrorV1> {
+        if !HISTORY_METHODS.contains(&method) {
+            return Err(HistoryReadErrorV1::Failed(format!(
+                "{method} is not a history read"
+            )));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.server
+            .send(json!({"id": id, "method": method, "params": params}))
+            .map_err(|error| HistoryReadErrorV1::Failed(error.message()))?;
+        let deadline = Instant::now() + HISTORY_RPC_TIMEOUT;
+        loop {
+            match self.server.next_message(deadline) {
+                Err(error) => return Err(HistoryReadErrorV1::Failed(error.message())),
+                // Nothing else runs on this connection, so an oversized line
+                // is this answer.
+                Ok(ObservedLineV1::Oversized) => return Err(HistoryReadErrorV1::Oversized),
+                Ok(ObservedLineV1::Malformed) => continue,
+                Ok(ObservedLineV1::Message(message)) => {
+                    if message.get("method").is_some()
+                        || message.get("id").and_then(Value::as_u64) != Some(id)
+                    {
+                        continue;
+                    }
+                    if let Some(result) = message.get("result") {
+                        return Ok(result.clone());
+                    }
+                    let reason = message
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request failed");
+                    return Err(HistoryReadErrorV1::Failed(
+                        reason.chars().take(200).collect(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// A Codex process found on this Host that could hold a thread open: the
+/// app-server of a desktop app, a terminal session, or another client.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::native_agent) struct CodexHolderProcessV1 {
+    pub(in crate::native_agent) pid: u32,
+    /// `desktop` when it runs from a desktop app bundle, else `cli`.
+    pub(in crate::native_agent) kind: &'static str,
+}
+
+/// Whether a command line is a Codex process that can hold threads: an
+/// app-server, or an interactive or exec session. Helpers such as the
+/// sandbox, exec-server and MCP commands, and probes, cannot.
+pub(in crate::native_agent) fn codex_holder_kind(command: &str) -> Option<&'static str> {
+    let mut words = command.split_whitespace();
+    let program = words.next()?;
+    let name = Path::new(program)
+        .file_name()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if name != "codex" && name != "codex.exe" {
+        return None;
+    }
+    let mut subcommand = None;
+    let mut skip_value = false;
+    for word in words {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if word == "-c" || word == "--config" || word == "--enable" || word == "--disable" {
+            skip_value = true;
+            continue;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        subcommand = Some(word);
+        break;
+    }
+    let holds = match subcommand {
+        None | Some("app-server") | Some("resume") | Some("exec") | Some("e") | Some("fork") => {
+            true
+        }
+        Some(_) => false,
+    };
+    if !holds || command.contains(" --version") || command.contains(" --help") {
+        return None;
+    }
+    let desktop = program.contains(".app/Contents/") || program.contains("\\WindowsApps\\");
+    Some(if desktop { "desktop" } else { "cli" })
+}
+
+/// The Codex processes on this Host that could hold a thread, other than
+/// Pastey's own children. `None` when the process list cannot be read.
+pub(in crate::native_agent) fn codex_holder_processes() -> Option<Vec<CodexHolderProcessV1>> {
+    let own = std::process::id();
+    let mut holders = Vec::new();
+    for (pid, parent, command) in process_table()? {
+        if pid == own || parent == own {
+            continue;
+        }
+        if let Some(kind) = codex_holder_kind(&command) {
+            holders.push(CodexHolderProcessV1 { pid, kind });
+        }
+    }
+    Some(holders)
+}
+
+#[cfg(unix)]
+fn process_table() -> Option<Vec<(u32, u32, String)>> {
+    let output = Command::new("ps")
+        .args(["-axww", "-o", "pid=,ppid=,command="])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then_some(())?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let pid = fields.next()?.parse().ok()?;
+                let parent = fields.next()?.parse().ok()?;
+                Some((pid, parent, fields.collect::<Vec<_>>().join(" ")))
+            })
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+fn process_table() -> Option<Vec<(u32, u32, String)>> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='codex.exe'\" | ForEach-Object { \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)\" }",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    output.status.success().then_some(())?;
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\t');
+                let pid = fields.next()?.trim().parse().ok()?;
+                let parent = fields.next()?.trim().parse().ok()?;
+                // CommandLine quotes the program path; unquote it.
+                let command = fields.next().unwrap_or("").trim().replacen('"', "", 2);
+                Some((pid, parent, command))
+            })
+            .collect(),
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_table() -> Option<Vec<(u32, u32, String)>> {
+    None
 }
 
 /// The native app-server can emit terminal notifications for other threads on
