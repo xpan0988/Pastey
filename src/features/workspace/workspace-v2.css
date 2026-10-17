@@ -311,3 +311,26 @@ button { color: inherit; }
 .v2-bridge-network { position: relative; }
 .v2-bridge-network > .v2-task-open { position: absolute; right: 0; z-index: 5; width: 320px; margin-top: 6px; padding: 10px; border-radius: 8px; background: #1c1b20; border: 1px solid rgba(255, 255, 255, 0.08); }
 .v2-join-card label { display: block; margin-top: 8px; font-size: 11px; color: #c9c7cf; }
+
+/* Agent sessions: one row per discovered session. */
+.v2-session-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid var(--v2-border, rgba(127, 127, 127, 0.25));
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.v2-session-row span { display: flex; flex-direction: column; min-width: 0; }
+.v2-session-row small { opacity: 0.75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v2-session-row b { white-space: nowrap; font-weight: 600; }
+.v2-session-row.selected { outline: 2px solid currentColor; outline-offset: -2px; }
+.v2-session-row.tone-live b { color: #1f8f4e; }
+.v2-session-row.tone-warning b { color: #b26b00; }
+.v2-session-row.tone-unknown b { opacity: 0.7; }

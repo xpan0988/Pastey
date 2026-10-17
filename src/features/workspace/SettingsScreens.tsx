@@ -20,6 +20,7 @@ import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProvide
 import type { AppConfig, RoomInfo } from "../../lib/types";
 import { bridgeCode } from "./workspaceViewModel";
 import { KnownDevicesSettings } from "./KnownDevicesSettings";
+import { SessionReadingSettings } from "./SessionReadingSettings";
 import { UnattendedAccessSettings } from "./UnattendedAccessSettings";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
@@ -77,6 +78,7 @@ export function SettingsOverview({ config, onNavigate, onConfigChange }: Setting
           <SharedSearchFolders />
           <KnownDevicesSettings />
           <UnattendedAccessSettings />
+          <SessionReadingSettings />
           <SettingsGroup title="Discovery"><SettingsRow title="Local network discovery" description="Current discovery state is Host-owned." value="Not projected" /></SettingsGroup>
           <SettingsGroup title="Tasks">
             <SettingsRow title="Task features" description="Reviewed cross-device managed Plan workflow." value="Available when Host ready" />

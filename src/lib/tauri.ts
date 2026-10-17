@@ -750,6 +750,142 @@ export function revokeUnattendedGrant(grantId: string): Promise<UnattendedGrant[
   return invoke("revoke_unattended_grant", { grantId });
 }
 
+/** Native session discovery (read only). Rust owns every rule: live state
+ * comes only from a live source, history only explains how a stopped
+ * session ended, and an agent's own words are claims, not proof. */
+export type NativeSessionProvider = "claude_code" | "codex";
+export type EvidenceBasis = "fact" | "inference" | "unknown";
+export type NativeSessionLiveState = "running" | "attached" | "not_running" | "unknown";
+export type NativeSessionLastTurn = "completed" | "interrupted" | "failed" | "in_progress" | "none" | "unreadable";
+export type NativeSessionStatus = "running" | "idle" | "completed" | "interrupted" | "failed" | "unknown";
+export type NativeSessionResumeVerdict = "safe" | "unsafe" | "unknown";
+
+/** One session as a peer Host describes it: no folder paths, a workspace
+ * only by its folder name and an opaque scope reference. */
+export interface RemoteNativeSession {
+  provider: NativeSessionProvider;
+  sessionId: string;
+  scopeRef: string;
+  workspaceLabel: string;
+  title: string | null;
+  origin: string;
+  createdAtMs: number | null;
+  lastActivityAtMs: number | null;
+  gitBranch: string | null;
+  live: { state: NativeSessionLiveState; source: string; observedAtMs: number; detail: string | null };
+  lastTurn: { outcome: NativeSessionLastTurn; atMs: number | null; source: string };
+  status: NativeSessionStatus;
+  statusBasis: EvidenceBasis;
+  resume: { verdict: NativeSessionResumeVerdict; reasons: string[] };
+}
+
+export interface RemoteNativeSessionSnapshot {
+  session: RemoteNativeSession;
+  activity: { userTurns: number; agentReplies: number; toolCalls: number; commands: number; failedCommands: number; changedFiles: string[]; changedElsewhere: number; errors: number };
+  historyComplete: boolean;
+  excerptsShared: boolean;
+  recent: Array<{ role: "user" | "agent_claim"; atMs: number | null; text: string }>;
+  workspace: { exists: boolean; gitBranch: string | null; head: string | null; headCommittedAtMs: number | null; uncommittedPaths: number | null; commitsSinceLastActivity: number | null };
+  evidence: Array<{ basis: EvidenceBasis; statement: string; source: string }>;
+}
+
+export type RemoteNativeSessionOutcome = "ok" | "not_authorized" | "not_found" | "busy" | "unavailable";
+
+export interface RemoteNativeSessionResponse {
+  schemaVersion: string;
+  requestId: string;
+  sourceHostRef: string;
+  outcome: RemoteNativeSessionOutcome;
+  scopes: Array<{ scopeRef: string; label: string; shareExcerpts: boolean }>;
+  discovery?: {
+    observedAtMs: number;
+    providers: Array<{ provider: NativeSessionProvider; historyReadable: boolean; liveSource: string | null; note: string | null }>;
+    sessions: RemoteNativeSession[];
+    truncated: boolean;
+    resolution: "unique" | "ambiguous" | "none";
+    sessionId: string | null;
+  } | null;
+  snapshot?: RemoteNativeSessionSnapshot | null;
+}
+
+export interface NativeSessionFilters {
+  provider?: NativeSessionProvider | null;
+  text?: string | null;
+  activeWithinSecs?: number | null;
+  scopeRef?: string | null;
+}
+
+export function discoverRemoteNativeSessions(roomId: string, targetHostRef: string, filters: NativeSessionFilters): Promise<RemoteNativeSessionResponse> {
+  return invoke("discover_remote_native_sessions", { roomId, targetHostRef, provider: filters.provider ?? null, text: filters.text ?? null, activeWithinSecs: filters.activeWithinSecs ?? null, scopeRef: filters.scopeRef ?? null });
+}
+
+export function inspectRemoteNativeSession(roomId: string, targetHostRef: string, provider: NativeSessionProvider, sessionId: string): Promise<RemoteNativeSessionResponse> {
+  return invoke("inspect_remote_native_session", { roomId, targetHostRef, provider, sessionId });
+}
+
+/** This device's own sessions, in folders its user names here. */
+export interface LocalNativeSession extends Omit<RemoteNativeSession, "scopeRef" | "workspaceLabel"> {
+  workspace: string;
+  originRaw: string | null;
+}
+
+export interface LocalNativeSessionDiscovery {
+  observedAtMs: number;
+  providers: Array<{ provider: NativeSessionProvider; historyReadable: boolean; liveSource: string | null; note: string | null }>;
+  sessions: LocalNativeSession[];
+  resolution: "unique" | "ambiguous" | "none";
+  sessionId: string | null;
+}
+
+export interface LocalNativeSessionSnapshot extends Omit<RemoteNativeSessionSnapshot, "session" | "activity" | "excerptsShared"> {
+  session: LocalNativeSession;
+  activity: Omit<RemoteNativeSessionSnapshot["activity"], "changedElsewhere">;
+}
+
+export function discoverNativeSessions(workspaces: string[], filters: NativeSessionFilters): Promise<LocalNativeSessionDiscovery> {
+  return invoke("discover_native_sessions", { query: { workspaces, provider: filters.provider ?? null, text: filters.text ?? null, activeWithinSecs: filters.activeWithinSecs ?? null } });
+}
+
+export function inspectNativeSession(workspaces: string[], provider: NativeSessionProvider, sessionId: string): Promise<LocalNativeSessionSnapshot> {
+  return invoke("inspect_native_session", { request: { workspaces, provider, sessionId } });
+}
+
+export type SessionReadGrantState = "active" | "expired" | "revoked" | "unavailable";
+
+/** A Host-local permission for one trusted device to read native session
+ * summaries in one folder over one Bridge. Trusting a device grants none. */
+export interface SessionReadGrant {
+  grantId: string;
+  deviceLabel: string;
+  displayFingerprint: string;
+  bridgeId: string;
+  workspace: string;
+  shareExcerpts: boolean;
+  createdAt: number;
+  expiresAt: number;
+  state: SessionReadGrantState;
+}
+
+export interface CreateSessionReadGrant {
+  deviceFingerprint: string;
+  roomId: string;
+  workspacePath: string;
+  durationHours: number;
+  shareExcerpts: boolean;
+}
+
+export function listSessionReadGrants(): Promise<SessionReadGrant[]> {
+  return invoke("list_session_read_grants");
+}
+
+export function createSessionReadGrant(request: CreateSessionReadGrant): Promise<SessionReadGrant> {
+  return invoke("create_session_read_grant", { request });
+}
+
+export function revokeSessionReadGrant(grantId: string): Promise<void> {
+  return invoke("revoke_session_read_grant", { grantId });
+}
+
 export async function listRooms(): Promise<RoomInfo[]> {
   return invoke("list_rooms");
 }

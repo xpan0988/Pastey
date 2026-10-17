@@ -8,6 +8,7 @@ import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferSc
 import type { RoomInfo, RoomItem } from "../../lib/types";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
 import type { AgentTaskController } from "./AgentTaskLifecycle";
+import { NativeSessionsCard } from "./NativeSessionsCard";
 import { nativeAgentAwaitingNativeDecision, nativeAgentConsequenceAbandonmentRequired, nativeAgentConversationLabel, nativeAgentConversationUnavailable, nativeAgentDisplayName, nativeAgentLifecycleLabel, nativeAgentMovementBlocksNewRun, nativeAgentRemoteReconciliationRequired, nativeAgentResponse, nativeAgentTargetAvailability, StatusBadge, useNativeAgentTask, useRemoteNativeCapabilities, type NativeAgentTargetAvailability } from "./AgentTaskLifecycle";
 import type { NativeAgentCapability, NativeAgentTaskStatus } from "../../lib/tauri";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
@@ -229,7 +230,10 @@ function TaskComposer({ mode, roomId, onMode, text, onText, peers, selectedPeerI
       ) : mode === "find" ? (
         <RemoteFileFinder roomId={roomId} peerName={peers.find((peer) => peer.peerSessionId === selectedPeerId)?.displayName ?? null} route={route} />
       ) : (
-        <NativeAgentTaskCard roomId={roomId} peers={peers} />
+        <>
+          <NativeAgentTaskCard roomId={roomId} peers={peers} />
+          <NativeSessionsCard roomId={roomId} peers={peers} />
+        </>
       )}
       <div className="v2-composer-controls">
         <button type="button" className="v2-square-button" disabled={mode === "send" && disabled} onClick={mode === "send" ? onFiles : undefined}>＋</button>

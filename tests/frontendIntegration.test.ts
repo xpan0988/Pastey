@@ -28,6 +28,7 @@ import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgres
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
+import { evidenceGroups, localSessionView, readGrantFormProblem, readGrantStateLabel, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import type { NativeDecisionReview } from "../src/lib/tauri";
 
 function room(peerConnected: boolean): RoomInfo {
@@ -838,4 +839,64 @@ test("Codex requests are shown as untrusted text and answered only once, by the 
   // A permission never approves; the settings say where requests go instead.
   const settings = readFileSync("src/features/workspace/UnattendedAccessSettings.tsx", "utf8");
   assert.match(settings, /shown on the device that started the task, where its user may approve it once or deny it/);
+});
+
+function sessionView(overrides: Partial<SessionView>): SessionView {
+  return {
+    provider: "claude_code", sessionId: "77777777-7777-4777-8777-777777777777", scopeRef: "scope:0123456789abcdef", workspaceLabel: "Pastey",
+    title: "Fix the retry bug", origin: "desktop", createdAtMs: 1, lastActivityAtMs: 2, gitBranch: "main",
+    live: { state: "not_running", source: "claude agents --json", observedAtMs: 3, detail: null },
+    lastTurn: { outcome: "completed", atMs: 2, source: "transcript" },
+    status: "completed", statusBasis: "fact", resume: { verdict: "safe", reasons: [] },
+    ...overrides,
+  };
+}
+
+test("a session's status comes from Rust's live facts, never from its last message", () => {
+  // History says the last turn ended, but a live source says it runs.
+  assert.equal(sessionStatusPresentation(sessionView({ status: "running", statusBasis: "fact", live: { state: "running", source: "claude agents --json", observedAtMs: 3, detail: null } })).label, "Running");
+  // History says the last turn ended and nothing runs it: not "done".
+  const ended = sessionStatusPresentation(sessionView({}));
+  assert.equal(ended.label, "Last turn ended");
+  assert.match(ended.explanation, /not proof the task is done/);
+  // History says it was mid-turn, but no live source can tell: unknown.
+  const unknown = sessionStatusPresentation(sessionView({ status: "unknown", statusBasis: "unknown", lastTurn: { outcome: "in_progress", atMs: 2, source: "transcript" }, live: { state: "unknown", source: "process list", observedAtMs: 3, detail: "a desktop app may hold it" } }));
+  assert.equal(unknown.label, "Unknown");
+  assert.match(unknown.explanation, /a desktop app may hold it/);
+  assert.equal(sessionStatusPresentation(sessionView({ status: "interrupted", statusBasis: "inference" })).label, "Interrupted (inferred)");
+  assert.equal(resumeLabel(sessionView({ resume: { verdict: "unknown", reasons: [] } })), "Continuing is not shown to be safe");
+});
+
+test("a Host that has not shared its sessions says where to allow it", () => {
+  assert.match(remoteOutcomeMessage({ outcome: "not_authorized" }, "Windows PC") ?? "", /On Windows PC, open Settings → Session reading/);
+  assert.equal(remoteOutcomeMessage({ outcome: "ok" }, "Windows PC"), null);
+  assert.match(remoteOutcomeMessage({ outcome: "busy" }, "Windows PC") ?? "", /still answering/);
+});
+
+test("session filters, folder labels and evidence groups are normalized for display", () => {
+  assert.deepEqual(sessionFilters({ provider: "gemini", text: "  ", activeWithinSecs: 3600, scopeRef: "" }), { provider: null, text: null, activeWithinSecs: 3600, scopeRef: null });
+  assert.deepEqual(sessionFilters({ provider: "codex", text: " retry ", activeWithinSecs: null, scopeRef: "scope:0123456789abcdef" }), { provider: "codex", text: "retry", activeWithinSecs: null, scopeRef: "scope:0123456789abcdef" });
+  const local = { ...sessionView({}), workspace: "C:\\Users\\me\\Pastey", originRaw: "cli" } as Parameters<typeof localSessionView>[0];
+  assert.equal(localSessionView(local).workspaceLabel, "Pastey");
+  assert.equal(localSessionView({ ...local, workspace: "/Users/me/Projects/Site" }).workspaceLabel, "Site");
+  const groups = evidenceGroups([{ basis: "fact", statement: "a", source: "s" }, { basis: "unknown", statement: "b", source: "s" }, { basis: "inference", statement: "c", source: "s" }]);
+  assert.deepEqual([groups.facts.length, groups.inferences.length, groups.unknowns.length], [1, 1, 1]);
+});
+
+test("a session reading permission names a device, a folder and a length", () => {
+  assert.match(readGrantFormProblem({}) ?? "", /trusted device/);
+  assert.match(readGrantFormProblem({ deviceFingerprint: "d", roomId: "r" }) ?? "", /folder/);
+  assert.match(readGrantFormProblem({ deviceFingerprint: "d", roomId: "r", workspacePath: "/p", durationHours: 5 }) ?? "", /how long/);
+  assert.equal(readGrantFormProblem({ deviceFingerprint: "d", roomId: "r", workspacePath: "/p", durationHours: 720, shareExcerpts: false }), null);
+  assert.equal(readGrantStateLabel({ grantId: "g", deviceLabel: "Mac", displayFingerprint: "f", bridgeId: "b", workspace: "/p", shareExcerpts: false, createdAt: 1, expiresAt: 2, state: "active" }), "Active · statuses only");
+});
+
+test("the sessions card reads only and the Host's settings own every permission", () => {
+  const card = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  const settings = readFileSync("src/features/workspace/SessionReadingSettings.tsx", "utf8");
+  assert.match(card, /discoverRemoteNativeSessions\(roomId, remote\.hostRef!/);
+  assert.doesNotMatch(card, /continueNativeSession|startClaude|createSessionReadGrant/);
+  assert.match(card, /Pastey does not pick for you/);
+  assert.match(card, /the agent's own account, not verified/);
+  assert.match(settings, /trusting a device does not let it read anything/);
 });
