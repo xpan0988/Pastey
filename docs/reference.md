@@ -139,6 +139,36 @@ After `turn/start` returns the exact thread/turn identity, Pastey observes until
 
 Native sessions are Host-private. The Codex adapter keeps its app-server sessions per workspace, and only an exact requested `turn/completed` notification with `status: completed` and no error is terminal success. Cancellation wins a late completion; malformed, mismatched, failed, interrupted, or unknown outcomes are non-completion. Current-session resolution, replay checks, and rate limits remain the Room Control boundary; the Native Agent path does not expose provider credentials, native session IDs, raw workspace paths, or Agent reasoning.
 
+### Native session discovery facts
+
+Two local Tauri commands. They are not Room Control events, and no Bridge peer reaches them.
+
+- `discover_native_sessions(query)`:
+  - **Query:** `workspaces` (1 to 8 shareable folders), optional `provider` (`claude_code` or `codex`), optional `text`, optional `activeWithinSecs`. Unknown fields are refused.
+  - **Result:** `observedAtMs`; per provider `historyReadable`, `liveSource` and `note`; `sessions`, newest activity first; `resolution` (`unique`, `ambiguous` or `none`), with `sessionId` only when unique.
+- `inspect_native_session(request)`: `workspaces`, `provider` and `sessionId`. It answers only for a session whose recorded directory is one of the workspaces. Session ids must be a UUID (Claude Code) or `[A-Za-z0-9-]{1,64}` (Codex).
+
+Each session carries:
+- `provider`, `sessionId`, `workspace`, `title` (at most 120 characters);
+- `origin` (`desktop`, `cli`, `pastey`, `sdk`, `other` or `unknown`) and `originRaw`;
+- `createdAtMs`, `lastActivityAtMs`, `gitBranch`;
+- `live`: `state` (`running`, `attached`, `not_running` or `unknown`), with `source`, `observedAtMs` and `detail`;
+- `lastTurn`: `outcome` (`completed`, `interrupted`, `failed`, `in_progress`, `none` or `unreadable`), with `atMs` and `source`;
+- `status` (`running`, `idle`, `completed`, `interrupted`, `failed` or `unknown`) and `statusBasis` (`fact`, `inference` or `unknown`);
+- `resume`: `verdict` (`safe`, `unsafe` or `unknown`) and `reasons`.
+
+A snapshot adds:
+- `activity`: user turns, agent replies, tool calls, commands and failed commands, up to 20 changed files, errors;
+- `historyComplete`;
+- `recent`: up to 6 entries, `user` or `agent_claim`, each at most 600 characters;
+- `workspace`: exists, Git branch, head, head time, uncommitted paths now, commits since the last activity;
+- `evidence`: basis, statement, source.
+
+Bounds:
+- Claude transcripts are read up to 128 MiB each, and `claude agents --json` has 10 s.
+- Codex reads are paged: 50 threads or turns per page, and up to 15 pages of 20 items, smaller when a page exceeds the 1 MiB line bound. Each request has 20 s.
+- At most 200 sessions are returned per provider.
+
 ### Native Agent source map
 
 | Boundary | Primary source |
@@ -146,6 +176,7 @@ Native sessions are Host-private. The Codex adapter keeps its app-server session
 | Native capability, session, task, ownership, movement, baseline and conflict behavior | `src-tauri/src/native_agent.rs` |
 | Native executor admission policy, pending executor Review, and renderer-safe Review projection | `src-tauri/src/native_agent/admission.rs` |
 | Adapter seam, opaque capability payload, Codex adapter, and test-only `fake.longjob.v1` adapter | `src-tauri/src/native_agent/capability.rs`, `src-tauri/src/native_agent/capability/codex.rs`, `src-tauri/src/native_agent/capability/fake_longjob.rs` |
+| Read-only native session discovery and inspection (Claude Code, Codex) | `src-tauri/src/native_agent/sessions.rs`, `src-tauri/src/native_agent/sessions/claude.rs`, `src-tauri/src/native_agent/sessions/codex.rs`; Codex history reader and holder scan in `src-tauri/src/native_agent/capability/codex.rs` |
 | Test-only deterministic requester/executor pair and external Agent-turn ledger | `src-tauri/src/native_agent_pair_harness.rs` |
 | Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/main.rs` |
 | Native Agent Room Control envelope, validation, replay/session handling | `src-tauri/src/room_control.rs` |

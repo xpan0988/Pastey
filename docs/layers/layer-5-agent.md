@@ -285,6 +285,36 @@ invalid portable selectors, case-folding collisions, and bounded-manifest
 violations. Agent failure, cancellation, interruption, transfer failure, or an
 unknown Agent outcome similarly has no result apply and cannot prove completion.
 
+### Native session discovery (read only)
+
+Pastey can find the Claude Code and Codex sessions that already exist on this Host and report on them (`src-tauri/src/native_agent/sessions.rs`). It never starts, resumes, changes or stops a native session. It does not use windows, screenshots or UI automation.
+
+- **Scope.** This Host's user names the workspaces, 1 to 8 of them. Each must pass the shareable-folder rule: a specific real folder, not a root, the home folder, an application-data location or a link. A session is in scope only when its recorded working directory is exactly one of those workspaces. The commands are local; no Bridge peer reaches them, and device trust grants no access to local conversations.
+- **Claude Code.**
+  - History is the session JSONL that the official Agent SDK reads (`listSessions()` / `getSessionMessages()`): `<CLAUDE_CONFIG_DIR or ~/.claude>/projects/<encoded workspace>/<session id>.jsonl`. Only the folders of the named workspaces are opened, and each transcript's recorded `cwd` decides.
+  - The desktop app's Code sessions and the CLI share this store. Entries say `entrypoint: claude-desktop` or `cli`.
+  - Live state is `claude agents --json`, Claude Code's scripting list of active sessions. `busy` means running; any other listed status means a process holds the session idle; not listed means no process holds it. Without that command (not found, older version, timeout), live state is unknown.
+- **Codex.**
+  - History comes from Codex's own app-server, run as Pastey's read-only child from the Codex Pastey would launch (CLI or desktop app).
+  - The reader may send only `thread/list` (exact `cwd` filter, state database only, so Codex repairs nothing), `thread/turns/list` and `thread/items/list`, in pages small enough for the line bound.
+  - An app-server reports thread status only for threads it loaded itself, and nothing tells another process which threads a desktop app or terminal has open. So a thread's live state is known only when no Codex process other than Pastey's own could hold it (from the process list), and is otherwise unknown. Pastey's own live session in the workspace also makes it unknown.
+- **Status.** Live facts decide execution; history only explains how a session nothing runs had ended.
+  - Running and idle come only from a live source.
+  - With no live process: the last recorded turn gives completed, failed or interrupted. A history that stops mid-turn becomes interrupted, as an inference.
+  - With no live source: unknown, whatever the history says.
+  - A completed turn is not a completed task.
+- **Resume verdict.**
+  - `safe`: nothing holds the session, its workspace exists and its history is readable.
+  - `unsafe`: a live process holds it.
+  - `unknown`: otherwise.
+  - This is an assessment only: nothing resumes.
+- **Snapshot.** For one session: activity counts, the newest prompts and replies, and read-only Git facts about the workspace now.
+  - Every statement carries its basis (`fact`, `inference` or `unknown`) and source.
+  - The agent's replies are labelled `agent_claim`, and the snapshot states that the work they describe is not verified.
+- **Choosing a session.** Provider, text (title, workspace folder name, branch) and recency narrow the list. One match is `unique`; several are `ambiguous` and returned as candidates, newest first. Pastey never picks among them.
+
+Continuing a discovered session and observing a running turn are separate questions; see [codex-session-probe](../../tools/codex-session-probe/README.md) and the S2/S3 notes there.
+
 ## Managed execution path
 
 The Generic Managed Worker is a separate, currently implemented path for exact managed Plan steps. Its semantic workspace and `ManagedObject` revision flow apply to this path; they are not the definition of every Agent capability. The following roles and contracts describe managed execution unless stated otherwise.
@@ -493,6 +523,7 @@ Distributed delivery failure remains unable to prove remote native-process termi
 | Can today | Intentionally unavailable or incomplete |
 | --- | --- |
 | Host-native Codex capability discovery/invocation and Host-private native sessions | Generic capability acquisition/install behavior; Agent integration does not authorize installation |
+| Read-only, local discovery and inspection of existing Claude Code and Codex sessions in Host-named workspaces, with live state from provider sources | Discovery from a Bridge peer; continuing a discovered session; attaching to a running turn |
 | Capability-neutral native lifecycle with adapter dispatch by capability ID, opaque bounded input/output, and generic invoke-v2 (exercised by a test-only adapter) | Product UI for invoke-v2 or for any non-Codex native capability |
 | Native Agent local original-workspace execution and direct remote invocation for a workspace already on the selected Host | Automatic or invisible topology mutation; remote movement remains visible and consented |
 | Native executor admission: immutable Local/Bridge task ownership, Bridge-bound cancel, and a one-shot, process-local Accept/Deny executor Review for every remote invocation and received workspace | Configurable admission policy, stored grants, per-peer allowlists, or "always allow" |

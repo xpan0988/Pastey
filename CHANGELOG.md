@@ -23,6 +23,14 @@ The current development changes belong in `Unreleased`. Each release archives th
 - A Codex turn blocked on a native approval or question is shown as running and waiting for a native approval, on both Hosts, instead of plain running. Stop interrupts the turn.
 - Codex command and file-change approvals of a task started from another device are shown on that device, with the exact command, folder and stated reason, or the exact file changes, as plain text. Its user can Approve once or Deny each one; the executing device checks that the decision comes from the same device that started the task, in the current session, for exactly what was shown, and gives Codex that one answer. Pastey never approves for a session, never answers on its own or because of an unattended permission, and never answers permission requests, questions or forms, which still wait until stopped. Requests that cannot be shown completely and safely cannot be approved.
 - Selecting a remote device in the Codex task card now shows that device's own advertised Codex availability, with Check again, instead of this device's.
+- Read-only discovery of existing Claude Code and Codex sessions on this device, through two local commands for now (no screen yet).
+  - Pastey lists the sessions in the workspaces you name: Claude Code from the desktop app or the CLI, and Codex threads from either.
+  - Each session shows its workspace, origin and last activity, and whether it runs now, from Claude Code's own active-session list or, for Codex, only when no Codex process could hold it. Otherwise it says unknown.
+  - It also says how the last recorded turn ended and whether resuming would be safe.
+  - A report on one session gives its recent prompts and replies (labelled as the agent's own claims), activity counts and Git facts about the workspace, each marked as fact, inference or unknown.
+  - When several sessions match, all are returned for you to choose.
+  - Nothing is started, resumed or changed. Other devices cannot use it.
+  - Verified on a Mac with real sessions. Windows is cross-compiled only.
 - Codex works with only the ChatGPT desktop app installed. Pastey finds the Codex that the app bundles, through the app's own layout manifest, and starts it as its own app-server, with the user's existing Codex sign-in and configuration. No separate CLI install and no API key are needed.
   - A Codex CLI on PATH is still preferred when it works; otherwise the first working desktop app is used.
   - The task card says which one is in use.
