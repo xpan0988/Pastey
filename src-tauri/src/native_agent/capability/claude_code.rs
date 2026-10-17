@@ -498,7 +498,7 @@ impl ClaudeSessionRunV1 {
             }
             let turn = turn_after_prompt(&self.transcript, &self.prompt, since_ms);
             match live_status(&self.cli, &self.session_id) {
-                Ok(Some(status)) if status == "busy" => {
+                Ok(Some(status)) if status == "busy" || status == "starting" => {
                     unreadable = 0;
                     if awaiting {
                         progress.awaiting_native_decision(false);

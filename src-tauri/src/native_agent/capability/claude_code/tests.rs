@@ -66,9 +66,13 @@ case "$1" in
         now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
         printf '{"type":"user","cwd":"%s","timestamp":"%s","message":{"role":"user","content":"%s"}}\n' "$WS" "$now" "$prompt" >> "$T"
         status=busy; [ "$mode" = awaiting ] && status=waiting
-        printf '[{"sessionId":"%s","kind":"background","status":"%s"}]' "$sid" "$status" > "$ROOT/registry.json"
+        if [ "$mode" = starting ]; then
+          printf '[{"sessionId":"%s","kind":"background"}]' "$sid" > "$ROOT/registry.json"
+        else
+          printf '[{"sessionId":"%s","kind":"background","status":"%s"}]' "$sid" "$status" > "$ROOT/registry.json"
+        fi
         printf 'backgrounded · %s · name\n' "$short"
-        if [ "$mode" = continue ]; then
+        if [ "$mode" = continue ] || [ "$mode" = starting ]; then
           ( sleep 0.3
             printf '{"type":"assistant","cwd":"%s","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"Reply for Pastey"}],"stop_reason":"end_turn"}}\n' "$WS" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" >> "$T"
             printf '[{"sessionId":"%s","kind":"background","status":"idle"}]' "$sid" > "$ROOT/registry.json" ) >/dev/null 2>&1 &
@@ -173,6 +177,26 @@ fn an_unheld_session_is_continued_once_under_its_own_id_and_then_released() {
         Some(&*format!("stop {}", &SESSION[..8])),
         "released after the turn"
     );
+}
+
+#[test]
+fn a_session_listed_without_a_status_is_starting_not_waiting_on_an_approval() {
+    let fixture = FixtureV1::new("starting");
+    let (mut service, _) = fixture.service();
+    let started = service
+        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .unwrap();
+    let mut seen_waiting = false;
+    let terminal = loop {
+        let status = service.task_status(&started.task_id).unwrap();
+        seen_waiting |= status.code.as_deref() == Some("native_agent_awaiting_native_decision");
+        if status.state != NativeAgentTaskStateV1::Running {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+    assert!(!seen_waiting);
 }
 
 #[test]

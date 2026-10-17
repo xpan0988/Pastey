@@ -115,10 +115,11 @@ impl ClaudeSessionSourceV1 {
                 Some((
                     entry.get("sessionId")?.as_str()?.to_owned(),
                     LiveEntryV1 {
+                        // Listed briefly without a status while starting.
                         status: entry
                             .get("status")
                             .and_then(Value::as_str)
-                            .unwrap_or("unknown")
+                            .unwrap_or("starting")
                             .to_owned(),
                         kind: entry
                             .get("kind")
@@ -151,7 +152,7 @@ impl ClaudeSessionSourceV1 {
                 observed_at_ms,
             } => match sessions.get(session_id) {
                 Some(entry) => LiveObservationV1 {
-                    state: if entry.status == "busy" {
+                    state: if entry.status == "busy" || entry.status == "starting" {
                         LiveStateV1::Running
                     } else {
                         LiveStateV1::Attached
@@ -758,10 +759,12 @@ pub(in crate::native_agent) fn live_status(
         .iter()
         .find(|entry| entry.get("sessionId").and_then(Value::as_str) == Some(session_id))
         .map(|entry| {
+            // A session that is still starting is listed briefly without a
+            // status.
             entry
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown")
+                .unwrap_or("starting")
                 .to_owned()
         }))
 }
