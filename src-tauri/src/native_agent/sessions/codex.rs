@@ -105,9 +105,11 @@ impl CodexSessionSourceV1 {
         reader: &CodexHistoryReaderV1,
         workspaces: &[PathBuf],
     ) -> Result<Vec<Value>, String> {
+        // Codex records the plain path (`C:\...` on Windows), not the
+        // verbatim form a canonical Windows path has.
         let filter: Vec<String> = workspaces
             .iter()
-            .map(|workspace| workspace.to_string_lossy().into_owned())
+            .map(|workspace| dunce::simplified(workspace).to_string_lossy().into_owned())
             .collect();
         let mut threads = Vec::new();
         let mut cursor = Value::Null;

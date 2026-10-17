@@ -789,3 +789,16 @@ fn installed_sessions_are_discovered_and_inspected_read_only() {
     }
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn claude_folder_names_follow_claude_codes_encoding_of_the_plain_path() {
+    let config = Path::new("/c");
+    assert_eq!(
+        claude::project_dir(config, Path::new("/Users/me/Pastey")),
+        config.join("projects").join("-Users-me-Pastey")
+    );
+    assert_eq!(
+        claude::project_dir(config, Path::new(r"C:\Users\me\my.site")),
+        config.join("projects").join("C--Users-me-my-site")
+    );
+}

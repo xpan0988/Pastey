@@ -653,7 +653,9 @@ pub(in crate::native_agent) fn claude_config_dir() -> Option<PathBuf> {
 
 /// Claude Code's folder for one workspace's sessions.
 pub(in crate::native_agent) fn project_dir(config_dir: &Path, workspace: &Path) -> PathBuf {
-    let encoded: String = workspace
+    // Claude Code names the folder after the plain path it ran in: on
+    // Windows `C:\...`, never the verbatim `\\?\C:\...` a canonical path is.
+    let encoded: String = dunce::simplified(workspace)
         .to_string_lossy()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -801,9 +803,11 @@ pub(in crate::native_agent) fn find_cli() -> Option<PathBuf> {
         }
     }
     let home = dirs::home_dir()?;
-    let local = home.join(".local/bin/claude");
-    if local.is_file() {
-        return Some(local);
+    for name in names {
+        let local = home.join(".local/bin").join(name);
+        if local.is_file() {
+            return Some(local);
+        }
     }
     if cfg!(target_os = "macos") {
         let root = home.join("Library/Application Support/Claude/claude-code");
