@@ -1,169 +1,9 @@
 import { peerAddressProblem } from "../../lib/bridgeAddress";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { getBridgeNodeListProjection, runBridgeDeviceSelfCheck } from "../../lib/tauri";
-import type { TransferQueueItem } from "../../lib/transferScheduler";
-import type { BridgeDeviceDiagnostics, BridgeNodeListProjectionV1, DiagnosticState, FileTransferProgressEvent, NearbyDevice, NearbyJoinPending, RoomInfo, RoomItem } from "../../lib/types";
-import { MessageCard, TransferMessage } from "./BridgeWorkspace";
-import { formatBytes, formatClock, roomMembers, uniqueNearbyDevices } from "./workspaceViewModel";
-
-export function ActivityScreen({ items, transfers, queueItems, onRevealInFolder }: { items: RoomItem[]; transfers: FileTransferProgressEvent[]; queueItems: TransferQueueItem[]; onRevealInFolder?: (path: string) => Promise<void> }) {
-  const activeTransfers = transfers.filter((transfer) => !["completed", "failed", "cancelled", "burned", "interrupted"].includes(transfer.status));
-  const activeQueue = queueItems.filter((item) => ["queued", "preparing", "sending"].includes(item.status));
-  const recentItems = items.slice(0, 8);
-  const firstSavedPath = items.find((item) => item.direction === "incoming" && item.saved_path)?.saved_path ?? null;
-  return (
-    <section className="v2-screen">
-      <header className="v2-screen-header"><div><h1>Activity</h1><p>What has happened in this Bridge.</p></div><button type="button" className="v2-button" disabled={!firstSavedPath || !onRevealInFolder} onClick={() => { if (firstSavedPath && onRevealInFolder) void onRevealInFolder(firstSavedPath); }}>Open receiving folder</button></header>
-      <div className="v2-screen-body v2-activity-body">
-        <ActivityGroup label="Now">
-          {activeTransfers.map((transfer) => <TransferMessage key={transfer.transfer_id} name={transfer.file_name} status={transfer.status} />)}
-          {activeQueue.map((item) => <TransferMessage key={item.id} name={item.displayName ?? item.path} status={item.status} />)}
-          {activeTransfers.length === 0 && activeQueue.length === 0 ? <EmptyRow text="No transfer is active." /> : null}
-        </ActivityGroup>
-        <ActivityGroup label="Pending"><EmptyRow text="No task is waiting for review or Host admission in this renderer." /></ActivityGroup>
-        <ActivityGroup label="Recent">
-          {recentItems.map((item) => <MessageCard key={item.id} item={item} />)}
-          {recentItems.length === 0 ? <EmptyRow text="No recent Bridge activity." /> : null}
-        </ActivityGroup>
-      </div>
-    </section>
-  );
-}
-
-function ActivityGroup({ label, children }: { label: string; children: React.ReactNode }) {
-  return <section className="v2-activity-group"><h2>{label}</h2><div>{children}</div></section>;
-}
-
-function EmptyRow({ text }: { text: string }) {
-  return <div className="v2-empty-row"><i className="v2-dot" /><span>{text}</span></div>;
-}
-
-export function DevicesScreen({ room }: { room: RoomInfo | null }) {
-  const peers = useMemo(() => roomMembers(room), [room]);
-  const [nodeList, setNodeList] = useState<BridgeNodeListProjectionV1 | null>(null);
-  const [checks, setChecks] = useState<Record<string, { result?: BridgeDeviceDiagnostics; unavailable?: boolean }>>({});
-  const inFlight = useRef(new Set<string>());
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!room) {
-      setNodeList(null);
-      return;
-    }
-    void getBridgeNodeListProjection(room.id)
-      .then((projection) => { if (!cancelled) setNodeList(projection); })
-      .catch(() => { if (!cancelled) setNodeList(null); });
-    return () => { cancelled = true; };
-  }, [room?.id]);
-
-  async function runDiagnostics(hostRef: string) {
-    if (!room) return;
-    const bridgeId = room.id;
-    const checkKey = deviceCheckKey(bridgeId, hostRef);
-    if (inFlight.current.has(checkKey)) return;
-    inFlight.current.add(checkKey);
-    setChecks((current) => ({ ...current, [checkKey]: {} }));
-    try {
-      const result = await runBridgeDeviceSelfCheck(bridgeId, hostRef);
-      setChecks((current) => ({ ...current, [checkKey]: { result } }));
-    } catch {
-      setChecks((current) => ({ ...current, [checkKey]: { unavailable: true } }));
-    } finally {
-      inFlight.current.delete(checkKey);
-      setChecks((current) => ({ ...current }));
-    }
-  }
-
-  return (
-    <section className="v2-screen">
-      <header className="v2-screen-header"><div><h1>Bridge devices</h1><p>Known members and their current connection state. Device admission is not supported from this view.</p></div></header>
-      <div className="v2-screen-body v2-devices-body">
-        <h2>Current Bridge</h2>
-        <div className="v2-device-list">
-          {nodeList ? nodeList.nodes.map((node) => {
-            const isLocal = node.hostRef === nodeList.links[0]?.sourceHostRef || node.deviceProfile !== undefined;
-            const peer = peers.find((candidate) => candidate.hostRef === node.hostRef);
-            const state = node.currentSession?.liveness ?? "disconnected";
-            const checkKey = room && !isLocal ? deviceCheckKey(room.id, node.hostRef) : null;
-            const check = checkKey ? checks[checkKey] : undefined;
-            const loading = checkKey ? inFlight.current.has(checkKey) : false;
-            return <DeviceRow
-              key={node.hostRef}
-              name={isLocal ? "This device" : node.displayName ?? "Bridge Host"}
-              meta={isLocal ? "Local Host" : "Current Bridge member"}
-              detail={isLocal ? "This logical Bridge remains local until Burn." : state === "connected" ? "Exact current-session observations are shown when available." : "Logical membership is retained; no old session observation is current."}
-              state={state}
-              action={!isLocal ? <button type="button" className="v2-button v2-device-diagnostic-button" aria-label={`Run diagnostics for ${node.displayName ?? "Bridge Host"}`} disabled={loading} onClick={() => void runDiagnostics(node.hostRef)}>{loading ? "Checking…" : check ? "Retry" : "Check"}</button> : null}
-              diagnostics={check ? <DeviceDiagnosticsResult check={check} /> : null}
-            />;
-          }) : room ? <>
-            <DeviceRow name="This device" meta="Local Host" detail="This logical Bridge remains local until Burn." state="connected" />
-            {peers.map((peer) => {
-            const checkKey = room && peer.hostRef ? deviceCheckKey(room.id, peer.hostRef) : null;
-            const check = checkKey ? checks[checkKey] : undefined;
-            const loading = checkKey ? inFlight.current.has(checkKey) : false;
-            return <DeviceRow
-              key={peer.peerSessionId}
-              name={peer.displayName}
-              meta="Current Bridge member"
-              detail={peer.liveness === "connected" ? "Exact current session is routeable." : "Logical membership is retained; the old session is not routeable."}
-              state={peer.liveness}
-              action={peer.hostRef ? <button type="button" className="v2-button v2-device-diagnostic-button" aria-label={`Run diagnostics for ${peer.displayName}`} disabled={loading} onClick={() => void runDiagnostics(peer.hostRef!)}>{loading ? "Checking…" : check ? "Retry" : "Check"}</button> : null}
-              diagnostics={check ? <DeviceDiagnosticsResult check={check} /> : null}
-            />;
-            })}
-          </> : null}
-          {!room ? <EmptyRow text="Select a Bridge to inspect its devices." /> : null}
-          {room && peers.length === 0 ? <EmptyRow text="No remote device has joined this Bridge yet." /> : null}
-        </div>
-        <p className="v2-developer-footnote">Nearby and code-based Bridge creation belong to New Bridge. Pastey does not currently add another Host to an existing Bridge.</p>
-      </div>
-    </section>
-  );
-}
-
-function deviceCheckKey(bridgeId: string, hostRef: string): string {
-  return JSON.stringify([bridgeId, hostRef]);
-}
-
-function DeviceRow({ name, meta, detail, state, action, diagnostics }: { name: string; meta: string; detail: string; state: string; action?: React.ReactNode; diagnostics?: React.ReactNode }) {
-  return <article className="v2-device-row"><div className="v2-device-icon" /><div><strong>{name}</strong><small>{meta} · {state}</small><p>{detail}</p></div><div className="v2-device-actions"><i className={`v2-dot ${state === "connected" ? "connected" : state === "reconnecting" ? "pending" : ""}`} />{action}</div>{diagnostics}</article>;
-}
-
-function DeviceDiagnosticsResult({ check }: { check: { result?: BridgeDeviceDiagnostics; unavailable?: boolean } }) {
-  if (check.unavailable) {
-    return <div className="v2-device-diagnostics unavailable" role="status">Current Host diagnostics are temporarily unavailable.</div>;
-  }
-  if (!check.result) {
-    return <div className="v2-device-diagnostics" role="status">Checking the exact current Host session…</div>;
-  }
-  const { connection, managedReadiness, linkBenchmark, managedE2e } = check.result;
-  return <div className="v2-device-diagnostics" role="status">
-    <DiagnosticGroup title="Connection" facts={[
-      ["Identity", connection.identity],
-      ["Secure session", connection.secureSession],
-      ["Control channel", connection.controlChannel],
-      ["Data path", connection.dataPath],
-    ]} />
-    <DiagnosticGroup title="Managed readiness" facts={[
-      ["Provider", managedReadiness.provider],
-      ["Runtime", managedReadiness.runtime],
-      ["Execution world", managedReadiness.executionWorld],
-      ["Managed execution", managedReadiness.managedExecution],
-    ]} />
-    {linkBenchmark ? <small>Pipeline baseline · {linkBenchmark.average_MBps.toFixed(1)} MB/s</small> : null}
-    {managedE2e ? <section><strong>Managed E2E self-check</strong><span><span>Result</span><b className={`v2-diagnostic-state ${managedE2e.outcome === "PASS" ? "healthy" : managedE2e.outcome === "BLOCKED" ? "unknown" : "unavailable"}`}>{managedE2e.outcome}</b></span>{managedE2e.coreTerminalState ? <span><span>Core terminal state</span><b>{managedE2e.coreTerminalState}</b></span> : null}{managedE2e.failureCode ? <span><span>Reason</span><b>{managedE2e.failureCode}</b></span> : null}</section> : null}
-  </div>;
-}
-
-function DiagnosticGroup({ title, facts }: { title: string; facts: Array<[string, DiagnosticState]> }) {
-  return <section><strong>{title}</strong>{facts.map(([label, state]) => <span key={label}><span>{label}</span><b className={`v2-diagnostic-state ${state}`}>{diagnosticStateLabel(state)}</b></span>)}</section>;
-}
-
-function diagnosticStateLabel(state: DiagnosticState): string {
-  if (state === "not_configured") return "Not configured";
-  return state.charAt(0).toUpperCase() + state.slice(1);
-}
+import { useEffect, useRef, useState } from "react";
+import type { NearbyDevice, NearbyJoinPending, RoomInfo, RoomItem } from "../../lib/types";
+import { MessageCard } from "./BridgeWorkspace";
+import { Badge, Dot, EmptyState, Field, Icon, ListRow, Notice, Segmented } from "./ui";
+import { bridgeCode, uniqueNearbyDevices } from "./workspaceViewModel";
 
 export function NewBridgeScreen({
   onCreate,
@@ -172,6 +12,7 @@ export function NewBridgeScreen({
   onJoinNearby,
   onCompleteNearby,
   nearbyDiscoveryAvailable,
+  menuButton,
 }: {
   onCreate: () => Promise<void>;
   onJoin: (code: string, address?: string) => Promise<void>;
@@ -179,6 +20,7 @@ export function NewBridgeScreen({
   onJoinNearby: (deviceId: string) => Promise<NearbyJoinPending | null>;
   onCompleteNearby: (requestId: string, code: string) => Promise<void>;
   nearbyDiscoveryAvailable: boolean;
+  menuButton?: React.ReactNode;
 }) {
   const [code, setCode] = useState("");
   const [nearbyPending, setNearbyPending] = useState<NearbyJoinPending | null>(null);
@@ -234,25 +76,52 @@ export function NewBridgeScreen({
     try { await action(); } catch (error) { setMessage(error instanceof Error ? error.message : String(error)); } finally { busyRef.current = false; setBusyAction(null); }
   }
   return (
-    <section className="v2-screen">
-      <header className="v2-screen-header"><div><h1>New Bridge</h1><p>Connect another device, then keep the work scoped to this Bridge.</p></div></header>
-      <div className="v2-screen-body v2-new-bridge-body">
-        <h2>Nearby</h2>
-        <div className="v2-nearby-list">
-          {nearbyDevices.map((device) => {
-            // A device paired before may start another Bridge even while Busy.
-            const ready = (device.availability === "Available" || device.known === true) && device.compatible;
-            return <article key={device.device_id} className="v2-nearby-device"><div className="v2-device-icon" /><div><strong>{device.display_name}</strong><small>{device.known ? "Paired before · " : ""}{nearbyDeviceSummary(device)}</small><span className={`v2-nearby-status ${ready ? "ready" : ""}`}><i className={`v2-dot ${ready ? "connected" : ""}`} />{device.compatible ? device.availability : "Update needed"}</span></div><button type="button" className="v2-button primary" disabled={busyAction !== null || !ready} onClick={() => void run(`nearby:${device.device_id}`, async () => { const pending = await onJoinNearby(device.device_id); setNearbyCode(""); setNearbyPending(pending); })}>{busyAction === `nearby:${device.device_id}` ? (device.known ? "Connecting…" : "Waiting…") : device.known ? "Connect" : "Join"}</button></article>;
-          })}
-          {nearbyDevices.length === 0 ? <div className="v2-nearby-empty"><p>{nearbyMessage}</p><button type="button" className="v2-button" disabled={busyAction !== null} onClick={() => void run("refresh", async () => { await loadNearby(); })}>{busyAction === "refresh" ? "Refreshing…" : "Refresh"}</button></div> : null}
-        </div>
-        {nearbyPending ? <section className="v2-join-card"><strong>{nearbyPending.deviceName} accepted</strong><small>Enter the 8-digit code now shown on {nearbyPending.deviceName}. The code is never sent over the network; it proves both devices are the ones you chose. Both devices then remember each other and connect without a code next time.</small><div><input value={nearbyCode} onChange={(event) => setNearbyCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Code shown on the other device" /><button type="button" className="v2-button primary" disabled={nearbyCode.length !== 8 || busyAction !== null} onClick={() => void run("nearby-code", async () => { await onCompleteNearby(nearbyPending.requestId, nearbyCode); setNearbyPending(null); })}>{busyAction === "nearby-code" ? "Pairing…" : "Pair"}</button></div></section> : null}
-        <h2>Join manually</h2>
-        <section className="v2-join-card"><strong>Enter an 8-digit Bridge code</strong><small>Session permission ends when the Bridge is burned or the current session is replaced.</small><div><input value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Bridge code" /><button type="button" className="v2-button primary" disabled={code.length !== 8 || busyAction !== null || (remote && addressProblem !== null)} onClick={() => void run("join", () => onJoin(code, remote ? address.trim() : undefined))}>{busyAction === "join" ? "Joining…" : "Join"}</button></div><label><input type="checkbox" checked={remote} onChange={(event) => setRemote(event.target.checked)} /> The other device is on another network</label>{remote ? <><input value={address} onChange={(event) => setAddress(event.target.value)} placeholder="home-pc.tail1234.ts.net or 100.x.y.z" aria-label="Other device's overlay address" /><small>Its address on a private network you both use, such as Tailscale or WireGuard. The address only says where to look; the code still decides whether you join, and it gives the other device no permissions.{address.trim() && addressProblem ? ` ${addressProblem}` : ""}</small></> : null}</section>
-        <h2>Create with code</h2>
-        <section className="v2-join-card"><strong>Create an empty Bridge</strong><small>A new Bridge and 8-digit code are created only after this explicit action.</small><div><button type="button" className="v2-button primary" disabled={busyAction !== null} onClick={() => void run("create", onCreate)}>{busyAction === "create" ? "Creating…" : "Create Bridge"}</button></div></section>
-        {message ? <p className="v2-error">{message}</p> : null}
-      </div>
+    <section className="page">
+      <header className="page-header">{menuButton}<div className="page-header-main"><h1>New Bridge</h1><p>Pair this device with one of your other devices.</p></div></header>
+      <div className="page-body"><div className="content stack-lg">
+        <section className="section">
+          <div className="section-head-row"><div className="section-head"><h2>Nearby</h2><p>Pastey devices on this network. A device you paired before connects without a code.</p></div>
+            <button type="button" className="btn btn-sm" disabled={busyAction !== null} onClick={() => void run("refresh", async () => { await loadNearby(); })}><Icon name="refresh" small />{busyAction === "refresh" ? "Refreshing…" : "Refresh"}</button></div>
+          <div className="card"><div className="list">
+            {nearbyDevices.map((device) => {
+              // A device paired before may start another Bridge even while Busy.
+              const ready = (device.availability === "Available" || device.known === true) && device.compatible;
+              return <ListRow
+                key={device.device_id}
+                leading={<Icon name="device" />}
+                title={device.display_name}
+                meta={<>{device.known ? "Paired before · " : ""}{nearbyDeviceSummary(device)}</>}
+                side={<>{device.compatible ? device.availability === "Available" ? null : <Badge>{device.availability}</Badge> : <Badge tone="warn">Update needed</Badge>}<button type="button" className="btn btn-primary btn-sm" disabled={busyAction !== null || !ready} onClick={() => void run(`nearby:${device.device_id}`, async () => { const pending = await onJoinNearby(device.device_id); setNearbyCode(""); setNearbyPending(pending); })}>{busyAction === `nearby:${device.device_id}` ? (device.known ? "Connecting…" : "Waiting…") : device.known ? "Connect" : "Join"}</button></>}
+              />;
+            })}
+            {nearbyDevices.length === 0 ? <div className="list-empty row"><Dot pulse={nearbyDiscoveryAvailable} />{nearbyMessage}</div> : null}
+          </div>
+          {nearbyPending ? <div className="add-form">
+            <strong>{nearbyPending.deviceName} accepted</strong>
+            <p className="small muted">Enter the 8-digit code now shown on {nearbyPending.deviceName}. The code is never sent over the network; it proves both devices are the ones you chose. Both devices then remember each other and connect without a code next time.</p>
+            <div className="row"><input className="input code-input" value={nearbyCode} onChange={(event) => setNearbyCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Code shown on the other device" inputMode="numeric" autoFocus /><button type="button" className="btn btn-primary" disabled={nearbyCode.length !== 8 || busyAction !== null} onClick={() => void run("nearby-code", async () => { await onCompleteNearby(nearbyPending.requestId, nearbyCode); setNearbyPending(null); })}>{busyAction === "nearby-code" ? "Pairing…" : "Pair"}</button></div>
+          </div> : null}
+          </div>
+        </section>
+
+        <section className="section">
+          <div className="section-head"><h2>Join with a code</h2><p>Enter the 8-digit code another device shows for its Bridge.</p></div>
+          <div className="card"><div className="card-body">
+            <div className="row"><input className="input code-input" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Bridge code" inputMode="numeric" /><button type="button" className="btn btn-primary" disabled={code.length !== 8 || busyAction !== null || (remote && addressProblem !== null)} onClick={() => void run("join", () => onJoin(code, remote ? address.trim() : undefined))}>{busyAction === "join" ? "Joining…" : "Join"}</button></div>
+            <label className="check"><input type="checkbox" checked={remote} onChange={(event) => setRemote(event.target.checked)} /><span>The other device is on another network</span></label>
+            {remote ? <Field label="Its private-network address" hint={<>Its address on a private network you both use, such as Tailscale or WireGuard. The address only says where to look; the code still decides whether you join, and it gives the other device no permissions.{address.trim() && addressProblem ? ` ${addressProblem}` : ""}</>}>
+              <input className="input input-mono" value={address} onChange={(event) => setAddress(event.target.value)} placeholder="home-pc.tail1234.ts.net or 100.x.y.z" aria-label="Other device's overlay address" />
+            </Field> : null}
+            <p className="xsmall subtle">Session permission ends when the Bridge is burned or the current session is replaced.</p>
+          </div></div>
+        </section>
+
+        <section className="section">
+          <div className="section-head"><h2>Show a code here</h2><p>Create an empty Bridge on this device and enter its code on the other one. A new Bridge and 8-digit code are created only after this explicit action.</p></div>
+          <div><button type="button" className="btn" disabled={busyAction !== null} onClick={() => void run("create", onCreate)}>{busyAction === "create" ? "Creating…" : "Create Bridge"}</button></div>
+        </section>
+        {message ? <Notice tone="bad">{message}</Notice> : null}
+      </div></div>
     </section>
   );
 }
@@ -265,20 +134,32 @@ function nearbyDeviceSummary(device: NearbyDevice): string {
   return [platform, device.app_version ? `Pastey ${device.app_version}` : null, seen].filter(Boolean).join(" · ");
 }
 
-export function InboxScreen({ items, inboxDir, onRevealInFolder }: { items: RoomItem[]; inboxDir?: string | null; onRevealInFolder?: (path: string) => Promise<void> }) {
-  const received = items.filter((item) => item.direction === "incoming");
+type InboxFilter = "all" | "text" | "files";
+
+/** Everything received on this device, across Bridges. */
+export function InboxScreen({ items, rooms, inboxDir, onRevealInFolder, menuButton }: { items: RoomItem[]; rooms: RoomInfo[]; inboxDir?: string | null; onRevealInFolder?: (path: string) => Promise<void>; menuButton?: React.ReactNode }) {
+  const received = items.filter((item) => item.direction === "incoming").sort((left, right) => right.created_at - left.created_at);
   const folderTarget = inboxDir ?? received.find((item) => item.saved_path)?.saved_path ?? null;
-  const [filter, setFilter] = useState<"all" | "text" | "images" | "files">("all");
-  const filtered = received.filter((item) => filter === "all" || filter === "text" ? filter === "all" || item.payload_type === "text" : item.payload_type === "file");
+  const [filter, setFilter] = useState<InboxFilter>("all");
+  const filtered = received.filter((item) => filter === "all" || (filter === "text" ? item.payload_type === "text" : item.payload_type === "file"));
+  const count = (value: InboxFilter) => value === "all" ? received.length : received.filter((item) => value === "text" ? item.payload_type === "text" : item.payload_type === "file").length;
+  const bridgeName = (roomId: string) => {
+    const room = rooms.find((candidate) => candidate.id === roomId);
+    return room ? room.peer_device_name ?? `Bridge ${bridgeCode(room)}` : "An ended Bridge";
+  };
   return (
-    <section className="v2-screen v2-inbox-screen">
-      <header className="v2-screen-header"><div><h1>Inbox</h1><p>Received text, images, and files across Bridges.</p></div><button type="button" className="v2-button" disabled={!folderTarget || !onRevealInFolder} onClick={() => { if (folderTarget && onRevealInFolder) void onRevealInFolder(folderTarget); }}>Open folder</button></header>
-      <div className="v2-filterbar">{(["all", "text", "images", "files"] as const).map((value) => <button key={value} type="button" className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{value[0].toUpperCase() + value.slice(1)} <span>{value === "all" ? received.length : value === "text" ? received.filter((item) => item.payload_type === "text").length : received.filter((item) => item.payload_type === "file").length}</span></button>)}</div>
-      <div className="v2-screen-body v2-inbox-body"><h2>Today</h2>{filtered.map((item) => <MessageCard key={item.id} item={item} />)}{filtered.length === 0 ? <EmptyRow text="No received items in this view." /> : null}</div>
+    <section className="page">
+      <header className="page-header">{menuButton}<div className="page-header-main"><h1>Inbox</h1><p>Text and files received on this device, from every Bridge.</p></div>
+        <div className="page-header-actions"><button type="button" className="btn btn-sm" disabled={!folderTarget || !onRevealInFolder} onClick={() => { if (folderTarget && onRevealInFolder) void onRevealInFolder(folderTarget); }}><Icon name="folder" small />Open folder</button></div></header>
+      <div className="page-body"><div className="content stack-lg">
+        <Segmented label="Show" value={filter} onChange={setFilter} options={(["all", "text", "files"] as const).map((value) => ({ value, label: `${value === "all" ? "All" : value === "text" ? "Text" : "Files"} ${count(value)}` }))} />
+        {filtered.length === 0 ? <EmptyState title="Nothing here yet">Text and files other devices send you appear here.</EmptyState> : <div className="stack-lg">
+          {filtered.map((item) => <div key={item.id} className="stack" style={{ gap: 4 }}>
+            <span className="xsmall subtle">From {bridgeName(item.room_id)}</span>
+            <MessageCard item={item} onRevealInFolder={onRevealInFolder} />
+          </div>)}
+        </div>}
+      </div></div>
     </section>
   );
-}
-
-export function ItemMetadata({ item }: { item: RoomItem }) {
-  return <span>{formatClock(item.created_at)} · {formatBytes(item.size_bytes)}</span>;
 }

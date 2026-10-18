@@ -1,25 +1,19 @@
 import { bridgeConnectionErrorMessage } from "../../lib/bridgeAddress";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgentTaskLifecycle } from "./AgentTaskLifecycle";
 import { BridgeWorkspace } from "./BridgeWorkspace";
 import { acceptDeveloperTerminal, acceptNativeInvocationReview, denyDeveloperTerminal, denyNativeInvocationReview, enterDeveloperMode, getDeveloperTerminalWorkspace, listNativeInvocationReviews, type NativeInvocationReview } from "../../lib/tauri";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
-import {
-  AboutSettings,
-  DiagnosticsSettings,
-  ProviderSettings,
-  SettingsOverview,
-  TransferSettings,
-  TroubleshootingSettings,
-} from "./SettingsScreens";
-import { BridgeContextPanel, BridgeNavigation } from "./WorkspaceChrome";
-import { ActivityScreen, DevicesScreen, InboxScreen, NewBridgeScreen } from "./WorkspaceScreens";
+import { SettingsScreen, type SettingsRoute } from "./SettingsScreens";
+import { Icon, Notice } from "./ui";
+import { BridgeNavigation } from "./WorkspaceChrome";
+import { InboxScreen, NewBridgeScreen } from "./WorkspaceScreens";
 import { type WorkspaceRoute, type WorkspaceV2Props } from "./workspaceTypes";
 import { bridgeCode, roomMembers } from "./workspaceViewModel";
 
 const ROUTES: WorkspaceRoute[] = [
-  "bridge", "activity", "devices", "new-bridge", "inbox", "settings",
-  "settings-diagnostics", "settings-provider", "settings-transfer", "settings-troubleshooting", "settings-about",
+  "bridge", "new-bridge", "inbox", "settings",
+  "settings-devices", "settings-permissions", "settings-agents", "settings-advanced", "settings-about",
 ];
 
 function initialRoute(): WorkspaceRoute {
@@ -31,6 +25,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   const [route, setRoute] = useState<WorkspaceRoute>(initialRoute);
   const [bridgeMode, setBridgeMode] = useState<"normal" | "developer">("normal");
   const [message, setMessage] = useState<string | null>(null);
+  const [navOpen, setNavOpen] = useState(false);
   const [developerWorkspaces, setDeveloperWorkspaces] = useState<Record<string, DeveloperTerminalWorkspace>>({});
   const [developerSessions, setDeveloperSessions] = useState<Record<string, DeveloperModeUiSession>>({});
   const [admissionBusy, setAdmissionBusy] = useState<string | null>(null);
@@ -41,9 +36,6 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   const activeRoom = props.room;
   const roomIdsKey = props.rooms.filter((room) => room.status !== "burned").map((room) => room.id).sort().join(":");
 
-  const activeCount = props.transfers.filter((transfer) => !["completed", "failed", "cancelled", "burned", "interrupted"].includes(transfer.status)).length
-    + props.queueItems.filter((item) => ["queued", "preparing", "sending"].includes(item.status)).length;
-  const pendingCount = task.status?.state === "draft" || task.status?.state === "approved" ? 1 : 0;
   const inboxCount = props.activityItems.filter((item) => item.direction === "incoming").length;
 
   useEffect(() => {
@@ -103,16 +95,10 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
     return () => { cancelled = true; window.clearInterval(timer); };
   }, [refreshInvocationReviews]);
 
-  const taskSummary = useMemo(() => task.status && task.presentation ? {
-    eyebrow: task.status.state === "draft" ? "Action required" : "Task",
-    title: task.presentation.label,
-    detail: `${task.progress} · ${task.status.readyHosts}/${task.status.totalHosts} Hosts ready`,
-    tone: task.presentation.tone,
-  } : null, [task.presentation, task.progress, task.status]);
-
   function navigate(next: WorkspaceRoute) {
     setRoute(next);
     setMessage(null);
+    setNavOpen(false);
   }
 
   async function createBridge() {
@@ -163,6 +149,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
 
   function openBridge(room: NonNullable<typeof activeRoom>) {
     setRoute("bridge");
+    setNavOpen(false);
     setBridgeMode("normal");
     void props.onOpenBridge(room);
   }
@@ -218,26 +205,23 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
     }
   }
 
+  const menuButton = <button type="button" className="btn btn-ghost btn-icon menu-toggle" aria-label="Show navigation" onClick={() => setNavOpen(true)}><Icon name="menu" /></button>;
+
   return (
-    <div className="v2-app-shell">
-      <BridgeNavigation route={route} rooms={props.rooms} activeRoom={activeRoom} inboxCount={inboxCount} onNavigate={navigate} onOpenBridge={openBridge} />
-      <main className="v2-main">
-        {message ? <p className="v2-global-message">{message}</p> : null}
-        {pendingAdmission && admissionRoom ? <section className="v2-admission-banner" role="alert"><div><strong>Developer Mode request</strong><p>{requestingPeer?.displayName ?? "A connected Host"} requests terminal access to this Host in Bridge {bridgeCode(admissionRoom)}.</p></div><div><button type="button" className="v2-button" disabled={admissionBusy !== null} onClick={() => void decideTerminalAdmission(false)}>Deny</button><button type="button" className="v2-button primary" disabled={admissionBusy !== null} onClick={() => void decideTerminalAdmission(true)}>{admissionBusy ? "Responding…" : "Accept"}</button></div></section> : null}
-        {pendingReview && reviewRoom ? <section className="v2-admission-banner" role="alert"><div><strong>Agent request</strong><p>{reviewPeer?.displayName ?? "A connected Host"} requests to run {pendingReview.capabilityDisplayName} on this Host in Bridge {bridgeCode(reviewRoom)}.</p></div><div><button type="button" className="v2-button" disabled={reviewBusy !== null} onClick={() => void decideInvocationReview(false)}>Deny</button><button type="button" className="v2-button primary" disabled={reviewBusy !== null} onClick={() => void decideInvocationReview(true)}>{reviewBusy ? "Responding…" : "Accept"}</button></div></section> : null}
-        {route === "bridge" ? <BridgeWorkspace room={activeRoom} items={props.roomItems} queueItems={props.queueItems} task={task} developerMode={bridgeMode === "developer"} developerSession={activeRoom ? developerSessions[activeRoom.id] ?? null : null} developerWorkspace={activeRoom ? developerWorkspaces[activeRoom.id] ?? { pendingRequests: [], sessions: [] } : { pendingRequests: [], sessions: [] }} onDeveloperSession={(session) => setDeveloperSessions((current) => ({ ...current, [session.roomId]: session }))} onRefreshDeveloper={refreshDeveloperWorkspaces} onNewBridge={() => navigate("new-bridge")} onRefresh={props.onRefreshBridge} onDeveloper={() => setBridgeMode((current) => current === "normal" ? "developer" : "normal")} onBurn={props.onBurnBridge} onEnqueue={props.onEnqueueTransferInputs} /> : null}
-        {route === "activity" ? <ActivityScreen items={props.activityItems} transfers={props.transfers} queueItems={props.queueItems} onRevealInFolder={props.onRevealInFolder} /> : null}
-        {route === "devices" ? <DevicesScreen room={activeRoom} /> : null}
-        {route === "new-bridge" ? <NewBridgeScreen onCreate={createBridge} onJoin={joinBridge} onListNearby={props.onListNearbyDevices} onJoinNearby={joinNearbyDevice} onCompleteNearby={completeNearbyJoin} nearbyDiscoveryAvailable={props.nearbyDiscoveryAvailable} /> : null}
-        {route === "inbox" ? <InboxScreen items={props.activityItems} inboxDir={props.config.inbox_dir} onRevealInFolder={props.onRevealInFolder} /> : null}
-        {route === "settings" ? <SettingsOverview config={props.config} onNavigate={navigate} onConfigChange={props.onConfigChange} /> : null}
-        {route === "settings-diagnostics" ? <DiagnosticsSettings onNavigate={navigate} /> : null}
-        {route === "settings-provider" ? <ProviderSettings onNavigate={navigate} /> : null}
-        {route === "settings-transfer" ? <TransferSettings config={props.config} onNavigate={navigate} /> : null}
-        {route === "settings-troubleshooting" ? <TroubleshootingSettings onNavigate={navigate} /> : null}
-        {route === "settings-about" ? <AboutSettings config={props.config} onNavigate={navigate} /> : null}
+    <div className={`app${navOpen ? " nav-open" : ""}`}>
+      <BridgeNavigation route={route} rooms={props.rooms} activeRoom={activeRoom} inboxCount={inboxCount} appVersion={props.config.app_version} onNavigate={navigate} onOpenBridge={openBridge} />
+      {navOpen ? <div className="scrim" onClick={() => setNavOpen(false)} /> : null}
+      <main className="main">
+        {pendingAdmission && admissionRoom || pendingReview && reviewRoom ? <div className="request-stack">
+          {pendingAdmission && admissionRoom ? <section className="request" role="alert"><Icon name="terminal" /><div className="request-main"><strong>Developer Mode request</strong><span>{requestingPeer?.displayName ?? "A connected device"} asks to open a terminal on this device over Bridge {bridgeCode(admissionRoom)}.</span></div><div className="request-actions"><button type="button" className="btn" disabled={admissionBusy !== null} onClick={() => void decideTerminalAdmission(false)}>Deny</button><button type="button" className="btn btn-primary" disabled={admissionBusy !== null} onClick={() => void decideTerminalAdmission(true)}>{admissionBusy ? "Responding…" : "Accept"}</button></div></section> : null}
+          {pendingReview && reviewRoom ? <section className="request" role="alert"><Icon name="agent" /><div className="request-main"><strong>Agent request</strong><span>{reviewPeer?.displayName ?? "A connected device"} asks to run {pendingReview.capabilityDisplayName} on this device over Bridge {bridgeCode(reviewRoom)}. It runs only if you accept.</span></div><div className="request-actions"><button type="button" className="btn" disabled={reviewBusy !== null} onClick={() => void decideInvocationReview(false)}>Deny</button><button type="button" className="btn btn-primary" disabled={reviewBusy !== null} onClick={() => void decideInvocationReview(true)}>{reviewBusy ? "Responding…" : "Accept"}</button></div></section> : null}
+        </div> : null}
+        {message ? <div className="main-message"><Notice tone="bad">{message}</Notice></div> : null}
+        {route === "bridge" ? <BridgeWorkspace room={activeRoom} items={props.roomItems} queueItems={props.queueItems} transfers={props.transfers} task={task} developerMode={bridgeMode === "developer"} developerSession={activeRoom ? developerSessions[activeRoom.id] ?? null : null} developerWorkspace={activeRoom ? developerWorkspaces[activeRoom.id] ?? { pendingRequests: [], sessions: [] } : { pendingRequests: [], sessions: [] }} onDeveloperSession={(session) => setDeveloperSessions((current) => ({ ...current, [session.roomId]: session }))} onRefreshDeveloper={refreshDeveloperWorkspaces} onNewBridge={() => navigate("new-bridge")} onRefresh={props.onRefreshBridge} onDeveloper={() => setBridgeMode((current) => current === "normal" ? "developer" : "normal")} onBurn={props.onBurnBridge} onEnqueue={props.onEnqueueTransferInputs} onRevealInFolder={props.onRevealInFolder} onOpenSettings={() => navigate("settings-permissions")} menuButton={menuButton} /> : null}
+        {route === "new-bridge" ? <NewBridgeScreen onCreate={createBridge} onJoin={joinBridge} onListNearby={props.onListNearbyDevices} onJoinNearby={joinNearbyDevice} onCompleteNearby={completeNearbyJoin} nearbyDiscoveryAvailable={props.nearbyDiscoveryAvailable} menuButton={menuButton} /> : null}
+        {route === "inbox" ? <InboxScreen items={props.activityItems} rooms={props.rooms} inboxDir={props.config.inbox_dir} onRevealInFolder={props.onRevealInFolder} menuButton={menuButton} /> : null}
+        {route.startsWith("settings") ? <SettingsScreen route={route as SettingsRoute} config={props.config} onNavigate={navigate} onConfigChange={props.onConfigChange} menuButton={menuButton} /> : null}
       </main>
-      <BridgeContextPanel room={activeRoom} route={route} activeCount={activeCount} pendingCount={pendingCount} taskSummary={taskSummary} onNavigate={navigate} />
     </div>
   );
 }

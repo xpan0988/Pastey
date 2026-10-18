@@ -52,11 +52,24 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Changed
 
+- The desktop UI is reorganized around Bridges, with one design system (type, colour, spacing and components) for light and dark themes. See [UX and information architecture](docs/ux-information-architecture.md).
+  - The sidebar holds only device-wide places (New Bridge, Inbox, Settings) and the Bridges. Each Bridge has three tabs: **Share** (text and files, both ways), **Agent** (Run Codex) and **Sessions** (read-only discovery). Its connection, pairing, devices, what it may do on this device (with Revoke) and Burn are in **Bridge details**.
+  - **Find file** is now **+ → Get a file from <device>…** in the Share composer, in a dialog. The flow and its review are unchanged.
+  - Settings has six sections: General, Devices & trust, Permissions, Agents, Advanced and About. Device identity and trust moved out of Unattended Codex access into Devices & trust. Permissions lists every grant (unattended Codex, session reading, shared search folders) with Revoke first and the add form one step away.
+  - Settings no longer shows controls the Host does not act on (save received files or images, burn after download) or rows that only said "Unavailable". The stored values are kept.
+  - The default 760 × 760 window no longer squeezes the Bridge between two side panels; narrow windows get a collapsible sidebar.
+  - Files dropped on the window are sent from the Share view, as its placeholder always said.
+
 - A remote native capability invocation now requires the executing Host's executor Review before anything runs. Authentication and capability availability no longer suffice: the invocation waits, unprepared and unstarted, until the Host user accepts it under the exact session it arrived on; Deny, expiry, session loss and Burn end it without starting. Local invocations are admitted immediately by the same policy. Executor Reviews are process-local and show no invocation input.
 - An approved workspace movement no longer runs Codex on the executing Host by itself. After the workspace lands, the executor shows the same Agent request as a direct invocation; only its Accept starts Codex, and Deny, expiry, session loss, Burn or restart end the movement as a definite non-start and remove the landed workspace. Requester movement approval is unchanged and still required; it authorizes the movement, not execution.
 - The requester's workspace-movement Review no longer says Codex will run: it says the receiving device runs Codex only if it accepts, and its button reads "Approve and send".
 
 ### Fixed
+
+- Run with Codex could stay disabled with no explanation. For a run on another device the button needs that device's folder path typed on this device, and the field was easy to miss (choosing a folder in the other device's Session reading or Unattended access settings does not fill it). The card now lists each requirement, says why the button is disabled, separates a folder already on that device from one sent from this device, and never depends on Session reading.
+- A Codex target chosen on another device fell back to this device when the Bridge reconnected with a new session. The target is now kept by its Host identity and shows "not connected" until it returns.
+- Another device's Codex availability was checked only when it was selected or on Check again. It is now checked again every 15 seconds and when the window regains focus, keeping the last answer visible meanwhile.
+- Right after Run with Codex on another device, the task card forgot which device the task ran on: recovery lists only tasks that need resolution, so its empty answer cleared the device. The card named no device and treated the task as local, so Codex's requests on it offered no Approve once or Deny here. The started task now stays bound to the device it was sent to, and Stop and decisions go there.
 
 - Windows: Codex installed as an app execution alias (in `%LOCALAPPDATA%\Microsoft\WindowsApps`), or installed after Pastey started, was reported as unavailable. Pastey now:
   - finds aliases;

@@ -183,19 +183,41 @@ export type RemoteNativeCapabilityObservation =
   | { roomId: string; hostRef: string; state: "observed"; capabilities: NativeAgentCapability[] }
   | { roomId: string; hostRef: string; state: "error"; message: string };
 
+/** How often a selected remote Host's capability is observed again while
+ * its card is open, so a change there (Codex installed, signed in, or gone)
+ * reaches this device without a manual check. */
+export const REMOTE_CAPABILITY_REFRESH_MS = 15_000;
+
+/** The observation shown while a new query is in flight. A background
+ * refresh of the same Host keeps the last observed answer instead of
+ * flashing back to "checking"; a different Host, or an explicit check,
+ * starts from "checking" so nothing stale is attributed to it. */
+export function observationWhileRefreshing(
+  previous: RemoteNativeCapabilityObservation | null,
+  roomId: string,
+  hostRef: string,
+  background: boolean,
+): RemoteNativeCapabilityObservation {
+  if (background && previous && previous.roomId === roomId && previous.hostRef === hostRef && previous.state !== "checking") {
+    return previous;
+  }
+  return { roomId, hostRef, state: "checking" };
+}
+
 /** The selected remote Host's own advertised native capabilities, observed
- * over the existing capability query whenever the selection changes or the
- * user refreshes. Never this device's local capability state. */
+ * over the existing capability query when the selection changes, when the
+ * user checks again, periodically, and when the window regains focus.
+ * Never this device's local capability state. */
 export function useRemoteNativeCapabilities(roomId: string, hostRef: string | null) {
   const [observation, setObservation] = useState<RemoteNativeCapabilityObservation | null>(null);
   const generation = useRef(0);
-  const refresh = useCallback(async () => {
+  const query = useCallback(async (background: boolean) => {
     if (!roomId || !hostRef) {
       setObservation(null);
       return;
     }
     const current = ++generation.current;
-    setObservation({ roomId, hostRef, state: "checking" });
+    setObservation((previous) => observationWhileRefreshing(previous, roomId, hostRef, background));
     try {
       const capabilities = await listRemoteNativeAgentCapabilities(roomId, hostRef);
       if (current === generation.current) setObservation({ roomId, hostRef, state: "observed", capabilities });
@@ -205,11 +227,19 @@ export function useRemoteNativeCapabilities(roomId: string, hostRef: string | nu
       }
     }
   }, [hostRef, roomId]);
+  const refresh = useCallback(() => query(false), [query]);
   useEffect(() => {
     if (!hasTauriRuntime()) return;
-    void refresh();
-    return () => { generation.current += 1; };
-  }, [refresh]);
+    void query(false);
+    const timer = window.setInterval(() => void query(true), REMOTE_CAPABILITY_REFRESH_MS);
+    const onFocus = () => void query(true);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      generation.current += 1;
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [query]);
   const current = observation && observation.roomId === roomId && observation.hostRef === hostRef ? observation : null;
   return { observation: current, refresh };
 }
@@ -433,7 +463,12 @@ export function useNativeAgentTask(roomId: string) {
     return projection;
   }, [roomId]);
 
-  useEffect(() => { void refreshCapabilities(); }, [refreshCapabilities]);
+  useEffect(() => {
+    void refreshCapabilities();
+    const onFocus = () => void refreshCapabilities();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshCapabilities]);
   useEffect(() => {
     if (!hasTauriRuntime() || !roomId) return;
     let cancelled = false;
@@ -533,9 +568,12 @@ export function useNativeAgentTask(roomId: string) {
       setTaskHostRef(hostRef);
       try {
         const projection = await loadRecoveryProjection();
-        if (!projection) setStatus(started);
+        // A drained projection clears the shown task; the task just started
+        // still runs on the Host it was sent to.
+        if (!projection) { setStatus(started); setTaskHostRef(hostRef); }
       } catch (error) {
         setStatus(started);
+        setTaskHostRef(hostRef);
         setMessage(error instanceof Error ? error.message : "Pastey could not load the remote task correlation.");
       }
     }
@@ -652,6 +690,8 @@ export function useNativeAgentTask(roomId: string) {
   return { capabilities, workspace, setWorkspace, taskText, setTaskText, newConversation, setNewConversation, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
 }
 
+const BADGE_TONE: Record<LifecycleTone, string> = { neutral: "", pending: "warn", live: "live", danger: "bad", complete: "ok" };
+
 export function StatusBadge({ tone, children }: { tone: LifecycleTone; children: React.ReactNode }) {
-  return <span className={`v2-status ${tone}`}>{children}</span>;
+  return <span className={`badge ${BADGE_TONE[tone]}`}>{children}</span>;
 }

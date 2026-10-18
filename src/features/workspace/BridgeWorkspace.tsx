@@ -1,27 +1,31 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useState } from "react";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { BridgeRoute } from "../../lib/bridgeRouting";
 import { sendTextToRoomWithBridgeRoute } from "../../lib/bridgeRoutingRuntime";
 import { legacyRoomToBridgePeerCollection } from "../../lib/bridgeRoomAdapter";
-import { sendTextToRoom } from "../../lib/tauri";
-import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferScheduler";
-import type { RoomInfo, RoomItem } from "../../lib/types";
-import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
-import type { AgentTaskController } from "./AgentTaskLifecycle";
-import { NativeSessionsCard } from "./NativeSessionsCard";
-import { nativeAgentAwaitingNativeDecision, nativeAgentConsequenceAbandonmentRequired, nativeAgentConversationLabel, nativeAgentConversationUnavailable, nativeAgentDisplayName, nativeAgentLifecycleLabel, nativeAgentMovementBlocksNewRun, nativeAgentRemoteReconciliationRequired, nativeAgentResponse, nativeAgentTargetAvailability, StatusBadge, useNativeAgentTask, useRemoteNativeCapabilities, type NativeAgentTargetAvailability } from "./AgentTaskLifecycle";
-import type { NativeAgentCapability, NativeAgentTaskStatus } from "../../lib/tauri";
-import { DeveloperModeScreen } from "./DeveloperModeScreen";
-import { RemoteFileFinder } from "./RemoteFileFinder";
-import { BridgeNetworkPanel } from "./BridgeNetworkPanel";
-import { NativeDecisionPanel } from "./NativeDecisionPanel";
 import { nativeDecisionsAwaitUser } from "../../lib/nativeDecisions";
-import { bridgeCode, bridgeDeviceCount, fileName, formatBytes, formatClock, roomPeers } from "./workspaceViewModel";
+import { ownAsyncDisposer } from "../../lib/subscriptionLifecycle";
+import { copyTextToClipboard, sendTextToRoom } from "../../lib/tauri";
+import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferScheduler";
+import type { DeveloperModeUiSession, DeveloperTerminalWorkspace, FileTransferProgressEvent, RoomInfo, RoomItem } from "../../lib/types";
+import { nativeAgentRecoveryRequiresAction, StatusBadge, useNativeAgentTask, type AgentTaskController } from "./AgentTaskLifecycle";
+import { BridgeDetails } from "./BridgeDetails";
+import { bridgeStatus } from "./BridgeNetworkPanel";
+import { DeveloperModeScreen } from "./DeveloperModeScreen";
+import { NativeAgentPanel } from "./NativeAgentPanel";
+import { NativeSessionsCard } from "./NativeSessionsCard";
+import { RemoteFileFinder } from "./RemoteFileFinder";
+import { Dialog, Dot, EmptyState, Icon, MenuButton, Notice, Tabs } from "./ui";
+import { bridgeCode, fileName, formatBytes, formatClock, roomMembers, roomPeers } from "./workspaceViewModel";
+
+export type BridgeTab = "share" | "agent" | "sessions";
 
 interface BridgeWorkspaceProps {
   room: RoomInfo | null;
   items: RoomItem[];
   queueItems: TransferQueueItem[];
+  transfers: FileTransferProgressEvent[];
   task: AgentTaskController;
   developerMode: boolean;
   developerSession: DeveloperModeUiSession | null;
@@ -33,15 +37,90 @@ interface BridgeWorkspaceProps {
   onDeveloper: () => void;
   onBurn: (room: RoomInfo) => Promise<void>;
   onEnqueue: (roomId: string, inputs: TransferQueueInput[]) => void;
+  onRevealInFolder: (path: string) => Promise<void>;
+  onOpenSettings: () => void;
+  menuButton?: React.ReactNode;
 }
 
-export function BridgeWorkspace({ room, items, queueItems, task, developerMode, developerSession, developerWorkspace, onDeveloperSession, onRefreshDeveloper, onNewBridge, onRefresh, onDeveloper, onBurn, onEnqueue }: BridgeWorkspaceProps) {
-  const [composerMode, setComposerMode] = useState<ComposerMode>("send");
+export function BridgeWorkspace(props: BridgeWorkspaceProps) {
+  if (!props.room) return <EmptyBridge onNewBridge={props.onNewBridge} menuButton={props.menuButton} />;
+  return <BridgeView key={props.room.id} {...props} room={props.room} />;
+}
+
+function BridgeView({ room, items, queueItems, transfers, task, developerMode, developerSession, developerWorkspace, onDeveloperSession, onRefreshDeveloper, onRefresh, onDeveloper, onBurn, onEnqueue, onRevealInFolder, onOpenSettings, menuButton }: BridgeWorkspaceProps & { room: RoomInfo }) {
+  const [tab, setTab] = useState<BridgeTab>("share");
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const peers = useMemo(() => roomPeers(room), [room]);
+  const members = useMemo(() => roomMembers(room), [room]);
+  const agent = useNativeAgentTask(room.id);
+  const status = bridgeStatus(room);
+  const title = members.length === 0 ? "Waiting for a device" : members.length === 1 ? members[0].displayName : `${members.length + 1} devices`;
+  const agentActive = agent.status?.state === "running" || agent.status?.state === "queued";
+  const agentNeedsYou = nativeAgentRecoveryRequiresAction(agent.status, agent.movement)
+    || agent.movement?.state === "awaiting_approval"
+    || (!!agent.status && nativeDecisionsAwaitUser(agent.status, !!agent.taskHostRef, Date.now() / 1000));
+
+  return <div className={`bridge${detailsOpen ? " with-inspector" : ""}`}>
+    <section className="bridge-main page" aria-label={`Bridge ${bridgeCode(room)}`}>
+      <header className="page-header">
+        {menuButton}
+        <div className="page-header-main">
+          <div className="bridge-title"><h1>{title}</h1><button type="button" className="status-pill" onClick={() => setDetailsOpen(true)} aria-label={`Bridge status: ${status.label}. Open details`}><Dot tone={status.tone} />{status.label}</button></div>
+          <p>Bridge <span className="mono">{bridgeCode(room)}</span>{developerMode ? " · Developer Mode" : ""}</p>
+        </div>
+        <div className="page-header-actions">
+          {developerMode ? <button type="button" className="btn btn-sm" onClick={onDeveloper}><Icon name="back" small />Back to Bridge</button> : null}
+          <button type="button" className={`btn btn-ghost btn-icon${detailsOpen ? " active" : ""}`} aria-label="Bridge details" title="Bridge details" aria-pressed={detailsOpen} onClick={() => setDetailsOpen(!detailsOpen)}><Icon name="panel" /></button>
+          <MenuButton label="More Bridge actions">{(close) => <>
+            <button type="button" role="menuitem" disabled={!peers.length || developerMode} onClick={() => { close(); onDeveloper(); }}><Icon name="terminal" /><span>Developer Mode<small>Request a terminal on the other device</small></span></button>
+            <button type="button" role="menuitem" onClick={() => { close(); setDetailsOpen(true); }}><Icon name="panel" /><span>Bridge details<small>Connection, devices, permissions, Burn</small></span></button>
+          </>}</MenuButton>
+        </div>
+      </header>
+      {developerMode ? <div className="panel-scroll"><div className="panel-inner"><DeveloperModeScreen room={room} session={developerSession} workspace={developerWorkspace} onSession={onDeveloperSession} onRefresh={onRefreshDeveloper} /></div></div> : <>
+        <div className="page-tabs">
+          <Tabs label="Bridge" value={tab} onChange={setTab} tabs={[
+            { value: "share", label: "Share" },
+            { value: "agent", label: "Agent", badge: agentNeedsYou ? "!" : agentActive ? <Dot tone="live" pulse /> : undefined },
+            { value: "sessions", label: "Sessions" },
+          ]} />
+        </div>
+        <div className="page" hidden={tab !== "share"}>
+          <ShareView room={room} items={items} queueItems={queueItems} transfers={transfers} peers={peers} task={task} active={tab === "share"} onRefresh={onRefresh} onEnqueue={onEnqueue} onRevealInFolder={onRevealInFolder} />
+        </div>
+        <div className="panel-scroll" hidden={tab !== "agent"}><NativeAgentPanel roomId={room.id} agent={agent} peers={peers} members={members} /></div>
+        <div className="panel-scroll" hidden={tab !== "sessions"}><NativeSessionsCard roomId={room.id} peers={[...peers]} members={[...members]} /></div>
+      </>}
+    </section>
+    {detailsOpen ? <>
+      <div className="scrim inspector-scrim" onClick={() => setDetailsOpen(false)} />
+      <BridgeDetails room={room} onClose={() => setDetailsOpen(false)} onRefresh={onRefresh} onBurn={onBurn} onOpenSettings={onOpenSettings} />
+    </> : null}
+  </div>;
+}
+
+/** What crossed this Bridge, oldest first, and the composer that sends to
+ * one selected device. Find file is the same kind of exchange in the other
+ * direction, so it lives here, behind the composer's add menu. */
+function ShareView({ room, items, queueItems, transfers, peers, task, active, onRefresh, onEnqueue, onRevealInFolder }: {
+  room: RoomInfo;
+  items: RoomItem[];
+  queueItems: TransferQueueItem[];
+  transfers: FileTransferProgressEvent[];
+  peers: ReturnType<typeof roomPeers>;
+  task: AgentTaskController;
+  active: boolean;
+  onRefresh: () => Promise<void>;
+  onEnqueue: (roomId: string, inputs: TransferQueueInput[]) => void;
+  onRevealInFolder: (path: string) => Promise<void>;
+}) {
   const [text, setText] = useState("");
   const [selectedPeerId, setSelectedPeerId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const peers = useMemo(() => roomPeers(room), [room]);
+  const [finding, setFinding] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const threadRef = useRef<HTMLDivElement | null>(null);
   // A stale selection is temporarily unavailable until the selection effect
   // adopts the fresh exact peer id. Never route one render through peers[0].
   const selectedPeer = peers.find((peer) => peer.peerSessionId === selectedPeerId) ?? null;
@@ -50,19 +129,57 @@ export function BridgeWorkspace({ room, items, queueItems, task, developerMode, 
     if (!peers.some((peer) => peer.peerSessionId === selectedPeerId)) setSelectedPeerId(peers[0]?.peerSessionId ?? "");
   }, [peers, selectedPeerId]);
 
-  useEffect(() => {
-    if (task.status) setComposerMode("task");
-  }, [task.status]);
-
   const selectedRoute = useMemo<BridgeRoute | null>(() => {
-    if (!room || !selectedPeer) return null;
+    if (!selectedPeer) return null;
     try {
       return { bridgeSessionId: legacyRoomToBridgePeerCollection(room).bridgeSessionId, target: { kind: "selected_peer", peerSessionId: selectedPeer.peerSessionId } };
     } catch { return null; }
   }, [room, selectedPeer]);
 
+  const thread = useMemo(() => items.filter((item) => item.room_id === room.id).sort((left, right) => left.created_at - right.created_at).slice(-200), [items, room.id]);
+  const queued = queueItems.filter((item) => item.roomId === room.id && ["queued", "preparing", "sending"].includes(item.status) && !item.activeTransferId);
+  const liveTransfers = transfers.filter((transfer) => transfer.room_id === room.id && !["completed", "failed", "cancelled", "burned", "interrupted"].includes(transfer.status));
+  const progressByItem = new Map(liveTransfers.map((transfer) => [transfer.item_id, transfer]));
+  const orphanTransfers = liveTransfers.filter((transfer) => !thread.some((item) => item.id === transfer.item_id));
+
+  useEffect(() => {
+    const element = threadRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [thread.length, queued.length, orphanTransfers.length, active]);
+
+  function enqueuePaths(paths: string[]) {
+    if (!selectedRoute || !selectedPeer || !paths.length) return;
+    const operationId = `bridge-send:${room.id}:${crypto.randomUUID()}`;
+    onEnqueue(room.id, paths.map((path) => ({
+      path,
+      bridgeRoute: selectedRoute,
+      bridgeOperationId: operationId,
+      bridgeTargetKind: "selected_peer",
+      bridgeContentKind: "file",
+      targetPeerSessionId: selectedPeer.peerSessionId,
+      targetPeerDisplayName: selectedPeer.displayName,
+      targetCount: 1,
+    })));
+  }
+
+  // Files dropped on the window go to the selected device, exactly like
+  // Send files. Only while this view is showing and a device is routeable.
+  const enqueueRef = useRef(enqueuePaths);
+  enqueueRef.current = enqueuePaths;
+  const canDrop = active && !!selectedRoute;
+  useEffect(() => {
+    if (!canDrop || !("__TAURI_INTERNALS__" in window)) return;
+    const dispose = ownAsyncDisposer(getCurrentWebview().onDragDropEvent((event) => {
+      const payload = event.payload;
+      if (payload.type === "enter" || payload.type === "over") setDragging(true);
+      else if (payload.type === "leave") setDragging(false);
+      else if (payload.type === "drop") { setDragging(false); enqueueRef.current(payload.paths); }
+    }));
+    return () => { setDragging(false); dispose(); };
+  }, [canDrop]);
+
   async function sendText() {
-    if (!room || !selectedRoute || !text.trim()) return;
+    if (!selectedRoute || !text.trim() || busy) return;
     setBusy(true); setMessage(null);
     try {
       await sendTextToRoomWithBridgeRoute(room, text.trim(), sendTextToRoom, selectedRoute);
@@ -74,290 +191,198 @@ export function BridgeWorkspace({ room, items, queueItems, task, developerMode, 
   }
 
   async function chooseFiles() {
-    if (!room || !selectedRoute || !selectedPeer) return;
+    if (!selectedRoute || !selectedPeer) return;
     try {
       const selected = await open({ multiple: true, directory: false });
-      const paths = typeof selected === "string" ? [selected] : Array.isArray(selected) ? selected : [];
-      if (!paths.length) return;
-      const operationId = `bridge-send:${room.id}:${crypto.randomUUID()}`;
-      onEnqueue(room.id, paths.map((path) => ({
-        path,
-        bridgeRoute: selectedRoute,
-        bridgeOperationId: operationId,
-        bridgeTargetKind: "selected_peer",
-        bridgeContentKind: "file",
-        targetPeerSessionId: selectedPeer.peerSessionId,
-        targetPeerDisplayName: selectedPeer.displayName,
-        targetCount: 1,
-      })));
+      enqueuePaths(typeof selected === "string" ? [selected] : Array.isArray(selected) ? selected : []);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Pastey could not choose files.");
     }
   }
 
-  async function burnBridge() {
-    if (!room) return;
-    const confirmed = window.confirm(`Burn Bridge ${bridgeCode(room)}?\n\nThis permanently removes the Bridge content, membership, authority, and current-session state from this device. Explicitly saved user-owned files remain outside Bridge storage.`);
-    if (confirmed) await onBurn(room);
-  }
+  const peerName = selectedPeer?.displayName ?? peers[0]?.displayName ?? null;
+  const empty = thread.length === 0 && queued.length === 0 && orphanTransfers.length === 0 && !task.status;
 
-  if (!room) return <EmptyBridge onNewBridge={onNewBridge} />;
-
-  const recent = items.filter((item) => item.room_id === room.id).slice(0, 4);
-  const queued = queueItems.filter((item) => item.roomId === room.id && ["queued", "preparing", "sending"].includes(item.status));
-  const hasManagedTask = task.status !== null;
-
-  return (
-    <section className="v2-workspace-page">
-      <header className="v2-workspace-header">
-        <div><h1>Bridge {bridgeCode(room)}</h1><p>{bridgeDeviceCount(room)} devices · {developerMode ? "Developer Mode workspace" : "current-session workspace"}</p></div>
-        <div className="v2-bridge-session-actions">
-          <BridgeNetworkPanel room={room} onPairingChanged={onRefresh} />
-          {developerMode ? <button type="button" className="v2-button" onClick={onDeveloper}>Bridge workspace</button> : null}
-          {task.status && ["checking_readiness", "preparing", "running"].includes(task.status.state)
-            ? <button type="button" className="v2-button" disabled={task.busy !== null} onClick={() => void task.cancel()}>{task.busy === "cancel" ? "Cancelling…" : "Stop task"}</button>
-            : null}
-          <button type="button" className="v2-button danger" onClick={() => void burnBridge()}>Burn</button>
-        </div>
-      </header>
-      {developerMode ? <DeveloperModeScreen room={room} session={developerSession} workspace={developerWorkspace} onSession={onDeveloperSession} onRefresh={onRefreshDeveloper} /> : <div className="v2-thread-shell">
-        <div className="v2-thread">
-          {hasManagedTask ? <TaskConversation task={task} /> : (
-            <>
-              {queued.map((item) => <TransferMessage key={item.id} name={item.displayName ?? fileName(item.path)} status={item.status} />)}
-              {recent.map((item) => <MessageCard key={item.id} item={item} />)}
-              {recent.length === 0 && queued.length === 0 ? (
-                <div className="v2-pastey-message"><small>Pastey</small><p>Pastey is ready. Paste text or images, drop files, or switch to Task when you want Pastey to work across this Bridge.</p></div>
-              ) : null}
-            </>
-          )}
-        </div>
-        <TaskComposer
-          mode={composerMode}
-          roomId={room.id}
-          onMode={setComposerMode}
-          text={text}
-          onText={setText}
-          peers={peers}
-          selectedPeerId={selectedPeer?.peerSessionId ?? ""}
-          onPeer={setSelectedPeerId}
-          disabled={!selectedRoute || busy}
-          route={selectedRoute}
-          task={task}
-          onFiles={() => void chooseFiles()}
-          onSend={() => void sendText()}
-          onDeveloper={onDeveloper}
+  return <>
+    <div className="thread" ref={threadRef}>
+      <div className="thread-inner">
+        {task.status ? <TaskConversation task={task} /> : null}
+        {empty ? <EmptyState title={peerName ? `Share with ${peerName}` : "Nothing shared yet"} actions={selectedRoute ? <><button type="button" className="btn" onClick={() => void chooseFiles()}><Icon name="file" />Send files…</button><button type="button" className="btn" onClick={() => setFinding(true)}><Icon name="download" />Get a file…</button></> : null}>
+          {peerName ? "Type or paste text below, drop files on this window, or get a file from the other device." : "When the other device connects, you can send it text and files here."}
+        </EmptyState> : null}
+        {thread.map((item, index) => <ThreadEntry key={item.id} item={item} previous={thread[index - 1]} progress={progressByItem.get(item.id)} onRevealInFolder={onRevealInFolder} />)}
+        {orphanTransfers.map((transfer) => <TransferEntry key={transfer.transfer_id} direction={transfer.direction} name={transfer.file_name} detail={transferDetail(transfer)} progress={transfer.file_size > 0 ? transfer.transferred_bytes / transfer.file_size : null} />)}
+        {queued.map((item) => <TransferEntry key={item.id} direction="outgoing" name={item.displayName ?? fileName(item.path)} detail={`${item.status === "queued" ? "Queued" : item.status === "preparing" ? "Preparing" : "Sending"}${item.targetPeerDisplayName ? ` to ${item.targetPeerDisplayName}` : ""}`} progress={null} />)}
+      </div>
+    </div>
+    <div className="composer-wrap">
+      {!selectedRoute ? <div style={{ maxWidth: "var(--content-w)", margin: "0 auto 8px" }}><Notice tone="neutral">{peers.length === 0 ? "No device is connected to this Bridge right now. Pastey keeps trying; open Bridge details to pair or set an address." : "Choose a device to send to."}</Notice></div> : null}
+      <section className={`composer${dragging ? " dragging" : ""}`} aria-label="Send to the other device">
+        <textarea
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void sendText(); } }}
+          placeholder={dragging ? "Drop to send…" : peerName ? `Message ${peerName}, or drop files…` : "Waiting for a device…"}
+          aria-label="Send message"
+          disabled={!selectedRoute}
+          rows={2}
         />
-        {message || task.message ? <p className="v2-error" role="status">{message ?? task.message}</p> : null}
-      </div>}
-    </section>
-  );
+        <div className="composer-bar">
+          <MenuButton label="Add" icon="plus" align="left" up disabled={!selectedRoute} buttonClassName="btn btn-ghost btn-icon btn-sm">{(close) => <>
+            <button type="button" role="menuitem" onClick={() => { close(); void chooseFiles(); }}><Icon name="file" /><span>Send files…<small>Choose files on this device</small></span></button>
+            <button type="button" role="menuitem" onClick={() => { close(); setFinding(true); }}><Icon name="download" /><span>Get a file from {peerName ?? "the other device"}…<small>Find one file in folders it shares</small></span></button>
+          </>}</MenuButton>
+          <span className="composer-target">
+            {peers.length > 1
+              ? <>To <select className="select select-sm" value={selectedPeerId} onChange={(event) => setSelectedPeerId(event.target.value)} aria-label="Send to">{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></>
+              : peerName ? <>To {peerName}</> : null}
+          </span>
+          <span className="spacer" />
+          <button type="button" className="btn btn-primary btn-icon send-button" aria-label="Send" disabled={!selectedRoute || busy || !text.trim()} onClick={() => void sendText()}><Icon name="arrowUp" /></button>
+        </div>
+      </section>
+      {message || task.message ? <p className="composer-hint error-text" role="status">{message ?? task.message}</p> : <p className="composer-hint">Enter sends · Shift+Enter adds a line</p>}
+    </div>
+    {finding ? <Dialog title={`Get a file from ${peerName ?? "the other device"}`} description="Find one file by name in the folders that device shares with this Bridge. Only the file you choose is sent to your Inbox." onClose={() => setFinding(false)}>
+      <RemoteFileFinder roomId={room.id} peerName={peerName} route={selectedRoute} />
+    </Dialog> : null}
+  </>;
 }
 
+function sameDay(left: number, right: number): boolean {
+  return new Date(left * 1000).toDateString() === new Date(right * 1000).toDateString();
+}
+
+function dayLabel(timestampSeconds: number): string {
+  const date = new Date(timestampSeconds * 1000);
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) return "Today";
+  const yesterday = new Date(today.getTime() - 86_400_000);
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: date.getFullYear() === today.getFullYear() ? undefined : "numeric" }).format(date);
+}
+
+function transferDetail(transfer: FileTransferProgressEvent): string {
+  const done = formatBytes(transfer.transferred_bytes);
+  const total = formatBytes(transfer.file_size);
+  return `${transfer.direction === "incoming" ? "Receiving" : "Sending"} · ${done} of ${total}`;
+}
+
+const ITEM_STATUS: Record<RoomItem["status"], string> = { created: "Waiting", sent: "Sent", received: "Received", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted" };
+
+function ThreadEntry({ item, previous, progress, onRevealInFolder }: { item: RoomItem; previous?: RoomItem; progress?: FileTransferProgressEvent; onRevealInFolder: (path: string) => Promise<void> }) {
+  const showDay = !previous || !sameDay(previous.created_at, item.created_at);
+  return <>
+    {showDay ? <span className="thread-day">{dayLabel(item.created_at)}</span> : null}
+    <MessageCard item={item} progress={progress} onRevealInFolder={onRevealInFolder} />
+  </>;
+}
+
+export function MessageCard({ item, progress, onRevealInFolder }: { item: RoomItem; progress?: FileTransferProgressEvent; onRevealInFolder?: (path: string) => Promise<void> }) {
+  const [copied, setCopied] = useState(false);
+  const outgoing = item.direction !== "incoming";
+  const failed = item.status === "failed" || item.status === "interrupted";
+  const meta = <div className="msg-meta">
+    <span>{formatClock(item.created_at)}</span>
+    {failed || item.status === "cancelled" || item.status === "created" ? <span className={failed ? "error-text xsmall" : ""}>{ITEM_STATUS[item.status]}</span> : null}
+    {item.payload_type === "text" && item.text ? <button type="button" onClick={() => void copyTextToClipboard(item.text ?? "").then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1500); }).catch(() => undefined)}>{copied ? "Copied" : "Copy"}</button> : null}
+    {item.saved_path && onRevealInFolder ? <button type="button" onClick={() => void onRevealInFolder(item.saved_path!)}>Show in folder</button> : null}
+  </div>;
+  if (item.payload_type === "text") {
+    return <div className={`msg ${outgoing ? "out" : "in"}`}>
+      <div className="msg-bubble">{item.text ?? item.display_name ?? "Text"}</div>
+      {meta}
+      {item.error_message ? <span className="error-text xsmall">{item.error_message}</span> : null}
+    </div>;
+  }
+  const ratio = progress && progress.file_size > 0 ? progress.transferred_bytes / progress.file_size : null;
+  return <div className={`msg ${outgoing ? "out" : "in"}`}>
+    <div className="file-chip">
+      <span className="file-icon" aria-hidden="true"><Icon name="file" /></span>
+      <span>
+        <strong title={item.display_name ?? undefined}>{item.display_name || "File"}</strong>
+        <small>{progress ? transferDetail(progress) : `${formatBytes(item.size_bytes)} · ${ITEM_STATUS[item.status]}`}</small>
+        {progress ? <div className={`progress${ratio === null ? " indeterminate" : ""}`}><i style={ratio === null ? undefined : { width: `${Math.round(ratio * 100)}%` }} /></div> : null}
+      </span>
+    </div>
+    {meta}
+    {item.error_message ? <span className="error-text xsmall">{item.error_message}</span> : null}
+  </div>;
+}
+
+export function TransferEntry({ direction, name, detail, progress }: { direction: string; name: string; detail: string; progress: number | null }) {
+  return <div className={`msg ${direction === "incoming" ? "in" : "out"}`}>
+    <div className="file-chip">
+      <span className="file-icon" aria-hidden="true"><Icon name="file" /></span>
+      <span>
+        <strong>{name}</strong>
+        <small>{detail}</small>
+        <div className={`progress${progress === null ? " indeterminate" : ""}`}><i style={progress === null ? undefined : { width: `${Math.round(progress * 100)}%` }} /></div>
+      </span>
+    </div>
+  </div>;
+}
+
+/** A managed Plan for this Bridge, pinned above the thread while it is
+ * open: review, Host readiness, execution and the terminal state Core
+ * reports. Nothing here synthesizes a result. */
 function TaskConversation({ task }: { task: AgentTaskController }) {
   const status = task.status;
   if (!status || !task.presentation) return null;
   const isReview = status.state === "draft";
   const isTerminal = ["completed", "failed", "interrupted", "cancelled"].includes(status.state);
-  return (
-    <>
-      <div className="v2-user-message"><small>You</small><p>Managed Agent Task · whole-Plan Bridge scope</p></div>
-      <div className="v2-pastey-message"><small>Pastey</small><p>{isReview ? "A bounded Plan Draft is ready for requester review." : task.presentation.detail}</p></div>
-      {isReview ? <PlanReviewCard task={task} /> : <PlanExecutionCard task={task} />}
-      {isTerminal ? <ResultCard task={task} /> : null}
-    </>
-  );
+  return isReview ? <PlanReviewCard task={task} /> : <>
+    <PlanExecutionCard task={task} />
+    {isTerminal ? <ResultCard task={task} /> : null}
+  </>;
 }
 
 function PlanReviewCard({ task }: { task: AgentTaskController }) {
   const status = task.status!;
-  return (
-    <article className="v2-plan-card">
-      <header><div><strong>Proposed task</strong><small>Review the bounded Plan before anything runs.</small></div><StatusBadge tone="pending">Review</StatusBadge></header>
-      <div className="v2-plan-step"><i className="v2-dot live" /><span><strong>{status.totalSteps || "—"} authored Plan steps</strong><small>PM owns WHAT, WHERE, and ORDER across {status.totalHosts || "the participating"} Hosts.</small></span></div>
-      <div className="v2-plan-step unavailable"><i className="v2-dot" /><span><strong>Step topology unavailable</strong><small>The renderer cannot safely name operations or destinations from this status projection. Authored Transfer steps remain explicit in Core.</small></span></div>
-      <div className="v2-authority-note"><small>Authority</small><p>Requester approval covers this immutable revision only. Host readiness and admission still follow.</p></div>
-      <footer><button type="button" className="v2-button" disabled={task.busy !== null} onClick={task.closeRevision}>Close review</button><button type="button" className="v2-button primary" disabled={task.busy !== null} onClick={() => void task.approve()}>{task.busy === "approve" ? "Approving…" : "Approve Plan"}</button></footer>
-    </article>
-  );
+  return <article className="card" aria-label="Plan review">
+    <header className="card-header"><div className="stack" style={{ gap: 2 }}><h3>Review this Plan</h3><span className="xsmall subtle">Nothing runs until you approve it.</span></div><StatusBadge tone="pending">Needs review</StatusBadge></header>
+    <div className="card-body">
+      <dl className="facts"><dt>Steps</dt><dd>{status.totalSteps || "—"}</dd><dt>Devices</dt><dd>{status.totalHosts || "—"}</dd></dl>
+      <Notice tone="info">Your approval covers this exact revision only. Each device still admits the Plan before any step runs. Step details stay with the Host and are not shown here.</Notice>
+    </div>
+    <footer className="card-footer"><button type="button" className="btn" disabled={task.busy !== null} onClick={task.closeRevision}>Close</button><button type="button" className="btn btn-primary" disabled={task.busy !== null} onClick={() => void task.approve()}>{task.busy === "approve" ? "Approving…" : "Approve Plan"}</button></footer>
+  </article>;
 }
 
 function PlanExecutionCard({ task }: { task: AgentTaskController }) {
   const status = task.status!;
   const canStart = status.state === "approved" && Boolean(status.approvalId);
-  return (
-    <article className={`v2-execution-card ${task.presentation?.tone ?? "neutral"}`}>
-      <header><strong>Task execution</strong><StatusBadge tone={task.presentation?.tone ?? "neutral"}>{task.busy === "cancel" ? "Cancelling" : task.presentation?.label}</StatusBadge></header>
-      <div className="v2-plan-step"><i className={`v2-dot ${status.state === "running" ? "live" : status.state === "completed" ? "connected" : "pending"}`} /><span><strong>{status.currentStepId ? `Current step · ${status.currentStepId}` : task.presentation?.label}</strong><small>{task.progress} · {status.readyHosts} of {status.totalHosts} Hosts ready</small></span></div>
-      <div className="v2-plan-step unavailable"><i className="v2-dot" /><span><strong>Explicit Transfer / dependency continuation</strong><small>Topology is not renderer-exposed. Pastey will not imply shared storage or hidden movement.</small></span></div>
-      {status.code ? <p className="v2-host-code">Host status: {status.code}</p> : null}
-      {canStart ? <footer><button type="button" className="v2-button primary" disabled={task.busy !== null} onClick={() => void task.beginReadiness()}>{task.busy === "start" ? "Preparing…" : "Begin Host readiness"}</button></footer> : null}
-    </article>
-  );
+  const canStop = ["checking_readiness", "preparing", "running"].includes(status.state);
+  return <article className="card" aria-label="Plan execution">
+    <header className="card-header"><div className="stack" style={{ gap: 2 }}><h3>Plan</h3><span className="xsmall subtle">{task.presentation?.detail}</span></div><StatusBadge tone={task.presentation?.tone ?? "neutral"}>{task.busy === "cancel" ? "Cancelling" : task.presentation?.label}</StatusBadge></header>
+    <div className="card-body">
+      <dl className="facts">
+        <dt>Progress</dt><dd>{task.progress}</dd>
+        <dt>Devices ready</dt><dd>{status.readyHosts} of {status.totalHosts}</dd>
+        {status.currentStepId ? <><dt>Current step</dt><dd className="mono">{status.currentStepId}</dd></> : null}
+        {status.code ? <><dt>Host status</dt><dd className="mono">{status.code}</dd></> : null}
+      </dl>
+    </div>
+    {canStart || canStop ? <footer className="card-footer">
+      {canStop ? <button type="button" className="btn btn-danger" disabled={task.busy !== null} onClick={() => void task.cancel()}>{task.busy === "cancel" ? "Cancelling…" : "Stop task"}</button> : null}
+      {canStart ? <button type="button" className="btn btn-primary" disabled={task.busy !== null} onClick={() => void task.beginReadiness()}>{task.busy === "start" ? "Preparing…" : "Begin Host readiness"}</button> : null}
+    </footer> : null}
+  </article>;
 }
 
 function ResultCard({ task }: { task: AgentTaskController }) {
-  return (
-    <article className={`v2-result-card ${task.presentation?.tone ?? "neutral"}`}>
-      <div><i className={`v2-dot ${task.status?.state === "completed" ? "connected" : task.presentation?.tone === "danger" ? "failed" : ""}`} /><span><strong>{task.presentation?.label}</strong><small>Authoritative terminal state reported by Host/Core.</small></span></div>
-      <p>Result content is not projected to the renderer. Pastey does not synthesize a result or infer success independently.</p>
-    </article>
-  );
+  return <Notice tone={task.status?.state === "completed" ? "ok" : task.presentation?.tone === "danger" ? "bad" : "neutral"} title={task.presentation?.label}>
+    This is the terminal state the Host reported. Result content is not shown here, and Pastey does not infer success on its own.
+  </Notice>;
 }
 
-type ComposerMode = "send" | "task" | "find";
-
-function TaskComposer({ mode, roomId, onMode, text, onText, peers, selectedPeerId, onPeer, disabled, route, task, onFiles, onSend, onDeveloper }: {
-  mode: ComposerMode;
-  roomId: string;
-  onMode: (mode: ComposerMode) => void;
-  text: string;
-  onText: (text: string) => void;
-  peers: ReturnType<typeof roomPeers>;
-  selectedPeerId: string;
-  onPeer: (id: string) => void;
-  disabled: boolean;
-  route: BridgeRoute | null;
-  task: AgentTaskController;
-  onFiles: () => void;
-  onSend: () => void;
-  onDeveloper: () => void;
-}) {
-  return (
-    <section className="v2-composer">
-      {mode === "send" ? (
-        <textarea value={text} onChange={(event) => onText(event.target.value)} placeholder="Paste text or image, or drop files here…" aria-label="Send message" />
-      ) : mode === "find" ? (
-        <RemoteFileFinder roomId={roomId} peerName={peers.find((peer) => peer.peerSessionId === selectedPeerId)?.displayName ?? null} route={route} />
-      ) : (
-        <>
-          <NativeAgentTaskCard roomId={roomId} peers={peers} />
-          <NativeSessionsCard roomId={roomId} peers={peers} />
-        </>
-      )}
-      <div className="v2-composer-controls">
-        <button type="button" className="v2-square-button" disabled={mode === "send" && disabled} onClick={mode === "send" ? onFiles : undefined}>＋</button>
-        <label className="v2-mode-select"><select value={mode} onChange={(event) => onMode(event.target.value as ComposerMode)}><option value="send">Send</option><option value="find">Find file</option><option value="task">Task</option></select></label>
-        {mode === "find" ? <label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label> : mode === "send" ? (
-          <><label className="v2-target-select"><select value={selectedPeerId} onChange={(event) => onPeer(event.target.value)} disabled={!peers.length}>{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label><button type="button" className="v2-developer-button" disabled={!peers.length} onClick={onDeveloper}>Developer Mode</button><button type="button" className="v2-send-button" disabled={disabled || !text.trim()} onClick={onSend}>↑</button></>
-        ) : <><span className="v2-plan-scope">Device → Agent → Task</span></>}
-      </div>
-      <small className="v2-composer-help">{mode === "find" ? "Find file searches only the places you choose on the selected device and sends only the file you pick to this device's Inbox. It never moves a project or workspace." : mode === "send" ? "Send mode targets one selected device. Developer Mode is human-only current-session terminal access; it does not grant Agent, Plan, or Execute authority." : "Agent Tasks use the whole Plan scope when opening an existing Plan. Native Agents own their workspace, authentication, tools, sandbox, and context; Pastey only observes their lifecycle."}</small>
-    </section>
-  );
-}
-
-function NativeAgentTaskCard({ roomId, peers }: { roomId: string; peers: ReturnType<typeof roomPeers> }) {
-  const agent = useNativeAgentTask(roomId);
-  const codex = agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex");
-  const [target, setTarget] = useState("local");
-  const [workspaceIsLocal, setWorkspaceIsLocal] = useState(false);
-  const remote = peers.find((peer) => peer.peerSessionId === target) ?? null;
-  const remoteCapabilities = useRemoteNativeCapabilities(roomId, remote?.hostRef ?? null);
-  const availability: NativeAgentTargetAvailability = remote
-    ? nativeAgentTargetAvailability("agent.coding.codex", remoteCapabilities.observation)
-    : localAvailability(codex);
-  const running = agent.status?.state === "running" || agent.status?.state === "queued";
-  const taskHostName = agent.taskHostRef
-    ? peers.find((peer) => peer.hostRef === agent.taskHostRef)?.displayName ?? "the selected device"
-    : null;
-  const movementBlocksNewRun = nativeAgentMovementBlocksNewRun(agent.movement);
-  const remoteReconciliationRequired = nativeAgentRemoteReconciliationRequired(agent.status, agent.movement);
-  const consequenceAbandonmentRequired = nativeAgentConsequenceAbandonmentRequired(agent.movement);
-  const resultReturnRetryRequired = agent.movement?.code === "result_return_retry_required"
-    || (agent.movement?.state === "interrupted" && ["result_apply_interrupted", "conflict_result_retention_required", "conflict_result_retention_failed"].includes(agent.movement.code ?? ""));
-  return <div className="v2-task-open">
-    <strong>Run with Codex</strong>
-    <label className="v2-target-select"><select value={target} onChange={(event) => setTarget(event.target.value)} disabled={running}><option value="local">This device</option>{peers.filter((peer) => peer.hostRef).map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select></label>
-    <small>{availabilityCopy(availability, remote?.displayName ?? null, workspaceIsLocal)}</small>
-    {remote && availability.state !== "checking" && availability.state !== "available" ? <button type="button" className="v2-button" disabled={running} onClick={() => void remoteCapabilities.refresh()}>Check again</button> : null}
-    {remote ? <label><input type="checkbox" checked={workspaceIsLocal} onChange={(event) => setWorkspaceIsLocal(event.target.checked)} disabled={running || movementBlocksNewRun} /> This workspace is on this device</label> : null}
-    <input value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="Original workspace path…" aria-label="Codex workspace" disabled={running} />
-    <textarea value={agent.taskText} onChange={(event) => agent.setTaskText(event.target.value)} placeholder="What should Codex do?" aria-label="Codex task" disabled={running} />
-    {!workspaceIsLocal || !remote ? <label><input type="checkbox" checked={agent.newConversation} onChange={(event) => agent.setNewConversation(event.target.checked)} disabled={running} /> Start a new conversation <small>Otherwise Codex continues your earlier conversation in this workspace, if there is one.</small></label> : null}
-    {agent.status ? <small>{nativeAgentLifecycleLabel(agent.status)}{taskHostName ? ` · on ${taskHostName}` : ""}{nativeAgentConversationLabel(agent.status) ? ` · ${nativeAgentConversationLabel(agent.status)}` : ""}{agent.status.result ? ` · ${agent.status.result}` : ""}</small> : null}
-    {nativeAgentConversationUnavailable(agent.status) ? <small className="v2-error">{nativeAgentDisplayName(agent.status?.agentId)} on {taskHostName ?? "this device"} could not reopen your earlier conversation, so nothing ran. Choose “Start a new conversation” to continue without that context.</small> : null}
-    {agent.status ? <NativeDecisionPanel status={agent.status} roomId={roomId} remote={!!agent.taskHostRef} hostName={taskHostName ?? "this device"} /> : null}
-    {nativeAgentAwaitingNativeDecision(agent.status) && !nativeDecisionsAwaitUser(agent.status, !!agent.taskHostRef, Date.now() / 1000) ? <small className="v2-error">{nativeAgentDisplayName(agent.status?.agentId)} on {taskHostName ?? "this device"} is waiting for a native request that cannot be answered from here, so the task cannot continue; stop it to interrupt the turn. To run without approval prompts, change the approval policy in that device’s own Codex configuration.</small> : null}
-    {agent.status ? <NativeAgentResponse status={agent.status} hostName={taskHostName} /> : null}
-    {remoteReconciliationRequired && !agent.movement ? <small className="v2-error">The remote task outcome is indeterminate. Pastey will not treat it as complete until it is reconciled or explicitly stopped.</small> : null}
-    {agent.movement ? <section className="v2-task-open"><strong>{agent.movement.state === "awaiting_approval" ? "Review workspace movement" : agent.movement.state.replace(/_/g, " ")}</strong><small>{agent.movement.reviewSummary}</small>{agent.movement.state === "awaiting_approval" ? <ul><li>Send “{agent.movement.sourceWorkspaceName}” to {remote?.displayName ?? "the selected device"}.</li><li>Ask that device to run Codex. It runs only if that device accepts.</li><li>Return and apply the result here if the source is unchanged.</li></ul> : null}{remoteReconciliationRequired ? <small className="v2-error">The remote task outcome is indeterminate. Pastey will not reuse this workspace until the task is reconciled or explicitly stopped.</small> : null}{consequenceAbandonmentRequired ? <small className="v2-error">{agent.movement.code === "native_agent_result_snapshot_recovery_failed" ? "Codex completed, but Pastey could not safely capture its result for return. Abandon this movement to release the original workspace; Codex will not run again." : "Pastey could not retain the returned result. Retry its exact Return or abandon this movement; the Agent’s recorded task outcome will remain unchanged."}</small> : null}{resultReturnRetryRequired ? <small className="v2-error">The exact Agent result is durable. Pastey can retry its Return without running Codex again.</small> : null}{agent.movement.state === "conflict_recovery_required" ? <><small className="v2-error">Your original workspace changed while Codex was working. Pastey preserved the result and did not overwrite your changes.</small><footer><button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.revealConflictResult()}>Reveal result</button><button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.discardConflictResult()}>Discard result</button></footer></> : null}</section> : null}
-    {agent.message ? <small className="v2-error">{agent.message}</small> : null}
-    <footer>{agent.movement?.state === "awaiting_approval" && remote ? <button type="button" className="v2-button primary" disabled={agent.busy} onClick={() => void agent.approveRemoteMovement(roomId, remote.peerSessionId)}>Approve and send</button> : remoteReconciliationRequired && !agent.recoveryTaskId ? <button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.refreshRecoveryProjection()}>Load recovery details</button> : remoteReconciliationRequired ? <>{agent.recoveryTargetHostRef ? <button type="button" className="v2-button primary" disabled={agent.busy} onClick={() => void agent.reconcileRemote()}>Reconcile</button> : null}<button type="button" className="v2-button" disabled={agent.busy || !agent.recoveryTaskId} onClick={() => void agent.stopRecovery()}>Stop</button></> : consequenceAbandonmentRequired ? <>{resultReturnRetryRequired ? <button type="button" className="v2-button primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button> : null}<button type="button" className="v2-button" disabled={agent.busy} onClick={() => void agent.stopRecovery()}>Abandon recovery</button></> : resultReturnRetryRequired ? <button type="button" className="v2-button primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button> : agent.canCancel ? <button type="button" className="v2-button" disabled={agent.busy} onClick={() => void (remote ? agent.cancelRemote(roomId, remote.peerSessionId, remote.hostRef!) : agent.cancel())}>Stop Codex</button> : <button type="button" className="v2-button primary" disabled={agent.busy || movementBlocksNewRun || availability.state !== "available" || (remote && !remote.hostRef) || !agent.workspace.trim() || !agent.taskText.trim()} onClick={() => void (remote ? (workspaceIsLocal ? agent.proposeRemoteMovement(roomId, remote.hostRef!) : agent.startRemote(roomId, remote.peerSessionId, remote.hostRef!)) : agent.start())}>{agent.busy ? "Starting…" : workspaceIsLocal && remote ? "Review movement" : "Run with Codex"}</button>}</footer>
-  </div>;
-}
-
-function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {
-  return { state: codex?.state ?? "unavailable", reason: codex?.reason ?? null, detail: codex?.detail ?? null, backend: codex?.backend ?? null };
-}
-
-/** What to tell the user about an unusable Codex, by the layer that failed. */
-export function codexUnavailableCopy(reason: string | null | undefined, where: string): string {
-  switch (reason) {
-    case "native_agent_not_installed":
-      return `Codex is not installed on ${where}, or Pastey there cannot find the codex command. On ${where}, check that “codex --version” works in a new terminal; if Codex was installed after Pastey started, quit Pastey there and open it again.`;
-    case "native_agent_launch_failed":
-      return `Pastey on ${where} found Codex but could not start it. Reinstall or update Codex on ${where}, then check again.`;
-    case "native_agent_probe_failed":
-      return `Codex on ${where} exits with an error when Pastey checks it (“codex --version”). Run that in a new terminal on ${where} to see why; a Codex installed with npm also needs Node.js on PATH.`;
-    case "native_agent_probe_timeout":
-      return `Codex on ${where} did not answer in time. Check again; its first start can be slow.`;
-    case "native_agent_incompatible":
-      return `Codex is detected on ${where}, but its required native interface is incompatible. Update Codex on ${where}.`;
-    default:
-      return `Codex is unavailable on ${where}.`;
-  }
-}
-
-function availabilityCopy(availability: NativeAgentTargetAvailability, remoteName: string | null, workspaceIsLocal: boolean): string {
-  const where = remoteName ?? "this device";
-  switch (availability.state) {
-    case "checking": return `Checking Codex on ${where}…`;
-    case "unknown": return `Pastey could not check Codex on ${where}: ${availability.message}`;
-    case "incompatible":
-    case "unavailable": {
-      const reason = availability.reason ?? (availability.state === "incompatible" ? "native_agent_incompatible" : null);
-      const copy = codexUnavailableCopy(reason, where);
-      return availability.detail ? `${copy} (${availability.detail})` : copy;
-    }
-    case "available":
-      if (!remoteName) {
-        return availability.backend === "desktop"
-          ? "Codex from the ChatGPT desktop app is ready to use its native session. No separate Codex CLI is needed."
-          : "Codex is ready to use its native session.";
-      }
-      return workspaceIsLocal
-        ? `Codex is available on ${where}. Pastey will review sending this workspace there and returning its result.`
-        : `Codex is available on ${where}. It runs in an existing workspace there after ${where} accepts; no files move.`;
-  }
-}
-
-/** The Agent's returned response, kept apart from lifecycle state. Native
- * output is untrusted and possibly remote: it is shown only as escaped
- * plain text (never markup, a command, a path or a link). */
-function NativeAgentResponse({ status, hostName }: { status: NativeAgentTaskStatus; hostName: string | null }) {
-  const response = nativeAgentResponse(status);
-  if (!response) return null;
-  const agentName = nativeAgentDisplayName(status.agentId);
-  return <section className="v2-agent-response" aria-label={`${agentName} response`}>
-    <strong>{agentName} response{hostName ? ` · from ${hostName}` : ""}</strong>
-    {response.kind === "text"
-      ? <><pre className="v2-agent-response-text">{response.text}</pre>{response.truncated ? <small>Pastey shortened this response to fit its size limit.</small> : null}</>
-      : response.kind === "undisplayable"
-        ? <small>The task completed with output Pastey cannot display as text.</small>
-        : <small>The task completed, but no response text is available.</small>}
+function EmptyBridge({ onNewBridge, menuButton }: { onNewBridge: () => void; menuButton?: React.ReactNode }) {
+  return <section className="page">
+    {menuButton ? <header className="page-header">{menuButton}</header> : null}
+    <div className="page-body" style={{ display: "grid", placeItems: "center" }}>
+      <EmptyState title="Connect a device" actions={<button type="button" className="btn btn-primary" onClick={onNewBridge}><Icon name="plus" />New Bridge</button>}>
+        A Bridge pairs this device with one of your other devices. Then you can share text and files, run Codex there, and see its Agent sessions.
+      </EmptyState>
+    </div>
   </section>;
-}
-
-export function MessageCard({ item }: { item: RoomItem }) {
-  const title = item.display_name || (item.payload_type === "text" ? "Clipboard text" : "Transfer");
-  return <article className="v2-message-card"><div><i className={`v2-dot ${item.status === "failed" ? "failed" : "connected"}`} /><strong>{title}</strong><small>{formatClock(item.created_at)} · {item.direction === "incoming" ? "Received" : "Sent"}</small></div>{item.text ? <p>{item.text}</p> : null}{item.size_bytes > 0 ? <small>{formatBytes(item.size_bytes)} · {item.status}</small> : <small>{item.status}</small>}</article>;
-}
-
-export function TransferMessage({ name, status }: { name: string; status: string }) {
-  return <article className="v2-message-card"><div><i className="v2-dot live" /><strong>{name}</strong><small>{status.replace(/_/g, " ")}</small></div><div className="v2-progress-track"><i /></div></article>;
-}
-
-function EmptyBridge({ onNewBridge }: { onNewBridge: () => void }) {
-  return <section className="v2-empty-bridge"><h1>No Bridge selected</h1><p>Open New Bridge to choose Nearby, join by code, or explicitly create a code.</p><div><button type="button" className="v2-button primary" onClick={onNewBridge}>New Bridge</button></div></section>;
 }

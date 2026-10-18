@@ -47,20 +47,20 @@ Record results in the template at the end. Never record codes, keys, device fing
 | # | Do | Expect |
 |---|---|---|
 | A1 | Launch both apps. Allow the firewall prompt on Windows, and record the choice (private or public). | Both reach the home screen. |
-| A2 | Settings → this device's identity on each. | A 20-character fingerprint; note it for B and E. |
+| A2 | Settings → Devices & trust → This device's identity on each. | A 20-character fingerprint; note it for B and E. |
 
 ## B. Secure pairing (both devices on the same Wi-Fi)
 
 | # | Do | Expect |
 |---|---|---|
-| B1 | Mac: New Bridge → Create Bridge. Windows: New Bridge → enter the Mac's code → Join. | Both show the Bridge as Connected; the network panel says **Paired device** on both. |
+| B1 | Mac: New Bridge → Create Bridge. Windows: New Bridge → enter the Mac's code → Join. | Both show the Bridge as Connected; Bridge details (the panel button in the Bridge header) show **Connected · Paired** on both. |
 | B2 | On a new Mac code, type a wrong code on Windows three times, then the right one. | Wrong codes: "did not answer" each time, and no Bridge appears on Windows. The right code then pairs. |
 | B3 | After B1, enter the same code again on Windows, or on a third device if available. | Refused or no answer. A code admits one device. |
 | B4 | Nearby flow. Windows: New Bridge → Nearby → Join on the Mac. Mac: Accept. | The Mac shows "Enter NNNN NNNN on <Windows>". Windows shows an "accepted" card asking for the code. Typing it pairs. Repeat once with **Reject**; Windows says rejected. |
 | B4a | After B1 or B4, open New Bridge on Windows again. The Mac shows **Paired before**; choose **Connect**. Repeat once from the Mac towards Windows. | A new Bridge connects with no code and no Accept; the other device shows "started a new Bridge with this device". Busy does not block it. |
-| B4b | On the Mac, open Settings → Paired devices and **Forget** Windows. Then Connect from Windows again. | The Mac now shows the ordinary Accept prompt and code. Mac Bridges with Windows are disconnected and need pairing again. |
-| B5 | Explicit re-pair. On the Mac's Bridge from B1: network panel → Pair another device. On Windows, enter that code under **New Bridge**. | Refused: "This device already has that Bridge". Then, on Windows, open that Bridge's network panel, type the code in **Pair with code**, and pairing succeeds. |
-| B6 | Legacy upgrade, if a pre-pairing build with an existing Bridge is available. Before upgrading, share a folder with that Bridge. | After upgrading both: the Bridge shows **Pairing required**, never reconnects on its own, and its history is visible. Re-pair it as in B5 (Show new code on one side, Pair with code on the other). Afterwards the folder share is gone and must be shared again; the history is still there. |
+| B4b | On the Mac, open Settings → Devices & trust → Paired devices and **Forget** Windows. Then Connect from Windows again. | The Mac now shows the ordinary Accept prompt and code. Mac Bridges with Windows are disconnected and need pairing again. |
+| B5 | Explicit re-pair. On the Mac's Bridge from B1: Bridge details → Pair again or pair another device → Pair another device. On Windows, enter that code under **New Bridge**. | Refused: "This device already has that Bridge". Then, on Windows, open that Bridge's details, type the code under **Pair with a code**, and pairing succeeds. |
+| B6 | Legacy upgrade, if a pre-pairing build with an existing Bridge is available. Before upgrading, share a folder with that Bridge. | After upgrading both: the Bridge shows **Pairing required**, never reconnects on its own, and its history is visible. Re-pair it as in B5 (Show a new code on one side, Pair with a code on the other, both in Bridge details). Afterwards the folder share is gone and must be shared again; the history is still there. |
 
 ## C. LAN Bridge operation
 
@@ -70,7 +70,7 @@ Record results in the template at the end. Never record codes, keys, device fing
 | C2 | Send the 1 GiB file Mac → Windows, then Windows → Mac. | Completes, and the SHA-256 matches. Record throughput from the transfer card. |
 | C3 | Paste an image; send the small file to the Bridge. | Both arrive; the hashes match. |
 | C4 | Start the 1 GiB send. Cancel it on the sender at about 30%. Repeat and cancel on the receiver. | Both sides show cancelled or interrupted; no partial file appears in the Inbox. |
-| C5 | On Windows, share the test folder with this Bridge. On the Mac, Find file by a name inside it, and receive one file. | Only the chosen file arrives, hash intact. The device that ran the search changes nothing on Windows. |
+| C5 | On Windows, share the test folder with this Bridge. On the Mac, in the Bridge's Share view, choose + → Get a file from <Windows>…, search a name inside it, and receive one file. | Only the chosen file arrives, hash intact. The device that ran the search changes nothing on Windows. |
 | C6 | Developer Terminal: run the [physical checklist](../development.md#developer-terminal-physical-checks) in one direction. | As listed there. |
 
 ## D. Reconnection (same Wi-Fi unless stated)
@@ -84,20 +84,20 @@ After each step, send one text and the small file both ways.
 | D3 | Turn Mac Wi-Fi off for 20 s, then on. | Reconnecting, then Connected. |
 | D4 | Sleep the Mac 2 minutes, then wake it. | Connected within about 30 s of waking. |
 | D5 | Start a 1 GiB send, then turn Mac Wi-Fi off mid-transfer for 20 s. | The transfer ends as interrupted, not as completed. A resend completes with a matching hash. |
-| D6 | On Windows only: Settings → Unattended Codex access → Replace identity key…, then restart Pastey on Windows. | The Bridge stays disconnected: the Mac refuses the new key on reconnect. Re-pair: on the Mac, network panel → Pair another device; on Windows, that Bridge's network panel → Pair with code. Then it is Connected. |
+| D6 | On Windows only: Settings → Devices & trust → Replace identity key…, then restart Pastey on Windows. | The Bridge stays disconnected: the Mac refuses the new key on reconnect. Re-pair: on the Mac, Bridge details → Pair another device; on Windows, that Bridge's details → Pair with a code. Then it is Connected. |
 
 ## E. Agent workflows (Codex on Windows, requested from the Mac)
 
 | # | Do | Expect |
 |---|---|---|
-| E0 | On Windows, check that `codex --version` works in a new terminal. In Pastey on the Mac, select Windows in the Codex card. | "Codex is available on <Windows>". If not, the card names the failing layer. Run `powershell -ExecutionPolicy Bypass -File .\scripts\diagnose-windows-codex.ps1` on Windows and record its report: it masks the user name, but review it before sharing. |
-| E0a | Only if the ChatGPT desktop app with Codex is installed on Windows. Run the diagnosis script and record its "Codex bundled with a desktop app" section. Then, with no Codex CLI on PATH (or in a Windows account without one), open Pastey's Codex card on Windows and choose Check again. Run E1 once. | The section shows a manifest with `layoutVersion=1`, an existing entrypoint, a working `--version`, and `app-server` help. The card says Codex from the ChatGPT desktop app is ready. E1 completes. If the card instead says not installed or incompatible, record its text and the script's report. |
-| E1 | From the Mac, start a small Codex task on Windows. | Windows shows the executor Review. Accept runs it; the reply returns to the Mac card. |
+| E0 | On Windows, check that `codex --version` works in a new terminal. In Pastey on the Mac, open the Bridge's Agent tab and choose Windows under Run on. | "Codex is available on <Windows>". If not, the card names the failing layer. Run `powershell -ExecutionPolicy Bypass -File .\scripts\diagnose-windows-codex.ps1` on Windows and record its report: it masks the user name, but review it before sharing. |
+| E0a | Only if the ChatGPT desktop app with Codex is installed on Windows. Run the diagnosis script and record its "Codex bundled with a desktop app" section. Then, with no Codex CLI on PATH (or in a Windows account without one), open the Agent tab of a Bridge on Windows (Run on: This device) and choose Check again, or Settings → Agents → Check again. Run E1 once. | The section shows a manifest with `layoutVersion=1`, an existing entrypoint, a working `--version`, and `app-server` help. The card says Codex from the ChatGPT desktop app is ready. E1 completes. If the card instead says not installed or incompatible, record its text and the script's report. |
+| E1 | From the Mac, Agent tab: Run on Windows, “Already on <Windows>”, type the folder's full Windows path and a small task, then Run with Codex. Before typing, the card lists what is still needed and the button says why it is disabled. | Windows shows the Agent request. Accept runs it; the reply returns to the Mac's task card, which names Windows. |
 | E2 | Repeat and choose Deny. | Nothing runs; the Mac shows that it did not start. |
-| E3 | Workspace movement: propose with a small folder, approve on the Mac, Accept on Windows. | The workspace lands, Codex runs, the result returns and applies, and the Mac's original folder is unchanged until it is applied. |
+| E3 | Workspace movement: Agent tab, Run on Windows, “On this device”, choose a small folder → Review movement, Approve and send on the Mac, Accept on Windows. | The workspace lands, Codex runs, the result returns and applies, and the Mac's original folder is unchanged until it is applied. |
 | E4 | Cancel a running task from the Mac. | Windows stops it, and both cards show cancelled. |
 | E5 | Turn Mac Wi-Fi off during a task for 20 s, then reconnect. | Reconcile shows the true outcome. Nothing runs twice. |
-| E6 | Unattended access. On Windows, compare the Mac's fingerprint (A2), trust it, and grant one folder. Start a task from the Mac. | It runs without Accept. Revoke the grant: the next task waits for Accept again. |
+| E6 | Unattended access. On Windows, Settings → Devices & trust: compare the Mac's fingerprint (A2) and trust it; then Settings → Permissions → Unattended Codex access: grant one folder. Start a task from the Mac. | It runs without Accept. Revoke the grant: the next task waits for Accept again. |
 | E7 | Re-pair this Bridge with a **different** device's code (or after D6), then repeat E1 from that device. | Earlier tasks, conversations and folder shares from before the re-pair are gone. Unattended runs need a grant for the new device. |
 
 ## F. Native P2P traversal across networks (isolated probe)
@@ -154,15 +154,29 @@ Prerequisites:
 
 | # | Do | Expect |
 |---|---|---|
-| I1 | On the Mac, Bridge → Agent sessions → choose Windows → Look for sessions, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. |
-| I2 | On Windows, Settings → Session reading: choose the Mac, the Demo folder, 1 day, excerpts off → Allow reading. Then repeat I1 on the Mac. | Windows's sessions in Demo are listed, with folder name "Demo" and no Windows path anywhere. Claude Code sessions show "Last turn ended" or "Running". A Codex thread shows "Unknown" while the ChatGPT desktop app or a `codex` terminal runs on Windows. Record what each row says. |
+| I1 | On the Mac, Bridge → Sessions tab → choose Windows → Look for sessions, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. |
+| I2 | On Windows, Settings → Permissions → Session reading → Add a permission…: choose the Mac, the Demo folder, 1 day, excerpts off → Allow reading. Then repeat I1 on the Mac. | Windows's sessions in Demo are listed, with folder name "Demo" and no Windows path anywhere. Claude Code sessions show "Last turn ended" or "Running". A Codex thread shows "Unknown" while the ChatGPT desktop app or a `codex` terminal runs on Windows. Record what each row says. |
 | I3 | On the Mac, open one Claude Code session. | The report shows status, live source (`claude agents --json`), last turn, counts, changed files relative to Demo, Git facts, and facts, inferences and unknowns. It says Windows shares statuses only: no prompt or reply text. |
 | I4 | On Windows, start a Claude Code turn in that session (`claude --resume <id>` in Demo, or the desktop app). While it runs, look again from the Mac and open it. | It shows "Running" while the turn runs, and "Last turn ended" after it. The report never claims done while running. |
-| I5 | On Windows, revoke the permission, or revoke the Mac under trusted devices. Look again from the Mac. | Back to "has not allowed". |
+| I5 | On Windows, revoke the permission (Settings → Permissions, or that Bridge's details → Allowed on this device), or revoke the Mac under Settings → Devices & trust. Look again from the Mac. | Back to "has not allowed". |
 | I6 | On Windows, allow again with excerpts on. Open the session from the Mac. | Up to 4 short excerpts, replies labelled as the agent's own account, any path shown as `<path>`. |
 | I7 | Burn the Bridge on either side, pair again, and look from the Mac. | "Has not allowed": permissions do not survive Burn. |
 
 Record which rows passed. Do not paste session titles, prompts or paths into the record.
+
+## J. Desktop UI (both devices)
+
+The UI was reorganized around Bridges ([UX and information architecture](../ux-information-architecture.md)). These rows check what automated tests and a browser preview cannot: the real windows, system pickers and Tauri events.
+
+| # | Do | Expect |
+|---|---|---|
+| J1 | Open Pastey at its default 760 × 760 window, then widen past 1080 px and narrow below 680 px. | At 760 px the sidebar and the Bridge fit with no overlap. Above 1080 px Bridge details dock on the right; below, they open as an overlay. Below 680 px the sidebar opens from the menu button. |
+| J2 | Settings → General → Appearance: Light, Dark, System. Restart Pastey. | Each theme applies at once and survives the restart; System follows the OS. |
+| J3 | Drag two files from Finder or Explorer onto a Bridge's Share view. | The composer shows "Drop to send…"; both files are sent to the selected device, like + → Send files…. Nothing happens on the Agent or Sessions tab. |
+| J4 | Mac, Agent tab: Run on Windows and leave the folder empty. Then type the path, then the task. | The checklist and the line beside the button say what is missing; the button enables only when nothing is. |
+| J5 | With the Agent tab open on the Mac, quit Pastey on Windows, wait 20 s, open it again. | The card says Windows is not connected, then, without a click, that Codex is available again. The device choice stays Windows throughout. |
+| J6 | On Windows, while the Mac's Agent tab is open, rename `codex` off PATH (or sign out) and back. Switch focus to the Mac window. | Within about 15 s, or at once on focus, the Mac shows the new availability and the button follows it. |
+| J7 | Burn a test Bridge from its details. | A confirmation names the Bridge and what is removed. Cancel keeps it; Burn removes it. |
 
 ## Record
 
@@ -178,6 +192,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Steps failed (step, what happened, time) | |
 | Steps not run, and why | |
 | Remote session reading (I1–I7) | |
+| Desktop UI (J1–J7) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
 | Net-probe summary (part F) | |

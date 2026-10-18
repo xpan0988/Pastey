@@ -4,7 +4,6 @@ import { useEffect, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
 import { WorkspaceV2 } from "./features/workspace/WorkspaceV2";
 import { bridgeCode } from "./features/workspace/workspaceViewModel";
-import "./features/workspace/workspace-v2.css";
 import {
   acceptNearbyJoin,
   burnRoom,
@@ -1484,56 +1483,48 @@ function App() {
   }
 
   if (!config) {
-    return (
-      <div className="app-shell center-panel">
-        <div className="panel">{error ?? "Loading pastey..."}</div>
-      </div>
-    );
+    return <div className="app-loading">{error ?? "Loading Pastey…"}</div>;
   }
 
   return (
-    <div className="app-shell workstation-app">
-      {error ? <div className="error-box">{error}</div> : null}
-      {joinRequest ? (
-        <div className="join-request-banner panel">
-          <div className="subtle-stack tight">
-            <strong>{joinRequest.device_name} wants to join.</strong>
-            <span className="muted">
-              {joinRequest.platform} • Pastey {joinRequest.app_version}
-            </span>
+    <>
+      <div className="toast-stack" aria-live="polite">
+        {error ? <div className="toast bad" role="alert"><strong>Something went wrong</strong><p>{error}</p><div className="row"><button type="button" className="btn btn-sm" onClick={() => setError(null)}>Dismiss</button></div></div> : null}
+        {joinRequest ? (
+          <div className="toast" role="alert">
+            <div className="stack" style={{ gap: 2 }}>
+              <strong>{joinRequest.device_name} wants to join.</strong>
+              <p>{joinRequest.platform} · Pastey {joinRequest.app_version}</p>
+            </div>
+            <div className="row">
+              <button type="button" className="btn" disabled={joinRequestBusy !== null} onClick={() => void handleRejectJoinRequest(joinRequest)}>
+                Reject
+              </button>
+              <button type="button" className="btn btn-primary" disabled={joinRequestBusy !== null} onClick={() => void handleAcceptJoinRequest(joinRequest)}>
+                {joinRequestBusy ? "Responding…" : "Accept"}
+              </button>
+            </div>
           </div>
-          <div className="row gap">
-            <button className="primary-button" disabled={joinRequestBusy !== null} onClick={() => void handleAcceptJoinRequest(joinRequest)}>
-              {joinRequestBusy ? "Responding…" : "Accept"}
-            </button>
-            <button className="ghost-button" disabled={joinRequestBusy !== null} onClick={() => void handleRejectJoinRequest(joinRequest)}>
-              Reject
-            </button>
+        ) : null}
+        {knownConnect && !joinRequest ? (
+          <div className="toast">
+            <div className="stack" style={{ gap: 2 }}>
+              <strong>{knownConnect} started a new Bridge with this device.</strong>
+              <p>You paired with it before, so no code was needed. Forget it in Settings → Devices & trust to stop this.</p>
+            </div>
+            <div className="row"><button type="button" className="btn btn-sm" onClick={() => setKnownConnect(null)}>OK</button></div>
           </div>
-        </div>
-      ) : null}
-      {knownConnect && !joinRequest ? (
-        <div className="join-request-banner panel">
-          <div className="subtle-stack tight">
-            <strong>{knownConnect} started a new Bridge with this device.</strong>
-            <span className="muted">You paired with it before, so no code was needed. Forget it in Settings to stop this.</span>
+        ) : null}
+        {acceptedPairing && !joinRequest && rooms.find((room) => room.id === acceptedPairing.roomId)?.pairing_state !== "paired" ? (
+          <div className="toast">
+            <div className="stack" style={{ gap: 2 }}>
+              <strong>Enter {acceptedPairing.code} on {acceptedPairing.deviceName}.</strong>
+              <p>This one-time code is never sent over the network.</p>
+            </div>
+            <div className="row"><button type="button" className="btn btn-sm" onClick={() => setAcceptedPairing(null)}>Done</button></div>
           </div>
-          <div className="row gap">
-            <button className="ghost-button" onClick={() => setKnownConnect(null)}>OK</button>
-          </div>
-        </div>
-      ) : null}
-      {acceptedPairing && !joinRequest && rooms.find((room) => room.id === acceptedPairing.roomId)?.pairing_state !== "paired" ? (
-        <div className="join-request-banner panel">
-          <div className="subtle-stack tight">
-            <strong>Enter {acceptedPairing.code} on {acceptedPairing.deviceName}.</strong>
-            <span className="muted">This one-time code is never sent over the network.</span>
-          </div>
-          <div className="row gap">
-            <button className="ghost-button" onClick={() => setAcceptedPairing(null)}>Done</button>
-          </div>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
 
       <WorkspaceV2
         config={config}
@@ -1557,7 +1548,7 @@ function App() {
         onConfigChange={setConfig}
         onEnqueueTransferInputs={enqueueRoomTransferInputs}
       />
-    </div>
+    </>
   );
 }
 

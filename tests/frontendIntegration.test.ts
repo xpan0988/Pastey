@@ -22,7 +22,10 @@ import {
   nativeAgentTargetAvailability,
   nativeAgentConversationLabel,
   nativeAgentConversationUnavailable,
+  observationWhileRefreshing,
+  REMOTE_CAPABILITY_REFRESH_MS,
 } from "../src/features/workspace/AgentTaskLifecycle";
+import { codexRunReadiness, looksLikeFullPath, type CodexRunInput } from "../src/lib/nativeAgentReadiness";
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
 import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
@@ -164,13 +167,13 @@ test("a Bridge without a verified device offers only explicit re-pairing", () =>
 });
 
 test("the local Codex card says when the desktop app's Codex is used", () => {
-  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   assert.match(card, /availability\.backend === "desktop"/);
   assert.match(card, /No separate Codex CLI is needed/);
 });
 
 test("Codex availability names the failing layer and keeps local detail local", () => {
-  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
   for (const reason of ["native_agent_not_installed", "native_agent_launch_failed", "native_agent_probe_failed", "native_agent_probe_timeout", "native_agent_incompatible"]) {
     assert.match(card, new RegExp(`case "${reason}"`));
@@ -206,19 +209,24 @@ test("nearby refresh deduplicates one physical device without mutating Bridge st
   assert.deepEqual(uniqueNearbyDevices([device, duplicate]), [duplicate]);
 });
 
-test("Devices is inspection-only and navigation cannot create or join a Bridge", () => {
-  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+test("Bridge devices are inspection-only and navigation cannot create or join a Bridge", () => {
+  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
   const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");
-  const devicesBody = screens.slice(screens.indexOf("export function DevicesScreen"), screens.indexOf("export function NewBridgeScreen"));
+  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const devicesBody = details.slice(details.indexOf("export function BridgeDevices"), details.indexOf("function deviceCheckKey"));
   assert.doesNotMatch(devicesBody, /onCreate|onJoin|onListNearby|onJoinNearby|Add device|Find nearby/);
-  assert.match(devicesBody, /Device admission is not supported from this view/);
-  assert.match(workspace, /route === "devices" \? <DevicesScreen room=\{activeRoom\}/);
+  assert.match(devicesBody, /Devices join a Bridge only by pairing/);
+  // Devices are a part of the selected Bridge, not a global route.
+  assert.doesNotMatch(readFileSync("src/features/workspace/workspaceTypes.ts", "utf8"), /"devices"|"activity"/);
+  assert.doesNotMatch(workspace, /DevicesScreen|ActivityScreen/);
+  assert.match(details, /<BridgeDevices room=\{room\} \/>/);
+  assert.match(bridge, /<BridgeDetails room=\{room\}/);
 });
 
 test("Bridge Device Check uses exact HostRef and remains explicitly user initiated", () => {
-  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
-  const devicesBody = screens.slice(screens.indexOf("export function DevicesScreen"), screens.indexOf("export function NewBridgeScreen"));
+  const devicesBody = details.slice(details.indexOf("export function BridgeDevices"), details.indexOf("function BridgePermissions"));
   assert.match(devicesBody, /runBridgeDeviceSelfCheck\(bridgeId, hostRef\)/);
   assert.match(devicesBody, /deviceCheckKey\(bridgeId, hostRef\)/);
   assert.match(devicesBody, /inFlight\.current\.has\(checkKey\)/);
@@ -249,9 +257,9 @@ test("capability acquisition confirmation binding remains display-only", () => {
 });
 
 test("Bridge Devices consumes the read-only NodeList without turning it into a Check or admission flow", () => {
-  const screens = readFileSync("src/features/workspace/WorkspaceScreens.tsx", "utf8");
+  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
-  const devicesBody = screens.slice(screens.indexOf("export function DevicesScreen"), screens.indexOf("export function NewBridgeScreen"));
+  const devicesBody = details.slice(details.indexOf("export function BridgeDevices"), details.indexOf("function BridgePermissions"));
   assert.match(devicesBody, /getBridgeNodeListProjection\(room\.id\)/);
   assert.match(devicesBody, /nodeList\.nodes\.map/);
   assert.match(bindings, /invoke\("get_bridge_node_list_projection", \{ bridgeId \}\)/);
@@ -285,7 +293,7 @@ test("Developer Mode stays inside the selected Bridge and receiver observation i
   assert.doesNotMatch(routeTypes, /"developer"/);
   assert.doesNotMatch(workspace, /route === "developer"/);
   assert.match(workspace, /bridgeMode === "developer"/);
-  assert.match(bridge, /developerMode \? <DeveloperModeScreen/);
+  assert.match(bridge, /developerMode \? <div[^>]*><div[^>]*><DeveloperModeScreen/);
   assert.match(workspace, /getDeveloperTerminalWorkspace\(roomId\)/);
   assert.match(workspace, /Developer Mode request/);
   assert.match(workspace, />Deny</);
@@ -366,7 +374,7 @@ test("reconciliation-required Native Agent movement remains exclusive while ordi
 
 test("Native Agent recovery uses the existing card with durable refresh and explicit repair actions", () => {
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.match(lifecycle, /getNativeAgentRecoveryProjection\(roomId\)/);
   assert.match(lifecycle, /await loadRecoveryProjection\(\)/);
@@ -516,11 +524,12 @@ test("Native Agent responses are shown apart from lifecycle and only as escaped 
   assert.equal(nativeAgentDisplayName("agent.coding.codex"), "Codex");
   assert.equal(nativeAgentDisplayName("fake.longjob.v1"), "fake.longjob.v1");
 
-  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.doesNotMatch(card, /dangerouslySetInnerHTML|innerHTML/);
-  assert.match(card, /<pre className="v2-agent-response-text">\{response\.text\}<\/pre>/);
-  const responseCard = card.slice(card.indexOf("function NativeAgentResponse"), card.indexOf("export function MessageCard"));
+  assert.match(card, /<pre className="agent-response-text">\{response\.text\}<\/pre>/);
+  const responseCard = card.slice(card.indexOf("function NativeAgentResponse"));
+  assert.ok(responseCard.length > 0);
   assert.doesNotMatch(responseCard, /<a\b|href=|onClick|open\(|invoke\(/);
   assert.match(bindings, /output\?: unknown;/);
 });
@@ -541,7 +550,7 @@ test("Native approval waits stay running and are explained, not hidden", () => {
   // A cancelled task is never shown as waiting, whatever its last code was.
   assert.equal(nativeAgentAwaitingNativeDecision({ ...running, state: "cancelled" }), false);
   assert.equal(nativeAgentLifecycleLabel({ ...running, state: "failed", code: "native_agent_start_failed" }), "failed · did not start");
-  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   assert.match(card, /waiting for a native request that cannot be answered from here/);
   assert.match(card, /agent\.canCancel \? <button[\s\S]*?>Stop Codex<\/button>/);
 });
@@ -566,12 +575,13 @@ test("A selected remote Host shows its own advertised Codex availability", () =>
     nativeAgentTargetAvailability("agent.coding.codex", { roomId: "room", hostRef: "host:windows", state: "error", message: "no response" }),
     { state: "unknown", message: "no response" },
   );
-  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
-  // The remote target never falls back to this device's local Codex state.
-  assert.match(card, /const availability: NativeAgentTargetAvailability = remote\s*\? nativeAgentTargetAvailability\("agent\.coding\.codex", remoteCapabilities\.observation\)\s*: localAvailability\(codex\);/);
-  assert.match(card, /availability\.state !== "available"/);
+  // A chosen remote target never falls back to this device's local Codex
+  // state, even while it is disconnected (it is chosen by HostRef).
+  assert.match(card, /const availability: NativeAgentTargetAvailability = targetHostRef\s*\? nativeAgentTargetAvailability\("agent\.coding\.codex", remoteCapabilities\.observation\)\s*: localAvailability\(codex\);/);
+  assert.match(card, /disabled=\{!readiness\.ready \|\| taskActive\}/);
   assert.match(lifecycle, /listRemoteNativeAgentCapabilities\(roomId, hostRef\)/);
   assert.match(bindings, /invoke\("list_remote_native_agent_capabilities", \{ roomId, targetHostRef \}\)/);
   // A finished task stays visible (with its response) when recovery drains.
@@ -599,7 +609,7 @@ test("Continued and new Agent conversations are shown only once confirmed", () =
   assert.equal(nativeAgentLifecycleLabel(unavailable), "failed · conversation unavailable");
   assert.equal(nativeAgentConversationUnavailable({ ...unavailable, code: "native_agent_start_failed" }), false);
 
-  const card = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.doesNotMatch(card, /resumed native session/);
@@ -683,7 +693,9 @@ test("Find file and shared folders keep paths and authority on the searched devi
   assert.doesNotMatch(finder, /innerHTML|sourcePath|createDirectFileTransferBridgePlan|propose.*Movement/);
   assert.match(finder, /selectBridgePlanSearchCandidate\(roomId, attemptId, candidateId, controlRoute\)/);
   assert.match(finder, /approveBridgePlan\(revisionId, approvalId\)/);
-  assert.match(card, /<option value="find">Find file<\/option>/);
+  // Find file is the Share composer's "get a file" action, opened in a dialog.
+  assert.match(card, /Get a file from \{peerName \?\? "the other device"\}…/);
+  assert.match(card, /<RemoteFileFinder roomId=\{room\.id\} peerName=\{peerName\} route=\{selectedRoute\} \/>/);
   // A folder is shared only from this device's own folder picker.
   assert.match(settings, /open\(\{ directory: true, multiple: false \}\)/);
   assert.match(bindings, /invoke\("authorize_search_folder", \{ path, roomId \}\)/);
@@ -754,19 +766,25 @@ test("Unattended Codex permissions are narrow, explained and only created on the
   assert.equal(expiryLabel(200 + 2 * 3600, 200), "expires in 2 h");
 
   const settings = readFileSync("src/features/workspace/UnattendedAccessSettings.tsx", "utf8");
+  const trust = readFileSync("src/features/workspace/DeviceTrustSettings.tsx", "utf8");
   const panel = readFileSync("src/features/workspace/BridgeNetworkPanel.tsx", "utf8");
+  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
   // No blanket permission exists anywhere.
-  for (const file of [settings, panel, lifecycle, readFileSync("src/lib/tauri.ts", "utf8")]) {
+  for (const file of [settings, trust, panel, details, lifecycle, readFileSync("src/lib/tauri.ts", "utf8")]) {
     assert.doesNotMatch(file, /always allow|allowAll|trust_all/i);
   }
   // Trust requires comparing the fingerprint; permissions say what they do not cover.
-  assert.match(settings, /Only continue if \$\{device\.peerName\} shows exactly this identity/);
+  assert.match(trust, /Only continue if \$\{device\.peerName\} shows exactly this identity/);
   assert.match(settings, /Codex's own approval requests are never answered by it/);
   assert.match(settings, /must stay on, awake, signed in and running Pastey/);
   // The requesting device can only show itself; it cannot create permissions.
   assert.match(panel, /presentDeviceIdentity\(room\.id, peerHostRef\)/);
   assert.doesNotMatch(panel, /createUnattendedGrant|trustPeerDevice/);
+  // A Bridge's details can revoke what it is allowed here, never create it.
+  assert.doesNotMatch(details, /createUnattendedGrant|createSessionReadGrant|authorizeSearchFolder|trustPeerDevice/);
+  assert.match(details, /revokeUnattendedGrant\(grant\.grantId\)/);
+  assert.match(details, /revokeSessionReadGrant\(grant\.grantId\)/);
   assert.match(lifecycle, /waiting for the other device to accept \(no unattended permission applied\)/);
 });
 
@@ -899,4 +917,161 @@ test("the sessions card reads only and the Host's settings own every permission"
   assert.match(card, /Pastey does not pick for you/);
   assert.match(card, /the agent's own account, not verified/);
   assert.match(settings, /trusting a device does not let it read anything/);
+});
+
+function codexInput(overrides: Partial<CodexRunInput> = {}): CodexRunInput {
+  return {
+    target: { kind: "remote", name: "DESKTOP-DMI2L9P", connected: true },
+    availability: { state: "available" },
+    workspaceSource: "on_target",
+    workspace: "C:\\Users\\me\\Pastey",
+    taskText: "Run the tests",
+    busy: false,
+    movementBlocksNewRun: false,
+    ...overrides,
+  };
+}
+
+test("Run with Codex on an available remote Host is ready once its folder path and task are given", () => {
+  const ready = codexRunReadiness(codexInput());
+  assert.equal(ready.ready, true);
+  assert.equal(ready.blocker, null);
+  assert.equal(ready.action, "run_remote");
+  assert.equal(ready.actionLabel, "Run with Codex");
+  assert.match(ready.next, /asks its user to accept/);
+  assert.ok(ready.requirements.every((requirement) => requirement.met));
+
+  // The reported case: Codex is available on Windows and a folder was
+  // chosen there (for Session reading), but this device was never told the
+  // path. The button used to stay disabled silently; now it says why.
+  const noPath = codexRunReadiness(codexInput({ workspace: "  " }));
+  assert.equal(noPath.ready, false);
+  assert.match(noPath.blocker ?? "", /full path of the folder on DESKTOP-DMI2L9P/);
+  assert.deepEqual(noPath.requirements.filter((requirement) => !requirement.met).map((requirement) => requirement.id), ["workspace"]);
+
+  assert.equal(codexRunReadiness(codexInput({ taskText: "" })).blocker, "Describe what Codex should do.");
+  assert.equal(codexRunReadiness(codexInput({ busy: true })).ready, false);
+  assert.equal(codexRunReadiness(codexInput({ busy: true })).actionLabel, "Starting…");
+});
+
+test("Run with Codex names each unmet requirement in order, by target and folder location", () => {
+  const disconnected = codexRunReadiness(codexInput({ target: { kind: "remote", name: "DESKTOP-DMI2L9P", connected: false }, workspace: "" }));
+  assert.equal(disconnected.requirements[0].id, "device");
+  assert.match(disconnected.blocker ?? "", /not connected right now/);
+  assert.match(codexRunReadiness(codexInput({ availability: { state: "checking" } })).blocker ?? "", /Checking Codex on DESKTOP-DMI2L9P/);
+  assert.match(codexRunReadiness(codexInput({ availability: { state: "unknown", message: "timeout" } })).blocker ?? "", /could not check Codex/);
+  assert.match(codexRunReadiness(codexInput({ availability: { state: "unavailable", reason: "native_agent_not_installed" } })).blocker ?? "", /not available on DESKTOP-DMI2L9P/);
+  assert.match(codexRunReadiness(codexInput({ movementBlocksNewRun: true })).blocker ?? "", /earlier workspace movement is still unresolved/);
+
+  // A folder on this device is reviewed and moved, never run in place.
+  const movement = codexRunReadiness(codexInput({ workspaceSource: "send_from_here", workspace: "/Users/me/app" }));
+  assert.equal(movement.action, "review_movement");
+  assert.equal(movement.actionLabel, "Review movement");
+  assert.match(movement.next, /Nothing moves until you approve/);
+  assert.match(codexRunReadiness(codexInput({ workspaceSource: "send_from_here", workspace: "" })).blocker ?? "", /Choose the folder on this device to send/);
+
+  const local = codexRunReadiness(codexInput({ target: { kind: "local" } }));
+  assert.equal(local.action, "run_local");
+  assert.ok(!local.requirements.some((requirement) => requirement.id === "device"));
+
+  assert.equal(looksLikeFullPath("C:\\Users\\me\\app"), true);
+  assert.equal(looksLikeFullPath("/Users/me/app"), true);
+  assert.equal(looksLikeFullPath("\\\\server\\share"), true);
+  assert.equal(looksLikeFullPath("Pastey"), false);
+});
+
+test("Native execution readiness never depends on Session reading permissions", () => {
+  const readiness = readFileSync("src/lib/nativeAgentReadiness.ts", "utf8");
+  const panel = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  for (const source of [readiness, panel]) {
+    assert.doesNotMatch(source, /SessionReadGrant|listSessionReadGrants|readGrant|discoverRemoteNativeSessions/);
+  }
+  // The button is disabled only by the readiness model, which shows its reason.
+  assert.match(panel, /disabled=\{!readiness\.ready \|\| taskActive\} title=\{blocker \?\? undefined\}/);
+  assert.match(panel, /<Checklist items=\{readiness\.requirements\} \/>/);
+  assert.match(panel, /\{blocker \?\? readiness\.next\}/);
+});
+
+test("A chosen Codex Host is kept by HostRef across reconnects and never falls back to this device", () => {
+  const panel = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  assert.match(panel, /const remote = targetHostRef \? peers\.find\(\(peer\) => peer\.hostRef === targetHostRef\) \?\? null : null;/);
+  assert.doesNotMatch(panel, /peerSessionId === target\b/);
+  // Stop and Approve route to the task's own Host, not whatever is selected now.
+  assert.match(panel, /peers\.find\(\(peer\) => peer\.hostRef === agent\.taskHostRef\)/);
+  assert.match(panel, /peers\.find\(\(peer\) => peer\.hostRef === agent\.movement\?\.targetHostRef\)/);
+  const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  assert.match(sessions, /peers\.find\(\(peer\) => peer\.hostRef === target\)/);
+  // A just-started remote task keeps its Host even when recovery is drained.
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  assert.match(lifecycle, /if \(!projection\) \{ setStatus\(started\); setTaskHostRef\(hostRef\); \}/);
+});
+
+test("A remote Host's capability is observed again in the background without flashing back to checking", () => {
+  const available = { roomId: "room", hostRef: "host:windows", state: "observed" as const, capabilities: [{ agentId: "agent.coding.codex", displayName: "Codex", state: "available" as const }] };
+  assert.equal(observationWhileRefreshing(available, "room", "host:windows", true), available);
+  assert.deepEqual(observationWhileRefreshing(available, "room", "host:windows", false), { roomId: "room", hostRef: "host:windows", state: "checking" });
+  assert.deepEqual(observationWhileRefreshing(available, "room", "host:other", true), { roomId: "room", hostRef: "host:other", state: "checking" });
+  assert.deepEqual(observationWhileRefreshing(available, "room-b", "host:windows", true), { roomId: "room-b", hostRef: "host:windows", state: "checking" });
+  assert.deepEqual(observationWhileRefreshing(null, "room", "host:windows", true), { roomId: "room", hostRef: "host:windows", state: "checking" });
+  const failed = { roomId: "room", hostRef: "host:windows", state: "error" as const, message: "no answer" };
+  assert.equal(observationWhileRefreshing(failed, "room", "host:windows", true), failed);
+  assert.ok(REMOTE_CAPABILITY_REFRESH_MS >= 5_000 && REMOTE_CAPABILITY_REFRESH_MS <= 60_000);
+
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  assert.match(lifecycle, /window\.setInterval\(\(\) => void query\(true\), REMOTE_CAPABILITY_REFRESH_MS\)/);
+  assert.match(lifecycle, /window\.addEventListener\("focus", onFocus\)/);
+  assert.match(lifecycle, /window\.clearInterval\(timer\)/);
+  // A reconnecting Host is queried again as soon as it is routeable.
+  assert.match(readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8"), /useRemoteNativeCapabilities\(roomId, remote \? targetHostRef : null\)/);
+});
+
+test("Settings are device-wide sections and every permission can be found and revoked", () => {
+  const settings = readFileSync("src/features/workspace/SettingsScreens.tsx", "utf8");
+  for (const label of ["General", "Devices & trust", "Permissions", "Agents", "Advanced", "About"]) {
+    assert.match(settings, new RegExp(`label: "${label}"`));
+  }
+  const permissions = settings.slice(settings.indexOf("function PermissionsSettings"), settings.indexOf("function SharedSearchFolders"));
+  assert.match(permissions, /<UnattendedAccessSettings \/>/);
+  assert.match(permissions, /<SessionReadingSettings \/>/);
+  assert.match(permissions, /<SharedSearchFolders \/>/);
+  // Stored but unused by the Host: not offered as if they did something.
+  assert.doesNotMatch(settings, /auto_burn_after_download|save_received_files_to_inbox|save_received_images_to_inbox/);
+  // No placeholder rows that look like settings.
+  assert.doesNotMatch(settings, /value="Unavailable"|Not projected|Not renderer-exposed|UnavailableRows/);
+  // Each Bridge shows and revokes what it is allowed, and links here.
+  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
+  assert.match(details, /grant\.bridgeId === room\.id/);
+  assert.match(details, /folder\.bridgeId === room\.id/);
+  assert.match(readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8"), /onOpenSettings=\{\(\) => navigate\("settings-permissions"\)\}/);
+  // Grants list first; the add form is one explicit step away.
+  for (const file of ["UnattendedAccessSettings.tsx", "SessionReadingSettings.tsx"]) {
+    const source = readFileSync(`src/features/workspace/${file}`, "utf8");
+    assert.ok(source.indexOf("ordered.map") < source.indexOf("add-form"), file);
+    assert.match(source, /Revoke<\/button>/);
+  }
+});
+
+test("Burn, Forget and identity replacement each need an explicit confirmation", () => {
+  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
+  assert.equal(details.match(/onBurn\(room\)/g)?.length, 1);
+  const dialog = details.slice(details.indexOf("{confirmBurn ? <Dialog"));
+  assert.match(dialog, /onBurn\(room\)/);
+  assert.match(dialog, /permanently removes the Bridge content, membership, authority, and current-session state/);
+  assert.doesNotMatch(readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8"), /onBurn\(/);
+  const known = readFileSync("src/features/workspace/KnownDevicesSettings.tsx", "utf8");
+  assert.match(known.slice(known.indexOf("{confirm ? <Dialog")), /forget\(confirm\)/);
+  const trust = readFileSync("src/features/workspace/DeviceTrustSettings.tsx", "utf8");
+  assert.match(trust.slice(trust.indexOf("{confirmRotate ? <Dialog")), /act\(rotateDeviceIdentity\)/);
+  assert.equal(trust.match(/trustPeerDevice\(/g)?.length, 1);
+});
+
+test("Execution, observation and continuation stay separate in the Bridge", () => {
+  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(bridge, /\{ value: "share", label: "Share" \}/);
+  assert.match(bridge, /value: "agent", label: "Agent"/);
+  assert.match(bridge, /\{ value: "sessions", label: "Sessions" \}/);
+  const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  // Discovered sessions are never offered as continuable from here.
+  assert.doesNotMatch(sessions, /startRemoteNativeCodexTask|startNativeCodexTask|continue_native_session|>Continue</);
+  assert.match(sessions, /This view does not continue sessions/);
 });

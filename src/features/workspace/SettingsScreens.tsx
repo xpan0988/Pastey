@@ -1,101 +1,102 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
+import { readAppearance, saveAppearance, type Appearance } from "../../lib/appearance";
 import {
   authorizeSearchFolder,
-  listAuthorizedSearchFolders,
-  listRooms,
-  revokeAuthorizedSearchFolder,
+  checkForUpdates,
   checkManagedWorkerProviderHealth,
+  copyLastError,
   createManagedWorkerProvider,
   deleteManagedWorkerProvider,
   getManagedWorkerProviderSettings,
+  listAuthorizedSearchFolders,
   listManagedRuntimeOptions,
+  listNativeAgentCapabilities,
+  listRooms,
+  openLogsFolder,
+  revealInFolder,
+  revokeAuthorizedSearchFolder,
   selectManagedExecuteRuntime,
   selectManagedWorkerProvider,
   updateConfig,
   updateManagedWorkerProvider,
 } from "../../lib/tauri";
-import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot } from "../../lib/tauri";
+import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot, NativeAgentCapability } from "../../lib/tauri";
 import type { AppConfig, RoomInfo } from "../../lib/types";
-import { bridgeCode } from "./workspaceViewModel";
+import { DeviceTrustSettings } from "./DeviceTrustSettings";
 import { KnownDevicesSettings } from "./KnownDevicesSettings";
+import { availabilityCopy } from "./NativeAgentPanel";
 import { SessionReadingSettings } from "./SessionReadingSettings";
 import { UnattendedAccessSettings } from "./UnattendedAccessSettings";
+import { Badge, Dot, Icon, ListRow, Notice, Segmented, Switch, type IconName } from "./ui";
+import { bridgeCode } from "./workspaceViewModel";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
 
+export type SettingsRoute = Extract<WorkspaceRoute, `settings${string}`>;
+
+/** Device-wide settings only. What belongs to one Bridge (its connection,
+ * devices, and what it is allowed here) is in that Bridge's details. */
+const SECTIONS: ReadonlyArray<{ route: SettingsRoute; label: string; icon: IconName }> = [
+  { route: "settings", label: "General", icon: "settings" },
+  { route: "settings-devices", label: "Devices & trust", icon: "shield" },
+  { route: "settings-permissions", label: "Permissions", icon: "key" },
+  { route: "settings-agents", label: "Agents", icon: "agent" },
+  { route: "settings-advanced", label: "Advanced", icon: "terminal" },
+  { route: "settings-about", label: "About", icon: "info" },
+];
+
 interface SettingsProps {
+  route: SettingsRoute;
   config: AppConfig;
   onNavigate: NavigateWorkspace;
   onConfigChange: (config: AppConfig) => void;
+  menuButton?: ReactNode;
 }
 
-type ConfigKey = "save_received_files_to_inbox" | "save_received_images_to_inbox" | "auto_burn_after_download" | "dev_tools_enabled";
+export function SettingsScreen({ route, config, onNavigate, onConfigChange, menuButton }: SettingsProps) {
+  const section = SECTIONS.find((candidate) => candidate.route === route) ?? SECTIONS[0];
+  return <section className="page" aria-label="Settings">
+    {menuButton ? <header className="page-header narrow-only">{menuButton}<div className="page-header-main"><h1>Settings</h1></div></header> : null}
+    <div className="settings">
+      <nav className="settings-nav" aria-label="Settings sections">
+        {SECTIONS.map((candidate) => <button key={candidate.route} type="button" className={`nav-item${candidate.route === section.route ? " active" : ""}`} aria-current={candidate.route === section.route ? "page" : undefined} onClick={() => onNavigate(candidate.route)}><Icon name={candidate.icon} />{candidate.label}</button>)}
+      </nav>
+      <div className="settings-content"><div className="content">
+        <h1>{section.label}</h1>
+        {section.route === "settings" ? <GeneralSettings config={config} /> : null}
+        {section.route === "settings-devices" ? <><DeviceTrustSettings /><KnownDevicesSettings /></> : null}
+        {section.route === "settings-permissions" ? <PermissionsSettings /> : null}
+        {section.route === "settings-agents" ? <AgentSettings /> : null}
+        {section.route === "settings-advanced" ? <AdvancedSettings config={config} onConfigChange={onConfigChange} /> : null}
+        {section.route === "settings-about" ? <AboutSettings config={config} /> : null}
+      </div></div>
+    </div>
+  </section>;
+}
 
-export function SettingsOverview({ config, onNavigate, onConfigChange }: SettingsProps) {
-  const [pendingKey, setPendingKey] = useState<ConfigKey | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  async function changeConfig(key: ConfigKey, value: boolean) {
-    if (pendingKey) return;
-    setPendingKey(key);
-    setError(null);
-    try {
-      const authoritative = await updateConfig({ ...config, [key]: value });
-      onConfigChange(authoritative);
-    } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
-    } finally {
-      setPendingKey(null);
-    }
-  }
-
-  return (
-    <SettingsFrame title="Settings" description="Configure how Pastey works across your devices.">
-      <div className="v2-settings-columns">
-        <div>
-          <SettingsGroup title="General">
-            <SettingsRow title="Device name" description="Shown to other devices." value="This device" />
-            <SettingsRow title="Theme" description="Uses the operating system appearance." value="System" />
-            <SettingsRow title="Global shortcut" description="Quickly open Pastey." value={config.shortcut} />
-          </SettingsGroup>
-          <SettingsGroup title="Receiving">
-            <SettingsRow title="Receiving folder" description="Current user-owned destination." value={config.inbox_dir ? "Custom" : "Default"} />
-            <ConfigToggleRow title="Save received files" description="Persist received files to the receiving folder." checked={config.save_received_files_to_inbox} disabled={pendingKey !== null} onChange={(value) => void changeConfig("save_received_files_to_inbox", value)} />
-            <ConfigToggleRow title="Save received images" description="Persist received images to the receiving folder." checked={config.save_received_images_to_inbox} disabled={pendingKey !== null} onChange={(value) => void changeConfig("save_received_images_to_inbox", value)} />
-            <SettingsRow title="Open receiving folder" description="Open the current receiving destination." value="Unavailable" />
-          </SettingsGroup>
-          <SettingsGroup title="Transfers">
-            <SettingsRow title="Max concurrent transfers" description="Pastey manages concurrency automatically." value={config.transfer_window_override ? String(config.transfer_window_override) : "Automatic"} />
-            <ConfigToggleRow title="Burn defaults" description="Default cleanup behavior for new Bridges." checked={config.auto_burn_after_download} disabled={pendingKey !== null} onChange={(value) => void changeConfig("auto_burn_after_download", value)} />
-          </SettingsGroup>
-        </div>
-        <div>
-          <SettingsGroup title="Approvals">
-            <SettingsRow title="Agent Plan approval" description="Requester review is always required for an immutable Draft." value="Always required" status="ready" />
-            <SettingsRow title="Developer Mode admission" description="Separate human approval for this terminal session." value="Always required" status="ready" />
-          </SettingsGroup>
-          <SharedSearchFolders />
-          <KnownDevicesSettings />
-          <UnattendedAccessSettings />
-          <SessionReadingSettings />
-          <SettingsGroup title="Discovery"><SettingsRow title="Local network discovery" description="Current discovery state is Host-owned." value="Not projected" /></SettingsGroup>
-          <SettingsGroup title="Tasks">
-            <SettingsRow title="Task features" description="Reviewed cross-device managed Plan workflow." value="Available when Host ready" />
-            <SettingsLink title="Task provider" description="Host-owned planning provider configuration." value="Open" route="settings-provider" onNavigate={onNavigate} />
-          </SettingsGroup>
-          <SettingsGroup title="Advanced">
-            <ConfigToggleRow title="Developer tools" description="Show renderer-facing diagnostics controls; terminal admission remains separate." checked={config.dev_tools_enabled} disabled={pendingKey !== null} onChange={(value) => void changeConfig("dev_tools_enabled", value)} />
-            <SettingsLink title="Diagnostics" description="Logging and renderer-safe diagnostics." value="Open" route="settings-diagnostics" onNavigate={onNavigate} />
-            <SettingsLink title="Transfer diagnostics" description="Existing transfer scheduler controls." value="Open" route="settings-transfer" onNavigate={onNavigate} />
-            <SettingsLink title="Troubleshooting" description="Device state, errors, and local checks." value="Open" route="settings-troubleshooting" onNavigate={onNavigate} />
-            <SettingsLink title="About" description="Version, app data, and updates." value="Open" route="settings-about" onNavigate={onNavigate} />
-          </SettingsGroup>
-        </div>
+function GeneralSettings({ config }: { config: AppConfig }) {
+  const [appearance, setAppearance] = useState<Appearance>(readAppearance);
+  return <>
+    <section className="section">
+      <div className="card">
+        <div className="setting-row"><span><strong>Appearance</strong><small>Light, dark, or follow the system.</small></span>
+          <Segmented label="Appearance" value={appearance} onChange={(value) => { setAppearance(value); saveAppearance(value); }} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} /></div>
+        <div className="setting-row"><span><strong>Receiving folder</strong><small>Where files other devices send you are saved.</small></span>
+          {config.inbox_dir ? <button type="button" className="btn btn-sm" onClick={() => void revealInFolder(config.inbox_dir!)}><Icon name="folder" small />Open</button> : <span className="value">Pastey's default folder</span>}</div>
+        <div className="setting-row"><span><strong>Global shortcut</strong><small>Opens Pastey from anywhere.</small></span><span className="value mono">{config.shortcut}</span></div>
       </div>
-      {error ? <p className="v2-error" role="alert">{error}</p> : null}
-    </SettingsFrame>
-  );
+    </section>
+  </>;
+}
+
+function PermissionsSettings() {
+  return <>
+    <p className="muted" style={{ marginBottom: "var(--space-6)" }}>What other devices may do on this device. Each permission names one device, one Bridge and one folder, and only you can create or revoke it here. A trusted device without a permission can do none of this.</p>
+    <UnattendedAccessSettings />
+    <SessionReadingSettings />
+    <SharedSearchFolders />
+  </>;
 }
 
 /** Folders this device's user shares for other Bridge devices' file search.
@@ -106,6 +107,7 @@ function SharedSearchFolders() {
   const [folders, setFolders] = useState<AuthorizedSearchFolder[] | null>(null);
   const [bridges, setBridges] = useState<RoomInfo[]>([]);
   const [bridgeId, setBridgeId] = useState("");
+  const [adding, setAdding] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -114,7 +116,7 @@ function SharedSearchFolders() {
   }, []);
   const bridgeName = (id: string | null) => {
     const bridge = bridges.find((room) => room.id === id);
-    return bridge ? `Bridge ${bridgeCode(bridge)}` : id ? "an ended Bridge" : null;
+    return bridge ? `Bridge ${bridgeCode(bridge)}${bridge.peer_device_name ? ` (${bridge.peer_device_name})` : ""}` : id ? "an ended Bridge" : null;
   };
   async function add() {
     if (!bridgeId) { setError("Choose the Bridge whose devices may search the folder."); return; }
@@ -124,6 +126,7 @@ function SharedSearchFolders() {
       if (typeof chosen !== "string") return;
       await authorizeSearchFolder(chosen, bridgeId);
       setFolders(await listAuthorizedSearchFolders());
+      setAdding(false);
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError));
     } finally { setPending(false); }
@@ -134,20 +137,58 @@ function SharedSearchFolders() {
     catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
     finally { setPending(false); }
   }
-  return <SettingsGroup title="Shared search folders">
-    <p className="v2-settings-note">Devices on the chosen Bridge can find files in a shared folder by name and ask for one. Other Bridges cannot. Nothing in the folder is changed or deleted, and burning the Bridge ends the share.</p>
-    {folders === null ? <SettingsRow title="Shared folders" value="Checking…" /> : folders.length === 0 ? <SettingsRow title="No shared folders" description="Other devices cannot search this device. Downloads, Desktop, Documents and other places are never searchable until you share a specific folder here for one Bridge." value="None" /> : folders.map((folder) => <div className="v2-settings-row" key={folder.folderId}><span><strong>{folder.displayName}</strong><small>{folder.bridgeId ? `Shared with ${bridgeName(folder.bridgeId)}` : "Shared before Bridge scoping. Not searched; stop sharing and share it with one Bridge."}{folder.bridgeId && folder.unavailable ? " · moved or replaced; not searched" : ""}</small></span><button type="button" className="v2-button" disabled={pending} onClick={() => void remove(folder.folderId)}>Stop sharing</button></div>)}
-    <label className="v2-target-select"><select value={bridgeId} onChange={(event) => setBridgeId(event.target.value)} disabled={pending || bridges.length === 0} aria-label="Bridge to share with"><option value="">{bridges.length ? "Share with which Bridge?" : "No active Bridge"}</option>{bridges.map((bridge) => <option key={bridge.id} value={bridge.id}>Bridge {bridgeCode(bridge)}{bridge.peer_device_name ? ` · ${bridge.peer_device_name}` : ""}</option>)}</select></label>
-    <button type="button" className="v2-button" disabled={pending || !bridgeId} onClick={() => void add()}>Share a folder…</button>
-    {error ? <p className="v2-error" role="alert">{error}</p> : null}
-  </SettingsGroup>;
+  return <section className="section" aria-label="Shared search folders">
+    <div className="section-head"><h2>Shared search folders</h2><p>Devices on the chosen Bridge can find files in a shared folder by name and ask for one. Other Bridges cannot. Nothing in the folder is changed or deleted, and burning the Bridge ends the share.</p></div>
+    <div className="card">
+      <div className="list">
+        {folders === null ? <p className="list-empty">Checking…</p> : folders.length === 0 ? <p className="list-empty">No shared folders. Other devices cannot search this device. Downloads, Desktop, Documents and other places are never searchable until you share a specific folder here for one Bridge.</p> : folders.map((folder) => <ListRow key={folder.folderId} leading={<Icon name="folder" />} title={folder.displayName} meta={<>{folder.bridgeId ? `Shared with ${bridgeName(folder.bridgeId)}` : "Shared before Bridge scoping. Not searched; stop sharing and share it with one Bridge."}{folder.bridgeId && folder.unavailable ? " · moved or replaced; not searched" : ""}</>} side={<button type="button" className="btn btn-danger btn-sm" disabled={pending} onClick={() => void remove(folder.folderId)}>Stop sharing</button>} />)}
+      </div>
+      {adding ? <div className="add-form">
+        <strong>Share a folder</strong>
+        <div className="row-wrap">
+          <select className="select" value={bridgeId} onChange={(event) => setBridgeId(event.target.value)} disabled={pending || bridges.length === 0} aria-label="Bridge to share with"><option value="">{bridges.length ? "Share with which Bridge?" : "No active Bridge"}</option>{bridges.map((bridge) => <option key={bridge.id} value={bridge.id}>Bridge {bridgeCode(bridge)}{bridge.peer_device_name ? ` · ${bridge.peer_device_name}` : ""}</option>)}</select>
+          <button type="button" className="btn btn-primary" disabled={pending || !bridgeId} onClick={() => void add()}><Icon name="folder" small />Choose folder and share…</button>
+        </div>
+        <div className="row"><span className="spacer" /><button type="button" className="btn btn-sm" disabled={pending} onClick={() => setAdding(false)}>Cancel</button></div>
+      </div> : <footer className="card-footer"><button type="button" className="btn btn-sm" onClick={() => setAdding(true)}><Icon name="plus" small />Share a folder…</button></footer>}
+    </div>
+    {error ? <p className="error-text" role="alert">{error}</p> : null}
+  </section>;
 }
 
-export function DiagnosticsSettings({ onNavigate }: Pick<SettingsProps, "onNavigate">) {
-  return <SettingsFrame title="Diagnostics" description="Runtime visibility and bounded diagnostic controls." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Diagnostics logging"><SettingsRow title="Diagnostics logging" description="Bounded structured diagnostic mirrors." value="Backend-owned" /><SettingsRow title="Device diagnostics" description="Renderer-safe device profile is not wired to this screen." value="Unavailable" /></SettingsGroup><SettingsGroup title="Capability probe"><UnavailableRows names={["Python", "Git", "zsh", "bash"]} /></SettingsGroup><SettingsGroup title="Logs"><SettingsRow title="Logs folder" value="Unavailable" /><SettingsRow title="Copy last error" value="Unavailable" /></SettingsGroup></div></SettingsFrame>;
+function AgentSettings() {
+  const [capabilities, setCapabilities] = useState<NativeAgentCapability[] | null>(null);
+  const [checking, setChecking] = useState(false);
+  async function check() {
+    setChecking(true);
+    try { setCapabilities(await listNativeAgentCapabilities()); } catch { setCapabilities([]); } finally { setChecking(false); }
+  }
+  useEffect(() => { void check(); }, []);
+  const codex = capabilities?.find((capability) => capability.agentId === "agent.coding.codex");
+  return <>
+    <section className="section" aria-label="Native Agents on this device">
+      <div className="section-head-row"><div className="section-head"><h2>On this device</h2><p>Native Agents keep their own sign-in, tools, sandbox and context. Pastey only starts them, moves files when you approve, and reports what they return.</p></div>
+        <button type="button" className="btn btn-sm" disabled={checking} onClick={() => void check()}><Icon name="refresh" small />{checking ? "Checking…" : "Check again"}</button></div>
+      <div className="card">
+        <div className="setting-row"><span><strong>Codex</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(codex ? { state: codex.state, reason: codex.reason, detail: codex.detail, backend: codex.backend } : { state: "unavailable" }, null, false)}</small></span>
+          {capabilities === null ? <Dot pulse /> : <Badge tone={codex?.state === "available" ? "ok" : "warn"}>{codex?.state === "available" ? "Available" : codex?.state === "incompatible" ? "Needs update" : "Unavailable"}</Badge>}</div>
+      </div>
+    </section>
+    <section className="section" aria-label="Approvals">
+      <div className="section-head"><h2>Approvals</h2></div>
+      <div className="card">
+        <div className="setting-row"><span><strong>Codex requests from other devices</strong><small>Each request waits for your Accept on this device, unless an unattended permission under Permissions covers it.</small></span><span className="value">Always reviewed</span></div>
+        <div className="setting-row"><span><strong>Plans</strong><small>A Plan runs only after you approve its exact revision, and each device admits it.</small></span><span className="value">Always reviewed</span></div>
+        <div className="setting-row"><span><strong>Developer Mode terminals</strong><small>Each terminal request needs a separate Accept on the device it opens on.</small></span><span className="value">Always reviewed</span></div>
+      </div>
+    </section>
+    <ProviderSettings />
+  </>;
 }
 
-export function ProviderSettings({ onNavigate }: Pick<SettingsProps, "onNavigate">) {
+/** Host-local provider and runtime configuration for managed Plans. A
+ * selection is a prerequisite only; it grants no Agent or step authority. */
+function ProviderSettings() {
   const [runtimes, setRuntimes] = useState<ManagedRuntimeOption[] | null>(null);
   const [pendingRuntime, setPendingRuntime] = useState<ManagedRuntimeOption["runtimeId"] | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
@@ -195,7 +236,31 @@ export function ProviderSettings({ onNavigate }: Pick<SettingsProps, "onNavigate
     }
   }
 
-  return <SettingsFrame title="Task Provider" description="Host-owned provider and runtime configuration for reviewed Bridge tasks." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Managed Execute runtime">{runtimes ? runtimes.map((runtime) => <button type="button" className="v2-settings-link" key={runtime.runtimeId} disabled={!runtime.available || pendingRuntime !== null} onClick={() => void selectRuntime(runtime.runtimeId)}><SettingsRow title={runtime.runtimeId === "python" ? "Python" : "Node.js"} description="Known runtime identity discovered at a fixed Host-local location; no PATH fallback." value={runtime.selected ? (runtime.selectionReady ? "Selected" : "Re-select required") : (runtime.available ? "Select →" : "Unavailable")} status={runtime.selectionReady ? "ready" : undefined} /></button>) : <SettingsRow title="Runtime discovery" value="Checking…" />}</SettingsGroup>{runtimeError ? <p className="v2-error" role="alert">{runtimeError}</p> : null}<SettingsGroup title="Provider">{providerSettings ? <><p className="v2-settings-note">Managed selection: {providerSettings.managedSelection === "selected" ? "Selected" : providerSettings.managedSelection === "stale" ? "Re-select required" : "Not configured"}.</p>{providerSettings.providers.map((provider) => <section className="v2-provider-card" key={provider.configRef.configDigest}><SettingsRow title={`${provider.providerKind === "openai_compatible" ? "OpenAI-compatible" : provider.providerKind} · ${provider.model}`} description={provider.baseUrl} value={provider.selected ? "Selected" : "Not selected"} status={provider.selected ? "ready" : undefined} /><div className="v2-provider-details"><span>Health: {provider.health}</span><span>Timeout: {provider.timeoutMillis} ms</span><span>Output: {provider.maxOutputTokens} tokens</span>{provider.lastHealthCheckAt ? <span>Last check: {new Date(provider.lastHealthCheckAt * 1000).toLocaleString()}</span> : null}</div><div className="v2-provider-actions"><button type="button" className="v2-button" disabled={pendingProviderAction !== null} onClick={() => void runProviderAction(`health:${provider.configRef.configDigest}`, () => checkManagedWorkerProviderHealth(provider.configRef))}>Check connection</button><button type="button" className="v2-button" disabled={provider.selected || pendingProviderAction !== null} onClick={() => void runProviderAction(`select:${provider.configRef.configDigest}`, () => selectManagedWorkerProvider({ configRef: provider.configRef, model: provider.model }))}>Select for tasks</button><button type="button" className="v2-button" disabled={pendingProviderAction !== null} onClick={() => setEditingProvider(provider)}>Edit</button><button type="button" className="v2-button danger" disabled={pendingProviderAction !== null} onClick={() => void runProviderAction(`delete:${provider.configRef.configDigest}`, () => deleteManagedWorkerProvider(provider.configRef))}>Remove</button></div></section>)}<button type="button" className="v2-button" disabled={pendingProviderAction !== null} onClick={() => setEditingProvider("new")}>Add provider</button></> : <SettingsRow title="Provider settings" value="Checking…" />}{editingProvider ? <ProviderForm provider={editingProvider} pending={pendingProviderAction !== null} onCancel={() => setEditingProvider(null)} onSubmit={(operation) => void runProviderAction("save", operation).then((saved) => { if (saved) setEditingProvider(null); })} /> : null}</SettingsGroup>{providerError ? <p className="v2-error" role="alert">{providerError}</p> : null}<SettingsGroup title="Authority"><SettingsRow title="Runtime selection" description="This Host pins one known executable identity for future Execute bindings; it grants no step authority." value="Host-local" /><SettingsRow title="Provider selection" description="A selected provider is only a Host-local prerequisite; it grants no Agent authority." value="No authority" /><SettingsRow title="Agent Plan approval" description="Requester approval remains independently required." value="Always required" /></SettingsGroup></div></SettingsFrame>;
+  return <section className="section" aria-label="Plan provider">
+    <div className="section-head"><h2>Plans</h2><p>The model provider and runtime this device uses for reviewed Plans. Selecting one is only a prerequisite: it grants no Agent or step authority.</p></div>
+    <span className="subhead">Runtime</span>
+    <div className="card"><div className="list">
+      {runtimes ? runtimes.map((runtime) => <ListRow key={runtime.runtimeId} title={runtime.runtimeId === "python" ? "Python" : "Node.js"} meta="Found at a fixed location on this device; never from PATH." side={runtime.selected ? <Badge tone={runtime.selectionReady ? "ok" : "warn"}>{runtime.selectionReady ? "Selected" : "Re-select required"}</Badge> : <button type="button" className="btn btn-sm" disabled={!runtime.available || pendingRuntime !== null} onClick={() => void selectRuntime(runtime.runtimeId)}>{runtime.available ? "Select" : "Unavailable"}</button>} />) : <p className="list-empty">Checking…</p>}
+    </div></div>
+    {runtimeError ? <p className="error-text" role="alert">{runtimeError}</p> : null}
+    <span className="subhead">Provider</span>
+    <div className="card">
+      <div className="list">
+        {providerSettings ? providerSettings.providers.length === 0 ? <p className="list-empty">No provider configured.</p> : providerSettings.providers.map((provider) => <div key={provider.configRef.configDigest}>
+          <ListRow title={`${provider.providerKind === "openai_compatible" ? "OpenAI-compatible" : provider.providerKind} · ${provider.model}`} meta={`${provider.baseUrl} · health ${provider.health} · ${provider.timeoutMillis} ms · ${provider.maxOutputTokens} tokens${provider.lastHealthCheckAt ? ` · checked ${new Date(provider.lastHealthCheckAt * 1000).toLocaleString()}` : ""}`} side={provider.selected ? <Badge tone="ok">Selected</Badge> : null} />
+          <div className="row-wrap" style={{ padding: "0 16px 12px" }}>
+            <button type="button" className="btn btn-sm" disabled={pendingProviderAction !== null} onClick={() => void runProviderAction(`health:${provider.configRef.configDigest}`, () => checkManagedWorkerProviderHealth(provider.configRef))}>Check connection</button>
+            <button type="button" className="btn btn-sm" disabled={provider.selected || pendingProviderAction !== null} onClick={() => void runProviderAction(`select:${provider.configRef.configDigest}`, () => selectManagedWorkerProvider({ configRef: provider.configRef, model: provider.model }))}>Use for Plans</button>
+            <button type="button" className="btn btn-sm" disabled={pendingProviderAction !== null} onClick={() => setEditingProvider(provider)}>Edit</button>
+            <button type="button" className="btn btn-danger btn-sm" disabled={pendingProviderAction !== null} onClick={() => void runProviderAction(`delete:${provider.configRef.configDigest}`, () => deleteManagedWorkerProvider(provider.configRef))}>Remove</button>
+          </div>
+        </div>) : <p className="list-empty">Checking…</p>}
+      </div>
+      {editingProvider ? <ProviderForm provider={editingProvider} pending={pendingProviderAction !== null} onCancel={() => setEditingProvider(null)} onSubmit={(operation) => void runProviderAction("save", operation).then((saved) => { if (saved) setEditingProvider(null); })} />
+        : <footer className="card-footer"><span className="spacer xsmall subtle">{providerSettings ? `Plan selection: ${providerSettings.managedSelection === "selected" ? "selected" : providerSettings.managedSelection === "stale" ? "re-select required" : "not configured"}.` : ""}</span><button type="button" className="btn btn-sm" disabled={pendingProviderAction !== null || !providerSettings} onClick={() => setEditingProvider("new")}><Icon name="plus" small />Add provider…</button></footer>}
+    </div>
+    {providerError ? <p className="error-text" role="alert">{providerError}</p> : null}
+  </section>;
 }
 
 function ProviderForm({ provider, pending, onCancel, onSubmit }: { provider: ManagedWorkerProviderSettings | "new"; pending: boolean; onCancel: () => void; onSubmit: (operation: () => Promise<ManagedWorkerProviderSettingsSnapshot>) => void }) {
@@ -220,41 +285,67 @@ function ProviderForm({ provider, pending, onCancel, onSubmit }: { provider: Man
     setApiKey("");
   }
 
-  return <form className="v2-provider-form" onSubmit={submit}><strong>{editing ? "Edit provider" : "Add OpenAI-compatible provider"}</strong><label>Provider ID<input value={providerId} disabled={editing || pending} onChange={(event) => setProviderId(event.target.value)} /></label><label>Endpoint<input type="url" value={baseUrl} disabled={pending} onChange={(event) => setBaseUrl(event.target.value)} /></label><label>Model<input value={model} disabled={pending} onChange={(event) => setModel(event.target.value)} /></label><label>{editing ? "Replacement API key (optional)" : "API key"}<input type="password" autoComplete="new-password" required={!editing} value={apiKey} disabled={pending} onChange={(event) => setApiKey(event.target.value)} /></label><div className="v2-provider-form-grid"><label>Timeout (ms)<input type="number" min="1000" max="300000" value={timeoutMillis} disabled={pending} onChange={(event) => setTimeoutMillis(event.target.value)} /></label><label>Max output tokens<input type="number" min="1" max="32768" value={maxOutputTokens} disabled={pending} onChange={(event) => setMaxOutputTokens(event.target.value)} /></label></div><p>Credentials are sent only to this Host when you save and cannot be viewed again.</p><div className="v2-provider-actions"><button type="submit" className="v2-button primary" disabled={pending}>Save</button><button type="button" className="v2-button" disabled={pending} onClick={() => { setApiKey(""); onCancel(); }}>Cancel</button></div></form>;
+  return <form className="add-form" onSubmit={submit}>
+    <strong>{editing ? "Edit provider" : "Add an OpenAI-compatible provider"}</strong>
+    <label className="field"><span className="field-label">Provider ID</span><input className="input" value={providerId} disabled={editing || pending} onChange={(event) => setProviderId(event.target.value)} /></label>
+    <label className="field"><span className="field-label">Endpoint</span><input className="input input-mono" type="url" value={baseUrl} disabled={pending} onChange={(event) => setBaseUrl(event.target.value)} /></label>
+    <label className="field"><span className="field-label">Model</span><input className="input" value={model} disabled={pending} onChange={(event) => setModel(event.target.value)} /></label>
+    <label className="field"><span className="field-label">{editing ? "Replacement API key (optional)" : "API key"}</span><input className="input" type="password" autoComplete="new-password" required={!editing} value={apiKey} disabled={pending} onChange={(event) => setApiKey(event.target.value)} /></label>
+    <div className="row-wrap">
+      <label className="field" style={{ flex: "1 1 140px" }}><span className="field-label">Timeout (ms)</span><input className="input" type="number" min="1000" max="300000" value={timeoutMillis} disabled={pending} onChange={(event) => setTimeoutMillis(event.target.value)} /></label>
+      <label className="field" style={{ flex: "1 1 140px" }}><span className="field-label">Max output tokens</span><input className="input" type="number" min="1" max="32768" value={maxOutputTokens} disabled={pending} onChange={(event) => setMaxOutputTokens(event.target.value)} /></label>
+    </div>
+    <p className="xsmall subtle">The key is sent only to this device's Pastey when you save, and cannot be viewed again.</p>
+    <div className="row"><span className="spacer" /><button type="button" className="btn" disabled={pending} onClick={() => { setApiKey(""); onCancel(); }}>Cancel</button><button type="submit" className="btn btn-primary" disabled={pending}>Save</button></div>
+  </form>;
 }
 
-export function TransferSettings({ config, onNavigate }: Pick<SettingsProps, "config" | "onNavigate">) {
-  return <SettingsFrame title="Transfer Diagnostics" description="Advanced transport scheduling and pipeline controls." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Transfer behaviour"><SettingsRow title="Transfer diagnostics" description="Advanced transfer behavior setting." value={config.micro_flow_group_mode === "dynamic" ? "Dynamic" : "Fixed"} /></SettingsGroup><SettingsGroup title="Pipeline depth"><SettingsRow title="Transfer window" description="Options: 1 · 2 · 4 · 8 · 16 · Custom" value={config.transfer_window_override ? String(config.transfer_window_override) : "Default / Auto"} /></SettingsGroup><p className="v2-settings-note">These controls tune the existing explicit transfer runtime; they do not create a shared filesystem or separate movement path.</p></div></SettingsFrame>;
+function AdvancedSettings({ config, onConfigChange }: { config: AppConfig; onConfigChange: (config: AppConfig) => void }) {
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  async function setDevTools(value: boolean) {
+    if (pending) return;
+    setPending(true); setError(null);
+    try { onConfigChange(await updateConfig({ ...config, dev_tools_enabled: value })); }
+    catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
+    finally { setPending(false); }
+  }
+
+  async function copyError() {
+    try {
+      const last = await copyLastError();
+      setCopied(last ? "Copied the last error." : "No error recorded.");
+    } catch (nextError) { setCopied(nextError instanceof Error ? nextError.message : String(nextError)); }
+  }
+
+  return <>
+    <section className="section">
+      <div className="card">
+        <div className="setting-row"><span><strong>Developer tools</strong><small>Lets the transfer window override in Pastey's configuration take effect. It does not affect Developer Mode terminals, which always need the other device's Accept.</small></span><Switch label="Developer tools" checked={config.dev_tools_enabled} disabled={pending} onChange={(value) => void setDevTools(value)} /></div>
+        <div className="setting-row"><span><strong>Transfer grouping</strong><small>How small files are grouped for sending.</small></span><span className="value">{config.micro_flow_group_mode === "dynamic" ? "Dynamic" : "Fixed"}</span></div>
+        <div className="setting-row"><span><strong>Transfer window</strong><small>Concurrent chunks in flight. Pastey tunes this automatically.</small></span><span className="value">{config.transfer_window_override && config.dev_tools_enabled ? String(config.transfer_window_override) : "Automatic"}</span></div>
+      </div>
+      {error ? <p className="error-text" role="alert">{error}</p> : null}
+    </section>
+    <section className="section">
+      <div className="section-head"><h2>Diagnostics</h2><p>For reporting a problem. Logs stay on this device until you share them.</p></div>
+      <div className="card">
+        <div className="setting-row"><span><strong>Logs</strong><small>Open the folder with Pastey's logs.</small></span><button type="button" className="btn btn-sm" onClick={() => void openLogsFolder().catch(() => undefined)}><Icon name="folder" small />Open</button></div>
+        <div className="setting-row"><span><strong>Last error</strong><small>{copied ?? "Copy the most recent error to the clipboard."}</small></span><button type="button" className="btn btn-sm" onClick={() => void copyError()}><Icon name="copy" small />Copy</button></div>
+      </div>
+    </section>
+  </>;
 }
 
-export function TroubleshootingSettings({ onNavigate }: Pick<SettingsProps, "onNavigate">) {
-  return <SettingsFrame title="Troubleshooting" description="Inspect this Host and run local diagnostics." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="This device"><SettingsRow title="Device" value="This device" /><SettingsRow title="Platform" value={navigator.platform || "Unavailable"} /><SettingsRow title="Power" value="Not projected" /></SettingsGroup><SettingsGroup title="Last local test"><UnavailableRows names={["Mode", "Quality", "Average"]} /></SettingsGroup><SettingsGroup title="Local benchmark"><SettingsRow title="Benchmark mode" description="Localhost baseline only; no LAN or internet." value="Unavailable" /><SettingsRow title="Duration" value="Target 5s standard" /></SettingsGroup><button type="button" className="v2-button primary" disabled>Run local test</button></div></SettingsFrame>;
-}
-
-export function AboutSettings({ config, onNavigate }: Pick<SettingsProps, "config" | "onNavigate">) {
-  return <SettingsFrame title="About" description="Application information and maintenance." onBack={() => onNavigate("settings")}><div className="v2-settings-narrow"><SettingsGroup title="Pastey"><SettingsRow title="Version" value={config.app_version} /><SettingsRow title="Application data" description="Reveal" value={config.app_data_path || "Unavailable"} /></SettingsGroup><SettingsGroup title="Updates"><SettingsRow title="Update status" value="Not renderer-exposed" /><SettingsRow title="Check for updates" value="Unavailable" /></SettingsGroup><SettingsGroup title="Diagnostics"><SettingsLink title="Logs folder" value="Open" route="settings-diagnostics" onNavigate={onNavigate} /><SettingsLink title="Troubleshooting" value="Open" route="settings-troubleshooting" onNavigate={onNavigate} /></SettingsGroup></div></SettingsFrame>;
-}
-
-function SettingsFrame({ title, description, onBack, children }: { title: string; description: string; onBack?: () => void; children: ReactNode }) {
-  return <section className="v2-screen v2-settings-screen"><header className="v2-screen-header"><div className="v2-settings-heading">{onBack ? <button type="button" className="v2-settings-back" onClick={onBack}>Settings&nbsp; /</button> : null}<div><h1>{title}</h1><p>{description}</p></div></div></header><div className="v2-screen-body v2-settings-body">{children}</div></section>;
-}
-
-function SettingsGroup({ title, children }: { title: string; children: ReactNode }) {
-  return <section className="v2-settings-group"><h2>{title}</h2><div>{children}</div></section>;
-}
-
-function SettingsRow({ title, description, value, status }: { title: string; description?: string; value: string; status?: "ready" }) {
-  return <div className="v2-settings-row"><span><strong>{title}</strong>{description ? <small>{description}</small> : null}</span><b>{status ? <i className="v2-dot connected" /> : null}{value}</b></div>;
-}
-
-function ConfigToggleRow({ title, description, checked, disabled, onChange }: { title: string; description?: string; checked: boolean; disabled: boolean; onChange: (value: boolean) => void }) {
-  return <div className="v2-settings-row"><span><strong>{title}</strong>{description ? <small>{description}</small> : null}</span><button type="button" className={`v2-switch ${checked ? "on" : ""}`} role="switch" aria-checked={checked} aria-label={title} disabled={disabled} onClick={() => onChange(!checked)}><i /></button></div>;
-}
-
-function SettingsLink({ route, onNavigate, ...row }: { title: string; description?: string; value: string; route: WorkspaceRoute; onNavigate: NavigateWorkspace }) {
-  return <button type="button" className="v2-settings-link" onClick={() => onNavigate(route)}><SettingsRow {...row} value={`${row.value} →`} /></button>;
-}
-
-function UnavailableRows({ names }: { names: string[] }) {
-  return <>{names.map((name) => <SettingsRow key={name} title={name} value="Unavailable" />)}</>;
+function AboutSettings({ config }: { config: AppConfig }) {
+  return <section className="section">
+    <div className="card">
+      <div className="setting-row"><span><strong>Version</strong></span><span className="value mono">{config.app_version}</span></div>
+      <div className="setting-row"><span><strong>Application data</strong><small className="mono">{config.app_data_path || "—"}</small></span>{config.app_data_path ? <button type="button" className="btn btn-sm" onClick={() => void revealInFolder(config.app_data_path)}><Icon name="folder" small />Reveal</button> : null}</div>
+      <div className="setting-row"><span><strong>Updates</strong><small>Opens the Pastey releases page.</small></span><button type="button" className="btn btn-sm" onClick={() => void checkForUpdates().catch(() => undefined)}>Check for updates</button></div>
+    </div>
+    <Notice tone="neutral">Native Agents own their workspace, sign-in, tools, sandbox and context. Pastey manages movement, authority, effects, completion and what it observes of their lifecycle.</Notice>
+  </section>;
 }

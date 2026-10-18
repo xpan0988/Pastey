@@ -3,6 +3,7 @@ import { bridgeReachability, peerAddressProblem } from "../../lib/bridgeAddress"
 import { getBridgePeerAddress, openBridgePairing, presentDeviceIdentity, repairBridge, setBridgePeerAddress } from "../../lib/tauri";
 import { bridgeCode, roomPeers } from "./workspaceViewModel";
 import type { RoomInfo } from "../../lib/types";
+import { Badge, Dot, Field, Icon, Notice, type Tone } from "./ui";
 
 const REACHABILITY_COPY = {
   connected: "Connected",
@@ -11,53 +12,49 @@ const REACHABILITY_COPY = {
   none: "No other device yet",
 } as const;
 
-/** Where this Bridge's other device can be reached when it is on another
- * network, for reconnects. The address grants nothing: the Bridge's own
- * identity and session keys still decide every connection. */
-export function BridgeNetworkPanel({ room, onPairingChanged }: { room: RoomInfo; onPairingChanged: () => Promise<void> }) {
+/** One short status for the Bridge header and sidebar. */
+export function bridgeStatus(room: RoomInfo): { label: string; tone: Tone } {
+  const pairing = room.pairing_state ?? "pairing_required";
+  const reachability = bridgeReachability(room);
+  if (pairing === "pairing_required") return { label: "Pairing required", tone: "warn" };
+  if (pairing === "awaiting_peer") return { label: "Waiting for device", tone: "neutral" };
+  return {
+    label: reachability === "disconnected" ? "Not reachable" : REACHABILITY_COPY[reachability],
+    tone: reachability === "connected" ? "ok" : reachability === "reconnecting" ? "warn" : "neutral",
+  };
+}
+
+/** Pairing and reachability for this Bridge. The remote address only says
+ * where to look: the Bridge's own identity and session keys still decide
+ * every connection. */
+export function BridgeConnectionSection({ room, onPairingChanged }: { room: RoomInfo; onPairingChanged: () => Promise<void> }) {
   const [saved, setSaved] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
-  const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
   const reachability = bridgeReachability(room);
   const pairing = room.pairing_state ?? "pairing_required";
   const [pairCode, setPairCode] = useState("");
 
-  async function pairWithCode() {
+  async function act(action: () => Promise<string>, failure: string) {
     setBusy(true); setMessage(null);
-    try {
-      await repairBridge(room.id, pairCode);
-      setPairCode("");
-      await onPairingChanged();
-      setMessage("Paired with the device that showed this code.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not pair with that code.");
-    } finally { setBusy(false); }
+    try { setMessage({ text: await action(), ok: true }); }
+    catch (error) { setMessage({ text: error instanceof Error ? error.message : failure, ok: false }); }
+    finally { setBusy(false); }
   }
 
-  async function showNewCode() {
-    setBusy(true); setMessage(null);
-    try {
-      await openBridgePairing(room.id);
-      await onPairingChanged();
-      setMessage("Shown. On the other device, open New Bridge and enter the new code.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not create a new code.");
-    } finally { setBusy(false); }
-  }
-  const peerHostRef = roomPeers(room).find((peer) => peer.hostRef)?.hostRef ?? null;
+  const pairWithCode = () => act(async () => {
+    await repairBridge(room.id, pairCode);
+    setPairCode("");
+    await onPairingChanged();
+    return "Paired with the device that showed this code.";
+  }, "Pastey could not pair with that code.");
 
-  async function showDevice() {
-    if (!peerHostRef) return;
-    setBusy(true); setMessage(null);
-    try {
-      await presentDeviceIdentity(room.id, peerHostRef);
-      setMessage("Shown. On the other device, check Settings → Unattended Codex access.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not reach the other device.");
-    } finally { setBusy(false); }
-  }
+  const showNewCode = () => act(async () => {
+    await openBridgePairing(room.id);
+    await onPairingChanged();
+    return "Shown. On the other device, open New Bridge and enter the new code.";
+  }, "Pastey could not create a new code.");
 
   useEffect(() => {
     let cancelled = false;
@@ -68,51 +65,87 @@ export function BridgeNetworkPanel({ room, onPairingChanged }: { room: RoomInfo;
     return () => { cancelled = true; };
   }, [room.id]);
 
-  async function save(address: string | null) {
+  function save(address: string | null) {
     if (address !== null) {
       const problem = peerAddressProblem(address);
-      if (problem) { setMessage(problem); return; }
+      if (problem) { setMessage({ text: problem, ok: false }); return; }
     }
-    setBusy(true); setMessage(null);
-    try {
+    void act(async () => {
       const stored = await setBridgePeerAddress(room.id, address === null ? null : address.trim());
       setSaved(stored);
       setDraft(stored ?? "");
-      setMessage(stored ? "Saved. Pastey will look for the other device there when it is not on this network." : "Removed. Pastey will look only on this network.");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not save this address.");
-    } finally { setBusy(false); }
+      return stored ? "Saved. Pastey will look for the other device there when it is not on this network." : "Removed. Pastey will look only on this network.";
+    }, "Pastey could not save this address.");
   }
 
-  return <section className="v2-bridge-network" aria-label="Bridge network">
-    <button type="button" className="v2-button" onClick={() => setOpen(!open)}>
-      <i className={`v2-dot ${reachability === "connected" ? "connected" : reachability === "reconnecting" ? "pending" : ""}`} /> {pairing === "pairing_required" ? "Pairing required" : REACHABILITY_COPY[reachability]}{saved ? " · remote address set" : ""}
-    </button>
-    {open ? <div className="v2-task-open">
-      <strong>{pairing === "paired" ? "Paired device" : pairing === "awaiting_peer" ? "Waiting for the other device" : "Pairing required"}</strong>
-      <small>{pairing === "paired"
+  const statusLabel = pairing === "pairing_required" ? "Pairing required" : REACHABILITY_COPY[reachability];
+  return <>
+    <section className="inspector-section" aria-label="Connection">
+      <h3>Connection</h3>
+      <div className="row"><Dot tone={reachability === "connected" ? "ok" : reachability === "reconnecting" ? "warn" : "neutral"} /><span className="spacer small">{statusLabel}</span><Badge>{pairing === "paired" ? "Paired" : pairing === "awaiting_peer" ? "Code open" : "Not paired"}</Badge></div>
+      <p className="small muted">{pairing === "paired"
         ? "This Bridge reconnects only to the device it was paired with, which proves its identity each time. Pairing a different device starts fresh: folders shared with this Bridge and Agent tasks and conversations from before are removed."
         : pairing === "awaiting_peer"
           ? `Enter ${bridgeCode(room)} on the other device: under New Bridge, or, if it already has this Bridge, in this panel there. The code works once and expires after 15 minutes.`
-          : "This Bridge has no verified device, so it cannot reconnect or receive anything. Pair it again: show a new code here and enter it in this panel on the other device, or enter the code the other device shows. Only the code decides which device is trusted; give it only to your own device. Folders shared with this Bridge and earlier Agent tasks and conversations are removed when it pairs."}</small>
-      <footer><button type="button" className="v2-button" disabled={busy} onClick={() => void showNewCode()}>{pairing === "paired" ? "Pair another device" : "Show new code"}</button></footer>
+          : "This Bridge has no verified device, so it cannot reconnect or receive anything. Pair it again: show a new code here and enter it in this panel on the other device, or enter the code the other device shows. Only the code decides which device is trusted; give it only to your own device. Folders shared with this Bridge and earlier Agent tasks and conversations are removed when it pairs."}</p>
       {/* Shown in every state: after the other device replaces its identity
-          this side still looks paired, and only this field can re-pair it. */}
-      <>
-        <input value={pairCode} onChange={(event) => setPairCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="Code from the other device" aria-label="Code shown on the other device" disabled={busy} />
-        <footer><button type="button" className="v2-button primary" disabled={busy || pairCode.length !== 8} onClick={() => void pairWithCode()}>Pair with code</button></footer>
-      </>
-      <strong>Reach the other device from another network</strong>
-      <small>Its address on a private network you both use, such as Tailscale or WireGuard (for example home-pc.tail1234.ts.net or 100.x.y.z). Pastey tries it first when reconnecting, then this network. It gives the other device no permissions.</small>
-      <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="home-pc.tail1234.ts.net" aria-label="Remote address for this Bridge" disabled={busy} />
-      <footer>
-        {saved ? <button type="button" className="v2-button" disabled={busy} onClick={() => void save(null)}>Remove</button> : null}
-        <button type="button" className="v2-button primary" disabled={busy || !draft.trim() || draft.trim() === saved} onClick={() => void save(draft)}>Save address</button>
-      </footer>
-      <strong>Show this device</strong>
-      <small>Proves this device's identity to the other device for this session, so its user can compare fingerprints and choose to trust it. It grants nothing by itself.</small>
-      <footer><button type="button" className="v2-button" disabled={busy || !peerHostRef} onClick={() => void showDevice()}>Show this device</button></footer>
-      {message ? <small className={message.startsWith("Saved") || message.startsWith("Removed") || message.startsWith("Shown") || message.startsWith("Paired") ? "" : "v2-error"}>{message}</small> : null}
-    </div> : null}
+          this side still looks paired, and only this field can re-pair it.
+          While paired it is one click away instead of always open. */}
+      <details className="disclosure" open={pairing !== "paired"}>
+        <summary><Icon name="chevron" small />{pairing === "paired" ? "Pair again or pair another device" : "Pair this Bridge"}</summary>
+        <div className="disclosure-body stack">
+          <Field label="Pair with a code" hint="The 8-digit code the other device shows.">
+            <div className="row">
+              <input className="input input-mono" value={pairCode} onChange={(event) => setPairCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Code shown on the other device" disabled={busy} inputMode="numeric" />
+              <button type="button" className="btn btn-primary" disabled={busy || pairCode.length !== 8} onClick={() => void pairWithCode()}>Pair</button>
+            </div>
+          </Field>
+          <div><button type="button" className="btn btn-sm" disabled={busy} onClick={() => void showNewCode()}>{pairing === "paired" ? "Pair another device…" : "Show a new code"}</button></div>
+        </div>
+      </details>
+    </section>
+
+    <section className="inspector-section" aria-label="Another network">
+      <h3>Reach it on another network</h3>
+      <p className="small muted">{saved ? <>Pastey also looks for it at <span className="mono">{saved}</span>.</> : "Only on this network."} An address gives the other device no permissions.</p>
+      <details className="disclosure" open={!!saved}>
+        <summary><Icon name="chevron" small />{saved ? "Change address" : "Add a private-network address"}</summary>
+        <div className="disclosure-body stack">
+          <p className="xsmall subtle">Its address on a private network you both use, such as Tailscale or WireGuard. Pastey tries it first when reconnecting, then this network.</p>
+          <input className="input input-mono" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="home-pc.tail1234.ts.net" aria-label="Remote address for this Bridge" disabled={busy} />
+          <div className="row">
+            {saved ? <button type="button" className="btn btn-sm" disabled={busy} onClick={() => save(null)}>Remove</button> : null}
+            <button type="button" className="btn btn-sm" disabled={busy || !draft.trim() || draft.trim() === saved} onClick={() => save(draft)}>Save address</button>
+          </div>
+        </div>
+      </details>
+    </section>
+    {message ? <Notice tone={message.ok ? "ok" : "bad"}>{message.text}</Notice> : null}
+  </>;
+}
+
+/** Proves this device's identity to the other device for this session, so
+ * its user can compare fingerprints and choose to trust it. */
+export function ShowDeviceIdentity({ room }: { room: RoomInfo }) {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null);
+  const peerHostRef = roomPeers(room).find((peer) => peer.hostRef)?.hostRef ?? null;
+
+  async function showDevice() {
+    if (!peerHostRef) return;
+    setBusy(true); setMessage(null);
+    try {
+      await presentDeviceIdentity(room.id, peerHostRef);
+      setMessage({ text: "Shown. On the other device, check Settings → Devices & trust.", ok: true });
+    } catch (error) {
+      setMessage({ text: error instanceof Error ? error.message : "Pastey could not reach the other device.", ok: false });
+    } finally { setBusy(false); }
+  }
+
+  return <section className="inspector-section" aria-label="Show this device">
+    <h3>Let the other device trust this one</h3>
+    <p className="small muted">Shows this device's identity to the other device for this session, so its user can compare fingerprints and choose to trust it. It grants nothing by itself.</p>
+    <div><button type="button" className="btn btn-sm" disabled={busy || !peerHostRef} onClick={() => void showDevice()}>Show this device</button></div>
+    {message ? <Notice tone={message.ok ? "ok" : "bad"}>{message.text}</Notice> : null}
   </section>;
 }

@@ -1,17 +1,17 @@
 import type { AppConfig, FileTransferProgressEvent, NearbyDevice, NearbyJoinPending, RoomInfo, RoomItem } from "../../lib/types";
 import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferScheduler";
 
+/** Device-wide places. Everything about one Bridge (its devices, connection,
+ * Agent runs, sessions and Developer Mode) lives inside the Bridge route. */
 export type WorkspaceRoute =
   | "bridge"
-  | "activity"
-  | "devices"
   | "new-bridge"
   | "inbox"
   | "settings"
-  | "settings-diagnostics"
-  | "settings-provider"
-  | "settings-transfer"
-  | "settings-troubleshooting"
+  | "settings-devices"
+  | "settings-permissions"
+  | "settings-agents"
+  | "settings-advanced"
   | "settings-about";
 
 export interface WorkspaceV2Props {
