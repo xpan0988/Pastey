@@ -115,6 +115,12 @@ pub(crate) struct LastTurnObservationV1 {
     pub(crate) outcome: LastTurnV1,
     pub(crate) at_ms: Option<u64>,
     pub(crate) source: String,
+    /// The provider's own id of the last entry: Claude Code's last
+    /// main-chain entry `uuid`, Codex's newest turn id. Continuing requires
+    /// the session to still end with it, so nobody continues a session that
+    /// changed since its user looked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) marker: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -244,6 +250,10 @@ pub(crate) struct NativeSessionContinueV1 {
     pub(crate) provider: String,
     pub(crate) session_id: String,
     pub(crate) prompt: String,
+    /// The `lastTurn.marker` the user saw; continuing is refused when the
+    /// session no longer ends with it.
+    #[serde(default)]
+    pub(crate) expected_marker: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -329,6 +339,41 @@ pub(crate) fn derive_status(
         }
     };
     (status, basis, ResumeAssessmentV1 { verdict, reasons })
+}
+
+/// Why one session may not be continued now, in words its user can act on,
+/// or None. Checked before starting; the adapters check again at the moment
+/// of launch, where the provider allows it under its own exclusion.
+pub(crate) fn continuation_problem(
+    provider: &str,
+    session: &NativeSessionV1,
+    expected_marker: Option<&str>,
+) -> Option<String> {
+    if let Some(expected) = expected_marker {
+        if session.last_turn.marker.as_deref() != Some(expected) {
+            return Some("This session changed since you looked at it, so nothing ran. Look at it again before continuing.".into());
+        }
+    }
+    match (provider, session.resume.verdict) {
+        (_, ResumeVerdictV1::Safe) => None,
+        (_, ResumeVerdictV1::Unsafe) => Some(match provider {
+            PROVIDER_CODEX => "This Codex thread is open in another Codex client (the Codex app or a terminal). Close it there, then continue it here.".into(),
+            _ => "A Claude Code process holds this session (the desktop app, a terminal or a background session). Let it finish or close it, then continue it here.".into(),
+        }),
+        // Codex itself refuses a second writer when Pastey takes the thread,
+        // so a lock this Host cannot read is no reason to refuse here, as
+        // long as the history is readable and the folder exists.
+        (PROVIDER_CODEX, ResumeVerdictV1::Unknown)
+            if session.last_turn.outcome != LastTurnV1::Unreadable
+                && Path::new(&session.workspace).is_dir() =>
+        {
+            None
+        }
+        (_, ResumeVerdictV1::Unknown) => Some(format!(
+            "This session cannot be continued safely now: {}.",
+            session.resume.reasons.join("; ")
+        )),
+    }
 }
 
 /// Narrows sessions by provider, text and activity, and says whether one,

@@ -201,6 +201,22 @@ Use this for any crash of Pastey on the executing device, including one that alr
 | L4 | Settings → This device: Refresh, Full check, Run local test (each mode once). | Device facts, runtimes with versions, and a local-only measurement labelled "no network". |
 | L5 | Settings → General → Receiving folder → Change…, receive a file, then Use default. Turn Save received files off and receive a file. | The file lands in the chosen folder; with saving off it is not put in the receiving folder. |
 
+## M. Native session continuation (Codex threads, Claude Code sessions)
+
+Prerequisites: Codex 0.163 or later on both devices (CLI and, if installed, the ChatGPT desktop app); on Windows, Python 3 for the probe; I2 done (Windows lets the Mac read the Demo folder's sessions).
+
+| # | Do | Expect / record |
+|---|---|---|
+| M1 | On Windows: `python -I tools\codex-session-probe\writer_lock_probe.py (Get-Command codex).Source`, once with the ChatGPT app open on a Codex thread and once with `--cross-process`. | `b_resume_while_a_holds` and `resume_of_thread_held_elsewhere` say "already has an active writer"; after A exits, B resumes. This is the Windows proof of the single-writer lock the remote path relies on. Record the JSON (ids are shortened). |
+| M2 | Mac, local: Agents → Device: This device → choose a folder with a Codex thread you made in the ChatGPT app → Look → open it. With the thread still open in the app, read the report and its Continue section. | Live state "Open, idle" or "Running", source "Codex thread writer lock"; Continue explains that the thread is open in another Codex client. |
+| M3 | Close that thread in the app (open another), Look again, open it, Continue with "Reply with the word ok". | Under Run a task: one run on this device, "continued conversation", Completed with the reply. In the ChatGPT app, the thread shows the new turn. The thread id is unchanged. |
+| M4 | Repeat M3 but, before pressing Continue, add a turn to the thread in the app. | "This session changed since you looked at it, so nothing ran." Nothing new appears in the thread. |
+| M5 | Mac → Windows: Agents → Device: Windows → Look → open a Codex thread in Demo that the app on Windows does not have open → Continue. On Windows, Accept. | The Windows request banner says "continuing an existing thread". The run completes on Windows in the same thread, and its reply returns to the Mac card, which names Windows. |
+| M6 | M5 again, but Deny on Windows; then once with the thread open in the Windows app, Accept. | Deny: nothing runs. Open in the app: "open in another Codex client … nothing ran." |
+| M7 | On Windows, revoke the Mac's Session reading permission, then M5 from a report opened before. | Refused; nothing runs on Windows. The Mac card shows the task as indeterminate (the existing rule for a refused invocation): Stop it. |
+| M8 | During M5's run, quit Pastey on Windows (Task Manager). | The Mac shows the indeterminate notice. After Windows restarts: no `codex` process from that run remains (K4), the thread is no longer locked (M2-style look shows it free), and nothing runs again on its own. |
+| M9 | Claude Code, local: in a folder with an idle Claude Code session (not open in the desktop app or a terminal), Continue with a short prompt. Then try a remote Claude Code session from the Mac. | Local: completes in the same session id. Remote: Continue is unavailable with the reason (background sessions can outlive Pastey there). |
+
 ## Record
 
 Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
@@ -218,6 +234,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Desktop UI (J1–J7) | |
 | Crash diagnosis (K1–K6) | |
 | Device details (L1–L5) | |
+| Session continuation (M1–M9) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
 | Net-probe summary (part F) | |

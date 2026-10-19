@@ -773,7 +773,9 @@ export interface RemoteNativeSession {
   lastActivityAtMs: number | null;
   gitBranch: string | null;
   live: { state: NativeSessionLiveState; source: string; observedAtMs: number; detail: string | null };
-  lastTurn: { outcome: NativeSessionLastTurn; atMs: number | null; source: string };
+  /** `marker`: the provider's id of the last entry. Continuing requires the
+   * session to still end with it. */
+  lastTurn: { outcome: NativeSessionLastTurn; atMs: number | null; source: string; marker?: string | null };
   status: NativeSessionStatus;
   statusBasis: EvidenceBasis;
   resume: { verdict: NativeSessionResumeVerdict; reasons: string[] };
@@ -848,6 +850,20 @@ export function discoverNativeSessions(workspaces: string[], filters: NativeSess
 
 export function inspectNativeSession(workspaces: string[], provider: NativeSessionProvider, sessionId: string): Promise<LocalNativeSessionSnapshot> {
   return invoke("inspect_native_session", { request: { workspaces, provider, sessionId } });
+}
+
+/** Continues one of this device's own sessions in the session itself, with
+ * a new prompt, only while it still ends with `expectedMarker`. The task then
+ * follows the ordinary Native Agent status, Stop and recovery commands. */
+export function continueNativeSession(request: { workspaces: string[]; provider: NativeSessionProvider; sessionId: string; prompt: string; expectedMarker: string | null }): Promise<NativeAgentTaskStatus> {
+  return invoke("continue_native_session", { request });
+}
+
+/** Asks another current Bridge Host to continue one of its Codex threads,
+ * named by the scope its Session reading permission showed this device. The
+ * Host waits for its user's Accept; Codex there refuses a second writer. */
+export function continueRemoteNativeSession(request: { roomId: string; peerSessionId: string; targetHostRef: string; provider: NativeSessionProvider; sessionId: string; scopeRef: string; prompt: string; expectedMarker: string | null }): Promise<NativeAgentTaskStatus> {
+  return invoke("continue_remote_native_session", request);
 }
 
 export type SessionReadGrantState = "active" | "expired" | "revoked" | "unavailable";

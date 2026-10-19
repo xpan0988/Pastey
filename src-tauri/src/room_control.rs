@@ -1621,6 +1621,45 @@ pub async fn receive_room_control_event_handler(
                 // Host-local unattended grant apply; nothing else does.
                 let verified_device =
                     crate::host_runtime::verified_peer_device_for(&ctx.state, &binding);
+                // Continuing an existing Codex thread names its folder only by
+                // a scope the requesting device may read now. Resolved here,
+                // from this Host's own permissions, before anything else; a
+                // path from a peer, or any other scope, is refused.
+                let mut request = request;
+                if request.agent_capability == crate::native_agent::CODEX_THREAD_CAPABILITY {
+                    let readable = verified_device
+                        .as_ref()
+                        .and_then(|device| {
+                            crate::session_read_access::authorized_scopes(
+                                &ctx.state.paths,
+                                device,
+                                &binding,
+                                storage::now_ts(),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|scope| (scope.scope_ref, scope.workspace))
+                        .collect::<Vec<_>>();
+                    match crate::native_agent::resolve_codex_thread_peer_input(
+                        &request.input,
+                        &readable,
+                    ) {
+                        Ok(input) => request.input = input,
+                        Err(_) => {
+                            crate::logging::write_transfer_line(&format!(
+                                "[pastey native-agent] event=thread_continuation_refused task={} reason=not_readable",
+                                request.task_id
+                            ));
+                            return control_error(
+                                StatusCode::FORBIDDEN,
+                                "native_agent_not_authorized",
+                                "This device may not continue sessions in that folder.",
+                            );
+                        }
+                    }
+                }
                 let _admitted = match ctx.state.native_agents.lock().receive_bridge_invocation(
                     &binding,
                     &request,
@@ -4945,6 +4984,7 @@ mod tests {
                 outcome: LastTurnV1::Completed,
                 at_ms: Some(2),
                 source: "transcript".into(),
+                marker: None,
             },
             status: SessionStatusV1::Completed,
             status_basis: EvidenceBasisV1::Fact,

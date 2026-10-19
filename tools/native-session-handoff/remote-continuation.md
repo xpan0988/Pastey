@@ -1,6 +1,6 @@
 # Remote continuation of a Claude Code session: design and blockers (Phase 2)
 
-Status: **not enabled.** Local continuation (S2, `agent.coding.claude_code`) stays local-only. The adapter advertises no peer protocol, peers are not told it exists, and Core refuses any Bridge invocation of a capability without peer protocols (tested: `no_bridge_peer_can_invoke_it_or_learn_of_it`).
+Status: **not enabled for Claude Code.** Local continuation (S2, `agent.coding.claude_code`) stays local-only. Codex threads are different: since Codex 0.163 a cross-process writer lock rules out a second writer, and their app-server ends with Pastey, so remote continuation of Codex threads is enabled behind Session reading and the Host's Review (Layer 5, "Codex threads"). Of the boundaries below, the session precondition now exists for both providers (`lastTurn.marker`). The adapter advertises no peer protocol, peers are not told it exists, and Core refuses any Bridge invocation of a capability without peer protocols (tested: `no_bridge_peer_can_invoke_it_or_learn_of_it`).
 
 Remote continuation is allowed only once every boundary below is shown to be handled. Three are not, so it stays off.
 

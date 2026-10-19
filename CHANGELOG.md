@@ -8,6 +8,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Added
 
+- Continue an existing Codex thread or Claude Code session in the session itself, from Agents → Sessions → open a session → Continue session. The run keeps the session's id and history and appears under Run a task with Stop, its approval prompts and its reply.
+  - Codex threads use Codex 0.163's own thread writer lock: Pastey's dedicated app-server takes it with `thread/resume`, so Codex refuses while the Codex app or a terminal has the thread open, and closes it after the turn. Pastey also checks, under the lock, that the thread still ends with the turn you saw, belongs to its folder, and that the Codex it launched keeps writer locks.
+  - Codex threads on another device can be continued too: the request names the folder only through your Session reading permission there, and every continuation waits for that device's Accept.
+  - Claude Code sessions are continued on this device only, as before through `claude --bg --resume`, now also only while the session still ends with the entry you saw.
+  - Sessions report a "last entry" marker for that check, and Codex discovery reads each thread's writer lock: "open in another Codex client" or not, even while the Codex app runs. Sessions Pastey started are labelled.
+
 - Paired devices connect without a code. After two devices pair once with a code, each remembers the other's identity key.
   - Nearby shows such a device as "Paired before", and **Connect** starts a new Bridge with it, even when it already has one, without a code or an Accept prompt on the other device. The other device shows a notice.
   - The connection still proves both identity keys. A device that only claims to be paired, or that was forgotten, gets the ordinary prompt-and-code flow. Other devices on the same network never connect without a code.

@@ -24,7 +24,7 @@ export interface RemoteAccessFacts {
 export type AccessState = "ok" | "decided_there" | "needs_action" | "unknown";
 
 export interface AccessLine {
-  id: "pairing" | "run" | "decisions" | "reading";
+  id: "pairing" | "run" | "decisions" | "reading" | "continue";
   label: string;
   state: AccessState;
   detail: string;
@@ -81,5 +81,17 @@ export function remoteAccessGuidance(facts: RemoteAccessFacts): AccessLine[] {
     default:
       lines.push({ id: "reading", label: "Read sessions", state: "unknown", detail: `Not checked yet. Looking for sessions below asks ${where}.`, steps: readingSteps });
   }
+
+  // Continuing names a session only through a folder this device may read
+  // there, and each continuation still waits for that device's Accept.
+  lines.push(facts.sessionReading.state === "not_allowed"
+    ? { id: "continue", label: "Continue its sessions", state: "needs_action", detail: `Needs Session reading on ${where} first: a continuation names a session only in a folder this device may read.`, steps: readingSteps }
+    : {
+      id: "continue",
+      label: "Continue its sessions",
+      state: "decided_there",
+      detail: `Codex threads in folders ${where} shares with this device: each continuation waits for someone on ${where} to click Accept. Claude Code sessions are continued only on ${where} itself.`,
+      steps: [],
+    });
   return lines;
 }

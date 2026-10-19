@@ -156,8 +156,14 @@ export function nativeAgentConversationUnavailable(status: NativeAgentTaskStatus
   return status?.state === "failed" && status.code === CONVERSATION_UNAVAILABLE_CODE;
 }
 
+const AGENT_NAMES: Record<string, string> = {
+  "agent.coding.codex": "Codex",
+  "agent.coding.codex_thread": "Codex",
+  "agent.coding.claude_code": "Claude Code",
+};
+
 export function nativeAgentDisplayName(agentId: string | null | undefined): string {
-  return agentId === "agent.coding.codex" ? "Codex" : agentId || "Agent";
+  return (agentId && AGENT_NAMES[agentId]) || agentId || "Agent";
 }
 
 /** A selected Host's advertised capability as the card presents it. */
@@ -737,9 +743,19 @@ export function useNativeAgentTask(roomId: string) {
     finally { setBusy(false); }
   }, [busy, movement]);
 
+  /** A task this device started elsewhere in the Agents workspace (a
+   * continued session): shown and followed here like any other run. */
+  const adoptTask = useCallback((started: NativeAgentTaskStatus, hostRef: string | null = null) => {
+    setStatus(started);
+    setTaskHostRef(hostRef);
+    setMovement(null);
+    setMessage(null);
+    rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
+  }, [roomId]);
+
   const retryingResultReturn = returnRetryObservation?.roomId === roomId
     && returnRetryObservation.movement.movementId === movement?.movementId;
-  return { capabilities, workspace, setWorkspace, taskText, setTaskText, newConversation, setNewConversation, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
+  return { adoptTask, capabilities, workspace, setWorkspace, taskText, setTaskText, newConversation, setNewConversation, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
 }
 
 const BADGE_TONE: Record<LifecycleTone, string> = { neutral: "", pending: "warn", live: "live", danger: "bad", complete: "ok" };

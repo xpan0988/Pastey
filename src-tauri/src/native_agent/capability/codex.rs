@@ -52,6 +52,9 @@ use crate::native_agent::{
     WORKSPACE_MOVEMENT_PROTOCOLS,
 };
 
+pub(in crate::native_agent) mod thread_continuation;
+pub(in crate::native_agent) mod writer_lock;
+
 /// The configured executable that names the user's installed Codex.
 const INSTALLED_CODEX: &str = "codex";
 /// What an installed Codex provides to launch on Windows, in the order a
@@ -923,7 +926,7 @@ impl NativeInvocationRunV1 for CodexInvocationRunV1 {
                 Err(outcome) => return outcome,
             },
         };
-        let report = controller.run_turn(&thread_id, &self.prompt, progress);
+        let report = controller.run_turn(&thread_id, &self.prompt, None, progress);
         match report.outcome {
             NativeTurnOutcomeV1::Completed => report.response.into_completed_outcome(),
             kind => NativeInvocationOutcomeV1 {
@@ -2217,6 +2220,7 @@ impl CodexAppServerV1 {
         &self,
         thread_id: &str,
         task: &str,
+        client_message_id: Option<&str>,
         progress: &dyn NativeInvocationProgressV1,
     ) -> CodexTurnReportV1 {
         let mut response = CodexResponseCaptureV1::default();
@@ -2225,7 +2229,12 @@ impl CodexAppServerV1 {
             response,
         };
         if self
-            .send(json!({"id": TURN_START_ID, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}]}}))
+            .send(match client_message_id {
+                // Tags the turn in Codex's history, so its own record can
+                // later show whether this exact turn started.
+                Some(id) => json!({"id": TURN_START_ID, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}], "clientUserMessageId": id}}),
+                None => json!({"id": TURN_START_ID, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}]}}),
+            })
             .is_err()
         {
             return unknown(response);
@@ -2589,7 +2598,16 @@ impl CodexAppServerV1 {
                 let reply_id = message.get("id").filter(|id| !id.is_null());
                 if reply_id.and_then(Value::as_u64) == Some(id) {
                     return message.get("result").cloned().ok_or_else(|| {
-                        AppError::InvalidInput("Codex app-server request failed.".into())
+                        // Codex's own reason, bounded, so a caller can tell a
+                        // refusal (such as another writer) from a failure.
+                        let reason = message
+                            .pointer("/error/message")
+                            .and_then(Value::as_str)
+                            .map(|reason| reason.chars().take(200).collect::<String>());
+                        AppError::InvalidInput(match reason {
+                            Some(reason) => format!("Codex app-server request failed: {reason}"),
+                            None => "Codex app-server request failed.".into(),
+                        })
                     });
                 }
                 if reply_id.is_none() && message.get("error").is_some() {

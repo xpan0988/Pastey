@@ -421,6 +421,7 @@ impl TranscriptV1 {
                 outcome: LastTurnV1::None,
                 at_ms: None,
                 source: "transcript".into(),
+                marker: None,
             },
             activity: ActivitySummaryV1::default(),
             recent: VecDeque::new(),
@@ -611,6 +612,11 @@ fn observe_turn_entry(
         outcome,
         at_ms: at,
         source: format!("transcript: last main-chain entry ({reason})"),
+        marker: entry
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 64)
+            .map(str::to_owned),
     };
 }
 

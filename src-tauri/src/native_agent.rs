@@ -41,6 +41,35 @@ use capability::{
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_TASK_BYTES: usize = 16 * 1024;
 
+/// Continuing an existing Codex thread (`capability::codex::thread_continuation`).
+pub(crate) const CODEX_THREAD_CAPABILITY: &str =
+    capability::codex::thread_continuation::CODEX_THREAD_CAPABILITY_ID;
+
+/// A requesting device's continuation input: the folder only as the scope
+/// reference its Session reading permission showed it.
+pub(crate) fn codex_thread_peer_input(
+    scope_ref: &str,
+    thread_id: &str,
+    prompt: &str,
+    expected_last_turn_id: Option<&str>,
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    capability::codex::thread_continuation::peer_input(
+        scope_ref,
+        thread_id,
+        prompt,
+        expected_last_turn_id,
+    )
+}
+
+/// The executing Host resolves a peer's continuation input among the
+/// folders that exact device may read now, `(scope_ref, workspace)`.
+pub(crate) fn resolve_codex_thread_peer_input(
+    input: &OpaqueCapabilityPayloadV1,
+    readable: &[(String, PathBuf)],
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    capability::codex::thread_continuation::resolve_peer_input(input, readable)
+}
+
 /// One local lifecycle line per Native Agent transition, so a crash or a
 /// restart leaves evidence of how far a task got. Task identities and
 /// states only: never a workspace path, prompt, output or native content.
@@ -1094,6 +1123,12 @@ impl Default for NativeAgentServiceV1 {
         #[cfg(not(test))]
         adapters.push(Arc::new(
             capability::claude_code::ClaudeCodeNativeAdapterV1::default(),
+        ));
+        // Continuing an existing Codex thread under Codex's own writer lock
+        // (local only). Tests register it explicitly with a fixture.
+        #[cfg(not(test))]
+        adapters.push(Arc::new(
+            capability::codex::thread_continuation::CodexThreadAdapterV1::default(),
         ));
         Self::with_adapters(codex, adapters)
     }
@@ -3792,6 +3827,29 @@ impl NativeAgentServiceV1 {
         let input = capability::claude_code::continue_input(session_id, workspace, prompt)?;
         self.start_local_invocation(
             capability::claude_code::CLAUDE_CODE_CAPABILITY_ID,
+            &format!("native-agent:{}", Uuid::new_v4()),
+            &input,
+        )
+    }
+
+    /// Continues one existing Codex thread in its own native session. The
+    /// thread must still end with `expected_last_turn_id` once Codex's
+    /// writer lock is held; another client holding it refuses the start.
+    pub(crate) fn start_codex_thread_task(
+        &mut self,
+        workspace: &Path,
+        thread_id: &str,
+        prompt: &str,
+        expected_last_turn_id: Option<&str>,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let input = capability::codex::thread_continuation::continue_input(
+            workspace,
+            thread_id,
+            prompt,
+            expected_last_turn_id,
+        )?;
+        self.start_local_invocation(
+            capability::codex::thread_continuation::CODEX_THREAD_CAPABILITY_ID,
             &format!("native-agent:{}", Uuid::new_v4()),
             &input,
         )

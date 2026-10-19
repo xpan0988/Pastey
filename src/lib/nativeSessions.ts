@@ -142,3 +142,36 @@ export function readGrantStateLabel(grant: SessionReadGrant): string {
     case "unavailable": return "Not usable: the device was revoked, the Bridge ended, or the folder moved";
   }
 }
+
+/** Whether one session may be continued from here, and why not. Mirrors the
+ * Host's own check (`continuation_problem`), which runs again at the moment
+ * of launch; this only explains it in advance. */
+export function continuationAvailability(
+  session: Pick<SessionView, "provider" | "resume" | "lastTurn">,
+  onThisDevice: boolean,
+  hostName = "the other device",
+): { allowed: boolean; reason: string } {
+  if (!onThisDevice && session.provider !== "codex") {
+    return { allowed: false, reason: `Continuing a Claude Code session on another device is not available: a background Claude Code session can outlive Pastey on ${hostName}, and its outcome could be lost. Continue it on ${hostName}.` };
+  }
+  if (session.resume.verdict === "unsafe") {
+    return {
+      allowed: false,
+      reason: session.provider === "codex"
+        ? "This Codex thread is open in another Codex client (the Codex app or a terminal). Close it there, then continue it here."
+        : "A Claude Code process holds this session (the desktop app, a terminal or a background session). Let it finish or close it, then continue it here.",
+    };
+  }
+  if (session.provider === "codex") {
+    if (session.lastTurn.outcome === "unreadable") return { allowed: false, reason: "This thread's history cannot be read, so it cannot be continued safely." };
+    if (!onThisDevice) {
+      if (!session.lastTurn.marker) return { allowed: false, reason: `${hostName} did not say which turn this thread ends with, so Pastey cannot check that it is unchanged. Update Pastey on ${hostName}.` };
+      return { allowed: true, reason: `Someone on ${hostName} must Accept. Codex there refuses if the Codex app or a terminal has this thread open, and Pastey checks that it still ends where you see it.` };
+    }
+    return { allowed: true, reason: "Codex refuses if the Codex app or a terminal opens this thread first, and Pastey checks that it still ends where you see it." };
+  }
+  if (session.resume.verdict === "unknown") {
+    return { allowed: false, reason: `Pastey cannot show that nothing holds this session: ${session.resume.reasons.join("; ") || "no live source"}.` };
+  }
+  return { allowed: true, reason: "Claude Code continues it under its own id only if nothing holds it at launch; otherwise Pastey stops the copy it starts and reports the outcome as unknown." };
+}

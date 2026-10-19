@@ -26,6 +26,7 @@ fn turn(outcome: LastTurnV1) -> LastTurnObservationV1 {
         outcome,
         at_ms: Some(1),
         source: "test".into(),
+        marker: None,
     }
 }
 
@@ -801,4 +802,92 @@ fn claude_folder_names_follow_claude_codes_encoding_of_the_plain_path() {
         claude::project_dir(config, Path::new(r"C:\Users\me\my.site")),
         config.join("projects").join("C--Users-me-my-site")
     );
+}
+
+#[cfg(unix)]
+fn lock_held_for_t_live(
+    thread_id: &str,
+) -> crate::native_agent::capability::codex::writer_lock::WriterLockV1 {
+    use crate::native_agent::capability::codex::writer_lock::WriterLockV1;
+    if thread_id == "t-live" {
+        WriterLockV1::Held
+    } else {
+        WriterLockV1::Free
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_readable_codex_writer_lock_gives_each_thread_a_live_fact_even_while_the_app_runs() {
+    let root = temp_root();
+    let workspace = root.join("project");
+    let outside = root.join("private-project");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let agent = scripted_history_codex(&root, &workspace, &outside);
+    let (sessions, _) = CodexSessionSourceV1::new(agent, vec![])
+        .with_holders(a_desktop_holder)
+        .with_writer_lock(lock_held_for_t_live)
+        .discover(&[workspace.clone()]);
+    let done = sessions.iter().find(|s| s.session_id == "t-done").unwrap();
+    assert_eq!(
+        (done.live.state, done.resume.verdict),
+        (LiveStateV1::NotRunning, ResumeVerdictV1::Safe)
+    );
+    assert_eq!(done.live.source, "Codex thread writer lock");
+    // Held, with its last turn in progress: another client runs it.
+    let live = sessions.iter().find(|s| s.session_id == "t-live").unwrap();
+    assert_eq!(
+        (live.live.state, live.status, live.resume.verdict),
+        (
+            LiveStateV1::Running,
+            SessionStatusV1::Running,
+            ResumeVerdictV1::Unsafe
+        )
+    );
+    assert!(continuation_problem(PROVIDER_CODEX, live, None)
+        .unwrap()
+        .contains("open in another Codex client"));
+    assert_eq!(
+        continuation_problem(PROVIDER_CODEX, done, done.last_turn.marker.as_deref()),
+        None
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn continuing_needs_the_session_the_user_saw_and_a_safe_or_codex_enforced_state() {
+    let mut claude = session(PROVIDER_CLAUDE_CODE, "s-1", "/", "x", 1);
+    claude.last_turn.marker = Some("entry-9".into());
+    assert_eq!(
+        continuation_problem(PROVIDER_CLAUDE_CODE, &claude, Some("entry-9")),
+        None
+    );
+    assert!(
+        continuation_problem(PROVIDER_CLAUDE_CODE, &claude, Some("entry-8"))
+            .unwrap()
+            .contains("changed since you looked")
+    );
+    // Claude Code: a holder that cannot be ruled out is a refusal.
+    claude.resume.verdict = ResumeVerdictV1::Unknown;
+    claude.resume.reasons = vec!["no live source".into()];
+    assert!(
+        continuation_problem(PROVIDER_CLAUDE_CODE, &claude, Some("entry-9"))
+            .unwrap()
+            .contains("cannot be continued safely")
+    );
+    claude.resume.verdict = ResumeVerdictV1::Unsafe;
+    assert!(continuation_problem(PROVIDER_CLAUDE_CODE, &claude, None)
+        .unwrap()
+        .contains("holds this session"));
+    // Codex: an unreadable lock is not a refusal, because Codex refuses a
+    // second writer itself; an unreadable history or a missing folder is.
+    let mut codex = session(PROVIDER_CODEX, "t-1", "/", "x", 1);
+    codex.resume.verdict = ResumeVerdictV1::Unknown;
+    assert_eq!(continuation_problem(PROVIDER_CODEX, &codex, None), None);
+    codex.last_turn.outcome = LastTurnV1::Unreadable;
+    assert!(continuation_problem(PROVIDER_CODEX, &codex, None).is_some());
+    codex.last_turn.outcome = LastTurnV1::Completed;
+    codex.workspace = "/definitely/not/a/folder".into();
+    assert!(continuation_problem(PROVIDER_CODEX, &codex, None).is_some());
 }

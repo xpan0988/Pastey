@@ -2,14 +2,18 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState } from "react";
 import type { SessionReadingKnowledge } from "../../lib/accessGuidance";
 import {
+  continueNativeSession,
+  continueRemoteNativeSession,
   discoverNativeSessions,
   discoverRemoteNativeSessions,
   inspectNativeSession,
   inspectRemoteNativeSession,
+  type NativeAgentTaskStatus,
   type RemoteNativeSessionSnapshot,
 } from "../../lib/tauri";
 import {
   ACTIVITY_FILTERS,
+  continuationAvailability,
   evidenceGroups,
   localSessionView,
   originLabel,
@@ -37,7 +41,7 @@ const STATUS_TONE: Record<string, Tone> = { live: "live", done: "ok", warning: "
  * read only. Another device answers only for folders its own user shares
  * with this device, and sends statuses and evidence, not transcripts.
  * Looking never starts, continues or stops a session. */
-export function NativeSessionsCard({ roomId, peers, members, target, onReading }: {
+export function NativeSessionsCard({ roomId, peers, members, target, onReading, onContinued }: {
   roomId: string;
   peers: Peer[];
   members?: Peer[];
@@ -45,6 +49,8 @@ export function NativeSessionsCard({ roomId, peers, members, target, onReading }
   target: string;
   /** What looking learned about the other device's reading permission. */
   onReading?: (knowledge: SessionReadingKnowledge) => void;
+  /** A continuation this device started: followed under Run a task. */
+  onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void;
 }) {
   const [folder, setFolder] = useState("");
   const [form, setForm] = useState<{ provider: string; text: string; activeWithinSecs: number | null; scopeRef: string }>({ provider: "", text: "", activeWithinSecs: null, scopeRef: "" });
@@ -152,11 +158,13 @@ export function NativeSessionsCard({ roomId, peers, members, target, onReading }
       </div>
     </section> : null}
 
-    {snapshot ? <SessionSnapshotView snapshot={snapshot} hostName={hostName} remote={target !== "local"} /> : null}
+    {snapshot ? <SessionSnapshotView snapshot={snapshot} hostName={hostName} remote={target !== "local"} folder={folder} onContinued={onContinued} route={remote ? { roomId, peerSessionId: remote.peerSessionId, hostRef: remote.hostRef! } : null} /> : null}
   </div>;
 }
 
-function SessionSnapshotView({ snapshot, hostName, remote }: { snapshot: Snapshot; hostName: string; remote: boolean }) {
+type ContinueRoute = { roomId: string; peerSessionId: string; hostRef: string } | null;
+
+function SessionSnapshotView({ snapshot, hostName, remote, folder, onContinued, route }: { snapshot: Snapshot; hostName: string; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute }) {
   const session = snapshot.session;
   const status = sessionStatusPresentation(session);
   const evidence = evidenceGroups(snapshot.evidence);
@@ -177,9 +185,7 @@ function SessionSnapshotView({ snapshot, hostName, remote }: { snapshot: Snapsho
         <dt>Activity</dt><dd>{snapshotActivityLine(snapshot)}</dd>
         {snapshot.activity.changedFiles.length ? <><dt>Changed</dt><dd>{snapshot.activity.changedFiles.join(", ")}</dd></> : null}
         <dt>Folder now</dt><dd>{workspace.exists ? workspace.gitBranch ? `${workspace.gitBranch} at ${workspace.head ?? "?"}, ${workspace.uncommittedPaths ?? "?"} uncommitted path(s)${workspace.commitsSinceLastActivity != null ? `, ${workspace.commitsSinceLastActivity} commit(s) since the session's last activity` : ""}.` : "Not a Git repository." : "The folder no longer exists."}</dd>
-        <dt>Continuing</dt><dd>{remote
-          ? `Not supported from another device. On ${hostName}: ${resumeLabel(session).toLowerCase()}; continue it in ${providerLabel(session.provider)} there.`
-          : `${resumeLabel(session)}. This view does not continue sessions; continue it in ${providerLabel(session.provider)} itself.`}</dd>
+        <dt>Continuing</dt><dd>{resumeLabel(session)}.</dd>
       </dl>
       <div className="evidence">
         {evidence.facts.length ? <div className="evidence-group"><h4><Dot tone="ok" />Facts</h4><ul>{evidence.facts.map((item) => <li key={item.statement}>{item.statement} <small>({item.source})</small></li>)}</ul></div> : null}
@@ -189,6 +195,44 @@ function SessionSnapshotView({ snapshot, hostName, remote }: { snapshot: Snapsho
       {snapshot.excerptsShared
         ? snapshot.recent.length ? <div className="evidence-group"><h4>Recent conversation</h4><p className="xsmall subtle">Replies are the agent's own account, not verified.</p>{snapshot.recent.map((entry, index) => <div className="excerpt" key={index}><small>{entry.role === "user" ? "Prompt" : "Agent said"} · {relativeTime(entry.atMs)}</small>{entry.text}</div>)}</div> : null
         : <p className="xsmall subtle">{hostName} shares statuses only, not excerpts of the conversation.</p>}
+      <ContinueSession session={session} remote={remote} folder={folder} onContinued={onContinued} route={route} hostName={hostName} />
     </div>
   </section>;
+}
+
+/** Continues this session in the session itself, with one new prompt. The
+ * Host checks again at launch; nothing is retried, and no new session is
+ * ever made in its place. */
+function ContinueSession({ session, remote, folder, onContinued, route, hostName }: { session: SessionView; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute; hostName: string }) {
+  const [prompt, setPrompt] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [started, setStarted] = useState(false);
+  const availability = remote && !route
+    ? { allowed: false, reason: `${hostName} is not connected right now.` }
+    : continuationAvailability(session, !remote, hostName);
+
+  async function submit() {
+    if (!availability.allowed || !prompt.trim() || busy || started) return;
+    setBusy(true); setError(null);
+    try {
+      const status = route
+        ? await continueRemoteNativeSession({ roomId: route.roomId, peerSessionId: route.peerSessionId, targetHostRef: route.hostRef, provider: session.provider, sessionId: session.sessionId, scopeRef: session.scopeRef, prompt: prompt.trim(), expectedMarker: session.lastTurn.marker ?? null })
+        : await continueNativeSession({ workspaces: [folder], provider: session.provider, sessionId: session.sessionId, prompt: prompt.trim(), expectedMarker: session.lastTurn.marker ?? null });
+      setStarted(true);
+      onContinued?.(status, route?.hostRef ?? null);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : String(nextError));
+    } finally { setBusy(false); }
+  }
+
+  return <div className="evidence-group" aria-label="Continue this session">
+    <h4>Continue this session</h4>
+    {availability.allowed ? <>
+      <textarea className="textarea" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={`What should ${providerLabel(session.provider)} do next in this session?`} aria-label="Next prompt" disabled={busy || started} />
+      <div className="row"><span className="spacer xsmall subtle">{availability.reason}</span><button type="button" className="btn btn-primary" disabled={busy || started || !prompt.trim()} onClick={() => void submit()}>{busy ? "Starting…" : started ? "Started" : "Continue session"}</button></div>
+      {started ? <p className="small muted">{remote ? `Sent to ${hostName}. It runs once someone there accepts.` : "Started in this session."} Follow it, answer its requests or stop it under Run a task.</p> : null}
+    </> : <p className="small muted">{availability.reason}</p>}
+    {error ? <Notice tone="bad">{error}</Notice> : null}
+  </div>;
 }

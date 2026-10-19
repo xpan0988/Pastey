@@ -34,7 +34,7 @@ import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgres
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
-import { evidenceGroups, localSessionView, readGrantFormProblem, readGrantStateLabel, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
+import { continuationAvailability, evidenceGroups, localSessionView, readGrantFormProblem, readGrantStateLabel, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import type { NativeDecisionReview } from "../src/lib/tauri";
 
 function room(peerConnected: boolean): RoomInfo {
@@ -535,6 +535,8 @@ test("Native Agent responses are shown apart from lifecycle and only as escaped 
   assert.equal(nativeAgentResponse(null), null);
   assert.equal(nativeAgentDisplayName("agent.coding.codex"), "Codex");
   assert.equal(nativeAgentDisplayName("fake.longjob.v1"), "fake.longjob.v1");
+  assert.equal(nativeAgentDisplayName("agent.coding.codex_thread"), "Codex");
+  assert.equal(nativeAgentDisplayName("agent.coding.claude_code"), "Claude Code");
 
   const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
@@ -921,11 +923,20 @@ test("a session reading permission names a device, a folder and a length", () =>
   assert.equal(readGrantStateLabel({ grantId: "g", deviceLabel: "Mac", displayFingerprint: "f", bridgeId: "b", workspace: "/p", shareExcerpts: false, createdAt: 1, expiresAt: 2, state: "active" }), "Active · statuses only");
 });
 
-test("the sessions card reads only and the Host's settings own every permission", () => {
+test("the sessions card continues only this device's own sessions and never grants anything", () => {
   const card = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   const settings = readFileSync("src/features/workspace/SessionReadingSettings.tsx", "utf8");
   assert.match(card, /discoverRemoteNativeSessions\(roomId, remote\.hostRef!/);
-  assert.doesNotMatch(card, /continueNativeSession|startClaude|createSessionReadGrant/);
+  assert.doesNotMatch(card, /startClaude|createSessionReadGrant|startRemoteNative/);
+  // One explicit continuation, as the user saw it: here, or on the chosen
+  // device by the scope its read permission showed, never a path.
+  assert.equal(card.match(/continueNativeSession\(/g)?.length, 1);
+  assert.equal(card.match(/continueRemoteNativeSession\(/g)?.length, 1);
+  assert.match(card, /continueNativeSession\(\{ workspaces: \[folder\], provider: session\.provider, sessionId: session\.sessionId, prompt: prompt\.trim\(\), expectedMarker: session\.lastTurn\.marker \?\? null \}\)/);
+  assert.match(card, /continueRemoteNativeSession\(\{ roomId: route\.roomId, peerSessionId: route\.peerSessionId, targetHostRef: route\.hostRef, provider: session\.provider, sessionId: session\.sessionId, scopeRef: session\.scopeRef, prompt: prompt\.trim\(\), expectedMarker: session\.lastTurn\.marker \?\? null \}\)/);
+  assert.match(card, /continuationAvailability\(session, !remote, hostName\)/);
+  assert.match(card, /onContinued\?\.\(status, route\?\.hostRef \?\? null\)/);
+  assert.match(card, /disabled=\{busy \|\| started \|\| !prompt\.trim\(\)\}/);
   assert.match(card, /Pastey does not pick for you/);
   assert.match(card, /the agent's own account, not verified/);
   assert.match(settings, /trusting a device does not let it read anything/);
@@ -1089,13 +1100,13 @@ test("Execution, observation and continuation stay separate in the Bridge", () =
   // One Agents workspace, two separately labelled authorities.
   const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
   assert.match(workspace, /Run a task <Badge tone="live">Execution<\/Badge>/);
-  assert.match(workspace, /Sessions on \{targetName\} <Badge>Read only<\/Badge>/);
+  assert.match(workspace, /Sessions on \{targetName\} <Badge>Look or continue<\/Badge>/);
+  assert.match(workspace, /onContinued=\{agent\.adoptTask\}/);
   assert.match(workspace, /<NativeAgentPanel [^>]*target=\{target\} \/>/);
   assert.match(workspace, /<NativeSessionsCard [^>]*target=\{target\}/);
   const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
-  // Discovered sessions are never offered as continuable from here.
-  assert.doesNotMatch(sessions, /startRemoteNativeCodexTask|startNativeCodexTask|continue_native_session|>Continue</);
-  assert.match(sessions, /This view does not continue sessions/);
+  // Continuing never starts a new run in place of the session.
+  assert.doesNotMatch(sessions, /startRemoteNativeCodexTask|startNativeCodexTask/);
 });
 
 function accessFacts(overrides: Partial<RemoteAccessFacts> = {}): RemoteAccessFacts {
@@ -1113,7 +1124,10 @@ function accessFacts(overrides: Partial<RemoteAccessFacts> = {}): RemoteAccessFa
 
 test("Bridge access guidance keeps each authority separate and says where it is granted", () => {
   const lines = remoteAccessGuidance(accessFacts());
-  assert.deepEqual(lines.map((line) => line.id), ["pairing", "run", "decisions", "reading"]);
+  assert.deepEqual(lines.map((line) => line.id), ["pairing", "run", "decisions", "reading", "continue"]);
+  // Continuing is its own authority: it needs reading there and an Accept.
+  assert.equal(lines.find((line) => line.id === "continue")!.state, "decided_there");
+  assert.equal(remoteAccessGuidance(accessFacts({ sessionReading: { state: "not_allowed" } })).find((line) => line.id === "continue")!.state, "needs_action");
   // No single trust switch: running is decided on the executing device.
   const run = lines.find((line) => line.id === "run")!;
   assert.equal(run.state, "decided_there");
@@ -1209,4 +1223,31 @@ test("Sessions follow the Agents device and mark the ones Pastey started", () =>
   assert.doesNotMatch(sessions, /aria-label="Device"/);
   assert.match(sessions, /session\.origin === "pastey" \? <Badge tone="accent">Started by Pastey<\/Badge>/);
   assert.match(sessions, /response\.outcome === "not_authorized"\) onReading\?\.\(\{ state: "not_allowed" \}\)/);
+});
+
+test("A session is offered for continuation only where the Host would accept it", () => {
+  const base = sessionView({ provider: "codex", resume: { verdict: "safe", reasons: [] } });
+  assert.equal(continuationAvailability(base, true).allowed, true);
+  // Another device: a Codex thread only with the marker to check against,
+  // and only after that device's Accept; Claude Code never.
+  const remoteCodex = continuationAvailability({ ...base, lastTurn: { ...base.lastTurn, marker: "turn-9" } }, false, "DESKTOP");
+  assert.equal(remoteCodex.allowed, true);
+  assert.match(remoteCodex.reason, /Someone on DESKTOP must Accept/);
+  assert.equal(continuationAvailability({ ...base, lastTurn: { ...base.lastTurn, marker: null } }, false, "DESKTOP").allowed, false);
+  const remoteClaude = continuationAvailability(sessionView({ provider: "claude_code" }), false, "DESKTOP");
+  assert.equal(remoteClaude.allowed, false);
+  assert.match(remoteClaude.reason, /outlive Pastey on DESKTOP/);
+  // Held by the Codex app or a terminal.
+  const held = continuationAvailability({ ...base, resume: { verdict: "unsafe", reasons: [] } }, true);
+  assert.equal(held.allowed, false);
+  assert.match(held.reason, /open in another Codex client/);
+  // Codex enforces its own single writer, so an unreadable lock is no refusal...
+  assert.equal(continuationAvailability({ ...base, resume: { verdict: "unknown", reasons: ["lock unreadable"] } }, true).allowed, true);
+  // ...but an unreadable history is.
+  assert.equal(continuationAvailability({ ...base, lastTurn: { ...base.lastTurn, outcome: "unreadable" } }, true).allowed, false);
+  // Claude Code needs a shown-safe state.
+  const claude = sessionView({ provider: "claude_code", resume: { verdict: "unknown", reasons: ["no live source"] } });
+  assert.equal(continuationAvailability(claude, true).allowed, false);
+  assert.match(continuationAvailability(claude, true).reason, /no live source/);
+  assert.equal(continuationAvailability({ ...claude, resume: { verdict: "safe", reasons: [] } }, true).allowed, true);
 });

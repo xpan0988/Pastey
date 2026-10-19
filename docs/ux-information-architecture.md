@@ -13,6 +13,7 @@ How the desktop UI is organized, and why. Product rules (authority, movement, re
 | Movement: text and files, either way | **Share** tab. Send by typing, + → Send files…, or drop on the window. Get a file with + → Get a file from <device>… | Send: this device's user. Get: the other device's shared search folders only | Get a file: review the Search, then choose the one file |
 | Execution: Run Codex | **Agents** tab → Run a task | The executing device's Accept, or its own unattended permission | The other device's Accept; workspace movement reviewed here first |
 | Observation: Agent sessions | **Agents** tab → Sessions on <device> | The holding device's Session reading permission | None: read only, never starts, continues or stops a session |
+| Continuation: an existing session, in itself | **Agents** tab → a session's report → Continue session | This device's user; on another device, its Session reading permission and its Accept | The other device's Accept for each remote continuation; the session must still end where you saw it |
 
 ### Why one Agents tab, with two sections
 
@@ -20,7 +21,7 @@ People think "what are agents doing on that device", not "execution versus obser
 
 The authorities stay apart inside the one tab:
 - **Run a task** (badge: Execution) holds the form and the one task Pastey started and follows: its approvals, response, movement and recovery.
-- **Sessions on <device>** (badge: Read only) lists what Claude Code and Codex already keep there. A session Pastey started is marked "Started by Pastey"; its live state is still followed under Run a task, so a run is never presented as two live things. Nothing in this list starts, continues or stops anything.
+- **Sessions on <device>** lists what Claude Code and Codex already keep there. A session Pastey started is marked "Started by Pastey". Looking changes nothing. An idle session can be continued in the session itself from its report; the run is then followed under Run a task, so a run is never presented as two live things.
 - **Access on <device>** lists each authority separately (pairing, running Codex, Codex's own approval prompts, reading sessions) with what is known here, what the other device decides, and the exact steps there. There is no single trust switch, and nothing can be granted from this side.
 
 | Capability | Status |
@@ -28,11 +29,13 @@ The authorities stay apart inside the one tab:
 | Run Codex on this or another device; continue Pastey's own conversation in a folder | Implemented |
 | Workspace movement to another device and result return | Implemented |
 | Read-only discovery and inspection of Claude Code and Codex sessions, here or on another device with its permission | Implemented |
-| Continue a discovered Claude Code session on this device | Implemented in the Host (`continue_native_session`), not offered in the UI |
-| Continue a session from another device | Not implemented (disabled by design, see Layer 5) |
-| Continue a discovered Codex thread | Refused: no Codex interface shows a thread is free |
+| Continue an idle Codex thread on this device, in the thread itself | Implemented: Codex's writer lock excludes other writers; checked against the turn you saw (real, macOS) |
+| Continue a Codex thread on another device | Implemented: needs Session reading there and that device's Accept per run (Windows enforcement inferred, acceptance M) |
+| Continue an idle Claude Code session on this device | Implemented: `claude --bg --resume`, copy-on-held, checked against the entry you saw |
+| Continue a Claude Code session from another device | Not enabled: a background session can outlive Pastey there (remote-continuation.md) |
+| Observe or steer a turn the Codex app is running | Not possible through supported interfaces: its app-server is private; the writer lock only shows that it has the thread open |
 
-Continuation stays inside Execution: Run with Codex continues *Pastey's own* Codex conversation in a folder unless "Start a new conversation" is chosen. Discovered sessions are never offered as continuable from here. A remote session says so ("Not supported from another device"). The Host has a local-only Claude Code continuation command (`continue_native_session`), but the UI deliberately does not offer it yet.
+Continuation is Execution, started from Observation: Run with Codex continues *Pastey's own* Codex conversation in a folder unless "Start a new conversation" is chosen, and a session's report offers **Continue session** for an existing Codex thread or Claude Code session. It runs in the session itself, only while the session still ends with the entry you saw, and is then followed under Run a task. Each report says why when it cannot be continued (open in another client, changed, held, unreadable, or a Claude Code session on another device). A continuation on another device also needs Session reading there and that device's Accept.
 
 Managed Plans arrive by event and are pinned above the Share thread while open (review, readiness, execution, terminal state), because they are reviewed movement across the Bridge.
 

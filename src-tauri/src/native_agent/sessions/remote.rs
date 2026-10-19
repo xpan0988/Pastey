@@ -110,6 +110,10 @@ pub(crate) struct RemoteLastTurnV1 {
     pub(crate) outcome: LastTurnV1,
     pub(crate) at_ms: Option<u64>,
     pub(crate) source: String,
+    /// The provider's id of the last entry, which a continuation must still
+    /// find there. An id, not content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) marker: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +305,13 @@ fn validate_session(session: &RemoteSessionV1) -> AppResult<()> {
     if !valid_provider(&session.provider)
         || !valid_session_id(&session.session_id)
         || !valid_scope_ref(&session.scope_ref)
+        || session.last_turn.marker.as_deref().is_some_and(|marker| {
+            marker.is_empty()
+                || marker.len() > 64
+                || !marker
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
         || session
             .title
             .as_deref()
@@ -459,6 +470,7 @@ fn remote_session(session: &NativeSessionV1, scope: &SessionReadScopeV1) -> Remo
             outcome: session.last_turn.outcome,
             at_ms: session.last_turn.at_ms,
             source: safe(&session.last_turn.source),
+            marker: session.last_turn.marker.clone(),
         },
         status: session.status,
         status_basis: session.status_basis,

@@ -66,10 +66,10 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice }: {
 
     <section className="section" aria-label="Existing sessions">
       <div className="section-head">
-        <h2 className="row">Sessions on {targetName} <Badge>Read only</Badge></h2>
-        <p>Sessions Claude Code and Codex already keep there, including ones Pastey started (marked). Looking never starts, continues or stops a session; follow a run of yours above.</p>
+        <h2 className="row">Sessions on {targetName} <Badge>Look or continue</Badge></h2>
+        <p>Sessions Claude Code and Codex already keep there, including ones Pastey started (marked). Looking never changes a session. You can continue an idle session in the session itself (Codex threads on another device after its user accepts); the run then appears under Run a task.</p>
       </div>
-      <NativeSessionsCard roomId={room.id} peers={[...peers]} members={[...members]} target={target} onReading={(knowledge) => { if (targetHostRef) setReading((current) => ({ ...current, [targetHostRef]: knowledge })); }} />
+      <NativeSessionsCard roomId={room.id} peers={[...peers]} members={[...members]} target={target} onReading={(knowledge) => { if (targetHostRef) setReading((current) => ({ ...current, [targetHostRef]: knowledge })); }} onContinued={agent.adoptTask} />
     </section>
   </div>;
 }

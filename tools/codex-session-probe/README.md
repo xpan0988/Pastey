@@ -94,3 +94,21 @@ So within one server, an approval goes to **every** subscribed client, and any o
 - **Attach (3):** not available for the desktop's sessions on this version. The desktop's app-server is private to it. The protocol supports attach only among clients of one shared app-server (shown here with a minimal two-client run). It becomes reachable only if the desktop runs its sessions on the shared daemon; that would also need write and approval ownership, disconnect and idempotency rules, and a trust boundary decided first.
 
 Pastey does not claim 1 or 2 as 3, and ships none of them as a product feature.
+
+## Update 2026-10-19: Codex 0.163 thread writer locks
+
+Re-checked on the same Mac with ChatGPT 26.1013 (bundled `codex-cli 0.163.0-alpha.10.2`) and the CLI `0.163.0`. **Real** unless marked.
+
+- **The desktop's app-server is still private.** It is a child of the app with no listening socket or port, and no shared-daemon control socket exists. Attach (3) stays unavailable.
+- **New: a per-thread writer lock.** An app-server that loads a thread keeps `~/.codex/thread-writer-locks/<thread>.lock` open with an exclusive BSD `flock`, and removes the file when it exits (`thread/unsubscribe` alone did not release it within a second). The desktop held exactly the locks of the threads it had loaded.
+- **It is enforced across processes and versions.** `writer_lock_probe.py`: a second app-server's `thread/resume` of a held thread is refused with "thread … already has an active writer", both CLI ↔ CLI and CLI or bundled Codex against a thread the desktop holds. After the holder exits, resume succeeds. Another server's `thread/list` still says `notLoaded`, so protocol status alone is no cross-process signal; the lock is.
+- **It can be observed without taking it.** On macOS a POSIX `F_GETLK` reports the flock (pid -1) and acquires nothing.
+- **Continuation keeps the thread.** `continuity_probe.py`: a thread started in one process, then continued from another, kept its id, its earlier turn, and its context (the model recalled a code word from the first process's turn). `clientUserMessageId` is persisted in the history.
+- **`thread/resume` bumps `updatedAt`.** A precondition must therefore use the newest turn id, not the time.
+
+This changes conclusion 2 above: resuming a desktop thread is now safe whenever the resuming client holds the writer lock, because Codex itself refuses the other writer. Pastey ships it as `agent.coding.codex_thread` (Layer 5, "Codex threads"); the adapter's live tests (`installed_codex_continues_a_thread_with_its_context_and_releases_it`, `installed_codex_refuses_a_thread_another_client_holds`) passed on this Mac. **Not verified:** the same enforcement on Windows and Linux (inferred from the shared implementation), and what the Codex app shows when the user opens a thread while Pastey's turn holds it (expected: Codex's own "active writer" refusal there).
+
+```bash
+python3 -I tools/codex-session-probe/writer_lock_probe.py "$(command -v codex)" --cross-process
+python3 -I tools/codex-session-probe/continuity_probe.py "$(command -v codex)"
+```

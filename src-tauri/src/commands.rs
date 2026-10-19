@@ -904,53 +904,61 @@ pub async fn inspect_native_session(
 }
 
 /// Continues one existing native session that this Host's user chose, with a
-/// new prompt, through the provider's own resume mechanism. Only Claude Code
-/// sessions, and only one that discovery shows nothing holds: Claude Code's
-/// `--bg --resume` continues it under its own id only when no process holds
-/// it. Codex threads are refused: no Codex interface shows that a desktop app
-/// or terminal does not have a thread open. Local only. The task then follows
-/// the ordinary Native Agent status, cancel and recovery commands.
+/// new prompt, in the session itself through the provider's own mechanism,
+/// and only while it still ends with the entry the user saw:
+/// - Claude Code: only when discovery shows nothing holds it; Claude Code's
+///   `--bg --resume` continues it under its own id only when no process
+///   holds it (a copy otherwise, stopped and reported as unknown).
+/// - Codex: `thread/resume` in a dedicated app-server, which Codex refuses
+///   while another client (the Codex app or a terminal) holds the thread's
+///   writer lock; the adapter checks the last turn again under that lock.
+/// Local only. The task then follows the ordinary Native Agent status,
+/// cancel and recovery commands.
 #[tauri::command]
 pub async fn continue_native_session(
     request: crate::native_agent::sessions::NativeSessionContinueV1,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
-    use crate::native_agent::sessions::{ResumeVerdictV1, PROVIDER_CLAUDE_CODE, PROVIDER_CODEX};
-    if request.provider == PROVIDER_CODEX {
-        return Err("Continuing a discovered Codex thread is not supported: no Codex interface shows that a desktop app or terminal does not have it open, so two writers could not be ruled out.".into());
-    }
-    if request.provider != PROVIDER_CLAUDE_CODE {
-        return Err("Unknown native Agent provider.".into());
-    }
+    use crate::native_agent::sessions::{PROVIDER_CLAUDE_CODE, PROVIDER_CODEX};
+    let provider = match request.provider.as_str() {
+        PROVIDER_CLAUDE_CODE => PROVIDER_CLAUDE_CODE,
+        PROVIDER_CODEX => PROVIDER_CODEX,
+        _ => return Err("Unknown native Agent provider.".into()),
+    };
     let workspaces =
         crate::native_agent::sessions::authorized_workspaces(&state.paths, &request.workspaces)
             .map_err(|error| error.message())?;
     let (claude, codex) = state.native_agents.lock().session_sources(&workspaces);
     let session_id = request.session_id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
-        crate::native_agent::sessions::inspect(
-            &claude,
-            &codex,
-            &workspaces,
-            PROVIDER_CLAUDE_CODE,
-            &session_id,
-        )
+        crate::native_agent::sessions::inspect(&claude, &codex, &workspaces, provider, &session_id)
     })
     .await
     .map_err(|_| "Session inspection stopped unexpectedly.".to_string())?
     .map_err(|error| error.message())?;
-    if snapshot.session.resume.verdict != ResumeVerdictV1::Safe {
-        return Err(format!(
-            "This session cannot be continued safely now: {}.",
-            snapshot.session.resume.reasons.join("; ")
-        ));
+    if let Some(problem) = crate::native_agent::sessions::continuation_problem(
+        provider,
+        &snapshot.session,
+        request.expected_marker.as_deref(),
+    ) {
+        return Err(problem);
     }
     let workspace = std::path::PathBuf::from(&snapshot.session.workspace);
-    state
-        .native_agents
-        .lock()
-        .start_claude_session_task(&workspace, &request.session_id, &request.prompt)
-        .map_err(|error| error.message())
+    let mut native_agents = state.native_agents.lock();
+    match provider {
+        PROVIDER_CODEX => native_agents.start_codex_thread_task(
+            &workspace,
+            &request.session_id,
+            &request.prompt,
+            request.expected_marker.as_deref(),
+        ),
+        _ => native_agents.start_claude_session_task(
+            &workspace,
+            &request.session_id,
+            &request.prompt,
+        ),
+    }
+    .map_err(|error| error.message())
 }
 
 /// Finds the native sessions on one exact current Bridge Host, read only. The
@@ -1651,11 +1659,68 @@ pub async fn start_remote_native_capability_task(
     input: crate::native_agent::OpaqueCapabilityPayloadV1,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    invoke_remote_native_capability(
+        state.inner().clone(),
+        room_id,
+        peer_session_id,
+        target_host_ref,
+        agent_capability,
+        input,
+    )
+    .await
+}
+
+/// Continues one session of another current Bridge Host, in the session
+/// itself, as one ordinary remote invocation: the Host resolves the folder
+/// from this device's own Session reading permission, waits for its user's
+/// Accept, and Codex refuses a second writer. Only Codex threads: remote
+/// Claude Code continuation stays off (`remote-continuation.md`).
+#[tauri::command]
+pub async fn continue_remote_native_session(
+    room_id: String,
+    peer_session_id: String,
+    target_host_ref: String,
+    provider: String,
+    session_id: String,
+    scope_ref: String,
+    prompt: String,
+    expected_marker: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    if provider != crate::native_agent::sessions::PROVIDER_CODEX {
+        return Err("Continuing a Claude Code session on another device is not available: a background Claude Code session can outlive Pastey there, and its outcome could be lost.".into());
+    }
+    let input = crate::native_agent::codex_thread_peer_input(
+        &scope_ref,
+        &session_id,
+        &prompt,
+        expected_marker.as_deref(),
+    )
+    .map_err(|error| error.message())?;
+    invoke_remote_native_capability(
+        state.inner().clone(),
+        room_id,
+        peer_session_id,
+        target_host_ref,
+        crate::native_agent::CODEX_THREAD_CAPABILITY.into(),
+        input,
+    )
+    .await
+}
+
+async fn invoke_remote_native_capability(
+    state: Arc<AppState>,
+    room_id: String,
+    peer_session_id: String,
+    target_host_ref: String,
+    agent_capability: String,
+    input: crate::native_agent::OpaqueCapabilityPayloadV1,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     let target =
         crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
             .map_err(|error| error.message())?;
     let session = require_remote_native_capability(
-        state.inner().clone(),
+        state.clone(),
         &room_id,
         &target,
         &agent_capability,
@@ -1665,7 +1730,7 @@ pub async fn start_remote_native_capability_task(
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before native invocation.".into());
     }
-    let _ = present_device_identity_over(state.inner().clone(), session.binding()).await;
+    let _ = present_device_identity_over(state.clone(), session.binding()).await;
     let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
     let request = crate::native_agent::NativeAgentInvokeV2 {
         schema_version: crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA.into(),
@@ -1687,7 +1752,7 @@ pub async fn start_remote_native_capability_task(
         )
         .map_err(|error| error.message())?;
     send_native_invoke(
-        state.inner().clone(),
+        state.clone(),
         &room_id,
         &peer_session_id,
         &task_id,

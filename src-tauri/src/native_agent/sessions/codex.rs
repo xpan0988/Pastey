@@ -6,10 +6,12 @@
 //! the CLI share the same store (`~/.codex`), so threads from both appear.
 //!
 //! Live state: an app-server reports a thread's status only for threads it
-//! has loaded itself, so Pastey's reader always sees `notLoaded` and cannot
-//! tell whether a desktop app or terminal runs a thread. The only live fact
-//! available is that no Codex process at all could hold one; while any runs,
-//! a thread's live state is unknown.
+//! has loaded itself, so Pastey's reader always sees `notLoaded`. Since
+//! Codex 0.163 every client that loads a thread holds its writer lock
+//! (`writer_lock`), which Pastey reads without taking: held means another
+//! client (the Codex app, a terminal or Pastey) has the thread open, free
+//! means none does. Where the lock cannot be read, the only live fact left is
+//! that no Codex process at all could hold a thread.
 
 use std::path::{Path, PathBuf};
 
@@ -25,10 +27,13 @@ use super::{
 };
 use crate::error::AppResult;
 use crate::native_agent::capability::codex::{
-    codex_holder_processes, CodexHistoryReaderV1, CodexHolderProcessV1, HistoryReadErrorV1,
+    codex_holder_processes,
+    writer_lock::{thread_writer_lock, WriterLockV1},
+    CodexHistoryReaderV1, CodexHolderProcessV1, HistoryReadErrorV1,
 };
 
 const LIVE_SOURCE: &str = "process list";
+const LOCK_SOURCE: &str = "Codex thread writer lock";
 const PAGE: u64 = 50;
 const MAX_TURN_PAGES: usize = 20;
 const MAX_RECENT: usize = 6;
@@ -39,6 +44,7 @@ pub(crate) struct CodexSessionSourceV1 {
     /// Workspaces where Pastey itself has a live Codex session now.
     pastey_live: Vec<PathBuf>,
     holders: fn() -> Option<Vec<CodexHolderProcessV1>>,
+    writer_lock: fn(&str) -> WriterLockV1,
 }
 
 impl CodexSessionSourceV1 {
@@ -47,21 +53,75 @@ impl CodexSessionSourceV1 {
             executable,
             pastey_live,
             holders: codex_holder_processes,
+            writer_lock: thread_writer_lock,
         }
     }
 
-    /// Tests: a fixed process list instead of this Host's.
+    /// Tests: a fixed process list instead of this Host's, and no writer
+    /// lock reading, so this Host's own Codex never shows through.
     #[cfg(all(test, unix))]
     pub(in crate::native_agent) fn with_holders(
         mut self,
         holders: fn() -> Option<Vec<CodexHolderProcessV1>>,
     ) -> Self {
         self.holders = holders;
+        self.writer_lock = |_| WriterLockV1::Unknown("not read in tests");
         self
     }
 
-    fn live(&self, workspace: &Path) -> LiveObservationV1 {
+    /// Tests: a fixed writer-lock observation.
+    #[cfg(all(test, unix))]
+    pub(in crate::native_agent) fn with_writer_lock(
+        mut self,
+        writer_lock: fn(&str) -> WriterLockV1,
+    ) -> Self {
+        self.writer_lock = writer_lock;
+        self
+    }
+
+    /// Per thread, from its writer lock when it can be read.
+    fn live(
+        &self,
+        workspace: &Path,
+        thread_id: &str,
+        last_turn: &LastTurnObservationV1,
+    ) -> LiveObservationV1 {
         let observed_at_ms = now_ms();
+        match (self.writer_lock)(thread_id) {
+            WriterLockV1::Held => {
+                let running = last_turn.outcome == LastTurnV1::InProgress;
+                return LiveObservationV1 {
+                    state: if running {
+                        LiveStateV1::Running
+                    } else {
+                        LiveStateV1::Attached
+                    },
+                    source: LOCK_SOURCE.into(),
+                    observed_at_ms,
+                    detail: Some(if running {
+                        "another Codex client (the Codex app, a terminal or Pastey) has it open, and its last turn is in progress".into()
+                    } else {
+                        "another Codex client (the Codex app, a terminal or Pastey) has it open"
+                            .into()
+                    }),
+                };
+            }
+            WriterLockV1::Free => {
+                return LiveObservationV1 {
+                    state: LiveStateV1::NotRunning,
+                    source: LOCK_SOURCE.into(),
+                    observed_at_ms,
+                    detail: Some("no Codex client has this thread open".into()),
+                };
+            }
+            WriterLockV1::Unknown(_) => {}
+        }
+        self.process_live(workspace, observed_at_ms)
+    }
+
+    /// Without a readable lock: known only when no Codex process could
+    /// hold any thread.
+    fn process_live(&self, workspace: &Path, observed_at_ms: u64) -> LiveObservationV1 {
         let unknown = |detail: String| LiveObservationV1 {
             state: LiveStateV1::Unknown,
             source: LIVE_SOURCE.into(),
@@ -148,7 +208,7 @@ impl CodexSessionSourceV1 {
             json!({"threadId": thread_id, "limit": 1, "itemsView": "notLoaded", "sortDirection": "desc"}),
         ) {
             Ok(page) => turn_observation(page.pointer("/data/0")),
-            Err(_) => LastTurnObservationV1 { outcome: LastTurnV1::Unreadable, at_ms: None, source: "codex thread/turns/list".into() },
+            Err(_) => LastTurnObservationV1 { outcome: LastTurnV1::Unreadable, at_ms: None, source: "codex thread/turns/list".into(), marker: None },
         }
     }
 
@@ -161,7 +221,7 @@ impl CodexSessionSourceV1 {
         let id = thread.get("id")?.as_str()?.to_owned();
         let workspace = in_workspaces(thread.get("cwd")?.as_str()?, workspaces)?;
         let last_turn = Self::last_turn(reader, &id);
-        let live = self.live(&workspace);
+        let live = self.live(&workspace, &id, &last_turn);
         let (status, status_basis, resume) = derive_status(&live, &last_turn, workspace.is_dir());
         let originator = thread
             .get("originator")
@@ -233,7 +293,7 @@ impl CodexSessionSourceV1 {
             history_readable: true,
             live_source: Some(LIVE_SOURCE.into()),
             note: Some(format!(
-                "History read with the {} Codex. Live state is known only when no Codex process could hold a thread.",
+                "History read with the {} Codex. Live state comes from each thread's Codex writer lock where it can be read.",
                 reader.backend().unwrap_or("configured")
             )),
         };
@@ -314,8 +374,8 @@ impl CodexSessionSourceV1 {
         if session.status_basis == EvidenceBasisV1::Inference {
             evidence.push(EvidenceV1::new(
                 EvidenceBasisV1::Inference,
-                "No Codex process could hold this thread, yet its last turn is recorded as in progress: the process that ran it ended before the turn finished.",
-                "process list and thread history",
+                "Nothing has this thread open, yet its last turn is recorded as in progress: the process that ran it ended before the turn finished.",
+                "Codex thread writer lock or process list, and thread history",
             ));
         }
         let failed = statuses.iter().filter(|status| *status == "failed").count();
@@ -497,6 +557,7 @@ fn turn_observation(turn: Option<&Value>) -> LastTurnObservationV1 {
             outcome: LastTurnV1::None,
             at_ms: None,
             source,
+            marker: None,
         };
     };
     let outcome = match turn.get("status").and_then(Value::as_str) {
@@ -515,6 +576,11 @@ fn turn_observation(turn: Option<&Value>) -> LastTurnObservationV1 {
         outcome,
         at_ms,
         source,
+        marker: turn
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 64)
+            .map(str::to_owned),
     }
 }
 
