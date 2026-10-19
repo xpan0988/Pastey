@@ -100,7 +100,7 @@ export function MenuButton({ label, icon = "more", children, align = "right", up
 }
 
 /** A modal dialog for a focused, self-contained flow. */
-export function Dialog({ title, description, onClose, children, footer, labelledBy = "dialog-title" }: { title: ReactNode; description?: ReactNode; onClose: () => void; children: ReactNode; footer?: ReactNode; labelledBy?: string }) {
+export function Dialog({ title, description, onClose, children, footer, labelledBy = "dialog-title", wide }: { title: ReactNode; description?: ReactNode; onClose: () => void; children: ReactNode; footer?: ReactNode; labelledBy?: string; wide?: boolean }) {
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
     document.addEventListener("keydown", onKey);
@@ -108,7 +108,7 @@ export function Dialog({ title, description, onClose, children, footer, labelled
   }, [onClose]);
   return <>
     <div className="scrim" onClick={onClose} />
-    <section className="dialog" role="dialog" aria-modal="true" aria-labelledby={labelledBy}>
+    <section className={`dialog${wide ? " wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={labelledBy}>
       <header className="dialog-header">
         <div><h2 id={labelledBy}>{title}</h2>{description ? <p>{description}</p> : null}</div>
         <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Close" onClick={onClose}><Icon name="close" /></button>

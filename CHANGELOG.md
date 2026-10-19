@@ -53,10 +53,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 ### Changed
 
 - The desktop UI is reorganized around Bridges, with one design system (type, colour, spacing and components) for light and dark themes. See [UX and information architecture](docs/ux-information-architecture.md).
-  - The sidebar holds only device-wide places (New Bridge, Inbox, Settings) and the Bridges. Each Bridge has three tabs: **Share** (text and files, both ways), **Agent** (Run Codex) and **Sessions** (read-only discovery). Its connection, pairing, devices, what it may do on this device (with Revoke) and Burn are in **Bridge details**.
+  - The sidebar holds only device-wide places (New Bridge, Inbox, Settings) and the Bridges. Each Bridge has two tabs: **Share** (text and files, both ways) and **Agents**. Its connection, pairing, devices, what it may do on this device (with Revoke) and Burn are in **Bridge details**.
+  - **Agents** is one workspace per device: choose the device once, then **Run a task** (Execution) and **Sessions on <device>** (read only) appear as separately labelled sections. "Access on <device>" lists each authority apart (pairing, running Codex, Codex's own prompts, reading sessions), what is known here, what the other device decides, and the exact steps there. Sessions Pastey started are marked "Started by Pastey".
+  - **Device Details** (click a Bridge's device name, a device in Bridge details, or Device details in Agents) gathers one device's overview, connection, measured performance, agents, trust in both directions, and the managed self-check.
   - **Find file** is now **+ → Get a file from <device>…** in the Share composer, in a dialog. The flow and its review are unchanged.
-  - Settings has six sections: General, Devices & trust, Permissions, Agents, Advanced and About. Device identity and trust moved out of Unattended Codex access into Devices & trust. Permissions lists every grant (unattended Codex, session reading, shared search folders) with Revoke first and the add form one step away.
-  - Settings no longer shows controls the Host does not act on (save received files or images, burn after download) or rows that only said "Unavailable". The stored values are kept.
+  - Settings has seven sections: General, This device, Devices & trust, Permissions, Agents, Advanced and About. This device holds the identity, the device profile, the runtime check and the local speed test. Permissions lists every grant (unattended Codex, session reading, shared search folders) with Revoke first and the add form one step away.
+  - Settings no longer shows "Burn after download", which the Host never reads, or rows that only said "Unavailable". The stored value is kept.
   - The default 760 × 760 window no longer squeezes the Bridge between two side panels; narrow windows get a collapsible sidebar.
   - Files dropped on the window are sent from the Share view, as its placeholder always said.
 
@@ -65,6 +67,11 @@ The current development changes belong in `Unreleased`. Each release archives th
 - The requester's workspace-movement Review no longer says Codex will run: it says the receiving device runs Codex only if it accepts, and its button reads "Approve and send".
 
 ### Fixed
+
+- Restored what earlier UI rewrites had dropped although the Host still supports it: changing the receiving folder (and going back to the default), Save received files and Save received images (the Host uses them to choose where a received item lands; an earlier version of this entry wrongly said it does not), editable transfer grouping and transfer window, the device profile and runtime check, the local speed test, and a read-only connection test with a measured throughput for each Bridge device. The 2.0 frontend (August) had already replaced the speed test and device profile with placeholder rows.
+- Codex's stderr was read only up to 64 KiB and then left unread, so a talkative Codex filled the pipe and blocked mid-turn; the run never ended and could only be reported as unknown. Pastey now drains it to the end.
+- After switching Bridges or reloading, a task that was simply running disappeared from the card, and with it Stop and its approval prompts: recovery lists only tasks that need resolution. The card now follows the last task each Bridge started by its exact id.
+- The indeterminate notice now says what happened, what Reconcile can tell, to check the folder on the other device, and that Stop undoes nothing and nothing is re-run.
 
 - Run with Codex could stay disabled with no explanation. For a run on another device the button needs that device's folder path typed on this device, and the field was easy to miss (choosing a folder in the other device's Session reading or Unattended access settings does not fill it). The card now lists each requirement, says why the button is disabled, separates a folder already on that device from one sent from this device, and never depends on Session reading.
 - A Codex target chosen on another device fell back to this device when the Bridge reconnected with a new session. The target is now kept by its Host identity and shows "not connected" until it returns.
@@ -108,6 +115,8 @@ The current development changes belong in `Unreleased`. Each release archives th
 - An unchanged Bridge no longer rewrites its legacy peer row on every Room Control event.
 
 ### Documentation
+
+- Crash forensics: release builds abort on any panic and strip symbols, so a crash left no trace. Pastey now writes a bounded panic record (thread, source location, message) to its log before aborting, notes on the next start that the previous run ended uncleanly (also after an access violation or stack overflow, which run no panic hook), and logs each Native Agent step by task id. [Mac–Windows acceptance](docs/platform/mac-windows-acceptance.md) part K lists the Windows diagnosis steps, part L the device-detail checks.
 
 - Added the Bridge join audit (`docs/layers/layer-4-join-audit.md`) with the findings, their fixes and the remaining risks. Layer 4 and the reference now describe pairing, pinned reconnect and authenticated room requests.
 - Synchronized the README, architecture, Layer 4, Layer 5, reference, and development documentation with the capability-neutral adapter model, the opaque payload boundary, immutable task ownership and Bridge-bound authority, and two-sided Review: the requester's movement approval plus the executing Host's own Accept. The reference now lists the invoke-v2 schema and payload, `native_agent.retry_result_return`, the Review commands, admission codes and bounds, and the admission/adapter sources. The architecture now states its authority invariants explicitly, Layer 1 and Layer 2 cover landed workspaces and native capability facts, and the docs distinguish native executor admission from managed Host admission.

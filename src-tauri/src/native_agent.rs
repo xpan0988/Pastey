@@ -39,8 +39,27 @@ use capability::{
 };
 
 const MAX_LINE_BYTES: usize = 64 * 1024;
-const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_TASK_BYTES: usize = 16 * 1024;
+
+/// One local lifecycle line per Native Agent transition, so a crash or a
+/// restart leaves evidence of how far a task got. Task identities and
+/// states only: never a workspace path, prompt, output or native content.
+fn log_native_lifecycle(event: &str, task_id: &str, detail: &str) {
+    crate::logging::write_transfer_line(&native_lifecycle_line(event, task_id, detail));
+}
+
+fn native_lifecycle_line(event: &str, task_id: &str, detail: &str) -> String {
+    let separator = if detail.is_empty() { "" } else { " " };
+    format!("[pastey native-agent] event={event} task={task_id}{separator}{detail}")
+}
+
+fn lifecycle_state(status: &NativeAgentTaskStatusV1) -> String {
+    format!(
+        "state={:?} code={}",
+        status.state,
+        status.code.as_deref().unwrap_or("none")
+    )
+}
 /// Bounds one native control RPC acknowledgement only. It never bounds the
 /// accepted native turn's execution or terminal observation.
 const NATIVE_AGENT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1257,6 +1276,13 @@ impl NativeAgentServiceV1 {
                     persisted.task.state = NativeAgentTaskStateV1::Interrupted;
                     persisted.task.code = Some("native_agent_reconciliation_required".into());
                 }
+                // A turn this process was running did not survive the restart;
+                // whether the native Agent finished it is not known here.
+                log_native_lifecycle(
+                    "interrupted_by_restart",
+                    &persisted.task.task_id,
+                    &lifecycle_state(&persisted.task),
+                );
                 changed = true;
             } else if unbound_local_restart {
                 persisted.task.state = NativeAgentTaskStateV1::Failed;
@@ -3861,6 +3887,21 @@ impl NativeAgentServiceV1 {
         if recorded && status.is_err() && !self.task_bridges.contains_key(&request.task_id) {
             self.task_requesters.remove(&request.task_id);
         }
+        log_native_lifecycle(
+            "invocation_received",
+            &request.task_id,
+            &match &status {
+                Ok(admitted) => format!(
+                    "{} first={first_request} requester_verified={}",
+                    lifecycle_state(admitted),
+                    verified_device.is_some()
+                ),
+                Err(_) => format!(
+                    "rejected first={first_request} requester_verified={}",
+                    verified_device.is_some()
+                ),
+            },
+        );
         status
     }
 
@@ -4330,8 +4371,10 @@ impl NativeAgentServiceV1 {
     ) -> AppResult<NativeAgentTaskStatusV1> {
         self.expire_invocation_reviews(now);
         let Some(pending) = self.pending_reviews.remove(task_id) else {
+            log_native_lifecycle("review_accept_unavailable", task_id, "");
             return invalid("Native capability Review is unavailable.");
         };
+        log_native_lifecycle("review_accepted", task_id, "");
         if let Err(error) = self.revalidate_review(&pending, current, now) {
             self.end_review(task_id, admission::ADMISSION_REVOKED_CODE)?;
             return Err(error);
@@ -4566,6 +4609,14 @@ impl NativeAgentServiceV1 {
             None => None,
         };
         let started = adapter.start(task_id, input, native_conversation)?;
+        log_native_lifecycle(
+            "turn_starting",
+            task_id,
+            &format!(
+                "capability={capability_id} session_reused={}",
+                started.session_reused
+            ),
+        );
         if required_workspace.is_some() && started.host_workspace.as_deref() != required_workspace {
             // Nothing has run: the adapter only recorded the task.
             adapter.release(task_id);
@@ -4690,6 +4741,17 @@ impl NativeAgentServiceV1 {
                     persisted_status = Some(status.clone());
                 }
             }
+            log_native_lifecycle(
+                "turn_ended",
+                &task_id,
+                &format!(
+                    "outcome={outcome:?} {}",
+                    persisted_status
+                        .as_ref()
+                        .map(lifecycle_state)
+                        .unwrap_or_else(|| "state=unrecorded".into())
+                ),
+            );
             if let (Some(paths), Some(status)) = (durable_paths.as_ref(), persisted_status.as_ref())
             {
                 NativeAgentServiceV1::persist_task_status_after_native_turn(
@@ -5115,6 +5177,11 @@ impl NativeAgentServiceV1 {
                 task.state = NativeAgentTaskStateV1::Interrupted;
                 task.native_decisions.clear();
                 task.code = Some("native_agent_reconciliation_required".into());
+                log_native_lifecycle(
+                    "remote_delivery_ambiguous",
+                    task_id,
+                    "state=Interrupted code=native_agent_reconciliation_required",
+                );
             }
             task.clone()
         };
@@ -5394,6 +5461,11 @@ impl NativeAgentServiceV1 {
                         task.state = NativeAgentTaskStateV1::Interrupted;
                         task.native_decisions.clear();
                         task.code = Some("native_agent_reconciliation_required".into());
+                        log_native_lifecycle(
+                            "bridge_session_lost",
+                            task_id,
+                            "state=Interrupted code=native_agent_reconciliation_required",
+                        );
                     }
                 }
             }

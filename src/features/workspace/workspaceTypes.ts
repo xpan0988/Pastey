@@ -8,6 +8,7 @@ export type WorkspaceRoute =
   | "new-bridge"
   | "inbox"
   | "settings"
+  | "settings-this-device"
   | "settings-devices"
   | "settings-permissions"
   | "settings-agents"

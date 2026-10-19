@@ -13,13 +13,13 @@ import { nativeAgentRecoveryRequiresAction, StatusBadge, useNativeAgentTask, typ
 import { BridgeDetails } from "./BridgeDetails";
 import { bridgeStatus } from "./BridgeNetworkPanel";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
-import { NativeAgentPanel } from "./NativeAgentPanel";
-import { NativeSessionsCard } from "./NativeSessionsCard";
+import { AgentWorkspace } from "./AgentWorkspace";
+import { DeviceDetails } from "./DeviceDetails";
 import { RemoteFileFinder } from "./RemoteFileFinder";
 import { Dialog, Dot, EmptyState, Icon, MenuButton, Notice, Tabs } from "./ui";
 import { bridgeCode, fileName, formatBytes, formatClock, roomMembers, roomPeers } from "./workspaceViewModel";
 
-export type BridgeTab = "share" | "agent" | "sessions";
+export type BridgeTab = "share" | "agents";
 
 interface BridgeWorkspaceProps {
   room: RoomInfo | null;
@@ -38,7 +38,7 @@ interface BridgeWorkspaceProps {
   onBurn: (room: RoomInfo) => Promise<void>;
   onEnqueue: (roomId: string, inputs: TransferQueueInput[]) => void;
   onRevealInFolder: (path: string) => Promise<void>;
-  onOpenSettings: () => void;
+  onOpenSettings: (route?: "settings-permissions" | "settings-devices" | "settings-this-device") => void;
   menuButton?: React.ReactNode;
 }
 
@@ -50,6 +50,7 @@ export function BridgeWorkspace(props: BridgeWorkspaceProps) {
 function BridgeView({ room, items, queueItems, transfers, task, developerMode, developerSession, developerWorkspace, onDeveloperSession, onRefreshDeveloper, onRefresh, onDeveloper, onBurn, onEnqueue, onRevealInFolder, onOpenSettings, menuButton }: BridgeWorkspaceProps & { room: RoomInfo }) {
   const [tab, setTab] = useState<BridgeTab>("share");
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [deviceOpen, setDeviceOpen] = useState<string | null>(null);
   const peers = useMemo(() => roomPeers(room), [room]);
   const members = useMemo(() => roomMembers(room), [room]);
   const agent = useNativeAgentTask(room.id);
@@ -65,7 +66,7 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
       <header className="page-header">
         {menuButton}
         <div className="page-header-main">
-          <div className="bridge-title"><h1>{title}</h1><button type="button" className="status-pill" onClick={() => setDetailsOpen(true)} aria-label={`Bridge status: ${status.label}. Open details`}><Dot tone={status.tone} />{status.label}</button></div>
+          <div className="bridge-title">{members.length === 1 && members[0].hostRef ? <button type="button" className="title-button" onClick={() => setDeviceOpen(members[0].hostRef!)} title="Device details"><h1>{title}</h1></button> : <h1>{title}</h1>}<button type="button" className="status-pill" onClick={() => setDetailsOpen(true)} aria-label={`Bridge status: ${status.label}. Open details`}><Dot tone={status.tone} />{status.label}</button></div>
           <p>Bridge <span className="mono">{bridgeCode(room)}</span>{developerMode ? " · Developer Mode" : ""}</p>
         </div>
         <div className="page-header-actions">
@@ -81,21 +82,20 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
         <div className="page-tabs">
           <Tabs label="Bridge" value={tab} onChange={setTab} tabs={[
             { value: "share", label: "Share" },
-            { value: "agent", label: "Agent", badge: agentNeedsYou ? "!" : agentActive ? <Dot tone="live" pulse /> : undefined },
-            { value: "sessions", label: "Sessions" },
+            { value: "agents", label: "Agents", badge: agentNeedsYou ? "!" : agentActive ? <Dot tone="live" pulse /> : undefined },
           ]} />
         </div>
         <div className="page" hidden={tab !== "share"}>
           <ShareView room={room} items={items} queueItems={queueItems} transfers={transfers} peers={peers} task={task} active={tab === "share"} onRefresh={onRefresh} onEnqueue={onEnqueue} onRevealInFolder={onRevealInFolder} />
         </div>
-        <div className="panel-scroll" hidden={tab !== "agent"}><NativeAgentPanel roomId={room.id} agent={agent} peers={peers} members={members} /></div>
-        <div className="panel-scroll" hidden={tab !== "sessions"}><NativeSessionsCard roomId={room.id} peers={[...peers]} members={[...members]} /></div>
+        <div className="panel-scroll" hidden={tab !== "agents"}><AgentWorkspace room={room} agent={agent} peers={peers} members={members} onOpenDevice={setDeviceOpen} /></div>
       </>}
     </section>
     {detailsOpen ? <>
       <div className="scrim inspector-scrim" onClick={() => setDetailsOpen(false)} />
-      <BridgeDetails room={room} onClose={() => setDetailsOpen(false)} onRefresh={onRefresh} onBurn={onBurn} onOpenSettings={onOpenSettings} />
+      <BridgeDetails room={room} onClose={() => setDetailsOpen(false)} onRefresh={onRefresh} onBurn={onBurn} onOpenSettings={() => onOpenSettings("settings-permissions")} onOpenDevice={(hostRef) => hostRef ? setDeviceOpen(hostRef) : onOpenSettings("settings-this-device")} />
     </> : null}
+    {deviceOpen ? <DeviceDetails room={room} hostRef={deviceOpen} onClose={() => setDeviceOpen(null)} onOpenSettings={(route) => { setDeviceOpen(null); onOpenSettings(route); }} /> : null}
   </div>;
 }
 

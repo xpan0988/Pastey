@@ -47,7 +47,7 @@ Record results in the template at the end. Never record codes, keys, device fing
 | # | Do | Expect |
 |---|---|---|
 | A1 | Launch both apps. Allow the firewall prompt on Windows, and record the choice (private or public). | Both reach the home screen. |
-| A2 | Settings → Devices & trust → This device's identity on each. | A 20-character fingerprint; note it for B and E. |
+| A2 | Settings → This device → This device's identity on each. | A 20-character fingerprint; note it for B and E. |
 
 ## B. Secure pairing (both devices on the same Wi-Fi)
 
@@ -90,14 +90,14 @@ After each step, send one text and the small file both ways.
 
 | # | Do | Expect |
 |---|---|---|
-| E0 | On Windows, check that `codex --version` works in a new terminal. In Pastey on the Mac, open the Bridge's Agent tab and choose Windows under Run on. | "Codex is available on <Windows>". If not, the card names the failing layer. Run `powershell -ExecutionPolicy Bypass -File .\scripts\diagnose-windows-codex.ps1` on Windows and record its report: it masks the user name, but review it before sharing. |
-| E0a | Only if the ChatGPT desktop app with Codex is installed on Windows. Run the diagnosis script and record its "Codex bundled with a desktop app" section. Then, with no Codex CLI on PATH (or in a Windows account without one), open the Agent tab of a Bridge on Windows (Run on: This device) and choose Check again, or Settings → Agents → Check again. Run E1 once. | The section shows a manifest with `layoutVersion=1`, an existing entrypoint, a working `--version`, and `app-server` help. The card says Codex from the ChatGPT desktop app is ready. E1 completes. If the card instead says not installed or incompatible, record its text and the script's report. |
-| E1 | From the Mac, Agent tab: Run on Windows, “Already on <Windows>”, type the folder's full Windows path and a small task, then Run with Codex. Before typing, the card lists what is still needed and the button says why it is disabled. | Windows shows the Agent request. Accept runs it; the reply returns to the Mac's task card, which names Windows. |
+| E0 | On Windows, check that `codex --version` works in a new terminal. In Pastey on the Mac, open the Bridge's Agents tab and choose Windows as the Device. | "Codex is available on <Windows>". If not, the card names the failing layer. Run `powershell -ExecutionPolicy Bypass -File .\scripts\diagnose-windows-codex.ps1` on Windows and record its report: it masks the user name, but review it before sharing. |
+| E0a | Only if the ChatGPT desktop app with Codex is installed on Windows. Run the diagnosis script and record its "Codex bundled with a desktop app" section. Then, with no Codex CLI on PATH (or in a Windows account without one), open the Agents tab of a Bridge on Windows (Device: This device) and choose Check again, or Settings → Agents → Check again. Run E1 once. | The section shows a manifest with `layoutVersion=1`, an existing entrypoint, a working `--version`, and `app-server` help. The card says Codex from the ChatGPT desktop app is ready. E1 completes. If the card instead says not installed or incompatible, record its text and the script's report. |
+| E1 | From the Mac, Agents tab: Device Windows, “Already on <Windows>”, type the folder's full Windows path and a small task, then Run with Codex. Before typing, the card lists what is still needed and the button says why it is disabled. | Windows shows the Agent request. Accept runs it; the reply returns to the Mac's task card, which names Windows. |
 | E2 | Repeat and choose Deny. | Nothing runs; the Mac shows that it did not start. |
-| E3 | Workspace movement: Agent tab, Run on Windows, “On this device”, choose a small folder → Review movement, Approve and send on the Mac, Accept on Windows. | The workspace lands, Codex runs, the result returns and applies, and the Mac's original folder is unchanged until it is applied. |
+| E3 | Workspace movement: Agents tab, Device Windows, “On this device”, choose a small folder → Review movement, Approve and send on the Mac, Accept on Windows. | The workspace lands, Codex runs, the result returns and applies, and the Mac's original folder is unchanged until it is applied. |
 | E4 | Cancel a running task from the Mac. | Windows stops it, and both cards show cancelled. |
 | E5 | Turn Mac Wi-Fi off during a task for 20 s, then reconnect. | Reconcile shows the true outcome. Nothing runs twice. |
-| E6 | Unattended access. On Windows, Settings → Devices & trust: compare the Mac's fingerprint (A2) and trust it; then Settings → Permissions → Unattended Codex access: grant one folder. Start a task from the Mac. | It runs without Accept. Revoke the grant: the next task waits for Accept again. |
+| E6 | Unattended access. On Windows, Settings → Devices & trust: compare the Mac's fingerprint (A2, now under Settings → This device) and trust it; then Settings → Permissions → Unattended Codex access: grant one folder. Start a task from the Mac. | It runs without Accept. Revoke the grant: the next task waits for Accept again. |
 | E7 | Re-pair this Bridge with a **different** device's code (or after D6), then repeat E1 from that device. | Earlier tasks, conversations and folder shares from before the re-pair are gone. Unattended runs need a grant for the new device. |
 
 ## F. Native P2P traversal across networks (isolated probe)
@@ -154,7 +154,7 @@ Prerequisites:
 
 | # | Do | Expect |
 |---|---|---|
-| I1 | On the Mac, Bridge → Sessions tab → choose Windows → Look for sessions, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. |
+| I1 | On the Mac, Bridge → Agents tab → Device Windows → Look for sessions, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. Access on Windows → Read sessions now says Needs action, with the steps on Windows. |
 | I2 | On Windows, Settings → Permissions → Session reading → Add a permission…: choose the Mac, the Demo folder, 1 day, excerpts off → Allow reading. Then repeat I1 on the Mac. | Windows's sessions in Demo are listed, with folder name "Demo" and no Windows path anywhere. Claude Code sessions show "Last turn ended" or "Running". A Codex thread shows "Unknown" while the ChatGPT desktop app or a `codex` terminal runs on Windows. Record what each row says. |
 | I3 | On the Mac, open one Claude Code session. | The report shows status, live source (`claude agents --json`), last turn, counts, changed files relative to Demo, Git facts, and facts, inferences and unknowns. It says Windows shares statuses only: no prompt or reply text. |
 | I4 | On Windows, start a Claude Code turn in that session (`claude --resume <id>` in Demo, or the desktop app). While it runs, look again from the Mac and open it. | It shows "Running" while the turn runs, and "Last turn ended" after it. The report never claims done while running. |
@@ -172,11 +172,34 @@ The UI was reorganized around Bridges ([UX and information architecture](../ux-i
 |---|---|---|
 | J1 | Open Pastey at its default 760 × 760 window, then widen past 1080 px and narrow below 680 px. | At 760 px the sidebar and the Bridge fit with no overlap. Above 1080 px Bridge details dock on the right; below, they open as an overlay. Below 680 px the sidebar opens from the menu button. |
 | J2 | Settings → General → Appearance: Light, Dark, System. Restart Pastey. | Each theme applies at once and survives the restart; System follows the OS. |
-| J3 | Drag two files from Finder or Explorer onto a Bridge's Share view. | The composer shows "Drop to send…"; both files are sent to the selected device, like + → Send files…. Nothing happens on the Agent or Sessions tab. |
-| J4 | Mac, Agent tab: Run on Windows and leave the folder empty. Then type the path, then the task. | The checklist and the line beside the button say what is missing; the button enables only when nothing is. |
-| J5 | With the Agent tab open on the Mac, quit Pastey on Windows, wait 20 s, open it again. | The card says Windows is not connected, then, without a click, that Codex is available again. The device choice stays Windows throughout. |
-| J6 | On Windows, while the Mac's Agent tab is open, rename `codex` off PATH (or sign out) and back. Switch focus to the Mac window. | Within about 15 s, or at once on focus, the Mac shows the new availability and the button follows it. |
+| J3 | Drag two files from Finder or Explorer onto a Bridge's Share view. | The composer shows "Drop to send…"; both files are sent to the selected device, like + → Send files…. Nothing happens on the Agents tab. |
+| J4 | Mac, Agents tab: Device Windows, and leave the folder empty. Then type the path, then the task. | The checklist and the line beside the button say what is missing; the button enables only when nothing is. |
+| J5 | With the Agents tab open on the Mac, quit Pastey on Windows, wait 20 s, open it again. | The card says Windows is not connected, then, without a click, that Codex is available again. The device choice stays Windows throughout. |
+| J6 | On Windows, while the Mac's Agents tab is open, rename `codex` off PATH (or sign out) and back. Switch focus to the Mac window. | Within about 15 s, or at once on focus, the Mac shows the new availability and the button follows it. |
 | J7 | Burn a test Bridge from its details. | A confirmation names the Bridge and what is removed. Cancel keeps it; Burn removes it. |
+
+## K. Windows executor crash diagnosis
+
+Use this for any crash of Pastey on the executing device, including one that already happened. Pastey has no auto-restart of its own; record how it came back (relaunched by you, by sign-in, or by itself).
+
+| # | Do | Expect / record |
+|---|---|---|
+| K1 | On Windows, in PowerShell: `Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddDays(-7)} \| Where-Object { $_.Message -match 'pastey' } \| Format-List TimeCreated, ProviderName, Id, Message` | Record each "Application Error" (Id 1000) and "Windows Error Reporting" (Id 1001) for `pastey.exe`: the time, faulting module and exception code. `0xc0000409` is a Rust panic (release builds abort on panic); `0xc0000005` an access violation; `0xc00000fd` a stack overflow. A crash of `msedgewebview2.exe` is the WebView, not Pastey's core. |
+| K2 | `Get-ChildItem "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive" \| Where-Object Name -like '*pastey*'` and open `Report.wer` in the newest folder. | Record the exception code and module. Do not share the dump itself. |
+| K3 | `Get-Content "$env:LOCALAPPDATA\pastey\logs\pastey.log" -Tail 300` (also `pastey.log.1`). From this build on, the log has `[pastey crash] event=panic thread=… location=… message=…` for a panic, `[pastey lifecycle] event=previous_run_ended_uncleanly` on the next start after any unclean exit, and `[pastey native-agent] event=…` for each task step (received, review accepted, turn starting, turn ended, interrupted by restart). | Record the lines around the crash. They name tasks by id only; no folder paths or prompts. |
+| K4 | Right after a crash, before restarting Pastey: `Get-Process codex, node -ErrorAction SilentlyContinue \| Format-Table Id, ProcessName, StartTime`. | Whether Codex outlived Pastey. Expected: none (closing Pastey's pipe ends the app-server). If one remains, record it and whether the test folder still changed afterwards. |
+| K5 | Reproduce E1 with this build, once with Accept on Windows and once under an unattended permission. | Both complete. If it crashes, K1–K4 now have the cause. On the Mac the task shows the indeterminate notice; Reconcile, then Stop. Nothing is run again automatically. |
+| K6 | Start a task from the Mac, switch to another Bridge and back (or reload with ⌘R). | The running task card is still there, names Windows, and Stop still works. |
+
+## L. Device details and diagnostics
+
+| # | Do | Expect |
+|---|---|---|
+| L1 | Click the device name in a Bridge header, or a device in Bridge details. | Device Details opens with Overview, Connection, Performance, Agents, Trust & permissions and Advanced. |
+| L2 | Performance → Test connection. | About a second, then a measured average and peak MB/s, latency, quality and "Measured just now", labelled as Pastey's pipeline over this Bridge in memory. Record the numbers. |
+| L3 | Advanced → Run managed self-check. | Managed readiness and the E2E result (PASS, BLOCKED or FAIL), as before under Bridge Devices → Check. |
+| L4 | Settings → This device: Refresh, Full check, Run local test (each mode once). | Device facts, runtimes with versions, and a local-only measurement labelled "no network". |
+| L5 | Settings → General → Receiving folder → Change…, receive a file, then Use default. Turn Save received files off and receive a file. | The file lands in the chosen folder; with saving off it is not put in the receiving folder. |
 
 ## Record
 
@@ -193,6 +216,8 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Steps not run, and why | |
 | Remote session reading (I1–I7) | |
 | Desktop UI (J1–J7) | |
+| Crash diagnosis (K1–K6) | |
+| Device details (L1–L5) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
 | Net-probe summary (part F) | |

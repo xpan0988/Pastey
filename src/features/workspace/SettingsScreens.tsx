@@ -28,6 +28,7 @@ import { DeviceTrustSettings } from "./DeviceTrustSettings";
 import { KnownDevicesSettings } from "./KnownDevicesSettings";
 import { availabilityCopy } from "./NativeAgentPanel";
 import { SessionReadingSettings } from "./SessionReadingSettings";
+import { ThisDeviceSettings } from "./ThisDeviceSettings";
 import { UnattendedAccessSettings } from "./UnattendedAccessSettings";
 import { Badge, Dot, Icon, ListRow, Notice, Segmented, Switch, type IconName } from "./ui";
 import { bridgeCode } from "./workspaceViewModel";
@@ -39,6 +40,7 @@ export type SettingsRoute = Extract<WorkspaceRoute, `settings${string}`>;
  * devices, and what it is allowed here) is in that Bridge's details. */
 const SECTIONS: ReadonlyArray<{ route: SettingsRoute; label: string; icon: IconName }> = [
   { route: "settings", label: "General", icon: "settings" },
+  { route: "settings-this-device", label: "This device", icon: "device" },
   { route: "settings-devices", label: "Devices & trust", icon: "shield" },
   { route: "settings-permissions", label: "Permissions", icon: "key" },
   { route: "settings-agents", label: "Agents", icon: "agent" },
@@ -64,7 +66,8 @@ export function SettingsScreen({ route, config, onNavigate, onConfigChange, menu
       </nav>
       <div className="settings-content"><div className="content">
         <h1>{section.label}</h1>
-        {section.route === "settings" ? <GeneralSettings config={config} /> : null}
+        {section.route === "settings" ? <GeneralSettings config={config} onConfigChange={onConfigChange} /> : null}
+        {section.route === "settings-this-device" ? <ThisDeviceSettings /> : null}
         {section.route === "settings-devices" ? <><DeviceTrustSettings /><KnownDevicesSettings /></> : null}
         {section.route === "settings-permissions" ? <PermissionsSettings /> : null}
         {section.route === "settings-agents" ? <AgentSettings /> : null}
@@ -75,17 +78,47 @@ export function SettingsScreen({ route, config, onNavigate, onConfigChange, menu
   </section>;
 }
 
-function GeneralSettings({ config }: { config: AppConfig }) {
+type SavedConfigKey = "save_received_files_to_inbox" | "save_received_images_to_inbox";
+
+function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConfigChange: (config: AppConfig) => void }) {
   const [appearance, setAppearance] = useState<Appearance>(readAppearance);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function save(next: AppConfig) {
+    if (pending) return;
+    setPending(true); setError(null);
+    try { onConfigChange(await updateConfig(next)); }
+    catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
+    finally { setPending(false); }
+  }
+
+  async function chooseFolder() {
+    const chosen = await open({ directory: true, multiple: false });
+    if (typeof chosen === "string") await save({ ...config, inbox_dir: chosen });
+  }
+
+  const toggle = (key: SavedConfigKey, value: boolean) => void save({ ...config, [key]: value });
+
   return <>
     <section className="section">
       <div className="card">
         <div className="setting-row"><span><strong>Appearance</strong><small>Light, dark, or follow the system.</small></span>
           <Segmented label="Appearance" value={appearance} onChange={(value) => { setAppearance(value); saveAppearance(value); }} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} /></div>
-        <div className="setting-row"><span><strong>Receiving folder</strong><small>Where files other devices send you are saved.</small></span>
-          {config.inbox_dir ? <button type="button" className="btn btn-sm" onClick={() => void revealInFolder(config.inbox_dir!)}><Icon name="folder" small />Open</button> : <span className="value">Pastey's default folder</span>}</div>
         <div className="setting-row"><span><strong>Global shortcut</strong><small>Opens Pastey from anywhere.</small></span><span className="value mono">{config.shortcut}</span></div>
       </div>
+    </section>
+    <section className="section" aria-label="Receiving">
+      <div className="section-head"><h2>Receiving</h2><p>Where text and files other devices send you are kept.</p></div>
+      <div className="card">
+        <div className="setting-row"><span><strong>Receiving folder</strong><small className="mono">{config.inbox_dir ?? "Pastey's default Inbox folder"}</small></span>
+          <span className="row">{config.inbox_dir ? <button type="button" className="btn btn-sm" onClick={() => void revealInFolder(config.inbox_dir!)}><Icon name="folder" small />Open</button> : null}
+            <button type="button" className="btn btn-sm" disabled={pending} onClick={() => void chooseFolder()}>Change…</button>
+            {config.inbox_dir ? <button type="button" className="btn btn-sm" disabled={pending} onClick={() => void save({ ...config, inbox_dir: null })}>Use default</button> : null}</span></div>
+        <div className="setting-row"><span><strong>Save received files</strong><small>Off: received files stay in Pastey's temporary storage instead of the receiving folder.</small></span><Switch label="Save received files" checked={config.save_received_files_to_inbox} disabled={pending} onChange={(value) => toggle("save_received_files_to_inbox", value)} /></div>
+        <div className="setting-row"><span><strong>Save received images</strong><small>Off: received images stay in Pastey's temporary storage instead of the receiving folder.</small></span><Switch label="Save received images" checked={config.save_received_images_to_inbox} disabled={pending} onChange={(value) => toggle("save_received_images_to_inbox", value)} /></div>
+      </div>
+      {error ? <p className="error-text" role="alert">{error}</p> : null}
     </section>
   </>;
 }
@@ -305,13 +338,15 @@ function AdvancedSettings({ config, onConfigChange }: { config: AppConfig; onCon
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
 
-  async function setDevTools(value: boolean) {
+  async function saveConfig(next: AppConfig) {
     if (pending) return;
     setPending(true); setError(null);
-    try { onConfigChange(await updateConfig({ ...config, dev_tools_enabled: value })); }
+    try { onConfigChange(await updateConfig(next)); }
     catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
     finally { setPending(false); }
   }
+
+  const setDevTools = (value: boolean) => saveConfig({ ...config, dev_tools_enabled: value });
 
   async function copyError() {
     try {
@@ -324,8 +359,10 @@ function AdvancedSettings({ config, onConfigChange }: { config: AppConfig; onCon
     <section className="section">
       <div className="card">
         <div className="setting-row"><span><strong>Developer tools</strong><small>Lets the transfer window override in Pastey's configuration take effect. It does not affect Developer Mode terminals, which always need the other device's Accept.</small></span><Switch label="Developer tools" checked={config.dev_tools_enabled} disabled={pending} onChange={(value) => void setDevTools(value)} /></div>
-        <div className="setting-row"><span><strong>Transfer grouping</strong><small>How small files are grouped for sending.</small></span><span className="value">{config.micro_flow_group_mode === "dynamic" ? "Dynamic" : "Fixed"}</span></div>
-        <div className="setting-row"><span><strong>Transfer window</strong><small>Concurrent chunks in flight. Pastey tunes this automatically.</small></span><span className="value">{config.transfer_window_override && config.dev_tools_enabled ? String(config.transfer_window_override) : "Automatic"}</span></div>
+        <div className="setting-row"><span><strong>Transfer grouping</strong><small>How many small files are sent together. Dynamic adapts to the connection.</small></span>
+          <select className="select select-sm" style={{ width: "auto" }} value={config.micro_flow_group_mode} disabled={pending} onChange={(event) => void saveConfig({ ...config, micro_flow_group_mode: event.target.value as AppConfig["micro_flow_group_mode"] })} aria-label="Transfer grouping"><option value="dynamic">Dynamic</option><option value="fixed">Fixed</option></select></div>
+        <div className="setting-row"><span><strong>Transfer window</strong><small>{config.dev_tools_enabled ? "Chunks in flight per transfer. Automatic lets Pastey tune it." : "Chunks in flight per transfer. Turn on Developer tools to override Pastey's automatic tuning."}</small></span>
+          <select className="select select-sm" style={{ width: "auto" }} value={config.transfer_window_override ? String(config.transfer_window_override) : "auto"} disabled={pending || !config.dev_tools_enabled} onChange={(event) => void saveConfig({ ...config, transfer_window_override: event.target.value === "auto" ? null : Number(event.target.value) })} aria-label="Transfer window"><option value="auto">Automatic</option>{[1, 2, 4, 8, 12, 16].map((value) => <option key={value} value={value}>{value}</option>)}</select></div>
       </div>
       {error ? <p className="error-text" role="alert">{error}</p> : null}
     </section>

@@ -1,5 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { SessionReadingKnowledge } from "../../lib/accessGuidance";
 import {
   discoverNativeSessions,
   discoverRemoteNativeSessions,
@@ -36,8 +37,15 @@ const STATUS_TONE: Record<string, Tone> = { live: "live", done: "ok", warning: "
  * read only. Another device answers only for folders its own user shares
  * with this device, and sends statuses and evidence, not transcripts.
  * Looking never starts, continues or stops a session. */
-export function NativeSessionsCard({ roomId, peers, members }: { roomId: string; peers: Peer[]; members?: Peer[] }) {
-  const [target, setTarget] = useState("local");
+export function NativeSessionsCard({ roomId, peers, members, target, onReading }: {
+  roomId: string;
+  peers: Peer[];
+  members?: Peer[];
+  /** "local" or the chosen device's HostRef, chosen by the Agents workspace. */
+  target: string;
+  /** What looking learned about the other device's reading permission. */
+  onReading?: (knowledge: SessionReadingKnowledge) => void;
+}) {
   const [folder, setFolder] = useState("");
   const [form, setForm] = useState<{ provider: string; text: string; activeWithinSecs: number | null; scopeRef: string }>({ provider: "", text: "", activeWithinSecs: null, scopeRef: "" });
   const [sessions, setSessions] = useState<SessionView[] | null>(null);
@@ -50,17 +58,18 @@ export function NativeSessionsCard({ roomId, peers, members }: { roomId: string;
   const remote = target === "local" ? null : peers.find((peer) => peer.hostRef === target) ?? null;
   const targetName = target === "local" ? "this device" : (members ?? peers).find((peer) => peer.hostRef === target)?.displayName ?? "the other device";
   const hostName = remote?.displayName ?? targetName;
-  const options = (members ?? peers).filter((peer) => peer.hostRef);
+  const firstTarget = useRef(true);
+
+  useEffect(() => {
+    if (firstTarget.current) { firstTarget.current = false; return; }
+    setSessions(null); setSnapshot(null); setScopes([]); setNotes([]); setMessage(null); setForm((current) => ({ ...current, scopeRef: "" }));
+  }, [target]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true); setMessage(null);
     try { await action(); }
     catch (error) { setMessage(error instanceof Error ? error.message : String(error)); }
     finally { setBusy(false); }
-  }
-
-  function reset(nextTarget: string) {
-    setTarget(nextTarget); setSessions(null); setSnapshot(null); setScopes([]); setNotes([]); setMessage(null); setForm({ ...form, scopeRef: "" });
   }
 
   const look = () => run(async () => {
@@ -70,6 +79,8 @@ export function NativeSessionsCard({ roomId, peers, members }: { roomId: string;
       const response = await discoverRemoteNativeSessions(roomId, remote.hostRef!, filters);
       setScopes(response.scopes);
       const problem = remoteOutcomeMessage(response, hostName);
+      if (response.outcome === "not_authorized") onReading?.({ state: "not_allowed" });
+      else if (response.outcome === "ok") onReading?.({ state: "allowed", folders: response.scopes.map((scope) => scope.label) });
       if (problem) { setSessions(null); setMessage(problem); return; }
       setSessions(response.discovery?.sessions ?? []);
       setNotes([...(response.discovery?.providers ?? []).flatMap((provider) => provider.note ? [`${providerLabel(provider.provider)}: ${provider.note}`] : []), ...(response.discovery?.truncated ? ["Only the newest sessions were sent; narrow the search to see others."] : [])]);
@@ -100,19 +111,10 @@ export function NativeSessionsCard({ roomId, peers, members }: { roomId: string;
 
   const disconnected = target !== "local" && !remote;
 
-  return <div className="panel-inner" aria-label="Agent sessions">
-    <div className="panel-intro">
-      <h2>Agent sessions</h2>
-      <p>Claude Code and Codex sessions that already exist, with what is known about them. Read only: looking never starts, continues or stops a session.</p>
-    </div>
-
+  return <div className="stack-lg" aria-label="Agent sessions">
     <section className="card">
       <div className="card-body">
         <div className="filters">
-          <select className="select" value={target} onChange={(event) => reset(event.target.value)} disabled={busy} aria-label="Device">
-            <option value="local">This device</option>
-            {options.map((peer) => <option key={peer.hostRef!} value={peer.hostRef!}>{peer.displayName}{peers.some((routeable) => routeable.hostRef === peer.hostRef) ? "" : " (not connected)"}</option>)}
-          </select>
           <select className="select" value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })} aria-label="Agent"><option value="">Claude Code and Codex</option><option value="claude_code">Claude Code</option><option value="codex">Codex</option></select>
           <select className="select" value={form.activeWithinSecs ?? ""} onChange={(event) => setForm({ ...form, activeWithinSecs: event.target.value ? Number(event.target.value) : null })} aria-label="Last activity">{ACTIVITY_FILTERS.map((filter) => <option key={filter.label} value={filter.seconds ?? ""}>{filter.label}</option>)}</select>
         </div>
@@ -144,7 +146,7 @@ export function NativeSessionsCard({ roomId, peers, members }: { roomId: string;
             onClick={() => void inspect(session)}
             title={session.title ?? "(untitled)"}
             meta={`${providerLabel(session.provider)} · ${session.workspaceLabel}${session.gitBranch ? ` · ${session.gitBranch}` : ""} · ${originLabel(session.origin)} · ${relativeTime(session.lastActivityAtMs)}`}
-            side={<span title={status.explanation}><Badge tone={STATUS_TONE[status.tone]}>{status.label}</Badge></span>}
+            side={<>{session.origin === "pastey" ? <Badge tone="accent">Started by Pastey</Badge> : null}<span title={status.explanation}><Badge tone={STATUS_TONE[status.tone]}>{status.label}</Badge></span></>}
           />;
         })}
       </div>

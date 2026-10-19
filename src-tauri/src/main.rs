@@ -161,6 +161,7 @@ fn main() {
             )?;
 
             app.manage(state.clone());
+            logging::install_crash_reporting(env!("CARGO_PKG_VERSION"));
             let antenna_state = state.clone();
             state.spawn(async move {
                 if discovery::ensure_service(antenna_state.clone())
@@ -328,6 +329,7 @@ fn main() {
             if let Some(state) = app_handle.try_state::<Arc<HostRuntime>>() {
                 state.shutdown_all();
             }
+            logging::record_clean_exit();
         }
     });
 }

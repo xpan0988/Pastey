@@ -244,6 +244,36 @@ export function useRemoteNativeCapabilities(roomId: string, hostRef: string | nu
   return { observation: current, refresh };
 }
 
+/** The last task each Bridge started, by its exact identity only, so a
+ * remount or reload can observe it again. Recovery lists only tasks that need
+ * resolution, so a task that is simply running would otherwise vanish from
+ * the card, and with it Stop and its native requests. */
+export interface RememberedNativeTask {
+  taskId: string;
+  hostRef: string | null;
+  movementId?: string | null;
+}
+
+const STARTED_TASKS_KEY = "pastey:native-started-tasks-v1";
+const startedTasks = new Map<string, RememberedNativeTask>();
+
+export function rememberStartedNativeTask(roomId: string, task: RememberedNativeTask) {
+  startedTasks.set(roomId, task);
+  try {
+    const stored = JSON.parse(window.sessionStorage.getItem(STARTED_TASKS_KEY) ?? "{}") as Record<string, RememberedNativeTask>;
+    window.sessionStorage.setItem(STARTED_TASKS_KEY, JSON.stringify({ ...stored, [roomId]: task }));
+  } catch { /* memory still holds it for this window */ }
+}
+
+export function rememberedNativeTask(roomId: string): RememberedNativeTask | null {
+  const inMemory = startedTasks.get(roomId);
+  if (inMemory) return inMemory;
+  try {
+    const stored = (JSON.parse(window.sessionStorage.getItem(STARTED_TASKS_KEY) ?? "{}") as Record<string, RememberedNativeTask>)[roomId];
+    return stored && typeof stored.taskId === "string" ? stored : null;
+  } catch { return null; }
+}
+
 const RETURN_RETRY_POLL_INTERVAL_MS = 1_000;
 const RETURN_RETRY_MAX_POLLS = 20;
 
@@ -472,7 +502,20 @@ export function useNativeAgentTask(roomId: string) {
   useEffect(() => {
     if (!hasTauriRuntime() || !roomId) return;
     let cancelled = false;
-    void loadRecoveryProjection(() => !cancelled).catch((error) => {
+    void loadRecoveryProjection(() => !cancelled).then(async (projection) => {
+      if (cancelled || projection) return;
+      // Nothing needs resolution: show the task this Bridge last started, by
+      // its exact identity, if it is still known.
+      const remembered = rememberedNativeTask(roomId);
+      if (!remembered) return;
+      const [rememberedStatus, rememberedMovement] = await Promise.all([
+        getNativeAgentTaskStatus(remembered.taskId).catch(() => null),
+        remembered.movementId ? getNativeAgentWorkspaceMovementStatus(remembered.movementId).catch(() => null) : Promise.resolve(null),
+      ]);
+      if (cancelled) return;
+      if (rememberedStatus) { setStatus(rememberedStatus); setTaskHostRef(remembered.hostRef); }
+      if (rememberedMovement) setMovement(rememberedMovement);
+    }).catch((error) => {
       if (!cancelled) setMessage(error instanceof Error ? error.message : "Pastey could not recover unresolved native Agent work.");
     });
     return () => { cancelled = true; };
@@ -554,16 +597,21 @@ export function useNativeAgentTask(roomId: string) {
   const start = useCallback(async () => {
     if (!workspace.trim() || !taskText.trim() || busy) return;
     setBusy(true); setMessage(null);
-    try { setStatus(await startNativeCodexTask(workspace.trim(), taskText.trim(), newConversation)); setTaskHostRef(null); setNewConversation(false); }
+    try {
+      const started = await startNativeCodexTask(workspace.trim(), taskText.trim(), newConversation);
+      setStatus(started); setTaskHostRef(null); setNewConversation(false);
+      rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef: null });
+    }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start Codex."); }
     finally { setBusy(false); }
-  }, [busy, newConversation, taskText, workspace]);
+  }, [busy, newConversation, roomId, taskText, workspace]);
 
   const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
     if (!roomId || !peerSessionId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
     setBusy(true); setMessage(null);
     try {
       const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, workspace.trim(), taskText.trim(), !newConversation);
+      rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
       setNewConversation(false);
       setTaskHostRef(hostRef);
       try {
@@ -584,7 +632,11 @@ export function useNativeAgentTask(roomId: string) {
   const proposeRemoteMovement = useCallback(async (roomId: string, hostRef: string) => {
     if (!roomId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
     setBusy(true); setMessage(null);
-    try { setMovement(await proposeRemoteNativeCodexWorkspaceMovement(hostRef, workspace.trim(), taskText.trim(), roomId)); }
+    try {
+      const proposed = await proposeRemoteNativeCodexWorkspaceMovement(hostRef, workspace.trim(), taskText.trim(), roomId);
+      setMovement(proposed);
+      rememberStartedNativeTask(roomId, { taskId: proposed.taskId, hostRef, movementId: proposed.movementId });
+    }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not prepare the workspace review."); }
     finally { setBusy(false); }
   }, [busy, taskText, workspace]);

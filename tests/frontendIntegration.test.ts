@@ -26,6 +26,9 @@ import {
   REMOTE_CAPABILITY_REFRESH_MS,
 } from "../src/features/workspace/AgentTaskLifecycle";
 import { codexRunReadiness, looksLikeFullPath, type CodexRunInput } from "../src/lib/nativeAgentReadiness";
+import { remoteAccessGuidance, type RemoteAccessFacts } from "../src/lib/accessGuidance";
+import { benchmarkFacts, benchmarkScope, deviceProfileFacts, measuredAgo, runtimeFacts } from "../src/lib/deviceDiagnostics";
+import { rememberedNativeTask, rememberStartedNativeTask } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
 import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
@@ -219,25 +222,34 @@ test("Bridge devices are inspection-only and navigation cannot create or join a 
   // Devices are a part of the selected Bridge, not a global route.
   assert.doesNotMatch(readFileSync("src/features/workspace/workspaceTypes.ts", "utf8"), /"devices"|"activity"/);
   assert.doesNotMatch(workspace, /DevicesScreen|ActivityScreen/);
-  assert.match(details, /<BridgeDevices room=\{room\} \/>/);
+  assert.match(details, /<BridgeDevices room=\{room\} onOpenDevice=\{onOpenDevice\} \/>/);
   assert.match(bridge, /<BridgeDetails room=\{room\}/);
 });
 
-test("Bridge Device Check uses exact HostRef and remains explicitly user initiated", () => {
-  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
+test("Device checks use the exact HostRef and run only when the user asks", () => {
+  const device = readFileSync("src/features/workspace/DeviceDetails.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
-  const devicesBody = details.slice(details.indexOf("export function BridgeDevices"), details.indexOf("function BridgePermissions"));
-  assert.match(devicesBody, /runBridgeDeviceSelfCheck\(bridgeId, hostRef\)/);
-  assert.match(devicesBody, /deviceCheckKey\(bridgeId, hostRef\)/);
-  assert.match(devicesBody, /inFlight\.current\.has\(checkKey\)/);
-  assert.match(devicesBody, /disabled=\{loading\}/);
-  assert.match(devicesBody, /Checking…/);
-  assert.match(devicesBody, /Retry/);
-  assert.match(devicesBody, /Not configured/);
-  assert.match(devicesBody, /Managed readiness/);
-  assert.match(devicesBody, /Managed E2E self-check/);
-  assert.doesNotMatch(devicesBody, /useEffect[\s\S]{0,500}runBridgeDeviceSelfCheck/);
-  assert.doesNotMatch(devicesBody, /bridge_peers|transport key|session_pair_ref|SQLite|reconnect:/);
+  const performance = device.slice(device.indexOf("function PerformanceSection"), device.indexOf("function AgentsSection"));
+  const advanced = device.slice(device.indexOf("function AdvancedSection"), device.indexOf("function DiagnosticGroup"));
+  // The read-only connection test and the heavier managed self-check are
+  // separate, explicit actions against this exact device.
+  assert.match(performance, /runBridgeDeviceDiagnostics\(room\.id, hostRef\)/);
+  assert.match(performance, /if \(inFlight\.current\) return;/);
+  assert.match(performance, /disabled=\{running \|\| !connected\}/);
+  assert.match(advanced, /runBridgeDeviceSelfCheck\(room\.id, hostRef\)/);
+  assert.match(advanced, /if \(inFlight\.current\) return;/);
+  assert.match(advanced, /disabled=\{loading \|\| !connected\}/);
+  assert.match(advanced, /Checking…/);
+  assert.match(advanced, /Run again/);
+  assert.match(device, /Not configured/);
+  assert.match(advanced, /Managed readiness/);
+  assert.match(advanced, /Managed E2E self-check/);
+  // No effect starts a check: each runs from its own button.
+  for (const body of [performance, advanced]) {
+    const effects = body.match(/useEffect\(\(\) => \{[\s\S]*?\}, \[[^\]]*\]\);/g) ?? [];
+    for (const effect of effects) assert.doesNotMatch(effect, /runBridgeDevice/);
+  }
+  assert.doesNotMatch(device, /bridge_peers|transport key|session_pair_ref|SQLite|reconnect:/);
   assert.match(bindings, /invoke\("run_bridge_device_diagnostics", \{ bridgeId, hostRef \}\)/);
   assert.match(bindings, /invoke\("run_bridge_device_self_check", \{ bridgeId, hostRef \}\)/);
 });
@@ -1034,15 +1046,19 @@ test("Settings are device-wide sections and every permission can be found and re
   assert.match(permissions, /<UnattendedAccessSettings \/>/);
   assert.match(permissions, /<SessionReadingSettings \/>/);
   assert.match(permissions, /<SharedSearchFolders \/>/);
-  // Stored but unused by the Host: not offered as if they did something.
-  assert.doesNotMatch(settings, /auto_burn_after_download|save_received_files_to_inbox|save_received_images_to_inbox/);
+  // Stored but never read by the Host: not offered as if it did something.
+  assert.doesNotMatch(settings, /auto_burn_after_download/);
+  // Read by the Host when it chooses where a received item lands.
+  assert.match(settings, /toggle\("save_received_files_to_inbox", value\)/);
+  assert.match(settings, /toggle\("save_received_images_to_inbox", value\)/);
   // No placeholder rows that look like settings.
   assert.doesNotMatch(settings, /value="Unavailable"|Not projected|Not renderer-exposed|UnavailableRows/);
   // Each Bridge shows and revokes what it is allowed, and links here.
   const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
   assert.match(details, /grant\.bridgeId === room\.id/);
   assert.match(details, /folder\.bridgeId === room\.id/);
-  assert.match(readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8"), /onOpenSettings=\{\(\) => navigate\("settings-permissions"\)\}/);
+  assert.match(readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8"), /onOpenSettings=\{\(next\) => navigate\(next \?\? "settings-permissions"\)\}/);
+  assert.match(readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8"), /onOpenSettings=\{\(\) => onOpenSettings\("settings-permissions"\)\}/);
   // Grants list first; the add form is one explicit step away.
   for (const file of ["UnattendedAccessSettings.tsx", "SessionReadingSettings.tsx"]) {
     const source = readFileSync(`src/features/workspace/${file}`, "utf8");
@@ -1068,10 +1084,129 @@ test("Burn, Forget and identity replacement each need an explicit confirmation",
 test("Execution, observation and continuation stay separate in the Bridge", () => {
   const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
   assert.match(bridge, /\{ value: "share", label: "Share" \}/);
-  assert.match(bridge, /value: "agent", label: "Agent"/);
-  assert.match(bridge, /\{ value: "sessions", label: "Sessions" \}/);
+  assert.match(bridge, /value: "agents", label: "Agents"/);
+  assert.doesNotMatch(bridge, /value: "sessions"/);
+  // One Agents workspace, two separately labelled authorities.
+  const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  assert.match(workspace, /Run a task <Badge tone="live">Execution<\/Badge>/);
+  assert.match(workspace, /Sessions on \{targetName\} <Badge>Read only<\/Badge>/);
+  assert.match(workspace, /<NativeAgentPanel [^>]*target=\{target\} \/>/);
+  assert.match(workspace, /<NativeSessionsCard [^>]*target=\{target\}/);
   const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   // Discovered sessions are never offered as continuable from here.
   assert.doesNotMatch(sessions, /startRemoteNativeCodexTask|startNativeCodexTask|continue_native_session|>Continue</);
   assert.match(sessions, /This view does not continue sessions/);
+});
+
+function accessFacts(overrides: Partial<RemoteAccessFacts> = {}): RemoteAccessFacts {
+  return {
+    remoteName: "DESKTOP-DMI2L9P",
+    thisDeviceName: "MacBook Pro",
+    thisFingerprint: "C0FF EE12 3456",
+    paired: true,
+    connected: true,
+    lastRunWaitedForAccept: null,
+    sessionReading: { state: "unknown" },
+    ...overrides,
+  };
+}
+
+test("Bridge access guidance keeps each authority separate and says where it is granted", () => {
+  const lines = remoteAccessGuidance(accessFacts());
+  assert.deepEqual(lines.map((line) => line.id), ["pairing", "run", "decisions", "reading"]);
+  // No single trust switch: running is decided on the executing device.
+  const run = lines.find((line) => line.id === "run")!;
+  assert.equal(run.state, "decided_there");
+  assert.match(run.detail, /waits for someone on DESKTOP-DMI2L9P to click Accept/);
+  assert.match(run.steps.join(" "), /On DESKTOP-DMI2L9P: Settings → Devices & trust[\s\S]*C0FF EE12 3456/);
+  assert.match(run.steps.join(" "), /On DESKTOP-DMI2L9P: Settings → Permissions → Unattended Codex access/);
+  // Codex's own prompts need no trust or permission.
+  const decisions = lines.find((line) => line.id === "decisions")!;
+  assert.equal(decisions.state, "ok");
+  assert.deepEqual(decisions.steps, []);
+  assert.match(decisions.detail, /needs no trust or permission/);
+  // Reading is unknown until asked, then reported as the other device said.
+  assert.equal(lines.find((line) => line.id === "reading")!.state, "unknown");
+  const denied = remoteAccessGuidance(accessFacts({ sessionReading: { state: "not_allowed" } })).find((line) => line.id === "reading")!;
+  assert.equal(denied.state, "needs_action");
+  assert.match(denied.steps.join(" "), /Settings → Permissions → Session reading/);
+  const allowed = remoteAccessGuidance(accessFacts({ sessionReading: { state: "allowed", folders: ["Pastey"] } })).find((line) => line.id === "reading")!;
+  assert.equal(allowed.state, "ok");
+  assert.match(allowed.detail, /Pastey/);
+  // A run that waited in Review is reported, not guessed beforehand.
+  assert.match(remoteAccessGuidance(accessFacts({ lastRunWaitedForAccept: true })).find((line) => line.id === "run")!.detail, /no unattended permission for this device/);
+  assert.equal(remoteAccessGuidance(accessFacts({ paired: false }))[0].state, "needs_action");
+  // Nothing here can grant anything.
+  const source = readFileSync("src/lib/accessGuidance.ts", "utf8") + readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  assert.doesNotMatch(source, /createUnattendedGrant|createSessionReadGrant|trustPeerDevice|authorizeSearchFolder/);
+});
+
+test("Measurements are shown with what they measured and when, never estimated", () => {
+  const result = { average_MBps: 112.34, peak_MBps: 140, latency_ms: 2.5, duration_ms: 1000, total_bytes: 117_000_000, failed_chunks: 0, duplicate_chunks: 0, benchmark_mode: "pastey_pipeline" as const, link_quality: "Excellent" as const, timestamp: Date.now() / 1000 - 30 };
+  const shown = benchmarkFacts(result);
+  assert.equal(shown.headline, "112.3 MB/s average");
+  assert.deepEqual(shown.facts.map(([label]) => label), ["Peak", "Latency", "Quality", "Measured for", "Measured"]);
+  assert.match(benchmarkScope("pastey_pipeline", true), /over this Bridge's current connection/);
+  assert.match(benchmarkScope("raw_memory", false), /no network/);
+  assert.equal(measuredAgo(1000, 1000 * 1000 + 30_000), "just now");
+  const rows = deviceProfileFacts({ device_id: "d", device_name: "DESKTOP", platform: "Windows", os_version: "11", arch: "x86_64", gpu_names: [], power_state: "plugged_in", updated_at: 0 });
+  assert.deepEqual(rows.map(([label]) => label), ["Name", "System", "Architecture", "Power"]);
+  assert.deepEqual(runtimeFacts({ runtimes: [{ name: "Node.js", available: false, source: "path" }, { name: "Python", available: true, version: "3.12", source: "path" }], gpu_acceleration: { cuda_available: false, metal_available: false, gpu_names: [] }, updated_at: 0 }), [["Python", "3.12"], ["Node.js", "Not found"]]);
+});
+
+test("A started task stays observable after the Agents view remounts", () => {
+  rememberStartedNativeTask("room-x", { taskId: "native-agent:1", hostRef: "host:windows" });
+  assert.deepEqual(rememberedNativeTask("room-x"), { taskId: "native-agent:1", hostRef: "host:windows" });
+  assert.equal(rememberedNativeTask("room-other"), null);
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  // Re-observed only by exact identity, only when nothing needs resolution.
+  assert.match(lifecycle, /if \(cancelled \|\| projection\) return;[\s\S]{0,200}rememberedNativeTask\(roomId\)/);
+  assert.match(lifecycle, /getNativeAgentTaskStatus\(remembered\.taskId\)/);
+  assert.match(lifecycle, /rememberStartedNativeTask\(roomId, \{ taskId: started\.taskId, hostRef \}\)/);
+  assert.match(lifecycle, /rememberStartedNativeTask\(roomId, \{ taskId: proposed\.taskId, hostRef, movementId: proposed\.movementId \}\)/);
+  // Nothing re-runs a task: only its status is read.
+  const remount = lifecycle.slice(lifecycle.indexOf("void loadRecoveryProjection(() => !cancelled)"), lifecycle.indexOf("return () => { cancelled = true; };"));
+  assert.doesNotMatch(remount, /start(Remote)?NativeCodexTask|approveRemote|retryNativeAgent/);
+});
+
+test("Device details, network tests and this device's diagnostics are reachable from the UI", () => {
+  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
+  const agents = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  const device = readFileSync("src/features/workspace/DeviceDetails.tsx", "utf8");
+  const thisDevice = readFileSync("src/features/workspace/ThisDeviceSettings.tsx", "utf8");
+  const settings = readFileSync("src/features/workspace/SettingsScreens.tsx", "utf8");
+  // Three ways in: the Bridge title, Bridge details' devices, the Agents device bar.
+  assert.match(bridge, /onClick=\{\(\) => setDeviceOpen\(members\[0\]\.hostRef!\)\}/);
+  assert.match(bridge, /onOpenDevice=\{\(hostRef\) => hostRef \? setDeviceOpen\(hostRef\) : onOpenSettings\("settings-this-device"\)\}/);
+  assert.match(details, /onClick=\{\(\) => onOpenDevice\(row\.hostRef\)\}/);
+  assert.match(agents, /onClick=\{\(\) => onOpenDevice\(targetHostRef\)\}/);
+  assert.match(bridge, /<DeviceDetails room=\{room\} hostRef=\{deviceOpen\}/);
+  for (const section of ["Overview", "Connection", "Performance", "Agents", "Trust & permissions", "Advanced"]) {
+    assert.match(device, new RegExp(`label: "${section}"`));
+  }
+  assert.match(device, /Test connection/);
+  assert.match(device, /getLastBenchmarkResults\(\)/);
+  assert.match(device, /No measurement for this Bridge yet\. Pastey does not estimate speed/);
+  // This device: identity, profile, runtimes and a local-only speed test.
+  assert.match(settings, /\{ route: "settings-this-device", label: "This device", icon: "device" \}/);
+  assert.match(thisDevice, /<DeviceIdentitySettings \/>/);
+  assert.match(thisDevice, /getDeviceProfile\(\{ forceRefresh: true \}\)/);
+  assert.match(thisDevice, /getDeviceCapabilities\(\{ forceRefresh: true, probeMode: mode \}\)/);
+  assert.match(thisDevice, /runLoopbackBenchmark\(\{ mode, durationSeconds: Number\(duration\) \}\)/);
+  // Restored Settings controls the Host acts on.
+  assert.match(settings, /save\(\{ \.\.\.config, inbox_dir: chosen \}\)/);
+  assert.match(settings, /save\(\{ \.\.\.config, inbox_dir: null \}\)/);
+  assert.match(settings, /micro_flow_group_mode: event\.target\.value/);
+  assert.match(settings, /transfer_window_override: event\.target\.value === "auto" \? null : Number\(event\.target\.value\)/);
+  assert.match(settings, /openLogsFolder\(\)/);
+  assert.match(settings, /copyLastError\(\)/);
+  assert.match(settings, /checkForUpdates\(\)/);
+});
+
+test("Sessions follow the Agents device and mark the ones Pastey started", () => {
+  const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  assert.doesNotMatch(sessions, /aria-label="Device"/);
+  assert.match(sessions, /session\.origin === "pastey" \? <Badge tone="accent">Started by Pastey<\/Badge>/);
+  assert.match(sessions, /response\.outcome === "not_authorized"\) onReading\?\.\(\{ state: "not_allowed" \}\)/);
 });

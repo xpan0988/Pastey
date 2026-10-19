@@ -562,3 +562,17 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
 .btn-ghost.active { background: var(--surface-3); color: var(--text); }
 .narrow-only { display: none; }
 @media (max-width: 680px) { .narrow-only { display: flex; } }
+
+/* Device Details, Agents workspace and trust guidance */
+.dialog.wide { width: min(760px, calc(100vw - 32px)); height: min(680px, calc(100vh - 48px)); }
+.dialog.wide .tabs { position: sticky; top: 0; z-index: 1; background: var(--bg); overflow-x: auto; }
+.title-button { min-width: 0; padding: 0; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }
+.title-button h1 { text-decoration: underline transparent; text-underline-offset: 4px; transition: text-decoration-color var(--duration); }
+.title-button:hover h1 { text-decoration-color: var(--border-strong); }
+.device-bar .field-label { margin-right: 4px; }
+.access-summary { padding-top: 4px; }
+.access-lines { display: grid; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
+.access-lines > li { display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); }
+.access-lines ol { display: grid; gap: 6px; margin: 0; padding-left: 18px; color: var(--text-2); }
+.fingerprint-callout { padding: 12px; border-radius: var(--radius-md); background: var(--surface-2); font-size: var(--text-lg); text-align: center; }
+.section-head h2.row { gap: var(--space-2); }

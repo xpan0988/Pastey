@@ -72,6 +72,89 @@ pub fn write_error_line(line: &str) {
     write_line(line, true);
 }
 
+const RUN_MARKER_FILE_NAME: &str = "pastey.running";
+const MAX_PANIC_MESSAGE_CHARS: usize = 300;
+
+static CRASH_LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Leaves evidence of a crash in the log. Release builds abort on panic and
+/// strip symbols, so without this a panic on any thread ends the process
+/// with nothing recorded. The run marker also reveals exits that run no
+/// panic hook (an access violation or stack overflow): it survives only an
+/// unclean exit and is reported on the next start.
+pub fn install_crash_reporting(app_version: &str) {
+    let Some(logs_dir) = log_state().lock().logs_dir.clone() else {
+        return;
+    };
+    let _ = CRASH_LOG_PATH.set(log_file_path(&logs_dir));
+    let marker = logs_dir.join(RUN_MARKER_FILE_NAME);
+    if let Ok(previous) = fs::read_to_string(&marker) {
+        write_error_line(&format!(
+            "[pastey lifecycle] event=previous_run_ended_uncleanly {}",
+            previous.trim().replace(['\n', '\r'], " ")
+        ));
+    }
+    let _ = fs::write(
+        &marker,
+        format!(
+            "started_at={} pid={} version={}",
+            now_unix_seconds(),
+            std::process::id(),
+            app_version
+        ),
+    );
+    write_transfer_line(&format!(
+        "[pastey lifecycle] event=started pid={} version={}",
+        std::process::id(),
+        app_version
+    ));
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let location = info
+            .location()
+            .map(|location| format!("{}:{}", location.file(), location.line()))
+            .unwrap_or_else(|| "unknown".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-text panic payload".into());
+        let line = panic_log_line(thread.name().unwrap_or("unnamed"), &location, &message);
+        // Written without the log mutex: the panicking thread may hold it.
+        if let Some(path) = CRASH_LOG_PATH.get() {
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                let _ = writeln!(file, "time={} {}", now_unix_seconds(), line);
+                let _ = file.sync_all();
+            }
+        }
+        previous_hook(info);
+    }));
+}
+
+/// Removes the run marker on an orderly exit.
+pub fn record_clean_exit() {
+    if let Some(logs_dir) = log_state().lock().logs_dir.clone() {
+        let _ = fs::remove_file(logs_dir.join(RUN_MARKER_FILE_NAME));
+    }
+    write_transfer_line("[pastey lifecycle] event=exited");
+}
+
+/// One bounded, single-line record of a panic.
+pub(crate) fn panic_log_line(thread: &str, location: &str, message: &str) -> String {
+    let mut message = message.replace(['\n', '\r'], " ");
+    if message.chars().count() > MAX_PANIC_MESSAGE_CHARS {
+        message = message
+            .chars()
+            .take(MAX_PANIC_MESSAGE_CHARS)
+            .collect::<String>()
+            + "…";
+    }
+    format!("[pastey crash] event=panic thread={thread} location={location} message={message}")
+}
+
 pub fn latest_error_summary(logs_dir: &Path) -> Option<String> {
     if let Some(last_error) = log_state().lock().last_error.clone() {
         return Some(last_error);
@@ -183,6 +266,24 @@ fn now_unix_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_is_recorded_on_one_bounded_line() {
+        let line = panic_log_line(
+            "tokio-runtime-worker",
+            "src/native_agent.rs:42",
+            "boom\nsecond line",
+        );
+        assert_eq!(
+            line,
+            "[pastey crash] event=panic thread=tokio-runtime-worker location=src/native_agent.rs:42 message=boom second line"
+        );
+        let long = "界".repeat(MAX_PANIC_MESSAGE_CHARS + 50);
+        let bounded = panic_log_line("main", "x.rs:1", &long);
+        assert!(bounded.ends_with('…'));
+        assert_eq!(bounded.matches('界').count(), MAX_PANIC_MESSAGE_CHARS);
+        assert!(!bounded.contains('\n'));
+    }
 
     #[test]
     fn latest_error_finds_recent_transfer_failure() {

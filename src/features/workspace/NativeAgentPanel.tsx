@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
 import { codexRunReadiness, looksLikeFullPath, type CodexWorkspaceSource } from "../../lib/nativeAgentReadiness";
 import { nativeDecisionsAwaitUser } from "../../lib/nativeDecisions";
@@ -45,16 +45,17 @@ function rememberWorkspace(key: string, path: string) {
 /** Run Codex on this device or on one device of this Bridge. The device is
  * chosen by its durable HostRef, so a reconnect (a new peer session) keeps
  * the choice instead of silently falling back to this device. */
-export function NativeAgentPanel({ roomId, agent, peers, members }: {
+export function NativeAgentPanel({ roomId, agent, peers, members, target }: {
   roomId: string;
   agent: NativeAgentController;
   /** Routeable now. */
   peers: readonly BridgePeerSession[];
   /** Every member, connected or not, for names. */
   members: readonly BridgePeerSession[];
+  /** "local" or the chosen device's HostRef, chosen by the Agents workspace. */
+  target: string;
 }) {
   const codex = agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex");
-  const [target, setTarget] = useState<string>("local");
   const [source, setSource] = useState<CodexWorkspaceSource>("on_target");
   const targetHostRef = target === "local" ? null : target;
   const targetMember = targetHostRef ? members.find((peer) => peer.hostRef === targetHostRef) ?? null : null;
@@ -83,8 +84,6 @@ export function NativeAgentPanel({ roomId, agent, peers, members }: {
   const blocker = taskActive ? "Codex is working on the current task. Stop it or wait for it to finish." : readiness.blocker;
   const locked = taskActive || agent.busy;
 
-  const options = useMemo(() => members.filter((peer) => peer.hostRef), [members]);
-
   async function chooseFolder() {
     const chosen = await open({ directory: true, multiple: false });
     if (typeof chosen === "string") agent.setWorkspace(chosen);
@@ -98,23 +97,11 @@ export function NativeAgentPanel({ roomId, agent, peers, members }: {
     else void agent.startRemote(roomId, remote.peerSessionId, targetHostRef);
   }
 
-  return <div className="panel-inner">
-    <div className="panel-intro">
-      <h2>Run Codex</h2>
-      <p>Codex works in its own session, with its own sign-in and sandbox, on the device you choose. Pastey moves files only after you approve, and shows what Codex returns.</p>
-    </div>
-
+  return <div className="stack-lg">
     <NativeAgentTaskState roomId={roomId} agent={agent} peers={peers} members={members} />
 
     <section className="card" aria-label="Run with Codex">
       <div className="card-body form-grid">
-        <Field label="Run on" htmlFor="codex-target">
-          <select id="codex-target" className="select" value={target} onChange={(event) => setTarget(event.target.value)} disabled={locked}>
-            <option value="local">This device</option>
-            {options.map((peer) => <option key={peer.hostRef} value={peer.hostRef}>{peer.displayName}{peers.some((routeable) => routeable.hostRef === peer.hostRef) ? "" : " (not connected)"}</option>)}
-          </select>
-        </Field>
-
         <div className="availability" role="status">
           <Dot tone={availabilityTone(availability, targetHostRef !== null && !remote)} pulse={availability.state === "checking"} />
           <span className="spacer">{targetHostRef && !remote ? `${targetName} is not connected right now.` : availabilityCopy(availability, targetHostRef ? targetName : null, effectiveSource === "send_from_here")}</span>
@@ -206,7 +193,9 @@ function NativeAgentTaskState({ roomId, agent, peers, members }: { roomId: strin
       {status ? <NativeDecisionPanel status={status} roomId={roomId} remote={!!agent.taskHostRef} hostName={taskHostName ?? "this device"} /> : null}
       {nativeAgentAwaitingNativeDecision(status) && !nativeDecisionsAwaitUser(status!, !!agent.taskHostRef, Date.now() / 1000) ? <Notice tone="warn">{nativeAgentDisplayName(status?.agentId)} on {taskHostName ?? "this device"} is waiting for a native request that cannot be answered from here, so the task cannot continue; stop it to interrupt the turn. To run without approval prompts, change the approval policy in that device’s own Codex configuration.</Notice> : null}
       {status ? <NativeAgentResponse status={status} hostName={taskHostName} /> : null}
-      {remoteReconciliationRequired && !agent.movement ? <Notice tone="warn">The remote task outcome is indeterminate. Pastey will not treat it as complete until it is reconciled or explicitly stopped.</Notice> : null}
+      {remoteReconciliationRequired && !agent.movement ? <Notice tone="warn" title="The remote task outcome is indeterminate.">
+        Pastey will not treat it as complete until it is reconciled or explicitly stopped. This device lost track of the run on {taskHostName ?? "the other device"}: the connection dropped, or that device's Pastey restarted, while Codex worked. Reconcile asks {taskHostName ?? "it"} what it knows now. If it lost the run too, the outcome stays unknown: check the folder there yourself, then choose Stop. Stop undoes nothing Codex already did, and Pastey never runs the task again on its own.
+      </Notice> : null}
       {agent.movement ? <div className="stack">
         <div className="row"><strong className="spacer">{agent.movement.state === "awaiting_approval" ? "Review workspace movement" : `Workspace movement · ${agent.movement.state.replace(/_/g, " ")}`}</strong>{agent.movement.state === "awaiting_approval" ? <StatusBadge tone="pending">Needs your approval</StatusBadge> : null}</div>
         <p className="small muted">{agent.movement.reviewSummary}</p>

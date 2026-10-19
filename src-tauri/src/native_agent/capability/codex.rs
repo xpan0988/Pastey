@@ -48,7 +48,7 @@ use crate::native_agent::{
     NativeConversationContinuityV1, NativeDecisionContentV1, NativeDecisionKindV1,
     NativeDecisionReviewV1, NativeDecisionStateV1, NativeDecisionV1, NativeFileChangeV1,
     NativeTurnOutcomeV1, CODEX_CAPABILITY_ID, MAX_LINE_BYTES, MAX_NATIVE_DECISION_CONTENT_BYTES,
-    MAX_STDERR_BYTES, MAX_TASK_BYTES, NATIVE_AGENT_RPC_TIMEOUT, NATIVE_DECISION_REVIEW_TTL_SECONDS,
+    MAX_TASK_BYTES, NATIVE_AGENT_RPC_TIMEOUT, NATIVE_DECISION_REVIEW_TTL_SECONDS,
     WORKSPACE_MOVEMENT_PROTOCOLS,
 };
 
@@ -1790,6 +1790,14 @@ fn read_bounded_line(
     }
 }
 
+/// Reads Codex's stderr to its end and keeps none of it. A reader that
+/// stopped early (it used to stop after 64 KiB) leaves the pipe
+/// full, and Codex then blocks on its next diagnostic write in the middle of
+/// a turn: the turn never ends and Pastey can only report it as unknown.
+fn drain_stderr(stderr: impl Read) -> u64 {
+    io::copy(&mut BufReader::new(stderr), &mut io::sink()).unwrap_or(0)
+}
+
 fn observe_stdout(stdout: impl Read, sender: mpsc::SyncSender<ObservedLineV1>) {
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
@@ -2135,11 +2143,7 @@ impl CodexAppServerV1 {
             .ok_or_else(|| AppError::InvalidInput("Codex stderr is unavailable.".into()))?;
         let (sender, receiver) = mpsc::sync_channel(256);
         thread::spawn(move || observe_stdout(stdout, sender));
-        thread::spawn(move || {
-            let _ = BufReader::new(stderr)
-                .take(MAX_STDERR_BYTES as u64)
-                .read_to_end(&mut Vec::new());
-        });
+        thread::spawn(move || drain_stderr(stderr));
         let controller = Self {
             child: Mutex::new(child),
             stdin: Mutex::new(Some(stdin)),
@@ -3742,5 +3746,14 @@ mod tests {
         assert!(!dunce::simplified(&canonical)
             .to_string_lossy()
             .starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn stderr_is_drained_to_its_end_however_much_codex_writes() {
+        let noisy = vec![b'w'; 1024 * 1024 + 3];
+        assert_eq!(
+            super::drain_stderr(std::io::Cursor::new(noisy.clone())),
+            noisy.len() as u64
+        );
     }
 }
