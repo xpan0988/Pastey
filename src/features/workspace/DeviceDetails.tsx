@@ -5,6 +5,7 @@ import {
   getBridgePeerAddress,
   getDeviceIdentity,
   getLastBenchmarkResults,
+  getRoomControlDiagnostics,
   listKnownDevices,
   listRemoteNativeAgentCapabilities,
   listSeenPeerDevices,
@@ -13,8 +14,10 @@ import {
   trustPeerDevice,
   revokeTrustedDevice,
   type NativeAgentCapability,
+  type RoomControlDiagnostics,
   type SeenPeerDevice,
 } from "../../lib/tauri";
+import { controlClassLabel, controlHealth, controlReasonLabel, refusalLine } from "../../lib/controlDiagnostics";
 import type { BridgeDeviceDiagnostics, BridgeNodeListProjectionV1, DiagnosticState, KnownDevice, LinkBenchmarkResult, RoomInfo } from "../../lib/types";
 import { codexUnavailableCopy } from "./NativeAgentPanel";
 import { Badge, Dialog, Dot, Icon, Notice, Tabs, type Tone } from "./ui";
@@ -235,6 +238,7 @@ function AdvancedSection({ room, hostRef, name, connected }: { room: RoomInfo; h
   return <div className="stack-lg">
     <div className="row-wrap"><button type="button" className="btn" disabled={loading || !connected} onClick={() => void runCheck()}>{loading ? "Checking…" : check ? "Run again" : "Run managed self-check"}</button><span className="xsmall subtle spacer">Tests the connection, then runs a small managed Plan end to end on {name}. Use it to diagnose Plans.</span></div>
     {check?.unavailable ? <Notice tone="warn">Diagnostics for {name} are temporarily unavailable.</Notice> : null}
+    <ControlChannelSection room={room} name={name} />
     {check?.result ? <>
       <DiagnosticGroup title="Managed readiness" facts={[
         ["Provider", check.result.managedReadiness.provider],
@@ -245,6 +249,40 @@ function AdvancedSection({ room, hostRef, name, connected }: { room: RoomInfo; h
       {check.result.managedE2e ? <div className="stack"><span className="subhead">Managed E2E self-check</span><dl className="facts"><dt>Result</dt><dd><Badge tone={check.result.managedE2e.outcome === "PASS" ? "ok" : check.result.managedE2e.outcome === "BLOCKED" ? "neutral" : "bad"}>{check.result.managedE2e.outcome}</Badge></dd>{check.result.managedE2e.coreTerminalState ? <><dt>Core terminal state</dt><dd>{check.result.managedE2e.coreTerminalState}</dd></> : null}{check.result.managedE2e.failureCode ? <><dt>Reason</dt><dd>{check.result.managedE2e.failureCode}</dd></> : null}</dl></div> : null}
     </> : null}
   </div>;
+}
+
+/** This Bridge's Room Control as this device sees it: what it accepted
+ * and refused by kind, any backpressure now, what it could not deliver,
+ * and the requests waiting for Accept here. Counts only; read on request. */
+function ControlChannelSection({ room, name }: { room: RoomInfo; name: string }) {
+  const [diagnostics, setDiagnostics] = useState<RoomControlDiagnostics | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  async function read() {
+    setError(null);
+    try { setDiagnostics(await getRoomControlDiagnostics(room.id)); }
+    catch (nextError) { setError(nextError instanceof Error ? nextError.message : String(nextError)); }
+  }
+  const now = diagnostics?.observedAt ?? Date.now() / 1000;
+  const health = diagnostics ? controlHealth(diagnostics) : null;
+  const refusals = diagnostics ? [["Last refused here", refusalLine(diagnostics.lastRefusal, now)], [`Last not delivered to ${name}`, refusalLine(diagnostics.lastOutboundFailure, now)]] as const : [];
+  return <section className="stack" aria-label="Control channel">
+    <div className="row-wrap"><span className="subhead spacer">Control channel</span><button type="button" className="btn btn-sm" onClick={() => void read()}>{diagnostics ? "Read again" : "Check control channel"}</button></div>
+    <p className="xsmall subtle">How this device handles this Bridge's control messages (checks, agent requests and statuses, session queries): what it accepted and refused, and why. Use it when a check or a request to {name} fails.</p>
+    {error ? <Notice tone="bad">{error}</Notice> : null}
+    {diagnostics && health ? <>
+      <Notice tone={health.tone === "ok" ? "ok" : "warn"}>{health.summary}</Notice>
+      <dl className="facts">
+        {diagnostics.classes.filter((entry) => entry.accepted || entry.refused.length).map((entry) => <Fragment key={entry.class}>
+          <dt>{controlClassLabel(entry.class)}</dt>
+          <dd>{entry.accepted} accepted · {entry.lastMinute} of {entry.perMinute} in the last minute{entry.refused.length ? ` · ${entry.refused.map(([reason, count]) => `${count} ${controlReasonLabel(reason)}`).join(", ")}` : ""}</dd>
+        </Fragment>)}
+        <dt>Waiting for Accept here</dt><dd>{diagnostics.nativeReviews.pending} of {diagnostics.nativeReviews.limit} · {diagnostics.nativeReviews.started} started, {diagnostics.nativeReviews.denied} denied, {diagnostics.nativeReviews.expired} expired, {diagnostics.nativeReviews.revoked} ended by revoked access</dd>
+        <dt>Kept for display</dt><dd>{diagnostics.historyDepth} of {diagnostics.historyLimit} Bridge Plan events{diagnostics.historyDropped ? ` · ${diagnostics.historyDropped} older ones dropped` : ""}</dd>
+        {diagnostics.outboundFailures.length ? <><dt>Not delivered to {name}</dt><dd>{diagnostics.outboundFailures.map((failure) => `${failure.count} × ${controlClassLabel(failure.class).toLowerCase()}: ${controlReasonLabel(failure.failure)}`).join("; ")}</dd></> : null}
+        {refusals.map(([label, line]) => line ? <Fragment key={label}><dt>{label}</dt><dd>{line}</dd></Fragment> : null)}
+      </dl>
+    </> : null}
+  </section>;
 }
 
 function DiagnosticGroup({ title, facts }: { title: string; facts: Array<[string, DiagnosticState]> }) {

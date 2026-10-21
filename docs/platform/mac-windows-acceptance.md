@@ -236,6 +236,20 @@ The target flow, end to end, on real devices. Prerequisites: a Mac ↔ Windows B
 | N11 | Windows: Stop sharing. Mac: look again. | "Windows hasn't shared any session-readable workspace with this Bridge…"; Run offers only the typed path or this device. |
 | N12 | A second Bridge between the same devices: look there from the Mac. | Nothing from the first Bridge's shares appears. |
 
+## O. Control channel over a long session
+
+What failed on real devices before this build: after about 64 Codex availability checks (each Run or Continue checks first; the Agents tab checks every 15 s), every later check failed with "Room control inbox is full" until Pastey restarted. Use both devices on this build. Record the Control channel facts (Device Details → Advanced → Check control channel, on each device) at the start and the end.
+
+| # | Do | Expect / record |
+|---|---|---|
+| O1 | Leave the Mac's Agents tab open on Windows for 30 minutes (about 120 automatic checks), with Pastey on Windows running throughout. | "Codex is available on Windows" throughout. On both devices: "Accepting control messages. Nothing is backed up.", Kept for display 0 (or a few Bridge Plan events after Find file), no refusals. |
+| O2 | Then, without restarting either side, N6–N8 (run in a shared folder, continue the thread, Accept on Windows). | Each completes; the reply returns to the Mac. |
+| O3 | On the Mac, click Check again (Agents → Run a task) 30 times as fast as you can. | Most answer at once; some may take a few seconds. If any fails, it says "rate limit was reached … refused this before acting on it". Windows's Control channel shows capability checks refused for their rate budget, then, within a minute and with no action, "Accepting control messages". |
+| O4 | Send 9 continuations from the Mac without answering on Windows. | Windows shows 8 Reviews. The ninth's card on the Mac says "not delivered · nothing ran" with the reason; Windows's Control channel shows 8 of 8 waiting. Deny one on Windows, continue again: it waits for Accept. |
+| O5 | While a continuation waits for Accept on Windows, turn Agent requests off for the folder (Bridge details → Workspaces), then Accept. | Accept is refused; nothing runs (no new turn in the thread). The Mac card ends "access ended before it started". |
+| O6 | Quit and reopen Pastey on Windows, then repeat O1 for 5 minutes and O2 once. | Same as O1 and O2; no "inbox is full" ever. |
+| O7 | On Windows, `Get-Content "$env:LOCALAPPDATA\pastey\logs\pastey.log" -Tail 200 \| Select-String "room-control"`. | Only `backpressure` / `backpressure_ended` lines from O3, with a class and counts; no prompts, paths or ids beyond 8 characters of the Bridge id. |
+
 ## Record
 
 Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
@@ -255,6 +269,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Device details (L1–L5) | |
 | Session continuation (M1–M9) | |
 | Bridge workspaces (N1–N12) | |
+| Control channel (O1–O7) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
 | Net-probe summary (part F) | |

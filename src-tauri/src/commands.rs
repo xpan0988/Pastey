@@ -1335,7 +1335,7 @@ pub fn revoke_unattended_grant(
 /// session. The peer records it only for that session; it admits and
 /// authorizes nothing, and a Host's user must still trust the device and
 /// grant it scoped permission before anything runs unattended.
-async fn present_device_identity_over(
+pub(crate) async fn present_device_identity_over(
     state: Arc<AppState>,
     binding: &crate::host_identity::HostSessionBinding,
 ) -> AppResult<()> {
@@ -1344,25 +1344,27 @@ async fn present_device_identity_over(
         config::master_key(&config)?
     };
     let identity = crate::device_identity::load_or_create(&state.paths, &master_key)?;
-    let attestation = identity.attest(binding, &uuid::Uuid::new_v4().to_string())?;
     let context = crate::room_control::room_control_session_context_for_peer(
         &state,
         &binding.bridge_id,
         &binding.peer_route_ref,
     )?;
-    let event = crate::room_control::native_agent_event(
-        "native_agent.device_identity",
-        serde_json::to_value(attestation)?,
-        &context,
-    )?;
-    crate::room_control::send_room_control_event(
+    crate::room_control::send_room_control_event_with_backpressure(
         state.clone(),
         &binding.bridge_id,
-        event,
+        || {
+            let attestation = identity.attest(binding, &uuid::Uuid::new_v4().to_string())?;
+            crate::room_control::native_agent_event(
+                "native_agent.device_identity",
+                serde_json::to_value(attestation)?,
+                &context,
+            )
+        },
         Some(crate::room_control::selected_peer_route(
             &binding.bridge_id,
             &binding.peer_route_ref,
         )),
+        std::time::Duration::from_secs(4),
     )
     .await?;
     Ok(())
@@ -1614,17 +1616,24 @@ pub fn accept_native_invocation_review(
     task_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
-    let route = state.native_agents.lock().invocation_review_route(&task_id);
+    accept_native_invocation_review_for(&state, &task_id).map_err(|error| error.message())
+}
+
+pub(crate) fn accept_native_invocation_review_for(
+    state: &AppState,
+    task_id: &str,
+) -> AppResult<crate::native_agent::NativeAgentTaskStatusV1> {
+    let route = state.native_agents.lock().invocation_review_route(task_id);
     // Resolved outside the native service lock; an absent session is
     // passed on so the Review still ends, closed.
     let current = route.and_then(|(bridge_id, peer_route_ref)| {
-        crate::host_runtime::current_host_session_binding(&state, &bridge_id, &peer_route_ref).ok()
+        crate::host_runtime::current_host_session_binding(state, &bridge_id, &peer_route_ref).ok()
     });
-    state
-        .native_agents
-        .lock()
-        .accept_invocation_review(&task_id, current.as_ref(), storage::now_ts())
-        .map_err(|error| error.message())
+    state.native_agents.lock().accept_invocation_review(
+        task_id,
+        current.as_ref(),
+        storage::now_ts(),
+    )
 }
 
 /// Denies one pending Review: the invocation never starts.
@@ -1767,7 +1776,7 @@ pub async fn continue_remote_native_session(
     .await
 }
 
-async fn invoke_remote_native_capability(
+pub(crate) async fn invoke_remote_native_capability(
     state: Arc<AppState>,
     room_id: String,
     peer_session_id: String,
@@ -1837,23 +1846,49 @@ async fn send_native_invoke(
         peer_session_id,
     )
     .map_err(|error| error.message())?;
-    let event = crate::room_control::native_agent_event("native_agent.invoke", payload, &context)
-        .map_err(|error| error.message())?;
-    if crate::room_control::send_room_control_event(
+    // The task id, not the event, identifies the invocation: the Host
+    // answers a repeat of it with the existing task. A fresh event is sent
+    // again only after a refusal for its rate budget, which proves the
+    // Host did nothing with the earlier one.
+    let sent = crate::room_control::send_room_control_event_with_backpressure(
         state.clone(),
         room_id,
-        event,
+        || {
+            crate::room_control::native_agent_event(
+                "native_agent.invoke",
+                payload.clone(),
+                &context,
+            )
+        },
         Some(crate::room_control::selected_peer_route(
             room_id,
             peer_session_id,
         )),
+        std::time::Duration::from_secs(6),
     )
-    .await
-    .is_err()
-    {
-        return interrupted_remote_native_invoke_status(&mut state.native_agents.lock(), task_id);
+    .await;
+    match sent {
+        Ok(_) => Ok(queued),
+        Err(error) => {
+            let failure = crate::room_control::delivery_failure(&error);
+            if failure.proves_nothing_happened() {
+                // Refused before the Host admitted anything: it never
+                // started there, so this is a definite non-start with the
+                // Host's own reason, not an outcome to reconcile.
+                state
+                    .native_agents
+                    .lock()
+                    .fail_remote_undelivered(
+                        task_id,
+                        "native_agent_not_delivered",
+                        &error.message(),
+                    )
+                    .map_err(|error| error.message())
+            } else {
+                interrupted_remote_native_invoke_status(&mut state.native_agents.lock(), task_id)
+            }
+        }
     }
-    Ok(queued)
 }
 
 #[tauri::command]
@@ -6028,6 +6063,20 @@ pub fn get_room_control_session_context(
 ) -> Result<RoomControlSessionContext, String> {
     crate::room_control::room_control_session_context(&state, &room_id)
         .map_err(|error| error.message())
+}
+
+/// Room Control on one Bridge, for diagnostics: queue depth, traffic and
+/// refusals by class, backpressure, outbound failures and Review counts.
+/// No event, payload or identifier.
+#[tauri::command]
+pub fn get_room_control_diagnostics(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::room_control::RoomControlDiagnosticsV1, String> {
+    let _ = storage::get_room_by_id(&state.paths, &room_id).map_err(|error| error.message())?;
+    Ok(crate::room_control::room_control_diagnostics(
+        &state, &room_id,
+    ))
 }
 
 #[tauri::command]

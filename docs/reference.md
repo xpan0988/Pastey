@@ -278,6 +278,45 @@ Accepted production endpoints must use HTTPS and valid bounded model/config valu
 
 Minimum Real Provider Conformance is implemented for the exact generic OpenAI-compatible request profile: strict response-model identity, bounded failure classification, cancellation-aware transport, and one-call streaming assembly. A supported external provider/model still means that exact configuration and model has recorded Pastey conformance acceptance; no compatible provider, health observation, or configuration alone claims a Managed E2E `PASS`.
 
+## Room Control message lifecycle and backpressure
+
+Source: `src-tauri/src/room_control.rs`. Every received event is first authenticated (sender transport key, decryption, `validate_control_event`: schema, session refs, expiry, size, allowed kind, unsafe fields). Then:
+
+**Admission, before anything acts on it** (`admit_received_event`). The event must be new to this Bridge's replay window (event, envelope and request ids, 256 each) and fit its class's rate budget. Only an admitted event records its replay ids. A refusal changes nothing but the diagnostic counters, so the sender may send a fresh event. For capability and Bridge Plan events, a refusal after admission (invalid content, authority, session) releases the replay ids again (`AdmittedEventV1`), so a refused event leaves no trace, as when these checks ran last. Native Agent events keep their ids once admitted (a task id is answered idempotently by Core).
+
+| Class | Kinds | Budget per minute / per 2 s | Kept after handling |
+|---|---|---|---|
+| `capability_query` | `peer_capability.query` | 60 / 12 | No: answered (off the request path, on the blocking pool) |
+| `capability_answer` | `peer_capability.response` | 120 / 24 (answers to this Host's own checks; twice the query budget absorbs arrival jitter) | No: recorded as the peer's capability fact |
+| `native_agent` | `native_agent.*` | 90 / 20 | No: Core's task, Review and session state is the record |
+| `bridge_plan` | `bridge_plan.*`, including v2 | 30 / 8 | v1 only, as display history |
+| `membership` | `bridge_membership.*` | 30 / 8 | No |
+
+Developer Terminal frames keep their own separate flow control and replay set.
+
+**Display history.** Only received Bridge Plan v1 events are kept, for Find File's progress (`list_received_room_control_events`): at most 64 per Bridge and 30 minutes each, oldest dropped first. It is observation only (the Bridge Plan stores hold the state of record), so it never refuses an event; there is no `inbox_full` refusal any more. Capability facts, Native Agent events and Bridge Plan v2 events are never kept here. Room server stop (Repair, restart) and Burn clear it with the replay and rate state.
+
+**Pending interactions** keep their own lifecycle outside Room Control. A native capability Review is `pending` until Accept, Deny, its 2-minute expiry (bounded by the Bridge's), or the end of its authority; one Bridge may hold 8, and a ninth is refused with `native_agent_review_capacity` (429) before anything is queued, never by dropping a waiting one. Accept and Deny each consume the Review once. Accept re-checks the session, Bridge, ownership and capability and, for an invocation that came through a shared folder, that the share still allows it (`share_requirement_holds`: unrevoked, unexpired, device still trusted with the same key, Bridge not burned, folder unmoved, Agent requests and, for a continuation, Sessions still on).
+
+**Refusal codes and what the sender may conclude** (`DELIVERY_REFUSALS`, `delivery_failure`):
+
+| Sender's reading | Codes | Meaning |
+|---|---|---|
+| `rate_limited` | `rate_limited`, `terminal_rate_limited` | Refused before acting. Safe to send a fresh event later. |
+| `review_capacity` | `native_agent_review_capacity` | Nothing queued; no waiting Review dropped. |
+| `refused` | `native_agent_not_authorized`, `native_agent_incompatible`, `host_mismatch`, `invalid_native_agent` | Refused before admitting anything. |
+| `replayed`, `expired` | `event_replayed`, `event_expired` | Already received, or too late. |
+| `inbox_full` | `inbox_full` (older Pastey only) | An older receiver refused after acting: not proof of anything. |
+| `rejected` | every other code | Refused; whether it acted first is not known. |
+| `transport` | timeouts, unreadable answers | Unknown whether it arrived. |
+| `not_sent` | preparation failed here | Never sent. |
+
+`not_sent`, `rate_limited`, `review_capacity` and `refused` prove the receiver did nothing (`proves_nothing_happened`). A Native Agent invocation refused that way ends on the requester as `failed` / `native_agent_not_delivered` with the receiver's reason; every other failure keeps the existing `native_agent_reconciliation_required` interruption, and nothing is ever re-run automatically.
+
+**Retrying.** `send_room_control_event_with_backpressure` builds a fresh event for each attempt and retries only on `rate_limited`, within a stated patience (capability query and answer 5 s, session query 5 s, its answer 10 s, identity 4 s, invocation 6 s, a received-workspace status 30 s). The native status loop offers one unchanged status again while it is rate-limited for up to 120 s without using its 5 resends, and a final status is resent until settled (delivered or resends used up), not just once. Nothing retries an unknown outcome.
+
+**Diagnostics** (`get_room_control_diagnostics`, Device Details → Advanced → Control channel): per class accepted and refused counts by reason, use of the last minute against the budget, current backpressure (since when, how many refused), history depth and drops, replay window, outbound failures by reading, the last refusal each way, and the Bridge's Reviews by outcome. Counts, classes, reasons and times only. Logs add one line when a class enters backpressure (then every 100th refusal) and one when it ends, with the Bridge id's first 8 characters.
+
 ## Bridge authentication facts
 
 Protocol `pastey-bridge-auth-v1` (`src-tauri/src/bridge_auth.rs`). Discovery messages travel as JSON over UDP port 48392; `/join` and the authenticated room routes over the room server's HTTP port.

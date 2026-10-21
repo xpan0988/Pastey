@@ -121,23 +121,27 @@ impl CurrentRemoteHostSession {
             &context.peer_route_ref,
             &context.peer_observation_ref,
         );
-        let event = room_control::peer_capability_event(
-            "peer_capability.query",
-            serde_json::json!({
-                "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
-                "peerSessionId": context.peer_route_ref,
-                "capabilityIds": capability_ids,
-            }),
-            &context,
-        )?;
-        room_control::send_room_control_event(
+        // A query the Host refused for its rate budget did nothing there,
+        // so a fresh one may follow within the answer's own wait.
+        room_control::send_room_control_event_with_backpressure(
             state.clone(),
             &current.binding.bridge_id,
-            event,
+            || {
+                room_control::peer_capability_event(
+                    "peer_capability.query",
+                    serde_json::json!({
+                        "schemaVersion": crate::peer_capabilities::PEER_CAPABILITY_SCHEMA,
+                        "peerSessionId": context.peer_route_ref,
+                        "capabilityIds": capability_ids,
+                    }),
+                    &context,
+                )
+            },
             Some(room_control::selected_peer_route(
                 &current.binding.bridge_id,
                 &current.binding.peer_route_ref,
             )),
+            Duration::from_secs(5),
         )
         .await?;
 
@@ -192,19 +196,22 @@ impl CurrentRemoteHostSession {
             &current.binding.bridge_id,
             current.binding.peer_host_ref.as_str(),
         );
-        let event = room_control::native_agent_event(
-            "native_agent.session_query",
-            serde_json::to_value(&query)?,
-            &context,
-        )?;
-        if let Err(error) = room_control::send_room_control_event(
+        let payload = serde_json::to_value(&query)?;
+        if let Err(error) = room_control::send_room_control_event_with_backpressure(
             state.clone(),
             &current.binding.bridge_id,
-            event,
+            || {
+                room_control::native_agent_event(
+                    "native_agent.session_query",
+                    payload.clone(),
+                    &context,
+                )
+            },
             Some(room_control::selected_peer_route(
                 &current.binding.bridge_id,
                 &current.binding.peer_route_ref,
             )),
+            Duration::from_secs(5),
         )
         .await
         {

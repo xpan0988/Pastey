@@ -28,6 +28,8 @@ import {
 import { codexRunReadiness, looksLikeFullPath, type CodexRunInput } from "../src/lib/nativeAgentReadiness";
 import { remoteAccessGuidance, type RemoteAccessFacts } from "../src/lib/accessGuidance";
 import { allows, peerShareGuidance, shareSummary, visibleShares } from "../src/lib/workspaceShares";
+import { controlHealth, controlReasonLabel, refusalLine } from "../src/lib/controlDiagnostics";
+import type { RoomControlDiagnostics } from "../src/lib/tauri";
 import { benchmarkFacts, benchmarkScope, deviceProfileFacts, measuredAgo, runtimeFacts } from "../src/lib/deviceDiagnostics";
 import { rememberedNativeTask, rememberStartedNativeTask } from "../src/features/workspace/AgentTaskLifecycle";
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
@@ -1325,4 +1327,48 @@ test("A session is offered for continuation only where the Host would accept it"
   assert.equal(continuationAvailability(claude, true).allowed, false);
   assert.match(continuationAvailability(claude, true).reason, /no live source/);
   assert.equal(continuationAvailability({ ...claude, resume: { verdict: "safe", reasons: [] } }, true).allowed, true);
+});
+
+function controlSnapshot(overrides: Partial<RoomControlDiagnostics> = {}): RoomControlDiagnostics {
+  return {
+    observedAt: 1_000,
+    historyDepth: 0,
+    historyLimit: 64,
+    historyDropped: 0,
+    historyStale: 0,
+    replayWindow: 12,
+    replayLimit: 256,
+    classes: [
+      { class: "capability_query", accepted: 500, refused: [], lastMinute: 20, perMinute: 60, burst: 12, backpressureSince: null, backpressureRefused: 0 },
+      { class: "native_agent", accepted: 40, refused: [], lastMinute: 2, perMinute: 90, burst: 20, backpressureSince: null, backpressureRefused: 0 },
+    ],
+    lastRefusal: null,
+    outboundFailures: [],
+    lastOutboundFailure: null,
+    nativeReviews: { pending: 0, limit: 8, started: 3, denied: 1, expired: 0, revoked: 0 },
+    ...overrides,
+  };
+}
+
+test("Room Control diagnostics say what the counts mean, from facts only", () => {
+  assert.equal(controlHealth(controlSnapshot()).tone, "ok");
+  const pressed = controlSnapshot({ classes: [{ class: "capability_query", accepted: 60, refused: [["rate_limited", 14]], lastMinute: 60, perMinute: 60, burst: 12, backpressureSince: 988, backpressureRefused: 14 }] });
+  const health = controlHealth(pressed);
+  assert.equal(health.tone, "warn");
+  assert.match(health.summary, /Capability checks asked of this device are being refused for their rate budget, since 12 s ago \(14 so far\)\. Nothing refused was acted on/);
+  assert.match(controlHealth(controlSnapshot({ nativeReviews: { pending: 8, limit: 8, started: 0, denied: 0, expired: 0, revoked: 0 } })).summary, /8 requests are waiting for Accept here, the most this Bridge may hold/);
+  assert.equal(controlReasonLabel("transport"), "no answer (outcome unknown)");
+  assert.equal(controlReasonLabel("rate_limited"), "refused for its rate budget (nothing was done)");
+  assert.equal(refusalLine({ class: "native_agent", reason: "review_capacity", at: 940 }, 1_000), "Agent requests, statuses and session queries: refused: too many requests waiting for Accept, 1 min ago");
+  // Read on request only, from Device Details; no polling.
+  const device = readFileSync("src/features/workspace/DeviceDetails.tsx", "utf8");
+  assert.match(device, /<ControlChannelSection room=\{room\} name=\{name\} \/>/);
+  assert.match(device, /onClick=\{\(\) => void read\(\)\}/);
+  assert.doesNotMatch(device.slice(device.indexOf("function ControlChannelSection")), /setInterval/);
+});
+
+test("A request the other device refused before acting on it ends as not delivered, not unknown", () => {
+  const base = { schemaVersion: "pastey-native-agent-task-v1", taskId: "t", agentId: "agent.coding.codex_thread", workspaceName: "PasteySessionTest", sessionReused: false, state: "failed" as const, result: null, output: null, conversation: null, nativeDecisions: [] };
+  assert.equal(nativeAgentLifecycleLabel({ ...base, code: "native_agent_not_delivered" }), "not delivered · nothing ran");
+  assert.equal(nativeAgentLifecycleLabel({ ...base, code: "native_agent_admission_revoked" }), "failed · access ended before it started");
 });

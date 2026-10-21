@@ -450,6 +450,77 @@ pub(crate) fn agent_request_scopes(
         .collect())
 }
 
+/// The share an invocation was admitted through. A Review can wait for
+/// minutes; its Accept starts the run only if this share still allows it
+/// then (`share_requirement_holds`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ShareRequirementV1 {
+    fingerprint: String,
+    public_key: String,
+    bridge_id: String,
+    peer_host_ref: String,
+    local_host_ref: String,
+    workspace: PathBuf,
+    continuing: bool,
+}
+
+impl ShareRequirementV1 {
+    /// For a request `resolve_agent_request` resolved to `input`.
+    pub(crate) fn of_resolved(
+        device: &VerifiedPeerDevice,
+        binding: &HostSessionBinding,
+        capability: &str,
+        input: &crate::native_agent::OpaqueCapabilityPayloadV1,
+    ) -> Option<Self> {
+        let workspace = serde_json::to_value(input)
+            .ok()?
+            .get("workspace")?
+            .as_str()
+            .map(PathBuf::from)?;
+        Some(Self {
+            fingerprint: device.fingerprint.clone(),
+            public_key: base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                device.public_key,
+            ),
+            bridge_id: binding.bridge_id.clone(),
+            peer_host_ref: binding.peer_host_ref.as_str().to_owned(),
+            local_host_ref: binding.local_host_ref.as_str().to_owned(),
+            workspace,
+            continuing: capability == crate::native_agent::CODEX_THREAD_CAPABILITY,
+        })
+    }
+}
+
+/// Whether the share an invocation was admitted through still allows it:
+/// unrevoked, unexpired, the device still trusted with the same key, the
+/// Bridge not burned, the folder unmoved, and Agent requests (and, for a
+/// continuation, Sessions) still on. Stored facts only: the requesting
+/// device need not be connected for its own request's Accept.
+pub(crate) fn share_requirement_holds(
+    paths: &AppPaths,
+    requirement: &ShareRequirementV1,
+    now: i64,
+) -> AppResult<bool> {
+    let workspace = requirement.workspace.to_string_lossy();
+    Ok(storage::active_session_read_grants(
+        paths,
+        &requirement.fingerprint,
+        &requirement.public_key,
+        &requirement.bridge_id,
+        &requirement.peer_host_ref,
+        &requirement.local_host_ref,
+        now,
+    )?
+    .into_iter()
+    .any(|grant| {
+        grant.workspace == workspace
+            && grant.agent_requests
+            && (!requirement.continuing || grant.read_sessions)
+            && workspace_intact(&grant.workspace)
+    }))
+}
+
 /// What the executing Host does with a peer's native invocation before it
 /// is admitted (and, without an unattended grant, held for Review): a Codex
 /// run naming a folder by its share reference, or any thread continuation

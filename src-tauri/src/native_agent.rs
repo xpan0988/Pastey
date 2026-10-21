@@ -586,6 +586,18 @@ enum NativeTurnOutcomeV1 {
 pub(crate) const NATIVE_DECISION_REVIEW_TTL_SECONDS: i64 = 30 * 60;
 /// Most native decision reviews one task carries at once.
 pub(crate) const MAX_NATIVE_DECISION_REVIEWS: usize = 3;
+
+/// One Bridge's native capability Reviews on this Host, by outcome.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeReviewCountsV1 {
+    pub(crate) pending: usize,
+    pub(crate) limit: usize,
+    pub(crate) started: usize,
+    pub(crate) denied: usize,
+    pub(crate) expired: usize,
+    pub(crate) revoked: usize,
+}
 /// Bound for one review's material content, as JSON. Larger content is
 /// never summarized or cut: the review simply cannot be approved. With
 /// `MAX_NATIVE_DECISION_REVIEWS` it keeps a status within one control event.
@@ -1100,6 +1112,9 @@ pub(crate) struct NativeAgentServiceV1 {
     /// Remote invocations held for Host Review, by task. Process-local and
     /// one-shot; see `admission`.
     pending_reviews: HashMap<String, PendingNativeInvocationV1>,
+    /// For a Review whose invocation came through a shared folder: the
+    /// share, which its Accept checks again before starting anything.
+    review_share_requirements: HashMap<String, crate::session_read_access::ShareRequirementV1>,
     /// Tasks a Review created that never started. No adapter has seen them
     /// and they have no durable envelope, so a restart forgets them.
     unstarted_review_tasks: HashSet<String>,
@@ -1162,6 +1177,7 @@ impl NativeAgentServiceV1 {
             task_bridges: HashMap::new(),
             revoked_bridges: HashSet::new(),
             pending_reviews: HashMap::new(),
+            review_share_requirements: HashMap::new(),
             unstarted_review_tasks: HashSet::new(),
             task_input_digests: HashMap::new(),
             movement_bindings: HashMap::new(),
@@ -1202,6 +1218,20 @@ impl NativeAgentServiceV1 {
         service.durable_paths = Some(paths);
         service.restore_durable_envelopes()?;
         Ok(service)
+    }
+
+    /// Tests: registers the Codex thread continuation adapter (registered
+    /// only in the product otherwise) with a fixture Codex and Codex home.
+    #[cfg(test)]
+    pub(crate) fn add_codex_thread_adapter_for_test(
+        &mut self,
+        executable: &Path,
+        codex_home: &Path,
+    ) {
+        let adapter = capability::codex::thread_continuation::CodexThreadAdapterV1::default();
+        adapter.use_executable(executable);
+        adapter.use_codex_home(codex_home);
+        self.adapters.push(Arc::new(adapter));
     }
 
     /// Tests: the task occupying a canonical Codex workspace, if any.
@@ -4353,6 +4383,7 @@ impl NativeAgentServiceV1 {
     /// landed tree. Nothing was prepared or started, so nothing needs
     /// reconciliation.
     fn end_review(&mut self, task_id: &str, code: &str) -> AppResult<NativeAgentTaskStatusV1> {
+        self.review_share_requirements.remove(task_id);
         let status = self.finish_unstarted_review(task_id, code)?;
         let movement_id = self
             .workspace_movements
@@ -4447,6 +4478,22 @@ impl NativeAgentServiceV1 {
             self.end_review(task_id, admission::ADMISSION_REVOKED_CODE)?;
             return Err(error);
         }
+        // Admitted through a shared folder: that share must still allow it
+        // now. Stopping the share, turning its switch off, its expiry,
+        // revoking the device or Burn while the Review waited all end it.
+        if let Some(requirement) = self.review_share_requirements.remove(task_id) {
+            let holds = self.durable_paths.as_ref().is_some_and(|paths| {
+                crate::session_read_access::share_requirement_holds(paths, &requirement, now)
+                    .unwrap_or(false)
+            });
+            if !holds {
+                log_native_lifecycle("review_share_revoked", task_id, "");
+                self.end_review(task_id, admission::ADMISSION_REVOKED_CODE)?;
+                return invalid(
+                    "The folder is no longer shared for this request, so nothing was started.",
+                );
+            }
+        }
         if let NativeInvocationContinuationV1::ReceivedWorkspace { movement_id } =
             &pending.continuation
         {
@@ -4512,6 +4559,63 @@ impl NativeAgentServiceV1 {
                 Err(error)
             }
         }
+    }
+
+    /// Records that a Review-held task came through `requirement`'s share.
+    /// Only for a task still waiting for its Review; a task that started
+    /// at once (an unattended grant) or already ended needs no later check.
+    pub(crate) fn require_share_at_accept(
+        &mut self,
+        task_id: &str,
+        requirement: crate::session_read_access::ShareRequirementV1,
+    ) {
+        if self.pending_reviews.contains_key(task_id) {
+            self.review_share_requirements
+                .entry(task_id.into())
+                .or_insert(requirement);
+        }
+    }
+
+    /// Whether `bridge_id` holds as many Reviews as it may.
+    pub(crate) fn review_capacity_reached(&self, bridge_id: &str) -> bool {
+        self.pending_reviews
+            .values()
+            .filter(|pending| pending.binding.bridge_id == bridge_id)
+            .count()
+            >= admission::MAX_PENDING_REVIEWS_PER_BRIDGE
+    }
+
+    /// Reviews of invocations `bridge_id`'s peers asked of this Host, by
+    /// outcome, for diagnostics. Counts only.
+    pub(crate) fn review_counts(&self, bridge_id: &str) -> NativeReviewCountsV1 {
+        let mut counts = NativeReviewCountsV1 {
+            pending: self
+                .pending_reviews
+                .values()
+                .filter(|pending| pending.binding.bridge_id == bridge_id)
+                .count(),
+            limit: admission::MAX_PENDING_REVIEWS_PER_BRIDGE,
+            ..NativeReviewCountsV1::default()
+        };
+        let Ok(tasks) = self.tasks.lock() else {
+            return counts;
+        };
+        for (task_id, task) in tasks.iter() {
+            if self.task_bridges.get(task_id).map(String::as_str) != Some(bridge_id)
+                || self.remote_targets.contains_key(task_id)
+                || self.pending_reviews.contains_key(task_id)
+            {
+                continue;
+            }
+            match task.code.as_deref() {
+                Some(admission::ADMISSION_DENIED_CODE) => counts.denied += 1,
+                Some(admission::REVIEW_EXPIRED_CODE) => counts.expired += 1,
+                Some(admission::ADMISSION_REVOKED_CODE) => counts.revoked += 1,
+                Some(admission::REVIEW_REQUIRED_CODE) => {}
+                _ => counts.started += 1,
+            }
+        }
+        counts
     }
 
     fn revalidate_review(
@@ -5289,6 +5393,42 @@ impl NativeAgentServiceV1 {
                     "remote_delivery_ambiguous",
                     task_id,
                     "state=Interrupted code=native_agent_reconciliation_required",
+                );
+            }
+            task.clone()
+        };
+        self.persist_envelope(task_id, None)?;
+        Ok(status)
+    }
+
+    /// The executing Host refused this invocation before admitting it (its
+    /// rate budget, its Review capacity, or this device's authority), so it
+    /// never started there: a definite non-start, unlike a lost receipt.
+    /// Only for an invocation still waiting for its first status.
+    pub(crate) fn fail_remote_undelivered(
+        &mut self,
+        task_id: &str,
+        code: &str,
+        reason: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let status = {
+            let mut tasks = self.tasks.lock().map_err(|_| {
+                AppError::InvalidInput("Native Agent task store is unavailable.".into())
+            })?;
+            let task = tasks.get_mut(task_id).ok_or_else(|| {
+                AppError::InvalidInput("Remote native Agent task is unavailable.".into())
+            })?;
+            if task.state == NativeAgentTaskStateV1::Queued
+                && task.code.as_deref() == Some("remote_agent_queued")
+            {
+                task.state = NativeAgentTaskStateV1::Failed;
+                task.native_decisions.clear();
+                task.code = Some(code.into());
+                task.result = Some(reason.into());
+                log_native_lifecycle(
+                    "remote_invocation_refused",
+                    task_id,
+                    &format!("state=Failed code={code}"),
                 );
             }
             task.clone()
@@ -6805,22 +6945,25 @@ pub(crate) async fn monitor_received_workspace_task(
                     executing_host_ref: runtime.local_host_ref.as_str().into(),
                     status: task.clone(),
                 }) {
-                    if let Ok(event) = crate::room_control::native_agent_event(
-                        "native_agent.status",
-                        payload,
-                        &context,
-                    ) {
-                        let _ = crate::room_control::send_room_control_event(
-                            runtime.clone(),
+                    // Offered again only while the requester refuses it for
+                    // its rate budget, which proves it never arrived.
+                    let _ = crate::room_control::send_room_control_event_with_backpressure(
+                        runtime.clone(),
+                        &room_id,
+                        || {
+                            crate::room_control::native_agent_event(
+                                "native_agent.status",
+                                payload.clone(),
+                                &context,
+                            )
+                        },
+                        Some(crate::room_control::selected_peer_route(
                             &room_id,
-                            event,
-                            Some(crate::room_control::selected_peer_route(
-                                &room_id,
-                                &peer_session_id,
-                            )),
-                        )
-                        .await;
-                    }
+                            &peer_session_id,
+                        )),
+                        Duration::from_secs(30),
+                    )
+                    .await;
                 }
             }
             last = Some(task.clone());

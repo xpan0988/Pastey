@@ -264,8 +264,36 @@ fn cached_report(
             }
             report
         }
-        None => observe_report(cache, executable),
+        None => first_report(cache, executable),
     }
+}
+
+/// With no observation yet, one caller probes and the others wait for its
+/// observation instead of starting probe processes of their own.
+fn first_report(cache: &AvailabilityCacheV1, executable: &Path) -> CapabilityAvailabilityV1 {
+    let probing_elsewhere = cache.lock().is_ok_and(|mut cache| {
+        let elsewhere = cache.refreshing;
+        cache.refreshing = true;
+        elsewhere
+    });
+    if probing_elsewhere {
+        // Two probes in a row, each bounded by `PROBE_TIMEOUT`.
+        let deadline = Instant::now() + PROBE_TIMEOUT * 2 + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+            let observed = cache.lock().ok().and_then(|cache| {
+                cache
+                    .observed
+                    .as_ref()
+                    .filter(|cached| cached.executable == executable)
+                    .map(|cached| cached.report.clone())
+            });
+            if let Some(report) = observed {
+                return report;
+            }
+        }
+    }
+    observe_report(cache, executable)
 }
 
 /// Probes now, without holding the cache, and records the observation.

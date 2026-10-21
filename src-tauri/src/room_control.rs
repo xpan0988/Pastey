@@ -32,11 +32,18 @@ pub const MAX_CONTROL_REQUEST_BYTES: usize = 96 * 1024;
 const MAX_CONTROL_EVENT_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 4 * 1024;
 const MAX_EVENT_LIFETIME_SECONDS: i64 = 120;
-const MAX_INBOX_ITEMS: usize = 64;
+/// Received Bridge Plan (v1) events kept for display: Find File reads its
+/// progress from them. Observation only, since the Bridge Plan store holds
+/// their state of record: the oldest leave first, and none is ever refused
+/// for lack of room.
+const MAX_HISTORY_ITEMS: usize = 64;
+const MAX_HISTORY_AGE_SECONDS: i64 = 30 * 60;
 const MAX_REPLAY_ITEMS: usize = 256;
-const MAX_EVENTS_PER_MINUTE: usize = 30;
 /// Further attempts to deliver one unchanged native task status.
 const MAX_STATUS_RESENDS: u32 = 5;
+/// How long one unchanged native task status is offered again while the
+/// requester refuses it for its rate budget (which proves it never arrived).
+const MAX_STATUS_BACKPRESSURE: Duration = Duration::from_secs(120);
 
 /// Whether one native task status needs no further delivery attempt: it was
 /// delivered, or it failed `MAX_STATUS_RESENDS` more times (the requester
@@ -45,7 +52,81 @@ const MAX_STATUS_RESENDS: u32 = 5;
 fn native_status_settled(delivered: bool, failed_sends: u32) -> bool {
     delivered || failed_sends >= MAX_STATUS_RESENDS
 }
-const MAX_BURST_EVENTS: usize = 8;
+
+/// What a received Room Control event is for. Each class has its own rate
+/// budget, so one kind of traffic (a polling UI's capability checks, say)
+/// can never use up what another (a running task's statuses) needs.
+/// Developer Terminal traffic keeps its own separate flow control.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControlClassV1 {
+    /// `peer_capability.query`: answered at once, never kept.
+    CapabilityQuery,
+    /// `peer_capability.response`: recorded at once, never kept. Its own
+    /// budget, so a burst of this Host's own checks cannot make it refuse
+    /// their answers.
+    CapabilityAnswer,
+    /// `native_agent.*`: invocations, statuses, decisions, session queries,
+    /// identity. Handled at once; their state of record is Core's.
+    NativeAgent,
+    /// `bridge_plan.*`, including protocol v2. Their state of record is the
+    /// Bridge Plan stores; v1 events are also kept as display history.
+    BridgePlan,
+    /// `bridge_membership.*`.
+    Membership,
+}
+
+impl ControlClassV1 {
+    pub(crate) const ALL: [Self; 5] = [
+        Self::CapabilityQuery,
+        Self::CapabilityAnswer,
+        Self::NativeAgent,
+        Self::BridgePlan,
+        Self::Membership,
+    ];
+
+    pub(crate) fn of(kind: &str) -> Self {
+        if kind == "peer_capability.response" {
+            Self::CapabilityAnswer
+        } else if kind.starts_with("peer_capability.") {
+            Self::CapabilityQuery
+        } else if kind.starts_with("native_agent.") {
+            Self::NativeAgent
+        } else if kind.starts_with("bridge_membership.") {
+            Self::Membership
+        } else {
+            Self::BridgePlan
+        }
+    }
+
+    /// Events accepted per rolling minute, and within any 2 seconds.
+    fn budget(self) -> (usize, usize) {
+        match self {
+            // A UI checks every few seconds, and every run checks first.
+            Self::CapabilityQuery => (60, 12),
+            // Answers to this Host's own queries: no more than the other
+            // Host admitted at its query budget, but they arrive with
+            // jitter, so twice that, and this Host never refuses answers
+            // to its own checks.
+            Self::CapabilityAnswer => (120, 24),
+            // One continuation is identity, invocation, a status per change
+            // (Queued, Running, each native request, the outcome) and the
+            // decisions; session queries come in pairs with identity.
+            Self::NativeAgent => (90, 20),
+            Self::BridgePlan | Self::Membership => (30, 8),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CapabilityQuery => "capability_query",
+            Self::CapabilityAnswer => "capability_answer",
+            Self::NativeAgent => "native_agent",
+            Self::BridgePlan => "bridge_plan",
+            Self::Membership => "membership",
+        }
+    }
+}
 const CONTROL_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-envelope+json";
 const CONTROL_RECEIPT_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-receipt+json";
 const CONTROL_ERROR_CONTENT_TYPE: &str = "application/vnd.pastey.room-control-error+json";
@@ -460,9 +541,24 @@ const UNSAFE_FIELDS: &[&str] = &[
 #[derive(Default)]
 pub struct RoomControlRuntimeState {
     rooms: HashMap<String, RoomControlRoomState>,
+    /// Tests: moves the rate limiter's clock (only) forward.
+    #[cfg(test)]
+    pub(crate) limiter_skew_seconds: i64,
 }
 
 impl RoomControlRuntimeState {
+    /// The rate limiter's clock, in seconds.
+    fn limiter_now(&self) -> i64 {
+        #[cfg(test)]
+        {
+            OffsetDateTime::now_utc().unix_timestamp() + self.limiter_skew_seconds
+        }
+        #[cfg(not(test))]
+        {
+            OffsetDateTime::now_utc().unix_timestamp()
+        }
+    }
+
     /// Burn is terminal for a Bridge: retain no inbox, replay cache, or rate
     /// state that could replay or display an old control action.
     pub fn purge_room(&mut self, room_id: &str) -> bool {
@@ -472,17 +568,41 @@ impl RoomControlRuntimeState {
 
 #[derive(Default)]
 struct RoomControlRoomState {
-    inbox: VecDeque<ReceivedRoomControlEvent>,
+    /// Display history of received Bridge Plan (v1) events only.
+    history: VecDeque<ReceivedRoomControlEvent>,
     seen_event_ids: VecDeque<String>,
     seen_event_id_set: HashSet<String>,
     seen_envelope_ids: VecDeque<String>,
     seen_envelope_id_set: HashSet<String>,
     seen_request_ids: VecDeque<String>,
     seen_request_id_set: HashSet<String>,
-    received_at_seconds: VecDeque<i64>,
+    received_at_seconds: HashMap<ControlClassV1, VecDeque<i64>>,
+    stats: RoomControlStatsV1,
     terminal_seen_event_ids: VecDeque<String>,
     terminal_seen_event_id_set: HashSet<String>,
     terminal_received_at_seconds: VecDeque<i64>,
+}
+
+/// What one Bridge's Room Control did, for diagnostics. Counts, classes,
+/// reasons and times only: never an event, a payload or an identifier.
+#[derive(Default)]
+struct RoomControlStatsV1 {
+    accepted: HashMap<ControlClassV1, u64>,
+    refused: HashMap<(ControlClassV1, &'static str), u64>,
+    history_dropped: u64,
+    last_refusal: Option<ControlRefusalV1>,
+    /// When each class's current run of rate refusals began, and its length.
+    backpressure: HashMap<ControlClassV1, (i64, u64)>,
+    outbound_failures: HashMap<(ControlClassV1, &'static str), u64>,
+    last_outbound_failure: Option<ControlRefusalV1>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlRefusalV1 {
+    class: ControlClassV1,
+    reason: &'static str,
+    at: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -932,7 +1052,66 @@ pub async fn send_room_control_event(
     event: Value,
     bridge_route: Option<Value>,
 ) -> AppResult<RoomControlDeliveryReceipt> {
-    send_room_control_event_internal(state, room_id, event, bridge_route).await
+    let class = ControlClassV1::of(
+        event
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    let sent = send_room_control_event_internal(state.clone(), room_id, event, bridge_route).await;
+    if let Err(error) = &sent {
+        note_outbound_failure(&state, room_id, class, delivery_failure(error));
+    }
+    sent
+}
+
+fn note_outbound_failure(
+    state: &AppState,
+    room_id: &str,
+    class: ControlClassV1,
+    failure: ControlDeliveryFailureV1,
+) {
+    let mut runtime = state.room_control.lock();
+    let stats = &mut runtime.rooms.entry(room_id.to_owned()).or_default().stats;
+    *stats
+        .outbound_failures
+        .entry((class, failure.label()))
+        .or_default() += 1;
+    stats.last_outbound_failure = Some(ControlRefusalV1 {
+        class,
+        reason: failure.label(),
+        at: storage::now_ts(),
+    });
+}
+
+/// Sends one event built afresh by `build` for each attempt, and tries
+/// again only while the receiver answers `rate_limited`: that refusal
+/// comes before it acts on anything, so a new attempt cannot do anything
+/// twice. Every other outcome, and running out of `patience`, is returned
+/// as it is. Never retries on an unknown outcome.
+pub(crate) async fn send_room_control_event_with_backpressure(
+    state: Arc<AppState>,
+    room_id: &str,
+    mut build: impl FnMut() -> AppResult<Value>,
+    bridge_route: Option<Value>,
+    patience: Duration,
+) -> AppResult<RoomControlDeliveryReceipt> {
+    let deadline = tokio::time::Instant::now() + patience;
+    let mut pause = Duration::from_millis(400);
+    loop {
+        let sent =
+            send_room_control_event(state.clone(), room_id, build()?, bridge_route.clone()).await;
+        match &sent {
+            Err(error)
+                if delivery_failure(error) == ControlDeliveryFailureV1::RateLimited
+                    && tokio::time::Instant::now() + pause < deadline =>
+            {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_secs(2));
+            }
+            _ => return sent,
+        }
+    }
 }
 
 async fn send_room_control_event_internal(
@@ -1095,8 +1274,129 @@ pub fn list_received_room_control_events(
         .lock()
         .rooms
         .get(room_id)
-        .map(|room| room.inbox.iter().cloned().collect())
+        .map(|room| room.history.iter().cloned().collect())
         .unwrap_or_default())
+}
+
+/// One class's traffic on one Bridge, as received here.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ControlClassDiagnosticsV1 {
+    class: ControlClassV1,
+    accepted: u64,
+    /// Refusals by reason (`rate_limited`, `event_replayed`,
+    /// `refused_after_admission`).
+    refused: Vec<(&'static str, u64)>,
+    /// Accepted in the last minute, against `per_minute`.
+    last_minute: usize,
+    per_minute: usize,
+    burst: usize,
+    /// Since when this class's events are being refused for its rate
+    /// budget, if they are now, and how many so far.
+    backpressure_since: Option<i64>,
+    backpressure_refused: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OutboundFailureDiagnosticsV1 {
+    class: ControlClassV1,
+    failure: &'static str,
+    count: u64,
+}
+
+/// Room Control on one Bridge, for diagnostics: counts, classes, reasons
+/// and times only, never an event, a payload or an identifier.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RoomControlDiagnosticsV1 {
+    observed_at: i64,
+    /// Bridge Plan events kept for display, and the most kept.
+    history_depth: usize,
+    history_limit: usize,
+    history_dropped: u64,
+    /// History entries past their age: always 0, since every addition
+    /// prunes them first; a non-zero value would mean nothing consumes it.
+    history_stale: usize,
+    replay_window: usize,
+    replay_limit: usize,
+    classes: Vec<ControlClassDiagnosticsV1>,
+    last_refusal: Option<ControlRefusalV1>,
+    outbound_failures: Vec<OutboundFailureDiagnosticsV1>,
+    last_outbound_failure: Option<ControlRefusalV1>,
+    native_reviews: crate::native_agent::NativeReviewCountsV1,
+}
+
+pub(crate) fn room_control_diagnostics(
+    state: &AppState,
+    room_id: &str,
+) -> RoomControlDiagnosticsV1 {
+    let now = storage::now_ts();
+    let native_reviews = state.native_agents.lock().review_counts(room_id);
+    let runtime = state.room_control.lock();
+    let limiter_now = runtime.limiter_now();
+    let empty = RoomControlRoomState::default();
+    let room = runtime.rooms.get(room_id).unwrap_or(&empty);
+    let stats = &room.stats;
+    let mut outbound_failures = stats
+        .outbound_failures
+        .iter()
+        .map(|((class, failure), count)| OutboundFailureDiagnosticsV1 {
+            class: *class,
+            failure,
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    outbound_failures.sort_by_key(|failure| (failure.class.label(), failure.failure));
+    RoomControlDiagnosticsV1 {
+        observed_at: now,
+        history_depth: room.history.len(),
+        history_limit: MAX_HISTORY_ITEMS,
+        history_dropped: stats.history_dropped,
+        history_stale: room
+            .history
+            .iter()
+            .filter(|kept| {
+                OffsetDateTime::parse(
+                    &kept.received_at,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .is_ok_and(|at| at.unix_timestamp() <= now - MAX_HISTORY_AGE_SECONDS)
+            })
+            .count(),
+        replay_window: room.seen_event_ids.len(),
+        replay_limit: MAX_REPLAY_ITEMS,
+        classes: ControlClassV1::ALL
+            .iter()
+            .map(|class| {
+                let (per_minute, burst) = class.budget();
+                let mut refused = stats
+                    .refused
+                    .iter()
+                    .filter(|((refused_class, _), _)| refused_class == class)
+                    .map(|((_, reason), count)| (*reason, *count))
+                    .collect::<Vec<_>>();
+                refused.sort();
+                let backpressure = stats.backpressure.get(class).copied();
+                ControlClassDiagnosticsV1 {
+                    class: *class,
+                    accepted: stats.accepted.get(class).copied().unwrap_or(0),
+                    refused,
+                    last_minute: room.received_at_seconds.get(class).map_or(0, |window| {
+                        window.iter().filter(|at| **at > limiter_now - 60).count()
+                    }),
+                    per_minute,
+                    burst,
+                    backpressure_since: backpressure.map(|(since, _)| since),
+                    backpressure_refused: backpressure.map_or(0, |(_, refused)| refused),
+                }
+            })
+            .collect(),
+        last_refusal: stats.last_refusal,
+        outbound_failures,
+        last_outbound_failure: stats.last_outbound_failure,
+        native_reviews,
+    }
 }
 
 pub fn clear_room_control_state(state: &Arc<AppState>, room_id: &str) {
@@ -1351,29 +1651,19 @@ pub async fn receive_room_control_event_handler(
         log_bridge_plan_control_event(&validated, "inbound_validated");
     }
     if validated.kind == "bridge_membership.departure" {
-        let now = OffsetDateTime::now_utc().unix_timestamp();
         {
             let mut runtime = ctx.state.room_control.lock();
+            let now = runtime.limiter_now();
             let room_state = runtime.rooms.entry(room_id.clone()).or_default();
-            if is_replayed(room_state, &validated) {
-                return control_error(
-                    StatusCode::CONFLICT,
-                    "event_replayed",
-                    "Room control event was already received.",
-                );
+            if let Err(refused) = admit_received_event(
+                room_state,
+                &validated,
+                ControlClassV1::Membership,
+                now,
+                &room_id,
+            ) {
+                return refused;
             }
-            if !accept_rate_limited_event(room_state, now) {
-                return control_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limited",
-                    "Room control event rate exceeded.",
-                );
-            }
-            record_replay_id(
-                &mut room_state.seen_event_ids,
-                &mut room_state.seen_event_id_set,
-                validated.event_id.clone(),
-            );
         }
 
         let removed = match storage::remove_departed_bridge_peer(
@@ -1427,6 +1717,7 @@ pub async fn receive_room_control_event_handler(
         let now = OffsetDateTime::now_utc().unix_timestamp();
         {
             let mut runtime = ctx.state.room_control.lock();
+            let limiter_now = runtime.limiter_now();
             let room_state = runtime.rooms.entry(room_id.clone()).or_default();
             if room_state
                 .terminal_seen_event_id_set
@@ -1438,7 +1729,7 @@ pub async fn receive_room_control_event_handler(
                     "Room control event was already received.",
                 );
             }
-            if !accept_terminal_rate_limited_event(room_state, now) {
+            if !accept_terminal_rate_limited_event(room_state, limiter_now) {
                 return control_error(
                     StatusCode::TOO_MANY_REQUESTS,
                     "terminal_rate_limited",
@@ -1530,36 +1821,22 @@ pub async fn receive_room_control_event_handler(
     }
     if validated.kind.starts_with("native_agent.") {
         // Native Agent invocation is a bounded product protocol over the
-        // existing authenticated current-session channel. Record replay before
-        // starting anything: receipt replay must never start a second task.
+        // existing authenticated current-session channel. Admit (replay,
+        // then this class's own rate budget) before starting anything:
+        // receipt replay must never start a second task, and a refusal
+        // here has done nothing.
         {
             let mut runtime = ctx.state.room_control.lock();
+            let now = runtime.limiter_now();
             let room_state = runtime.rooms.entry(room_id.clone()).or_default();
-            if is_replayed(room_state, &validated) {
-                return control_error(
-                    StatusCode::CONFLICT,
-                    "event_replayed",
-                    "Native Agent event was already received.",
-                );
-            }
-            if !accept_rate_limited_event(room_state, OffsetDateTime::now_utc().unix_timestamp()) {
-                return control_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "rate_limited",
-                    "Native Agent event rate exceeded.",
-                );
-            }
-            record_replay_id(
-                &mut room_state.seen_event_ids,
-                &mut room_state.seen_event_id_set,
-                validated.event_id.clone(),
-            );
-            if let Some(request_id) = validated.request_id.clone() {
-                record_replay_id(
-                    &mut room_state.seen_request_ids,
-                    &mut room_state.seen_request_id_set,
-                    request_id,
-                );
+            if let Err(refused) = admit_received_event(
+                room_state,
+                &validated,
+                ControlClassV1::NativeAgent,
+                now,
+                &room_id,
+            ) {
+                return refused;
             }
         }
         let payload = validated
@@ -1628,6 +1905,7 @@ pub async fn receive_room_control_event_handler(
                 // thread also needs it to allow reading sessions. Each run
                 // still waits for this Host's Review below.
                 let mut request = request;
+                let mut share_requirement = None;
                 match crate::session_read_access::resolve_agent_request(
                     &ctx.state.paths,
                     verified_device.as_ref(),
@@ -1636,7 +1914,17 @@ pub async fn receive_room_control_event_handler(
                     &request.input,
                     storage::now_ts(),
                 ) {
-                    Ok(Some(input)) => request.input = input,
+                    Ok(Some(input)) => {
+                        share_requirement = verified_device.as_ref().and_then(|device| {
+                            crate::session_read_access::ShareRequirementV1::of_resolved(
+                                device,
+                                &binding,
+                                &request.agent_capability,
+                                &input,
+                            )
+                        });
+                        request.input = input;
+                    }
                     Ok(None) => {}
                     Err(_) => {
                         crate::logging::write_transfer_line(&format!(
@@ -1650,19 +1938,38 @@ pub async fn receive_room_control_event_handler(
                         );
                     }
                 }
-                let _admitted = match ctx.state.native_agents.lock().receive_bridge_invocation(
-                    &binding,
-                    &request,
-                    storage::now_ts(),
-                    verified_device.as_ref(),
-                ) {
-                    Ok(status) => status,
-                    Err(_) => {
-                        return control_error(
-                            StatusCode::BAD_REQUEST,
-                            "native_agent_unavailable",
-                            "Native Agent invocation was rejected by this Host.",
-                        )
+                // One lock: the Host's user cannot Accept between admission
+                // and recording which share that Accept must check again.
+                let _admitted = {
+                    let mut agents = ctx.state.native_agents.lock();
+                    match agents.receive_bridge_invocation(
+                        &binding,
+                        &request,
+                        storage::now_ts(),
+                        verified_device.as_ref(),
+                    ) {
+                        Ok(status) => {
+                            if let Some(requirement) = share_requirement {
+                                agents.require_share_at_accept(&request.task_id, requirement);
+                            }
+                            status
+                        }
+                        // As many Reviews from this Bridge as allowed are
+                        // waiting: nothing was queued, and none was dropped.
+                        Err(_) if agents.review_capacity_reached(&binding.bridge_id) => {
+                            return control_error(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "native_agent_review_capacity",
+                                "Too many native capability invocations are awaiting Review.",
+                            )
+                        }
+                        Err(_) => {
+                            return control_error(
+                                StatusCode::BAD_REQUEST,
+                                "native_agent_unavailable",
+                                "Native Agent invocation was rejected by this Host.",
+                            )
+                        }
                     }
                 };
                 let response_context = match room_control_session_context_for_peer(
@@ -1692,6 +1999,8 @@ pub async fn receive_room_control_event_handler(
                     // stay unchanged (for example waiting for its requester's
                     // decision) and would otherwise never be reported.
                     let mut failed_sends = 0_u32;
+                    let mut rate_limited = false;
+                    let mut backpressure_since: Option<tokio::time::Instant> = None;
                     loop {
                         let status = {
                             let mut agents = response_state.native_agents.lock();
@@ -1720,31 +2029,63 @@ pub async fn receive_room_control_event_handler(
                                     &response_context,
                                 );
                                 if let Ok(payload) = payload {
-                                    delivered = send_room_control_event(
+                                    match send_room_control_event(
                                         response_state.clone(),
                                         &response_room,
                                         payload,
                                         Some(response_route.clone()),
                                     )
                                     .await
-                                    .is_ok();
+                                    {
+                                        Ok(_) => delivered = true,
+                                        // Refused for the requester's rate
+                                        // budget: nothing reached it, so the
+                                        // same status is offered again, for
+                                        // up to `MAX_STATUS_BACKPRESSURE`,
+                                        // without using up its resends.
+                                        Err(error)
+                                            if delivery_failure(&error)
+                                                == ControlDeliveryFailureV1::RateLimited =>
+                                        {
+                                            let since = *backpressure_since
+                                                .get_or_insert_with(tokio::time::Instant::now);
+                                            rate_limited =
+                                                since.elapsed() < MAX_STATUS_BACKPRESSURE;
+                                        }
+                                        Err(_) => {}
+                                    }
                                 }
                             }
-                            if native_status_settled(delivered, failed_sends) {
+                            if delivered {
+                                backpressure_since = None;
+                            }
+                            if rate_limited {
+                                rate_limited = false;
+                            } else if native_status_settled(delivered, failed_sends) {
                                 last = Some(status.clone());
                                 failed_sends = 0;
+                                backpressure_since = None;
                             } else {
                                 failed_sends += 1;
                             }
                         }
+                        // A final status ends the loop once it is settled
+                        // (delivered, or its bounded resends used up), not at
+                        // its first attempt: the requester learns the outcome
+                        // from it, without waiting for reconciliation.
                         if !matches!(
                             status.state,
                             crate::native_agent::NativeAgentTaskStateV1::Queued
                                 | crate::native_agent::NativeAgentTaskStateV1::Running
-                        ) {
+                        ) && last.as_ref() == Some(&status)
+                        {
                             return;
                         }
-                        let pause = if failed_sends > 0 { 1_000 } else { 250 };
+                        let pause = if failed_sends > 0 || backpressure_since.is_some() {
+                            1_000
+                        } else {
+                            250
+                        };
                         tokio::time::sleep(Duration::from_millis(pause)).await;
                     }
                 });
@@ -2146,21 +2487,20 @@ pub async fn receive_room_control_event_handler(
                             }
                         }
                     };
-                    let event = serde_json::to_value(answer)
-                        .map_err(AppError::from)
-                        .and_then(|payload| {
-                            native_agent_event(
-                                "native_agent.session_response",
-                                payload,
-                                &response_context,
-                            )
-                        });
-                    if let Ok(event) = event {
-                        let _ = send_room_control_event(
+                    if let Ok(payload) = serde_json::to_value(answer) {
+                        // The asker waits up to 30 s for this answer.
+                        let _ = send_room_control_event_with_backpressure(
                             answer_state,
                             &answer_room,
-                            event,
+                            || {
+                                native_agent_event(
+                                    "native_agent.session_response",
+                                    payload.clone(),
+                                    &response_context,
+                                )
+                            },
                             Some(answer_route),
+                            Duration::from_secs(10),
                         )
                         .await;
                     }
@@ -2327,6 +2667,28 @@ pub async fn receive_room_control_event_handler(
         }
         return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
     }
+    // Capability and Bridge Plan events: admitted before anything acts on
+    // them, so a replayed or rate-refused event never answers, records or
+    // starts anything. If the handler refuses the event afterwards, its
+    // replay identities are released again (`AdmittedEventV1`).
+    let class = ControlClassV1::of(&validated.kind);
+    {
+        let mut runtime = ctx.state.room_control.lock();
+        let now = runtime.limiter_now();
+        let room_state = runtime.rooms.entry(room_id.clone()).or_default();
+        if let Err(refused) = admit_received_event(room_state, &validated, class, now, &room_id) {
+            return refused;
+        }
+    }
+    let admitted = AdmittedEventV1 {
+        state: ctx.state.clone(),
+        room_id: room_id.clone(),
+        class,
+        event_id: validated.event_id.clone(),
+        envelope_id: validated.envelope_id.clone(),
+        request_id: validated.request_id.clone(),
+        kept: false,
+    };
     let mut protocol_action = crate::bridge_plan::InboundProtocolAction::None;
     if validated.kind == "peer_capability.response" {
         log_peer_capability("response_received", None, None);
@@ -2398,54 +2760,51 @@ pub async fn receive_room_control_event_handler(
         // receiver must echo it, rather than substituting the requester's
         // inbound session id, so the requester can bind the fact to its
         // current selected remote peer after authenticated delivery.
-        let projection = match local_peer_capability_response_projection(
-            &ctx.state,
-            peer_session_id,
-            storage::now_ts(),
-            &capability_ids,
-        ) {
-            Ok(projection) => projection,
-            Err(_) => {
-                log_peer_capability("response_rejected", None, Some("construction_failed"));
-                return control_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_capability",
-                    "Invalid peer capability response.",
-                );
-            }
-        };
-        log_peer_capability_projection("local_projection_created", &projection);
-        let payload =
-            serde_json::to_value(&projection).expect("peer capability projection serializes");
-        let response =
-            match peer_capability_event("peer_capability.response", payload, &response_context) {
-                Ok(response) => response,
-                Err(_) => {
-                    log_peer_capability("response_rejected", None, Some("construction_failed"));
-                    return control_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_capability",
-                        "Invalid peer capability response.",
-                    );
-                }
-            };
+        let peer_session_id = peer_session_id.to_owned();
         let response_route = selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
         let response_state = ctx.state.clone();
         let response_room_id = room_id.clone();
-        let dispatched_projection = projection.clone();
-        log_peer_capability_projection("response_dispatch", &projection);
+        // The answer is built and sent after this receipt, off the request
+        // path: observing a capability can start probe processes (when its
+        // cached observation is missing), which must never hold up this or
+        // any other request, such as the liveness ping every request needs.
         ctx.state.spawn(async move {
-            match send_room_control_event(
+            let probe_state = response_state.clone();
+            let projection = tokio::task::spawn_blocking(move || {
+                local_peer_capability_response_projection(
+                    &probe_state,
+                    &peer_session_id,
+                    storage::now_ts(),
+                    &capability_ids,
+                )
+            })
+            .await;
+            let Ok(Ok(projection)) = projection else {
+                log_peer_capability("response_rejected", None, Some("construction_failed"));
+                return;
+            };
+            log_peer_capability_projection("local_projection_created", &projection);
+            let payload =
+                serde_json::to_value(&projection).expect("peer capability projection serializes");
+            log_peer_capability_projection("response_dispatch", &projection);
+            // The requester waits up to 8 s; a refusal for its rate budget
+            // did nothing there, so a fresh response may follow.
+            match send_room_control_event_with_backpressure(
                 response_state,
                 &response_room_id,
-                response,
+                || {
+                    peer_capability_event(
+                        "peer_capability.response",
+                        payload.clone(),
+                        &response_context,
+                    )
+                },
                 Some(response_route),
+                Duration::from_secs(5),
             )
             .await
             {
-                Ok(_) => {
-                    log_peer_capability_projection("response_delivered", &dispatched_projection)
-                }
+                Ok(_) => log_peer_capability_projection("response_delivered", &projection),
                 Err(_) => log_peer_capability("response_rejected", None, Some("delivery_failed")),
             }
         });
@@ -2812,62 +3171,31 @@ pub async fn receive_room_control_event_handler(
         }
     }
     let received_at = now_iso();
+    // Capability facts and protocol v2 events were acted on above and keep
+    // no copy here. Bridge Plan v1 events are also kept, as bounded display
+    // history (Find File reads its progress from them).
+    if validated.kind.starts_with("bridge_plan.") && !validated.kind.starts_with("bridge_plan.v2.")
     {
+        log_bridge_plan_control_event(&validated, "inbound_persisted");
         let mut runtime = ctx.state.room_control.lock();
         let room_state = runtime.rooms.entry(room_id.clone()).or_default();
-        if room_state.inbox.len() >= MAX_INBOX_ITEMS {
-            return control_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "inbox_full",
-                "Room control inbox is full.",
-            );
-        }
-        if !accept_rate_limited_event(room_state, OffsetDateTime::now_utc().unix_timestamp()) {
-            return control_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "Room control event rate exceeded.",
-            );
-        }
-        if is_replayed(room_state, &validated) {
-            return control_error(
-                StatusCode::CONFLICT,
-                "event_replayed",
-                "Room control event was already received.",
-            );
-        }
-        log_bridge_plan_control_event(&validated, "inbound_persisted");
-        record_replay_id(
-            &mut room_state.seen_event_ids,
-            &mut room_state.seen_event_id_set,
-            validated.event_id.clone(),
+        keep_in_history(
+            room_state,
+            ReceivedRoomControlEvent {
+                event_id: validated.event_id.clone(),
+                kind: validated.kind,
+                room_ref: validated.room_ref,
+                source_device_ref: validated.source_device_ref,
+                target_peer_ref: validated.target_peer_ref,
+                created_at: validated.created_at,
+                expires_at: validated.expires_at,
+                received_at: received_at.clone(),
+                event: validated.event,
+            },
+            storage::now_ts(),
         );
-        if let Some(id) = validated.envelope_id.clone() {
-            record_replay_id(
-                &mut room_state.seen_envelope_ids,
-                &mut room_state.seen_envelope_id_set,
-                id,
-            );
-        }
-        if let Some(id) = validated.request_id.clone() {
-            record_replay_id(
-                &mut room_state.seen_request_ids,
-                &mut room_state.seen_request_id_set,
-                id,
-            );
-        }
-        room_state.inbox.push_back(ReceivedRoomControlEvent {
-            event_id: validated.event_id.clone(),
-            kind: validated.kind,
-            room_ref: validated.room_ref,
-            source_device_ref: validated.source_device_ref,
-            target_peer_ref: validated.target_peer_ref,
-            created_at: validated.created_at,
-            expires_at: validated.expires_at,
-            received_at: received_at.clone(),
-            event: validated.event,
-        });
     }
+    admitted.keep();
     encrypted_receipt_response(&event_key, &validated.event_id, &received_at)
 }
 
@@ -3345,6 +3673,181 @@ fn terminal_control_rejection(error: &AppError) -> (StatusCode, &'static str, &'
     )
 }
 
+/// Why a Room Control delivery failed, as far as the sender can know.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControlDeliveryFailureV1 {
+    /// Never sent: no current route, session or room here.
+    NotSent,
+    /// The receiver's rate budget for this kind of event is spent. It
+    /// refuses before acting on anything, so nothing happened there and a
+    /// fresh event may be sent after a short wait.
+    RateLimited,
+    /// The receiver already holds as many Reviews from this Bridge as it
+    /// allows. Nothing was queued and no waiting Review was dropped.
+    ReviewCapacity,
+    /// The receiver refused this device or this request (authority,
+    /// interface, target, validity) before admitting anything.
+    Refused,
+    /// The receiver had already received this exact event.
+    Replayed,
+    Expired,
+    /// An older receiver whose inbox was full. It refused only after it had
+    /// acted on the event, so this says nothing certain.
+    LegacyInboxFull,
+    /// Refused for another reason; whether it acted first is not known.
+    Rejected,
+    /// No answer, or one that cannot be read: whether it arrived is unknown.
+    Transport,
+}
+
+impl ControlDeliveryFailureV1 {
+    /// The receiver provably did nothing with it: an invocation it carried
+    /// never started there.
+    pub(crate) fn proves_nothing_happened(self) -> bool {
+        matches!(
+            self,
+            Self::NotSent | Self::RateLimited | Self::ReviewCapacity | Self::Refused
+        )
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotSent => "not_sent",
+            Self::RateLimited => "rate_limited",
+            Self::ReviewCapacity => "review_capacity",
+            Self::Refused => "refused",
+            Self::Replayed => "replayed",
+            Self::Expired => "expired",
+            Self::LegacyInboxFull => "inbox_full",
+            Self::Rejected => "rejected",
+            Self::Transport => "transport",
+        }
+    }
+}
+
+/// Each refusal code a receiver sends, the sender's message for it, and
+/// what it means. The one table both produces and classifies the message.
+const DELIVERY_REFUSALS: &[(&str, &str, ControlDeliveryFailureV1)] = {
+    use ControlDeliveryFailureV1::*;
+    &[
+        ("event_expired", "Room control event expired before delivery.", Expired),
+        ("event_replayed", "Room control event was already received.", Replayed),
+        ("native_decision_expired", "This request expired.", Rejected),
+        ("native_decision_resolved", "Codex no longer waits for this decision.", Rejected),
+        ("native_decision_changed", "What Codex asks changed; review it again.", Rejected),
+        ("native_decision_task_ended", "This task is no longer running.", Rejected),
+        (
+            "native_decision_unauthorized",
+            "Only the device that started this task, in a current session, can decide its requests.",
+            Rejected,
+        ),
+        ("session_mismatch", "Room control session mismatch.", Rejected),
+        (
+            "rate_limited",
+            "Room control rate limit was reached: the other device refused this before acting on it. Try again in a few seconds.",
+            RateLimited,
+        ),
+        (
+            "inbox_full",
+            "Room control inbox is full on the other device, which runs an older Pastey. Update Pastey there, or restart it.",
+            LegacyInboxFull,
+        ),
+        (
+            "native_agent_review_capacity",
+            "The other device already holds as many requests from this Bridge waiting for Accept as it allows. Nothing was queued; try again after someone there answers one.",
+            ReviewCapacity,
+        ),
+        (
+            "native_agent_not_authorized",
+            "The other device refused: this device may not ask to run agents in that folder.",
+            Refused,
+        ),
+        (
+            "native_agent_incompatible",
+            "The other device's Native Agent interface is incompatible.",
+            Refused,
+        ),
+        ("host_mismatch", "That request was for another device.", Refused),
+        (
+            "invalid_native_agent",
+            "The other device found the Native Agent request invalid.",
+            Refused,
+        ),
+        (
+            "native_agent_unavailable",
+            "The other device rejected the Native Agent request.",
+            Rejected,
+        ),
+        ("terminal_rate_limited", "Developer Terminal flow-control limit was reached.", RateLimited),
+        ("terminal_sequence_rejected", "Developer Terminal sequence was rejected.", Rejected),
+        ("terminal_authority_rejected", "Developer Terminal authority rejected the event.", Rejected),
+        ("terminal_event_rejected", "Developer Terminal rejected the event.", Rejected),
+        ("request_too_large", "Room control event is too large.", Rejected),
+        ("event_too_large", "Room control event is too large.", Rejected),
+        (
+            "review_revision_hash_mismatch",
+            "Bridge Plan review validation failed: review_revision_hash_mismatch.",
+            Rejected,
+        ),
+        (
+            "review_step_digest_mismatch",
+            "Bridge Plan review validation failed: review_step_digest_mismatch.",
+            Rejected,
+        ),
+        (
+            "review_session_mismatch",
+            "Bridge Plan review validation failed: review_session_mismatch.",
+            Rejected,
+        ),
+        (
+            "review_unknown_approval",
+            "Bridge Plan review validation failed: review_unknown_approval.",
+            Rejected,
+        ),
+        (
+            "review_expiry_invalid",
+            "Bridge Plan review validation failed: review_expired.",
+            Rejected,
+        ),
+        ("review_expired", "Bridge Plan review validation failed: review_expired.", Rejected),
+        (
+            "review_payload_invalid",
+            "Bridge Plan review validation failed: review_payload_invalid.",
+            Rejected,
+        ),
+        (
+            "attempt_missing",
+            "Bridge Plan protocol validation failed: attempt_missing.",
+            Rejected,
+        ),
+        (
+            "attempt_correlation_mismatch",
+            "Bridge Plan protocol validation failed: attempt_correlation_mismatch.",
+            Rejected,
+        ),
+        ("invalid_event", "Room control event validation failed.", Rejected),
+        ("invalid_envelope", "Room control event validation failed.", Rejected),
+        ("invalid_request", "Room control event validation failed.", Rejected),
+    ]
+};
+
+/// What one failed `send_room_control_event` means for the sender.
+pub(crate) fn delivery_failure(error: &AppError) -> ControlDeliveryFailureV1 {
+    match error {
+        AppError::Network(message) => DELIVERY_REFUSALS
+            .iter()
+            .find(|(_, known, _)| known == message)
+            .map_or(ControlDeliveryFailureV1::Transport, |(_, _, failure)| {
+                *failure
+            }),
+        AppError::Timeout(_) | AppError::Http(_) => ControlDeliveryFailureV1::Transport,
+        // Preparation failed here: no route, room or session; never sent.
+        AppError::InvalidInput(_) | AppError::NotFound(_) => ControlDeliveryFailureV1::NotSent,
+        _ => ControlDeliveryFailureV1::Transport,
+    }
+}
+
 async fn control_response_failure(response: reqwest::Response) -> AppError {
     let status = response.status();
     let error_code = if response.content_length().unwrap_or(0) <= MAX_CONTROL_RESPONSE_BYTES as u64
@@ -3359,58 +3862,22 @@ async fn control_response_failure(response: reqwest::Response) -> AppError {
     } else {
         None
     };
-    let message = match error_code.as_deref() {
-        Some("event_expired") => "Room control event expired before delivery.",
-        Some("event_replayed") => "Room control event was already received.",
-        Some("native_decision_expired") => "This request expired.",
-        Some("native_decision_resolved") => "Codex no longer waits for this decision.",
-        Some("native_decision_changed") => "What Codex asks changed; review it again.",
-        Some("native_decision_task_ended") => "This task is no longer running.",
-        Some("native_decision_unauthorized") => {
-            "Only the device that started this task, in a current session, can decide its requests."
-        }
-        Some("session_mismatch") => "Room control session mismatch.",
-        Some("inbox_full") => "Room control inbox is full.",
-        Some("terminal_rate_limited") => "Developer Terminal flow-control limit was reached.",
-        Some("rate_limited") => "Room control rate limit was reached.",
-        Some("terminal_sequence_rejected") => "Developer Terminal sequence was rejected.",
-        Some("terminal_authority_rejected") => "Developer Terminal authority rejected the event.",
-        Some("terminal_event_rejected") => "Developer Terminal rejected the event.",
-        Some("request_too_large" | "event_too_large") => "Room control event is too large.",
-        Some("review_revision_hash_mismatch") => {
-            "Bridge Plan review validation failed: review_revision_hash_mismatch."
-        }
-        Some("review_step_digest_mismatch") => {
-            "Bridge Plan review validation failed: review_step_digest_mismatch."
-        }
-        Some("review_session_mismatch") => {
-            "Bridge Plan review validation failed: review_session_mismatch."
-        }
-        Some("review_unknown_approval") => {
-            "Bridge Plan review validation failed: review_unknown_approval."
-        }
-        Some("review_expiry_invalid" | "review_expired") => {
-            "Bridge Plan review validation failed: review_expired."
-        }
-        Some("review_payload_invalid") => {
-            "Bridge Plan review validation failed: review_payload_invalid."
-        }
-        Some("attempt_missing") => "Bridge Plan protocol validation failed: attempt_missing.",
-        Some("attempt_correlation_mismatch") => {
-            "Bridge Plan protocol validation failed: attempt_correlation_mismatch."
-        }
-        Some("invalid_event" | "invalid_envelope" | "invalid_request") => {
-            "Room control event validation failed."
-        }
-        _ => match status {
-            StatusCode::CONFLICT => "Room control event was already received.",
-            StatusCode::GONE => "Room control event or room is unavailable.",
-            StatusCode::PAYLOAD_TOO_LARGE => "Room control event is too large.",
-            StatusCode::TOO_MANY_REQUESTS => "Room control transport rejected the event.",
-            StatusCode::FORBIDDEN => "Room control session mismatch.",
-            _ => "Room control delivery failed.",
-        },
-    };
+    let known = error_code
+        .as_deref()
+        .and_then(|code| {
+            DELIVERY_REFUSALS
+                .iter()
+                .find(|(known, _, _)| *known == code)
+        })
+        .map(|(_, message, _)| *message);
+    let message = known.unwrap_or(match status {
+        StatusCode::CONFLICT => "Room control event was already received.",
+        StatusCode::GONE => "Room control event or room is unavailable.",
+        StatusCode::PAYLOAD_TOO_LARGE => "Room control event is too large.",
+        StatusCode::TOO_MANY_REQUESTS => "Room control transport rejected the event.",
+        StatusCode::FORBIDDEN => "Room control session mismatch.",
+        _ => "Room control delivery failed.",
+    });
     AppError::Network(message.into())
 }
 
@@ -3448,24 +3915,208 @@ fn is_replayed(room: &RoomControlRoomState, event: &ValidatedControlEvent) -> bo
             .is_some_and(|id| room.seen_request_id_set.contains(id))
 }
 
-fn accept_rate_limited_event(room: &mut RoomControlRoomState, now_seconds: i64) -> bool {
-    while room
-        .received_at_seconds
+fn accept_rate_limited_event(
+    room: &mut RoomControlRoomState,
+    class: ControlClassV1,
+    now_seconds: i64,
+) -> bool {
+    let (per_minute, burst) = class.budget();
+    let window = room.received_at_seconds.entry(class).or_default();
+    while window
         .front()
         .is_some_and(|timestamp| *timestamp <= now_seconds - 60)
     {
-        room.received_at_seconds.pop_front();
+        window.pop_front();
     }
-    let burst_count = room
-        .received_at_seconds
+    let burst_count = window
         .iter()
         .filter(|timestamp| **timestamp > now_seconds - 2)
         .count();
-    if room.received_at_seconds.len() >= MAX_EVENTS_PER_MINUTE || burst_count >= MAX_BURST_EVENTS {
+    if window.len() >= per_minute || burst_count >= burst {
         return false;
     }
-    room.received_at_seconds.push_back(now_seconds);
+    window.push_back(now_seconds);
     true
+}
+
+/// Admits one received event before anything acts on it: it must be new to
+/// this Bridge's replay window and fit its class's rate budget. Only an
+/// admitted event records its replay identities; a refusal changes nothing
+/// but the counters, so the sender may send a fresh event later.
+fn admit_received_event(
+    room: &mut RoomControlRoomState,
+    validated: &ValidatedControlEvent,
+    class: ControlClassV1,
+    limiter_now: i64,
+    room_id: &str,
+) -> Result<(), Response> {
+    if is_replayed(room, validated) {
+        note_refusal(room, class, "event_replayed", room_id);
+        return Err(control_error(
+            StatusCode::CONFLICT,
+            "event_replayed",
+            "Room control event was already received.",
+        ));
+    }
+    if !accept_rate_limited_event(room, class, limiter_now) {
+        note_refusal(room, class, "rate_limited", room_id);
+        return Err(control_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Room control event rate exceeded.",
+        ));
+    }
+    note_acceptance(room, class, room_id);
+    record_replay_id(
+        &mut room.seen_event_ids,
+        &mut room.seen_event_id_set,
+        validated.event_id.clone(),
+    );
+    if let Some(id) = validated.envelope_id.clone() {
+        record_replay_id(
+            &mut room.seen_envelope_ids,
+            &mut room.seen_envelope_id_set,
+            id,
+        );
+    }
+    if let Some(id) = validated.request_id.clone() {
+        record_replay_id(
+            &mut room.seen_request_ids,
+            &mut room.seen_request_id_set,
+            id,
+        );
+    }
+    Ok(())
+}
+
+fn short_room(room_id: &str) -> &str {
+    room_id.get(..8).unwrap_or(room_id)
+}
+
+fn note_refusal(
+    room: &mut RoomControlRoomState,
+    class: ControlClassV1,
+    reason: &'static str,
+    room_id: &str,
+) {
+    let now = storage::now_ts();
+    let stats = &mut room.stats;
+    *stats.refused.entry((class, reason)).or_default() += 1;
+    stats.last_refusal = Some(ControlRefusalV1 {
+        class,
+        reason,
+        at: now,
+    });
+    if reason != "rate_limited" {
+        return;
+    }
+    let run = stats.backpressure.entry(class).or_insert((now, 0));
+    run.1 += 1;
+    // The first refusal of a run, then one line per 100: never a flood.
+    if run.1 == 1 || run.1.is_multiple_of(100) {
+        logging::write_transfer_line(&format!(
+            "[pastey room-control] event=backpressure room={} class={} refused={} since_s={}",
+            short_room(room_id),
+            class.label(),
+            run.1,
+            now - run.0
+        ));
+    }
+}
+
+fn note_acceptance(room: &mut RoomControlRoomState, class: ControlClassV1, room_id: &str) {
+    let stats = &mut room.stats;
+    *stats.accepted.entry(class).or_default() += 1;
+    if let Some((since, refused)) = stats.backpressure.remove(&class) {
+        logging::write_transfer_line(&format!(
+            "[pastey room-control] event=backpressure_ended room={} class={} refused={} lasted_s={}",
+            short_room(room_id),
+            class.label(),
+            refused,
+            storage::now_ts() - since
+        ));
+    }
+}
+
+/// Keeps one Bridge Plan event for display, dropping the oldest (and any
+/// older than the history's age) first. Never a reason to refuse an event.
+fn keep_in_history(room: &mut RoomControlRoomState, event: ReceivedRoomControlEvent, now: i64) {
+    let before = room.history.len();
+    room.history.retain(|kept| {
+        OffsetDateTime::parse(
+            &kept.received_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_or(true, |at| {
+            at.unix_timestamp() > now - MAX_HISTORY_AGE_SECONDS
+        })
+    });
+    while room.history.len() >= MAX_HISTORY_ITEMS {
+        room.history.pop_front();
+    }
+    room.stats.history_dropped += (before - room.history.len()) as u64;
+    room.history.push_back(event);
+}
+
+/// An admitted capability or Bridge Plan event. If the handler refuses it
+/// after admission (validation, authority, session), its replay identities
+/// are released again, so a refused event leaves no trace beyond the
+/// counters, exactly as when these checks came last.
+struct AdmittedEventV1 {
+    state: Arc<AppState>,
+    room_id: String,
+    class: ControlClassV1,
+    event_id: String,
+    envelope_id: Option<String>,
+    request_id: Option<String>,
+    kept: bool,
+}
+
+impl AdmittedEventV1 {
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for AdmittedEventV1 {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        let mut runtime = self.state.room_control.lock();
+        let Some(room) = runtime.rooms.get_mut(&self.room_id) else {
+            return;
+        };
+        forget_replay_id(
+            &mut room.seen_event_ids,
+            &mut room.seen_event_id_set,
+            &self.event_id,
+        );
+        if let Some(id) = &self.envelope_id {
+            forget_replay_id(
+                &mut room.seen_envelope_ids,
+                &mut room.seen_envelope_id_set,
+                id,
+            );
+        }
+        if let Some(id) = &self.request_id {
+            forget_replay_id(
+                &mut room.seen_request_ids,
+                &mut room.seen_request_id_set,
+                id,
+            );
+        }
+        let stats = &mut room.stats;
+        *stats
+            .refused
+            .entry((self.class, "refused_after_admission"))
+            .or_default() += 1;
+        stats.last_refusal = Some(ControlRefusalV1 {
+            class: self.class,
+            reason: "refused_after_admission",
+            at: storage::now_ts(),
+        });
+    }
 }
 
 fn accept_terminal_rate_limited_event(room: &mut RoomControlRoomState, now_seconds: i64) -> bool {
@@ -3655,7 +4306,7 @@ mod tests {
             "terminal-event".into(),
         );
         assert!(room.terminal_seen_event_id_set.contains("terminal-event"));
-        assert!(room.inbox.is_empty());
+        assert!(room.history.is_empty());
         assert!(room.received_at_seconds.is_empty());
     }
 
@@ -3684,7 +4335,7 @@ mod tests {
                 validated.event_id.clone(),
             );
             assert!(is_replayed(&room, &validated));
-            assert!(room.inbox.is_empty());
+            assert!(room.history.is_empty());
         }
 
         let wrong_session = bridge_departure_event(BridgeDepartureKind::Burn, &context).unwrap();
@@ -4045,7 +4696,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_and_inbox_bounds_are_finite() {
+    fn replay_history_and_rate_bounds_are_finite() {
         let mut queue = VecDeque::new();
         let mut set = HashSet::new();
         for index in 0..(MAX_REPLAY_ITEMS + 10) {
@@ -4053,22 +4704,237 @@ mod tests {
         }
         assert_eq!(queue.len(), MAX_REPLAY_ITEMS);
         assert_eq!(set.len(), MAX_REPLAY_ITEMS);
-        assert_eq!(MAX_INBOX_ITEMS, 64);
+        assert_eq!(MAX_HISTORY_ITEMS, 64);
         assert_eq!(MAX_CONTROL_REQUEST_BYTES, 96 * 1024);
         assert_eq!(MAX_CONTROL_EVENT_BYTES, 64 * 1024);
         assert_eq!(MAX_CONTROL_RESPONSE_BYTES, 4 * 1024);
-        let mut room = RoomControlRoomState::default();
-        for _ in 0..MAX_BURST_EVENTS {
-            assert!(accept_rate_limited_event(&mut room, 100));
+        // Every class has a finite burst and a finite minute, refused alike.
+        for class in ControlClassV1::ALL {
+            let (per_minute, burst) = class.budget();
+            assert!(burst <= per_minute && per_minute <= 120, "{class:?}");
+            let mut room = RoomControlRoomState::default();
+            for _ in 0..burst {
+                assert!(accept_rate_limited_event(&mut room, class, 100));
+            }
+            assert!(!accept_rate_limited_event(&mut room, class, 100));
+            // Spread over one minute, below the burst: the minute's budget.
+            let mut room = RoomControlRoomState::default();
+            for index in 0..per_minute as i64 {
+                let at = 1_000 + index * 59 / per_minute as i64;
+                assert!(
+                    accept_rate_limited_event(&mut room, class, at),
+                    "{class:?} {index}"
+                );
+            }
+            assert!(!accept_rate_limited_event(&mut room, class, 1_059));
+            // A minute after the first, the budget is back.
+            assert!(accept_rate_limited_event(&mut room, class, 1_061));
         }
-        assert!(!accept_rate_limited_event(&mut room, 100));
+    }
+
+    /// One class's traffic cannot use up another's budget: a capability
+    /// flood leaves a running task's statuses and decisions their own.
+    #[test]
+    fn each_class_has_its_own_rate_budget() {
+        let mut room = RoomControlRoomState::default();
+        while accept_rate_limited_event(&mut room, ControlClassV1::CapabilityQuery, 500) {}
+        assert!(!accept_rate_limited_event(
+            &mut room,
+            ControlClassV1::CapabilityQuery,
+            500
+        ));
+        assert!(accept_rate_limited_event(
+            &mut room,
+            ControlClassV1::CapabilityAnswer,
+            500
+        ));
+        assert!(accept_rate_limited_event(
+            &mut room,
+            ControlClassV1::NativeAgent,
+            500
+        ));
+        assert!(accept_rate_limited_event(
+            &mut room,
+            ControlClassV1::BridgePlan,
+            500
+        ));
+        assert!(accept_rate_limited_event(
+            &mut room,
+            ControlClassV1::Membership,
+            500
+        ));
+        assert_eq!(
+            ControlClassV1::of("peer_capability.query"),
+            ControlClassV1::CapabilityQuery
+        );
+        assert_eq!(
+            ControlClassV1::of("peer_capability.response"),
+            ControlClassV1::CapabilityAnswer
+        );
+        assert_eq!(
+            ControlClassV1::of("native_agent.status"),
+            ControlClassV1::NativeAgent
+        );
+        assert_eq!(
+            ControlClassV1::of("bridge_plan.v2.step_result"),
+            ControlClassV1::BridgePlan
+        );
+        assert_eq!(
+            ControlClassV1::of("bridge_plan.review_request"),
+            ControlClassV1::BridgePlan
+        );
+        assert_eq!(
+            ControlClassV1::of("bridge_membership.departure"),
+            ControlClassV1::Membership
+        );
+    }
+
+    fn history_event(index: usize, received_at: i64) -> ReceivedRoomControlEvent {
+        ReceivedRoomControlEvent {
+            event_id: format!("event-{index}"),
+            kind: "bridge_plan.step_progress".into(),
+            room_ref: "room".into(),
+            source_device_ref: "source".into(),
+            target_peer_ref: "target".into(),
+            created_at: "now".into(),
+            expires_at: "later".into(),
+            event: serde_json::json!({}),
+            received_at: OffsetDateTime::from_unix_timestamp(received_at)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        }
+    }
+
+    /// Display history is bounded by count and age, drops the oldest first,
+    /// and never makes the receiver refuse anything.
+    #[test]
+    fn history_is_bounded_oldest_first_and_never_refuses() {
+        let now = 1_800_000_000;
+        let mut room = RoomControlRoomState::default();
+        for index in 0..200 {
+            keep_in_history(&mut room, history_event(index, now), now);
+        }
+        assert_eq!(room.history.len(), MAX_HISTORY_ITEMS);
+        assert_eq!(room.history.front().unwrap().event_id, "event-136");
+        assert_eq!(room.history.back().unwrap().event_id, "event-199");
+        assert_eq!(room.stats.history_dropped, 136);
+        // Entries past their age leave at the next addition.
+        let later = now + MAX_HISTORY_AGE_SECONDS + 1;
+        keep_in_history(&mut room, history_event(500, later), later);
+        assert_eq!(room.history.len(), 1);
+        assert_eq!(room.stats.history_dropped, 136 + 64);
+    }
+
+    /// The sender's reading of each refusal comes from the same table that
+    /// wrote its message, and only refusals made before the receiver acted
+    /// count as proof that nothing happened there.
+    #[test]
+    fn delivery_failures_are_classified_from_the_table_that_wrote_them() {
+        for (code, message, failure) in DELIVERY_REFUSALS {
+            let expected = DELIVERY_REFUSALS
+                .iter()
+                .find(|(_, known, _)| known == message)
+                .unwrap()
+                .2;
+            assert_eq!(
+                delivery_failure(&AppError::Network((*message).into())),
+                expected,
+                "{code}"
+            );
+            assert_eq!(
+                *failure, expected,
+                "{code}: two codes share a message with different meanings"
+            );
+        }
+        let definite = |code: &str| {
+            let message = DELIVERY_REFUSALS
+                .iter()
+                .find(|(known, _, _)| *known == code)
+                .unwrap()
+                .1;
+            delivery_failure(&AppError::Network(message.into())).proves_nothing_happened()
+        };
+        for code in [
+            "rate_limited",
+            "native_agent_review_capacity",
+            "native_agent_not_authorized",
+            "native_agent_incompatible",
+            "host_mismatch",
+            "invalid_native_agent",
+        ] {
+            assert!(definite(code), "{code}");
+        }
+        // Received, or refused after acting, or unknown: never proof.
+        for code in [
+            "event_replayed",
+            "event_expired",
+            "inbox_full",
+            "native_agent_unavailable",
+            "session_mismatch",
+        ] {
+            assert!(!definite(code), "{code}");
+        }
+        assert_eq!(
+            delivery_failure(&AppError::Timeout(
+                "Room control delivery timed out.".into()
+            )),
+            ControlDeliveryFailureV1::Transport
+        );
+        assert_eq!(
+            delivery_failure(&AppError::Network("Room control delivery failed.".into())),
+            ControlDeliveryFailureV1::Transport
+        );
+        assert_eq!(
+            delivery_failure(&AppError::Network(
+                "Room control receipt is invalid.".into()
+            )),
+            ControlDeliveryFailureV1::Transport
+        );
+        assert_eq!(
+            delivery_failure(&AppError::InvalidInput(
+                "Room session is unavailable.".into()
+            )),
+            ControlDeliveryFailureV1::NotSent
+        );
+    }
+
+    /// Replay and rate admission come before anything acts on a capability
+    /// or Bridge Plan event, and only Bridge Plan v1 events are kept.
+    #[test]
+    fn general_events_are_admitted_before_any_side_effect() {
+        let source = include_str!("room_control.rs");
+        let start = source
+            .find("pub async fn receive_room_control_event_handler")
+            .unwrap();
+        let end = start
+            + source[start..]
+                .find("\nfn validate_control_event(")
+                .unwrap();
+        let handler = &source[start..end];
+        let admit = handler
+            .find("admit_received_event(room_state, &validated, class, now, &room_id)")
+            .unwrap();
+        for side_effect in [
+            "if validated.kind == \"peer_capability.response\" {",
+            "crate::bridge_plan::accept_inbound_protocol_event(",
+            "crate::native_v2_orchestration::accept_requester_readiness(",
+        ] {
+            assert!(admit < handler.find(side_effect).unwrap(), "{side_effect}");
+        }
+        assert_eq!(handler.matches("keep_in_history(").count(), 1);
+        assert!(handler.contains("if validated.kind.starts_with(\"bridge_plan.\") && !validated.kind.starts_with(\"bridge_plan.v2.\")"));
+        assert!(
+            !handler.contains("inbox_full"),
+            "no refusal for lack of room"
+        );
     }
 
     #[test]
     fn burn_purge_removes_room_control_inbox_replay_and_rate_state() {
         let mut runtime = RoomControlRuntimeState::default();
         let mut room = RoomControlRoomState::default();
-        room.inbox.push_back(ReceivedRoomControlEvent {
+        room.history.push_back(ReceivedRoomControlEvent {
             event_id: "event".into(),
             kind: "bridge_plan.step_progress".into(),
             room_ref: "room".into(),
@@ -4094,7 +4960,10 @@ mod tests {
             &mut room.seen_request_id_set,
             "request".into(),
         );
-        room.received_at_seconds.push_back(1);
+        room.received_at_seconds
+            .entry(ControlClassV1::CapabilityQuery)
+            .or_default()
+            .push_back(1);
         runtime.rooms.insert("room".into(), room);
         assert!(runtime.purge_room("room"));
         assert!(runtime.rooms.get("room").is_none());
@@ -5092,3 +5961,5 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod native_session_pair_tests;
+#[cfg(test)]
+mod runtime_pair_tests;

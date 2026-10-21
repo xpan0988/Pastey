@@ -973,6 +973,40 @@ export async function getRoomControlSessionContext(
   return invoke("get_room_control_session_context", { roomId });
 }
 
+export type ControlClass = "capability_query" | "capability_answer" | "native_agent" | "bridge_plan" | "membership";
+
+export interface ControlRefusal { class: ControlClass; reason: string; at: number }
+
+/** Room Control on one Bridge as this device sees it: counts, classes,
+ * reasons and times only, never an event or its content. */
+export interface RoomControlDiagnostics {
+  observedAt: number;
+  historyDepth: number;
+  historyLimit: number;
+  historyDropped: number;
+  historyStale: number;
+  replayWindow: number;
+  replayLimit: number;
+  classes: Array<{
+    class: ControlClass;
+    accepted: number;
+    refused: Array<[string, number]>;
+    lastMinute: number;
+    perMinute: number;
+    burst: number;
+    backpressureSince: number | null;
+    backpressureRefused: number;
+  }>;
+  lastRefusal: ControlRefusal | null;
+  outboundFailures: Array<{ class: ControlClass; failure: string; count: number }>;
+  lastOutboundFailure: ControlRefusal | null;
+  nativeReviews: { pending: number; limit: number; started: number; denied: number; expired: number; revoked: number };
+}
+
+export function getRoomControlDiagnostics(roomId: string): Promise<RoomControlDiagnostics> {
+  return invoke("get_room_control_diagnostics", { roomId });
+}
+
 export async function listReceivedRoomControlEvents(
   roomId: string,
 ): Promise<ReceivedRoomControlEvent[]> {

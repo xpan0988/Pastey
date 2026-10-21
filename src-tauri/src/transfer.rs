@@ -330,18 +330,9 @@ impl ChunkSendFailureKind {
     }
 }
 
-pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<u16> {
-    if let Some(port) = {
-        let servers = state.active_servers.lock();
-        servers.get(room_id).map(|server| server.port)
-    } {
-        return Ok(port);
-    }
-
-    let room = storage::get_room_by_id(&state.paths, room_id)?;
-
-    let transport_secret = crypto::generate_transport_secret();
-    let router = Router::new()
+/// Every route a Bridge's room server answers, for one room.
+pub(crate) fn room_router(state: Arc<AppState>, room_id: &str) -> Router {
+    Router::new()
         .route("/rooms/:room_id/join", post(join_handler))
         .route("/rooms/:room_id/items", post(receive_item_handler))
         .route(
@@ -380,7 +371,21 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
             post(diagnostics_pipeline_benchmark_handler)
                 .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
         )
-        .with_state(RoomServerContext::new(state.clone(), room.id.clone()));
+        .with_state(RoomServerContext::new(state, room_id.to_owned()))
+}
+
+pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<u16> {
+    if let Some(port) = {
+        let servers = state.active_servers.lock();
+        servers.get(room_id).map(|server| server.port)
+    } {
+        return Ok(port);
+    }
+
+    let room = storage::get_room_by_id(&state.paths, room_id)?;
+
+    let transport_secret = crypto::generate_transport_secret();
+    let router = room_router(state.clone(), &room.id);
 
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
