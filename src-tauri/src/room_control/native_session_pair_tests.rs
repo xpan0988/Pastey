@@ -148,7 +148,7 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
     let windows_answers = |event: Value| -> Value {
         validate(event.clone()).unwrap();
         let query: RemoteSessionQueryV1 = serde_json::from_value(event["payload"].clone()).unwrap();
-        let scopes = crate::session_read_access::authorized_scopes(
+        let scopes = crate::session_read_access::shared_workspaces(
             &windows_paths,
             &device,
             &at_windows,
@@ -187,21 +187,56 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
     let answer = mac_receives(&mut mac_pending, windows_answers(event));
     assert_eq!(answer.outcome, RemoteSessionOutcomeV1::NotAuthorized);
 
-    // The Windows user permits this folder: one session, by label.
-    let grant = crate::session_read_access::create_grant(
+    // The Windows user shares this folder from the Bridge, with nothing on:
+    // the Mac sees its name and what it allows, and no session.
+    let share = crate::session_read_access::share_with_bridge(
         &windows_paths,
         &windows_host,
         &[device.clone()],
-        &crate::session_read_access::CreateSessionReadGrantV1 {
-            device_fingerprint: device.fingerprint.clone(),
+        &crate::session_read_access::ShareWorkspaceV1 {
             room_id: "room-pair".into(),
+            device_fingerprint: Some(device.fingerprint.clone()),
             workspace_path: workspace.to_string_lossy().into_owned(),
             duration_hours: 1,
+            read_sessions: false,
             share_excerpts: false,
+            agent_requests: false,
         },
         storage::now_ts(),
     )
     .unwrap();
+    let event = ask(&mut mac_pending);
+    let answer = mac_receives(&mut mac_pending, windows_answers(event));
+    assert_eq!(answer.outcome, RemoteSessionOutcomeV1::NotAuthorized);
+    assert!(answer.discovery.is_none());
+    assert_eq!(answer.scopes.len(), 1);
+    let listed = &answer.scopes[0];
+    assert_eq!(listed.label, "Pastey");
+    assert!(!listed.read_sessions && !listed.agent_requests);
+    let scope_ref = listed.scope_ref.clone();
+    let wire = serde_json::to_string(&answer).unwrap();
+    assert!(
+        !wire.contains(workspace.to_str().unwrap()),
+        "no path leaves Windows: {wire}"
+    );
+
+    let update = |read: bool, run: bool| {
+        crate::session_read_access::update_share(
+            &windows_paths,
+            &crate::session_read_access::UpdateWorkspaceShareV1 {
+                grant_id: share.grant_id.clone(),
+                read_sessions: read,
+                share_excerpts: false,
+                agent_requests: run,
+                duration_hours: None,
+            },
+            storage::now_ts(),
+        )
+        .unwrap();
+    };
+
+    // "Sessions" on: one session, by label.
+    update(true, false);
     let event = ask(&mut mac_pending);
     let answer = mac_receives(&mut mac_pending, windows_answers(event));
     assert_eq!(answer.outcome, RemoteSessionOutcomeV1::Ok);
@@ -212,14 +247,84 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
         ("Pastey", SessionStatusV1::Completed)
     );
     assert_eq!(sessions[0].session_id, session);
+    assert_eq!(sessions[0].scope_ref, scope_ref);
 
-    // Revoked: nothing again.
-    crate::session_read_access::revoke_grant(&windows_paths, &grant.grant_id).unwrap();
+    // The Mac asks to run Codex in the shared folder, and to continue a
+    // thread there, by reference only. Both cross the Windows validator and
+    // parser, then Windows resolves them from its own share, as Room Control
+    // does before admission (and its Review).
+    let invoke_run = || {
+        let event = native_event(
+            "native_agent.invoke",
+            serde_json::to_value(crate::native_agent::NativeAgentInvokeV1 {
+                schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+                task_id: format!("native-agent:{}", uuid::Uuid::new_v4()),
+                target_host_ref: windows_host.as_str().into(),
+                agent_capability: crate::native_agent::CODEX_CAPABILITY_ID.into(),
+                workspace: scope_ref.clone(),
+                task: "Run the tests".into(),
+                resume: true,
+            })
+            .unwrap(),
+        );
+        validate(event.clone()).unwrap();
+        crate::native_agent::parse_invoke(event["payload"].clone()).unwrap()
+    };
+    let invoke_continue = || {
+        let event = native_event(
+            "native_agent.invoke",
+            serde_json::to_value(crate::native_agent::NativeAgentInvokeV2 {
+                schema_version: crate::native_agent::NATIVE_AGENT_INVOKE_V2_SCHEMA.into(),
+                task_id: format!("native-agent:{}", uuid::Uuid::new_v4()),
+                target_host_ref: windows_host.as_str().into(),
+                agent_capability: crate::native_agent::CODEX_THREAD_CAPABILITY.into(),
+                input: crate::native_agent::codex_thread_peer_input(
+                    &scope_ref,
+                    "019a0000-0000-7000-8000-000000000001",
+                    "Continue",
+                    Some("turn-9"),
+                )
+                .unwrap(),
+            })
+            .unwrap(),
+        );
+        validate(event.clone()).unwrap();
+        crate::native_agent::parse_invoke(event["payload"].clone()).unwrap()
+    };
+    let resolve = |request: &crate::native_agent::NativeInvocationRequestV1| {
+        crate::session_read_access::resolve_agent_request(
+            &windows_paths,
+            Some(&device),
+            &at_windows,
+            &request.agent_capability,
+            &request.input,
+            storage::now_ts(),
+        )
+    };
+    let sent = invoke_run();
+    assert!(!serde_json::to_string(&sent.input)
+        .unwrap()
+        .contains(workspace.to_str().unwrap()));
+    assert!(resolve(&sent).is_err(), "sessions only: no agent requests");
+    assert!(resolve(&invoke_continue()).is_err());
+
+    // "Agent requests" on as well: both resolve to Windows's own folder.
+    update(true, true);
+    let windows_path = workspace.to_string_lossy().into_owned();
+    let run = serde_json::to_value(resolve(&invoke_run()).unwrap().unwrap()).unwrap();
+    assert_eq!(run["workspace"], windows_path.as_str());
+    let continued = serde_json::to_value(resolve(&invoke_continue()).unwrap().unwrap()).unwrap();
+    assert_eq!(continued["workspace"], windows_path.as_str());
+    assert_eq!(continued["expectedLastTurnId"], "turn-9");
+
+    // Stopped sharing: nothing reads or resolves.
+    crate::session_read_access::stop_sharing(&windows_paths, &share.grant_id).unwrap();
     let event = ask(&mut mac_pending);
-    assert_eq!(
-        mac_receives(&mut mac_pending, windows_answers(event)).outcome,
-        RemoteSessionOutcomeV1::NotAuthorized
-    );
+    let answer = mac_receives(&mut mac_pending, windows_answers(event));
+    assert_eq!(answer.outcome, RemoteSessionOutcomeV1::NotAuthorized);
+    assert!(answer.scopes.is_empty());
+    assert!(resolve(&invoke_run()).is_err());
+    assert!(resolve(&invoke_continue()).is_err());
     let _ = std::fs::remove_dir_all(root);
     let _ = std::fs::remove_dir_all(workspace.parent().unwrap());
 }

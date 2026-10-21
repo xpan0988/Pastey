@@ -198,15 +198,15 @@ function TrustSection({ room, name, seen, myFingerprint, onChanged, onOpenSettin
         {seen ? <>
           <div className="row"><span className="spacer"><strong>{seen.trusted ? `${name} is trusted here` : `${name} is not trusted here`}</strong><br /><span className="xsmall subtle mono">{seen.displayFingerprint}</span></span>
             {seen.trusted ? <button type="button" className="btn btn-danger btn-sm" disabled={pending} onClick={() => void act(() => revokeTrustedDevice(seen.fingerprint))}>Revoke trust</button> : <button type="button" className="btn btn-sm" disabled={pending} onClick={() => setConfirm(true)}>Trust…</button>}</div>
-          <p className="xsmall subtle">Trust lets you give {name} permissions here: start Codex without your Accept, read sessions, or find files. It allows nothing by itself.</p>
-        </> : <p className="small muted">{name} has not shown its identity in this session, so it cannot be trusted yet. On {name}, open this Bridge's Agents tab and choose “Show this device”.</p>}
+          <p className="xsmall subtle">Trust lets you share folders with {name} (Bridge details → Workspaces) and give it other permissions here. It allows nothing by itself.</p>
+        </> : <p className="small muted">{name} has not shown its identity in this session, so it cannot be trusted yet. It does as soon as this Bridge is open on {name}.</p>}
         <div><button type="button" className="btn btn-link small" onClick={() => onOpenSettings("settings-permissions")}>What {name} may do here: Settings → Permissions</button></div>
       </div></div>
     </section>
     <section className="stack">
       <span className="subhead">On {name} · its user decides there</span>
       <div className="card"><div className="card-body">
-        <p className="small">Running Codex on {name} waits for someone there to click Accept, unless {name}'s user trusts this device and gives it unattended access to a folder. Reading {name}'s sessions needs its own Session reading permission there. Neither can be granted from here.</p>
+        <p className="small">Running Codex on {name} waits for someone there to click Accept, unless {name}'s user lets this device run in a folder without asking. Picking {name}'s folders by name, and reading its sessions, need {name} to share those folders with this Bridge, from this Bridge's Workspaces on {name}. None of this can be granted from here.</p>
         <p className="small muted">This device's fingerprint, to compare on {name}: <span className="mono">{myFingerprint ?? "…"}</span></p>
       </div></div>
     </section>

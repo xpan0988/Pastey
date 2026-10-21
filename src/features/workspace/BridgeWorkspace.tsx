@@ -6,7 +6,7 @@ import { sendTextToRoomWithBridgeRoute } from "../../lib/bridgeRoutingRuntime";
 import { legacyRoomToBridgePeerCollection } from "../../lib/bridgeRoomAdapter";
 import { nativeDecisionsAwaitUser } from "../../lib/nativeDecisions";
 import { ownAsyncDisposer } from "../../lib/subscriptionLifecycle";
-import { copyTextToClipboard, sendTextToRoom } from "../../lib/tauri";
+import { copyTextToClipboard, presentDeviceIdentity, sendTextToRoom } from "../../lib/tauri";
 import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferScheduler";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace, FileTransferProgressEvent, RoomInfo, RoomItem } from "../../lib/types";
 import { nativeAgentRecoveryRequiresAction, StatusBadge, useNativeAgentTask, type AgentTaskController } from "./AgentTaskLifecycle";
@@ -57,6 +57,7 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
   const status = bridgeStatus(room);
   const title = members.length === 0 ? "Waiting for a device" : members.length === 1 ? members[0].displayName : `${members.length + 1} devices`;
   const agentActive = agent.status?.state === "running" || agent.status?.state === "queued";
+  usePresentIdentityToPeers(room.id, peers);
   const agentNeedsYou = nativeAgentRecoveryRequiresAction(agent.status, agent.movement)
     || agent.movement?.state === "awaiting_approval"
     || (!!agent.status && nativeDecisionsAwaitUser(agent.status, !!agent.taskHostRef, Date.now() / 1000));
@@ -88,7 +89,7 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
         <div className="page" hidden={tab !== "share"}>
           <ShareView room={room} items={items} queueItems={queueItems} transfers={transfers} peers={peers} task={task} active={tab === "share"} onRefresh={onRefresh} onEnqueue={onEnqueue} onRevealInFolder={onRevealInFolder} />
         </div>
-        <div className="panel-scroll" hidden={tab !== "agents"}><AgentWorkspace room={room} agent={agent} peers={peers} members={members} onOpenDevice={setDeviceOpen} /></div>
+        <div className="panel-scroll" hidden={tab !== "agents"}><AgentWorkspace room={room} agent={agent} peers={peers} members={members} onOpenDevice={setDeviceOpen} onOpenDetails={() => setDetailsOpen(true)} /></div>
       </>}
     </section>
     {detailsOpen ? <>
@@ -97,6 +98,21 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
     </> : null}
     {deviceOpen ? <DeviceDetails room={room} hostRef={deviceOpen} onClose={() => setDeviceOpen(null)} onOpenSettings={(route) => { setDeviceOpen(null); onOpenSettings(route); }} /> : null}
   </div>;
+}
+
+/** While a Bridge is open here, each connected device of it is shown this
+ * device's identity once per connection, so its user can share folders
+ * with this device or trust it without a step here. It grants nothing:
+ * that device's own user still decides everything. */
+function usePresentIdentityToPeers(roomId: string, peers: ReturnType<typeof roomPeers>) {
+  const shown = useRef(new Set<string>());
+  useEffect(() => {
+    for (const peer of peers) {
+      if (!peer.hostRef || shown.current.has(peer.peerSessionId)) continue;
+      shown.current.add(peer.peerSessionId);
+      void presentDeviceIdentity(roomId, peer.hostRef).catch(() => shown.current.delete(peer.peerSessionId));
+    }
+  }, [peers, roomId]);
 }
 
 /** What crossed this Bridge, oldest first, and the composer that sends to

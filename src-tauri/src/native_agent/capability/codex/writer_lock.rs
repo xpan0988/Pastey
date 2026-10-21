@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 /// Whether another Codex client has a thread open for writing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WriterLockV1 {
-    /// A process holds the thread's writer lock now.
+    /// A process holds the thread's writer lock now. Only observable on
+    /// macOS so far.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Held,
     /// No process holds it.
     Free,

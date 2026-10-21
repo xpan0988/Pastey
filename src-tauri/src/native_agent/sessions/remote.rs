@@ -2,10 +2,13 @@
 //!
 //! A requester sends `native_agent.session_query` over its exact current
 //! peer session; the executing Host answers with
-//! `native_agent.session_response`. The Host answers only for workspaces the
-//! requesting device holds an active session read permission for, created
-//! by the Host's own user (`crate::session_read_access`); trusting a device
-//! grants nothing. The answer follows minimal disclosure:
+//! `native_agent.session_response`. Every answer lists the workspaces the
+//! Host's own user shares with the requesting device over this Bridge
+//! (`crate::session_read_access`), each with what it allows, so the
+//! requester can choose one without a path. Sessions are answered only for
+//! shared workspaces that allow reading them; trusting a device grants
+//! nothing, and sharing a folder does not share its sessions. The answer
+//! follows minimal disclosure:
 //!
 //! - no folder paths: a workspace appears as its folder name and an opaque
 //!   scope reference, changed files only relative to it, and any path-like
@@ -52,6 +55,8 @@ const PENDING_TTL: Duration = Duration::from_secs(60);
 pub(crate) enum RemoteSessionOperationV1 {
     Discover,
     Inspect,
+    /// Only the shared workspaces, without looking for sessions.
+    Workspaces,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,6 +98,20 @@ pub(crate) struct RemoteScopeV1 {
     pub(crate) scope_ref: String,
     pub(crate) label: String,
     pub(crate) share_excerpts: bool,
+    /// Whether its sessions may be read. An older Host listed only those.
+    #[serde(default = "yes")]
+    pub(crate) read_sessions: bool,
+    /// Whether this device may ask to run agents there (each run still
+    /// waits for that Host's Review).
+    #[serde(default)]
+    pub(crate) agent_requests: bool,
+    /// When the share ends, in seconds since the epoch.
+    #[serde(default)]
+    pub(crate) expires_at: Option<i64>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -605,6 +624,9 @@ fn response(
                 scope_ref: scope.scope_ref.clone(),
                 label: cut(&scope.label, 119),
                 share_excerpts: scope.share_excerpts,
+                read_sessions: scope.read_sessions,
+                agent_requests: scope.agent_requests,
+                expires_at: Some(scope.expires_at),
             })
             .collect(),
         discovery: None,
@@ -613,8 +635,9 @@ fn response(
 }
 
 /// The executing Host's answer to one validated query, for the workspaces
-/// the requesting device may read (`scopes`, already resolved from its
-/// permissions). Blocking: discovery launches bounded read-only processes.
+/// it shares with the requesting device (`scopes`, already resolved from
+/// its own shares). Sessions only of those that allow reading them.
+/// Blocking: discovery launches bounded read-only processes.
 pub(crate) fn answer(
     query: &RemoteSessionQueryV1,
     scopes: &[SessionReadScopeV1],
@@ -630,14 +653,20 @@ pub(crate) fn answer(
             &[],
         );
     }
-    let selected: Vec<SessionReadScopeV1> = match &query.scope_ref {
-        Some(scope_ref) => scopes
-            .iter()
-            .filter(|scope| &scope.scope_ref == scope_ref)
-            .cloned()
-            .collect(),
-        None => scopes.to_vec(),
-    };
+    if query.operation == RemoteSessionOperationV1::Workspaces {
+        return response(query, local_host_ref, RemoteSessionOutcomeV1::Ok, scopes);
+    }
+    let selected: Vec<SessionReadScopeV1> = scopes
+        .iter()
+        .filter(|scope| scope.read_sessions)
+        .filter(|scope| {
+            query
+                .scope_ref
+                .as_ref()
+                .is_none_or(|scope_ref| &scope.scope_ref == scope_ref)
+        })
+        .cloned()
+        .collect();
     if selected.is_empty() {
         return response(
             query,
@@ -688,6 +717,7 @@ pub(crate) fn answer(
             }
             answer.discovery = Some(remote);
         }
+        RemoteSessionOperationV1::Workspaces => {}
         RemoteSessionOperationV1::Inspect => {
             let provider = query.provider.as_deref().unwrap_or_default();
             let session_id = query.session_id.as_deref().unwrap_or_default();

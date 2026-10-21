@@ -612,11 +612,14 @@ export function useNativeAgentTask(roomId: string) {
     finally { setBusy(false); }
   }, [busy, newConversation, roomId, taskText, workspace]);
 
-  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
-    if (!roomId || !peerSessionId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
+  /** `shared`: a folder that Host shares with this device, named by its
+   * reference, which that Host resolves itself; otherwise the typed path. */
+  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string, shared: { scopeRef: string; label: string } | null = null) => {
+    const target = shared ? shared.scopeRef : workspace.trim();
+    if (!roomId || !peerSessionId || !hostRef || !target || !taskText.trim() || busy) return;
     setBusy(true); setMessage(null);
     try {
-      const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, workspace.trim(), taskText.trim(), !newConversation);
+      const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, target, taskText.trim(), !newConversation, shared?.label ?? null);
       rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
       setNewConversation(false);
       setTaskHostRef(hostRef);

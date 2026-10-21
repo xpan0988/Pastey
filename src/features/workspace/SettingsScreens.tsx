@@ -125,7 +125,7 @@ function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConf
 
 function PermissionsSettings() {
   return <>
-    <p className="muted" style={{ marginBottom: "var(--space-6)" }}>What other devices may do on this device. Each permission names one device, one Bridge and one folder, and only you can create or revoke it here. A trusted device without a permission can do none of this.</p>
+    <p className="muted" style={{ marginBottom: "var(--space-6)" }}>What other devices may do on this device, across all Bridges. Each permission names one device, one Bridge and one folder, and only you can create or revoke it. Folders are shared from inside their Bridge (Bridge details → Workspaces); here you can see and end every one. A trusted device without a permission can do none of this.</p>
     <UnattendedAccessSettings />
     <SessionReadingSettings />
     <SharedSearchFolders />

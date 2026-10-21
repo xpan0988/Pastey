@@ -178,20 +178,25 @@ Bounds:
 A requester asks one exact current Bridge Host about its native sessions with `native_agent.session_query`. The Host answers with `native_agent.session_response` on the same session. Both payloads use schema `pastey-native-session-v1` and reject unknown fields. The replay keys are `native-session-query:<requestId>` and `native-session-response:<requestId>`.
 
 **Query.** It has these fields:
-- `requestId`, `targetHostRef`, and `operation` (`discover` or `inspect`);
+- `requestId`, `targetHostRef`, and `operation` (`discover`, `inspect`, or `workspaces`, which only lists the shared workspaces and looks at no session);
 - optional `provider`, `text` (at most 200 characters, one line), `activeWithinSecs` and `scopeRef` (`scope:` followed by 16 hex characters);
 - `sessionId`, which an inspection must name together with `provider`.
 
-**Authority.** The Host resolves the asker from the exact current peer session and the device identity proven in it (`verified_peer_device_for`). It answers only for workspaces that device holds an active **session read permission** for.
-- The permission lives in the Host-local `session_read_grants` table (`src-tauri/src/session_read_access.rs`).
+**Authority.** The Host resolves the asker from the exact current peer session and the device identity proven in it (`verified_peer_device_for`). It answers only from that device's active **workspace shares**. The requester shows its identity before each query (`present_device_identity_over`), so a reconnect or a Host restart needs no other step.
+- A share lives in the Host-local `session_read_grants` table (`src-tauri/src/session_read_access.rs`). Each row is one folder shared with one trusted device over one Bridge, with what it allows: `read_sessions` (and `share_excerpts`, only with it) and `agent_requests`. Rows made before workspace sharing keep `read_sessions = 1` and get `agent_requests = 0`.
 - It binds the trusted device key, the Bridge, the peer HostRef, this Host and one canonical shareable workspace, and lasts 1 hour to 30 days.
-- It is active only while unrevoked and unexpired, the device is still trusted, and the Bridge is neither burned nor removed. A moved workspace drops out.
-- At most 32 are active.
-- Only the Host's local commands create, list or revoke permissions (`create_session_read_grant`, `list_session_read_grants`, `revoke_session_read_grant`). Trusting a device creates none. They are separate from unattended execution permissions, which they never satisfy.
-- Burn deletes a Bridge's permissions.
+- It is active only while unrevoked and unexpired, the device is still trusted, and the Bridge is neither burned nor removed. A moved workspace drops out. Revoking the device revokes its shares, so trusting it again revives none.
+- At most 32 are active. Sharing a folder already shared with that device over that Bridge changes that share instead of adding one.
+- Only the Host's local commands create, change, list or end shares (`share_bridge_workspace`, `update_workspace_share`, `stop_sharing_workspace`, `list_bridge_workspace_shares`, `list_session_read_grants`). `share_bridge_workspace` takes the Bridge and uses the device proven on it now (a fingerprint is required when more than one is); the device must already be trusted, and sharing never trusts it. Stopping a share also revokes that device's unattended grants for that folder on that Bridge. Trusting a device creates none. A share never satisfies an unattended grant.
+- Burn deletes a Bridge's shares.
 - The Host answers one query per Bridge at a time; another gets `busy`.
 
-**Answer.** It carries `requestId`, `sourceHostRef`, `outcome` (`ok`, `not_authorized`, `not_found`, `busy` or `unavailable`), and the device's `scopes` (`scopeRef`, folder `label`, `shareExcerpts`). It also carries either `discovery` or `snapshot`.
+**Shared folder references.** A peer names a shared folder only as `scope:` followed by 16 hex characters: a BLAKE3 digest of the Bridge id and the canonical path, so two Bridges never see the same reference for one folder. The executing Host resolves every reference against that device's active shares in exactly that session (`resolve_agent_request`, called by Room Control before admission):
+- a Codex run (`agent.coding.codex`, v1 invocation) whose `workspace` is a reference needs a share with `agent_requests`; a `workspace` that is a path keeps meaning that path, as before;
+- a thread continuation (`agent.coding.codex_thread`) needs a share with both `agent_requests` and `read_sessions`, and refuses a path;
+- anything else is refused with `native_agent_not_authorized` before admission; nothing is queued. An admitted request still waits for the Host's Review, unless an unattended grant for that folder applies (runs only; continuation always waits).
+
+**Answer.** It carries `requestId`, `sourceHostRef`, `outcome` (`ok`, `not_authorized`, `not_found`, `busy` or `unavailable`), and every folder shared with the device as `scopes` (`scopeRef`, folder `label`, `readSessions`, `shareExcerpts`, `agentRequests`, `expiresAt`; a scope from an older Host reads as readable without agent requests). Sessions come only from scopes with `readSessions`; `not_authorized` means none is readable (or the named one is not). It also carries either `discovery` or `snapshot`.
 - **Minimal disclosure:**
   - no folder path: a workspace appears only as its folder name and `scopeRef`;
   - path-like text in statements and titles becomes `<path>`;
@@ -213,7 +218,7 @@ The requester's commands are `discover_remote_native_sessions(roomId, targetHost
 | Adapter seam, opaque capability payload, Codex adapter, and test-only `fake.longjob.v1` adapter | `src-tauri/src/native_agent/capability.rs`, `src-tauri/src/native_agent/capability/codex.rs`, `src-tauri/src/native_agent/capability/fake_longjob.rs` |
 | Read-only native session discovery and inspection (Claude Code, Codex) | `src-tauri/src/native_agent/sessions.rs`, `src-tauri/src/native_agent/sessions/claude.rs`, `src-tauri/src/native_agent/sessions/codex.rs`; Codex history reader and holder scan in `src-tauri/src/native_agent/capability/codex.rs` |
 | Local Claude Code session continuation (`agent.coding.claude_code`) | `src-tauri/src/native_agent/capability/claude_code.rs` |
-| Remote session reading: permissions, wire types, minimal disclosure, Room Control kinds and requester wait | `src-tauri/src/session_read_access.rs`, `src-tauri/src/native_agent/sessions/remote.rs`, `src-tauri/src/room_control.rs` (`native_agent.session_query` / `session_response`), `src-tauri/src/bridge_lifecycle.rs` (`request_native_sessions`); UI in `src/features/workspace/NativeSessionsCard.tsx`, `src/features/workspace/SessionReadingSettings.tsx`, `src/lib/nativeSessions.ts` |
+| Remote session reading: permissions, wire types, minimal disclosure, Room Control kinds and requester wait | `src-tauri/src/session_read_access.rs`, `src-tauri/src/native_agent/sessions/remote.rs`, `src-tauri/src/room_control.rs` (`native_agent.session_query` / `session_response`), `src-tauri/src/bridge_lifecycle.rs` (`request_native_sessions`); UI in `src/features/workspace/BridgeWorkspaces.tsx` (Bridge details → Workspaces), `src/features/workspace/NativeSessionsCard.tsx`, `src/features/workspace/SessionReadingSettings.tsx` (Settings overview), `src/lib/workspaceShares.ts`, `src/lib/nativeSessions.ts` |
 | Test-only deterministic requester/executor pair and external Agent-turn ledger | `src-tauri/src/native_agent_pair_harness.rs` |
 | Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/main.rs` |
 | Native Agent Room Control envelope, validation, replay/session handling | `src-tauri/src/room_control.rs` |

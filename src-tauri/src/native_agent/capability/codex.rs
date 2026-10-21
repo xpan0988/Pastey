@@ -148,6 +148,35 @@ pub(in crate::native_agent) fn codex_input(
     Ok(legacy_v1_input(workspace, task, resume))
 }
 
+/// The prefix of a folder reference a Bridge peer received for a folder
+/// this Host shares with it (`crate::session_read_access`). Never a path.
+pub(in crate::native_agent) const WORKSPACE_REF_PREFIX: &str = "scope:";
+
+/// A Bridge peer may name a folder this Host shares with it, for agent
+/// requests, by its reference instead of a path. The executing Host turns
+/// that reference into its own folder among `shared` (`(scope_ref,
+/// workspace)`), and refuses any other reference. An input naming a path
+/// is returned unchanged (`None`): it keeps meaning exactly that path.
+pub(in crate::native_agent) fn resolve_peer_workspace_ref(
+    input: &OpaqueCapabilityPayloadV1,
+    shared: &[(String, PathBuf)],
+) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+    // Anything else is left to the adapter's own validation.
+    let Ok(parsed) = serde_json::from_value::<CodexInvocationInputV1>(input.value().clone()) else {
+        return Ok(None);
+    };
+    if !parsed.workspace.starts_with(WORKSPACE_REF_PREFIX) {
+        return Ok(None);
+    }
+    let Some((_, workspace)) = shared
+        .iter()
+        .find(|(scope_ref, _)| *scope_ref == parsed.workspace)
+    else {
+        return invalid("This device may not ask to run agents in that folder.");
+    };
+    codex_input(workspace, &parsed.task, parsed.resume).map(Some)
+}
+
 /// Codex holds one canonical workspace per unresolved task.
 pub(in crate::native_agent) fn workspace_exclusivity_key(workspace: &Path) -> ExclusivityKeyV1 {
     ExclusivityKeyV1::new(CODEX_CAPABILITY_ID, &workspace.to_string_lossy())

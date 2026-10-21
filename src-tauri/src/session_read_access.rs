@@ -1,13 +1,23 @@
-//! Host-local permissions for a trusted device to read native session
-//! summaries (Claude Code, Codex) in one workspace over one Bridge.
+//! Workspaces this Host shares with one Bridge, and what each allows.
 //!
-//! Every operation that creates, lists or revokes a permission is a local
+//! A share is the one Host-local record of "this folder, for this trusted
+//! device, over this Bridge": it names the folder to the device only by its
+//! name and an opaque reference, and it carries what the device may do
+//! there, each allowed separately by this Host's own user:
+//!
+//! - read native session summaries (Claude Code, Codex), optionally with
+//!   short excerpts;
+//! - ask to run a native agent there, or to continue a Codex thread there.
+//!   Each such run still waits for this Host's Review, unless an unattended
+//!   grant (`crate::unattended_access`) for the same folder applies.
+//!
+//! Every operation that creates, changes, lists or ends a share is a local
 //! command of this Host's own user; no Room Control event reaches them. A
-//! permission is bound to one trusted device key, the exact Bridge and peer
+//! share is bound to one trusted device key, the exact Bridge and peer
 //! HostRef it was proven on, this Host, and one canonical workspace, and it
-//! expires. Trusting a device grants nothing by itself. A permission only
-//! lets the device read summaries; it never starts, resumes or changes a
-//! session, and it is separate from unattended execution permissions.
+//! expires. Trusting a device grants nothing by itself, and sharing a folder
+//! allows nothing until one of its capabilities is turned on. The executing
+//! Host resolves every reference a peer sends against these records only.
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +30,7 @@ use crate::{
     storage::{self, AppPaths, StoredSessionReadGrant},
 };
 
-/// Longest session read permission: 30 days.
+/// Longest workspace share: 30 days.
 pub(crate) const MAX_READ_GRANT_HOURS: i64 = 30 * 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -38,92 +48,269 @@ pub(crate) enum SessionReadGrantStateV1 {
 pub(crate) struct SessionReadGrantViewV1 {
     pub(crate) grant_id: String,
     pub(crate) device_label: String,
+    pub(crate) device_fingerprint: String,
     pub(crate) display_fingerprint: String,
     pub(crate) bridge_id: String,
     /// Shown only to this Host's own user.
     pub(crate) workspace: String,
+    /// The folder's own name, which the device sees.
+    pub(crate) label: String,
+    pub(crate) read_sessions: bool,
     pub(crate) share_excerpts: bool,
+    pub(crate) agent_requests: bool,
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
     pub(crate) state: SessionReadGrantStateV1,
 }
 
+/// Shares one folder of this Host with the device proven on one Bridge now,
+/// from inside that Bridge: the device is the Bridge's own, never chosen.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct CreateSessionReadGrantV1 {
-    pub(crate) device_fingerprint: String,
+pub(crate) struct ShareWorkspaceV1 {
     pub(crate) room_id: String,
+    /// The Bridge device this Host's user saw and trusted. Required when
+    /// more than one device has shown itself on this Bridge.
+    #[serde(default)]
+    pub(crate) device_fingerprint: Option<String>,
     pub(crate) workspace_path: String,
     pub(crate) duration_hours: i64,
-    /// Whether short excerpts of prompts and replies may be sent. Off, only
-    /// statuses, titles, counts and evidence are.
+    pub(crate) read_sessions: bool,
     #[serde(default)]
     pub(crate) share_excerpts: bool,
+    pub(crate) agent_requests: bool,
 }
 
-/// One workspace a requesting device may read now, as the executor uses it.
+/// Changes what one share allows. `duration_hours`, when given, restarts its
+/// time from now.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpdateWorkspaceShareV1 {
+    pub(crate) grant_id: String,
+    pub(crate) read_sessions: bool,
+    #[serde(default)]
+    pub(crate) share_excerpts: bool,
+    pub(crate) agent_requests: bool,
+    #[serde(default)]
+    pub(crate) duration_hours: Option<i64>,
+}
+
+/// One workspace this Host shares with a requesting device now, as the
+/// executor uses it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SessionReadScopeV1 {
-    /// Opaque reference the peer sees instead of the folder's path.
+    /// Opaque reference the peer sees instead of the folder's path. Differs
+    /// per Bridge, so two Bridges cannot tell they name the same folder.
     pub(crate) scope_ref: String,
     pub(crate) workspace: PathBuf,
     /// The folder's own name, which the peer sees.
     pub(crate) label: String,
+    pub(crate) read_sessions: bool,
     pub(crate) share_excerpts: bool,
+    pub(crate) agent_requests: bool,
+    pub(crate) expires_at: i64,
 }
 
-/// Creates one permission. The device must be trusted and proven in a
-/// current session on exactly `room_id` now, which also fixes the peer
-/// HostRef the permission is bound to.
-pub(crate) fn create_grant(
+fn valid_duration(hours: i64) -> AppResult<()> {
+    if !(1..=MAX_READ_GRANT_HOURS).contains(&hours) {
+        return Err(AppError::InvalidInput(
+            "A workspace share lasts between 1 hour and 30 days.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn folder_label(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "workspace".into())
+}
+
+/// The reference a Bridge's peer uses for one shared folder.
+pub(crate) fn scope_ref(bridge_id: &str, workspace: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"pastey-workspace-share-v1\0");
+    hasher.update(bridge_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace.as_bytes());
+    format!("scope:{}", &hasher.finalize().to_hex()[..16])
+}
+
+fn view_of(paths: &AppPaths, grant_id: &str, now: i64) -> AppResult<SessionReadGrantViewV1> {
+    grants(paths, now)?
+        .into_iter()
+        .find(|view| view.grant_id == grant_id)
+        .ok_or_else(|| AppError::InvalidInput("The permission was not stored.".into()))
+}
+
+/// Shares one folder with the device proven on exactly `request.room_id`
+/// now, from inside that Bridge. The device must be trusted already; this
+/// never trusts it. Sharing a folder that is already shared with it over
+/// this Bridge changes that share instead of adding another.
+pub(crate) fn share_with_bridge(
     paths: &AppPaths,
     local_host_ref: &HostRef,
     current: &[VerifiedPeerDevice],
-    request: &CreateSessionReadGrantV1,
+    request: &ShareWorkspaceV1,
     now: i64,
 ) -> AppResult<SessionReadGrantViewV1> {
-    if !(1..=MAX_READ_GRANT_HOURS).contains(&request.duration_hours) {
-        return Err(AppError::InvalidInput(
-            "A session reading permission lasts between 1 hour and 30 days.".into(),
-        ));
-    }
-    let device = current
+    valid_duration(request.duration_hours)?;
+    let on_bridge: Vec<&VerifiedPeerDevice> = current
         .iter()
-        .find(|device| {
-            device.fingerprint == request.device_fingerprint
-                && device.binding.bridge_id == request.room_id
+        .rev()
+        .filter(|device| {
+            device.binding.bridge_id == request.room_id
+                && device.binding.local_host_ref == *local_host_ref
         })
-        .ok_or_else(|| {
-            AppError::InvalidInput(
-                "That device must be connected on that Bridge, and have shown itself, while you create the permission.".into(),
-            )
-        })?;
-    if device.binding.local_host_ref != *local_host_ref {
+        .collect();
+    let device = match &request.device_fingerprint {
+        Some(fingerprint) => on_bridge
+            .iter()
+            .find(|device| &device.fingerprint == fingerprint)
+            .copied(),
+        None if on_bridge
+            .iter()
+            .all(|device| device.fingerprint == on_bridge[0].fingerprint) =>
+        {
+            on_bridge.first().copied()
+        }
+        None => {
+            return Err(AppError::InvalidInput(
+                "More than one device is on this Bridge. Choose which one to share with.".into(),
+            ))
+        }
+    }
+    .ok_or_else(|| {
+        AppError::InvalidInput(
+            "The other device has not shown its identity on this connection yet. Open this Bridge on it, then share again.".into(),
+        )
+    })?;
+    let public_key = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        device.public_key,
+    );
+    if !storage::list_trusted_devices(paths)?.iter().any(|known| {
+        known.fingerprint == device.fingerprint
+            && known.public_key == public_key
+            && known.revoked_at.is_none()
+    }) {
         return Err(AppError::InvalidInput(
-            "That session belongs to another Host.".into(),
+            "Trust the other device first: compare its fingerprint on both devices, then share."
+                .into(),
         ));
     }
     let (workspace, _) = crate::file_candidates::validate_shareable_folder(
         paths,
         Path::new(&request.workspace_path),
     )?;
+    let peer_host_ref = device.binding.peer_host_ref.as_str();
+    let existing = storage::list_session_read_grants(paths)?
+        .into_iter()
+        .filter(|grant| {
+            grant.device_fingerprint == device.fingerprint
+                && grant.bridge_id == request.room_id
+                && grant.peer_host_ref == peer_host_ref
+                && grant.local_host_ref == local_host_ref.as_str()
+                && grant.workspace == workspace
+        })
+        .find(|grant| {
+            matches!(
+                grant_state(paths, grant, now),
+                Ok(SessionReadGrantStateV1::Active)
+            )
+        });
+    let expires_at = now + request.duration_hours * 60 * 60;
+    if let Some(existing) = existing {
+        storage::update_session_read_grant(
+            paths,
+            &existing.grant_id,
+            request.read_sessions,
+            request.share_excerpts,
+            request.agent_requests,
+            Some(expires_at),
+        )?;
+        return view_of(paths, &existing.grant_id, now);
+    }
     let grant = StoredSessionReadGrant {
         grant_id: format!("session-read-grant-{}", uuid::Uuid::new_v4()),
         device_fingerprint: device.fingerprint.clone(),
         bridge_id: request.room_id.clone(),
-        peer_host_ref: device.binding.peer_host_ref.as_str().to_owned(),
+        peer_host_ref: peer_host_ref.to_owned(),
         local_host_ref: local_host_ref.as_str().to_owned(),
         workspace,
-        share_excerpts: request.share_excerpts,
+        read_sessions: request.read_sessions,
+        share_excerpts: request.read_sessions && request.share_excerpts,
+        agent_requests: request.agent_requests,
         created_at: now,
-        expires_at: now + request.duration_hours * 60 * 60,
+        expires_at,
         revoked_at: None,
     };
     storage::insert_session_read_grant(paths, &grant)?;
-    grants(paths, now)?
+    view_of(paths, &grant.grant_id, now)
+}
+
+/// Changes what one active share allows. Its device, Bridge and folder stay.
+pub(crate) fn update_share(
+    paths: &AppPaths,
+    request: &UpdateWorkspaceShareV1,
+    now: i64,
+) -> AppResult<SessionReadGrantViewV1> {
+    if let Some(hours) = request.duration_hours {
+        valid_duration(hours)?;
+    }
+    let current = view_of(paths, &request.grant_id, now)
+        .map_err(|_| AppError::NotFound("That share no longer exists.".into()))?;
+    if current.state != SessionReadGrantStateV1::Active
+        && !(current.state == SessionReadGrantStateV1::Expired && request.duration_hours.is_some())
+    {
+        return Err(AppError::InvalidInput(
+            "That share has ended. Share the folder again.".into(),
+        ));
+    }
+    if !storage::update_session_read_grant(
+        paths,
+        &request.grant_id,
+        request.read_sessions,
+        request.share_excerpts,
+        request.agent_requests,
+        request.duration_hours.map(|hours| now + hours * 60 * 60),
+    )? {
+        return Err(AppError::InvalidInput(
+            "That share has ended. Share the folder again.".into(),
+        ));
+    }
+    let updated = view_of(paths, &request.grant_id, now)?;
+    if updated.state != SessionReadGrantStateV1::Active {
+        return Err(AppError::InvalidInput(
+            "That share is no longer available: the device, the Bridge or the folder changed."
+                .into(),
+        ));
+    }
+    Ok(updated)
+}
+
+/// Ends one share, with every unattended grant its device holds for that
+/// folder over that Bridge.
+pub(crate) fn stop_sharing(paths: &AppPaths, grant_id: &str) -> AppResult<()> {
+    if !storage::stop_sharing_workspace(paths, grant_id)? {
+        return Err(AppError::NotFound(
+            "That folder is no longer shared.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// This Host's shares over one Bridge, for its own user.
+pub(crate) fn bridge_shares(
+    paths: &AppPaths,
+    room_id: &str,
+    now: i64,
+) -> AppResult<Vec<SessionReadGrantViewV1>> {
+    Ok(grants(paths, now)?
         .into_iter()
-        .find(|view| view.grant_id == grant.grant_id)
-        .ok_or_else(|| AppError::InvalidInput("The permission was not stored.".into()))
+        .filter(|view| view.bridge_id == room_id)
+        .collect())
 }
 
 pub(crate) fn grants(paths: &AppPaths, now: i64) -> AppResult<Vec<SessionReadGrantViewV1>> {
@@ -139,11 +326,15 @@ pub(crate) fn grants(paths: &AppPaths, now: i64) -> AppResult<Vec<SessionReadGra
                 device_label: device
                     .map_or_else(|| "Unknown device".into(), |device| device.label.clone()),
                 display_fingerprint: display_fingerprint(&grant.device_fingerprint),
+                device_fingerprint: grant.device_fingerprint,
                 state,
                 grant_id: grant.grant_id,
                 bridge_id: grant.bridge_id,
+                label: folder_label(Path::new(&grant.workspace)),
                 workspace: grant.workspace,
+                read_sessions: grant.read_sessions,
                 share_excerpts: grant.share_excerpts,
+                agent_requests: grant.agent_requests,
                 created_at: grant.created_at,
                 expires_at: grant.expires_at,
             })
@@ -177,19 +368,11 @@ fn grant_state(
     Ok(SessionReadGrantStateV1::Active)
 }
 
-pub(crate) fn revoke_grant(paths: &AppPaths, grant_id: &str) -> AppResult<()> {
-    if !storage::revoke_session_read_grant(paths, grant_id)? {
-        return Err(AppError::NotFound(
-            "That permission is already revoked or unavailable.".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// The workspaces the device proven in exactly `binding` may read now. Empty
-/// unless the device holds an active permission for this Bridge, peer and
-/// Host; a workspace that moved since is left out.
-pub(crate) fn authorized_scopes(
+/// Every workspace this Host shares with the device proven in exactly
+/// `binding` now, whatever each allows. Empty unless the device holds an
+/// active share for this Bridge, peer and Host; a folder that moved since
+/// is left out. Two shares of one folder allow what either allows.
+pub(crate) fn shared_workspaces(
     paths: &AppPaths,
     device: &VerifiedPeerDevice,
     binding: &HostSessionBinding,
@@ -217,24 +400,85 @@ pub(crate) fn authorized_scopes(
         }
         let workspace = PathBuf::from(&grant.workspace);
         if let Some(existing) = scopes.iter_mut().find(|scope| scope.workspace == workspace) {
-            // Two permissions for one folder: excerpts only if one allows them.
-            existing.share_excerpts |= grant.share_excerpts;
+            existing.read_sessions |= grant.read_sessions;
+            existing.share_excerpts |= grant.read_sessions && grant.share_excerpts;
+            existing.agent_requests |= grant.agent_requests;
+            existing.expires_at = existing.expires_at.max(grant.expires_at);
             continue;
         }
         scopes.push(SessionReadScopeV1 {
-            scope_ref: format!(
-                "scope:{}",
-                &blake3::hash(grant.workspace.as_bytes()).to_hex()[..16]
-            ),
-            label: workspace
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "workspace".into()),
+            scope_ref: scope_ref(&binding.bridge_id, &grant.workspace),
+            label: folder_label(&workspace),
             workspace,
-            share_excerpts: grant.share_excerpts,
+            read_sessions: grant.read_sessions,
+            share_excerpts: grant.read_sessions && grant.share_excerpts,
+            agent_requests: grant.agent_requests,
+            expires_at: grant.expires_at,
         });
     }
     Ok(scopes)
+}
+
+/// The shared workspaces whose sessions the device may read now.
+#[cfg(test)]
+pub(crate) fn authorized_scopes(
+    paths: &AppPaths,
+    device: &VerifiedPeerDevice,
+    binding: &HostSessionBinding,
+    now: i64,
+) -> AppResult<Vec<SessionReadScopeV1>> {
+    Ok(shared_workspaces(paths, device, binding, now)?
+        .into_iter()
+        .filter(|scope| scope.read_sessions)
+        .collect())
+}
+
+/// `(scope_ref, workspace)` of the shared workspaces where the device may
+/// ask to run a native agent now; with `continuing`, only those whose
+/// sessions it may also read, since continuing names an existing session.
+pub(crate) fn agent_request_scopes(
+    paths: &AppPaths,
+    device: &VerifiedPeerDevice,
+    binding: &HostSessionBinding,
+    now: i64,
+    continuing: bool,
+) -> AppResult<Vec<(String, PathBuf)>> {
+    Ok(shared_workspaces(paths, device, binding, now)?
+        .into_iter()
+        .filter(|scope| scope.agent_requests && (!continuing || scope.read_sessions))
+        .map(|scope| (scope.scope_ref, scope.workspace))
+        .collect())
+}
+
+/// What the executing Host does with a peer's native invocation before it
+/// is admitted (and, without an unattended grant, held for Review): a Codex
+/// run naming a folder by its share reference, or any thread continuation
+/// (which names its folder only that way), is turned into this Host's own
+/// folder among the shares of the device proven in exactly `binding` now.
+/// Running needs the share to allow agent requests; continuing also needs
+/// it to allow reading sessions. Anything else is refused. `None`: the
+/// request names no shared folder and stays as it is.
+pub(crate) fn resolve_agent_request(
+    paths: &AppPaths,
+    device: Option<&VerifiedPeerDevice>,
+    binding: &HostSessionBinding,
+    capability: &str,
+    input: &crate::native_agent::OpaqueCapabilityPayloadV1,
+    now: i64,
+) -> AppResult<Option<crate::native_agent::OpaqueCapabilityPayloadV1>> {
+    let continuing = capability == crate::native_agent::CODEX_THREAD_CAPABILITY;
+    if !continuing && capability != crate::native_agent::CODEX_CAPABILITY_ID {
+        return Ok(None);
+    }
+    let shared = match device {
+        Some(device) => agent_request_scopes(paths, device, binding, now, continuing)?,
+        None => Vec::new(),
+    };
+    if continuing {
+        crate::native_agent::resolve_codex_thread_peer_input(input, &shared).map(Some)
+    } else {
+        crate::native_agent::resolve_codex_workspace_ref(input, &shared)
+    }
 }
 
 #[cfg(test)]

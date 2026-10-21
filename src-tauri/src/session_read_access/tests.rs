@@ -93,17 +93,20 @@ impl FixtureV1 {
         .unwrap();
     }
 
+    /// The folder shared for its sessions only.
     fn grant(&self, device: &VerifiedPeerDevice, excerpts: bool) -> SessionReadGrantViewV1 {
-        create_grant(
+        share_with_bridge(
             &self.paths,
             &self.windows,
             &[device.clone()],
-            &CreateSessionReadGrantV1 {
-                device_fingerprint: device.fingerprint.clone(),
+            &ShareWorkspaceV1 {
                 room_id: device.binding.bridge_id.clone(),
+                device_fingerprint: Some(device.fingerprint.clone()),
                 workspace_path: self.workspace.to_string_lossy().into_owned(),
                 duration_hours: 24,
+                read_sessions: true,
                 share_excerpts: excerpts,
+                agent_requests: false,
             },
             storage::now_ts(),
         )
@@ -159,52 +162,59 @@ fn a_permission_names_one_folder_by_its_name_and_an_opaque_reference() {
 }
 
 #[test]
-fn a_permission_needs_the_device_proven_on_that_bridge_now_and_is_bounded() {
+fn a_share_needs_the_device_proven_on_that_bridge_now_and_is_bounded() {
     let h = FixtureV1::new();
     let (_, device) = h.proven(BRIDGE, "s1");
     h.trust(&device);
-    let request = |hours| CreateSessionReadGrantV1 {
-        device_fingerprint: device.fingerprint.clone(),
+    let request = |hours| ShareWorkspaceV1 {
         room_id: BRIDGE.into(),
+        device_fingerprint: Some(device.fingerprint.clone()),
         workspace_path: h.workspace.to_string_lossy().into_owned(),
         duration_hours: hours,
+        read_sessions: true,
         share_excerpts: false,
+        agent_requests: false,
     };
     for hours in [0, MAX_READ_GRANT_HOURS + 1] {
-        assert!(create_grant(&h.paths, &h.windows, &[device.clone()], &request(hours), 0).is_err());
+        assert!(
+            share_with_bridge(&h.paths, &h.windows, &[device.clone()], &request(hours), 0).is_err()
+        );
     }
     assert!(
-        create_grant(&h.paths, &h.windows, &[], &request(1), storage::now_ts()).is_err(),
+        share_with_bridge(&h.paths, &h.windows, &[], &request(1), storage::now_ts()).is_err(),
         "not proven now"
     );
     let untrusted = FixtureV1::new();
     let (_, stranger) = untrusted.proven(BRIDGE, "s1");
     assert!(
-        create_grant(
+        share_with_bridge(
             &untrusted.paths,
             &untrusted.windows,
             &[stranger.clone()],
-            &CreateSessionReadGrantV1 {
-                device_fingerprint: stranger.fingerprint.clone(),
+            &ShareWorkspaceV1 {
+                device_fingerprint: Some(stranger.fingerprint.clone()),
                 ..request(1)
             },
             storage::now_ts()
         )
         .is_err(),
-        "an untrusted device gets no permission"
+        "an untrusted device gets no share"
     );
     let home = dirs::home_dir().unwrap().to_string_lossy().into_owned();
-    assert!(create_grant(
-        &h.paths,
-        &h.windows,
-        &[device.clone()],
-        &CreateSessionReadGrantV1 {
-            workspace_path: home,
-            ..request(1)
-        },
-        storage::now_ts()
-    )
-    .is_err());
+    assert!(
+        share_with_bridge(
+            &h.paths,
+            &h.windows,
+            &[device.clone()],
+            &ShareWorkspaceV1 {
+                workspace_path: home,
+                ..request(1)
+            },
+            storage::now_ts()
+        )
+        .is_err(),
+        "too broad to share"
+    );
 }
 
 #[test]
@@ -215,11 +225,11 @@ fn revocation_device_revocation_burn_and_a_moved_folder_end_reading() {
     let now = storage::now_ts();
 
     let view = h.grant(&device, true);
-    revoke_grant(&h.paths, &view.grant_id).unwrap();
+    stop_sharing(&h.paths, &view.grant_id).unwrap();
     assert!(authorized_scopes(&h.paths, &device, &binding, now)
         .unwrap()
         .is_empty());
-    assert!(revoke_grant(&h.paths, &view.grant_id).is_err());
+    assert!(stop_sharing(&h.paths, &view.grant_id).is_err());
 
     h.grant(&device, true);
     crate::unattended_access::revoke_device(&h.paths, &device.fingerprint).unwrap();
@@ -280,11 +290,504 @@ fn a_permission_never_matches_another_bridge_or_host() {
 fn no_peer_message_can_create_or_revoke_a_session_read_permission() {
     let room_control = include_str!("../room_control.rs");
     for forbidden in [
-        "create_grant(",
-        "revoke_grant(",
         "insert_session_read_grant(",
-        "revoke_session_read_grant(",
+        "share_with_bridge(",
+        "update_share(",
+        "stop_sharing(",
+        "update_session_read_grant(",
+        "stop_sharing_workspace(",
     ] {
         assert!(!room_control.contains(forbidden), "{forbidden}");
     }
+}
+
+fn share_request(h: &FixtureV1, read: bool, run: bool) -> ShareWorkspaceV1 {
+    ShareWorkspaceV1 {
+        room_id: BRIDGE.into(),
+        device_fingerprint: None,
+        workspace_path: h.workspace.to_string_lossy().into_owned(),
+        duration_hours: 24,
+        read_sessions: read,
+        share_excerpts: false,
+        agent_requests: run,
+    }
+}
+
+fn payload(value: serde_json::Value) -> crate::native_agent::OpaqueCapabilityPayloadV1 {
+    serde_json::from_value(value).unwrap()
+}
+
+fn codex_run(workspace: &str) -> crate::native_agent::OpaqueCapabilityPayloadV1 {
+    payload(serde_json::json!({ "workspace": workspace, "task": "fix the test", "resume": true }))
+}
+
+fn resolve(
+    h: &FixtureV1,
+    device: Option<&VerifiedPeerDevice>,
+    binding: &HostSessionBinding,
+    capability: &str,
+    input: &crate::native_agent::OpaqueCapabilityPayloadV1,
+) -> AppResult<Option<crate::native_agent::OpaqueCapabilityPayloadV1>> {
+    resolve_agent_request(
+        &h.paths,
+        device,
+        binding,
+        capability,
+        input,
+        storage::now_ts(),
+    )
+}
+
+#[test]
+fn sharing_from_a_bridge_uses_its_own_device_and_never_trusts_it() {
+    let h = FixtureV1::new();
+    let (_, device) = h.proven(BRIDGE, "s1");
+    assert!(
+        share_with_bridge(
+            &h.paths,
+            &h.windows,
+            &[],
+            &share_request(&h, true, false),
+            storage::now_ts()
+        )
+        .is_err(),
+        "the Bridge's device must have shown itself on this connection"
+    );
+    let untrusted = share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, false),
+        storage::now_ts(),
+    )
+    .unwrap_err();
+    assert!(
+        untrusted.message().contains("Trust"),
+        "{}",
+        untrusted.message()
+    );
+    assert!(
+        storage::list_trusted_devices(&h.paths).unwrap().is_empty(),
+        "sharing trusts nobody"
+    );
+    h.trust(&device);
+    let other_bridge = ShareWorkspaceV1 {
+        room_id: "room-other".into(),
+        ..share_request(&h, true, false)
+    };
+    assert!(
+        share_with_bridge(
+            &h.paths,
+            &h.windows,
+            &[device.clone()],
+            &other_bridge,
+            storage::now_ts()
+        )
+        .is_err(),
+        "a device proven on one Bridge is not shared with over another"
+    );
+    let view = share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, false),
+        storage::now_ts(),
+    )
+    .unwrap();
+    assert_eq!(
+        (view.label.as_str(), view.read_sessions, view.agent_requests),
+        ("Pastey", true, false)
+    );
+    assert_eq!(view.state, SessionReadGrantStateV1::Active);
+    // Sharing it again changes that share instead of adding a second one.
+    let again = share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, true),
+        storage::now_ts(),
+    )
+    .unwrap();
+    assert_eq!(again.grant_id, view.grant_id);
+    assert!(again.agent_requests);
+    assert_eq!(
+        bridge_shares(&h.paths, BRIDGE, storage::now_ts())
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_shared_folder_allows_only_what_its_owner_turned_on() {
+    let h = FixtureV1::new();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    h.trust(&device);
+    let now = storage::now_ts();
+    let view = share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, false, false),
+        now,
+    )
+    .unwrap();
+    // Shared, but nothing allowed: the folder is listed and nothing else.
+    let listed = shared_workspaces(&h.paths, &device, &binding, now).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert!(authorized_scopes(&h.paths, &device, &binding, now)
+        .unwrap()
+        .is_empty());
+    assert!(
+        agent_request_scopes(&h.paths, &device, &binding, now, false)
+            .unwrap()
+            .is_empty()
+    );
+    let reference = listed[0].scope_ref.clone();
+    assert!(resolve(
+        &h,
+        Some(&device),
+        &binding,
+        crate::native_agent::CODEX_CAPABILITY_ID,
+        &codex_run(&reference)
+    )
+    .is_err());
+
+    // Reading only: sessions, no runs and no continuation.
+    let update = |read, excerpts, run| UpdateWorkspaceShareV1 {
+        grant_id: view.grant_id.clone(),
+        read_sessions: read,
+        share_excerpts: excerpts,
+        agent_requests: run,
+        duration_hours: None,
+    };
+    let reading = update_share(&h.paths, &update(true, true, false), now).unwrap();
+    assert!(reading.read_sessions && reading.share_excerpts && !reading.agent_requests);
+    assert_eq!(
+        authorized_scopes(&h.paths, &device, &binding, now)
+            .unwrap()
+            .len(),
+        1
+    );
+    let thread =
+        crate::native_agent::codex_thread_peer_input(&reference, "thread-1", "go on", None)
+            .unwrap();
+    assert!(resolve(
+        &h,
+        Some(&device),
+        &binding,
+        crate::native_agent::CODEX_THREAD_CAPABILITY,
+        &thread
+    )
+    .is_err());
+
+    // Agent requests only: runs by reference, no reading, no continuation.
+    let running = update_share(&h.paths, &update(false, true, true), now).unwrap();
+    assert!(!running.share_excerpts, "excerpts need reading");
+    let resolved = resolve(
+        &h,
+        Some(&device),
+        &binding,
+        crate::native_agent::CODEX_CAPABILITY_ID,
+        &codex_run(&reference),
+    )
+    .unwrap()
+    .expect("a reference is resolved");
+    let resolved = serde_json::to_value(&resolved).unwrap();
+    assert_eq!(
+        resolved["workspace"],
+        h.workspace.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        (resolved["task"].as_str(), resolved["resume"].as_bool()),
+        (Some("fix the test"), Some(true))
+    );
+    assert!(resolve(
+        &h,
+        Some(&device),
+        &binding,
+        crate::native_agent::CODEX_THREAD_CAPABILITY,
+        &thread
+    )
+    .is_err());
+
+    // Both: continuing a thread resolves to this Host's own folder.
+    update_share(&h.paths, &update(true, false, true), now).unwrap();
+    let continued = serde_json::to_value(
+        resolve(
+            &h,
+            Some(&device),
+            &binding,
+            crate::native_agent::CODEX_THREAD_CAPABILITY,
+            &thread,
+        )
+        .unwrap()
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        continued["workspace"],
+        h.workspace.to_string_lossy().as_ref()
+    );
+    assert_eq!(continued["threadId"], "thread-1");
+}
+
+#[test]
+fn a_peer_never_chooses_the_path_and_a_path_stays_a_path() {
+    let h = FixtureV1::new();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    h.trust(&device);
+    share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, true),
+        storage::now_ts(),
+    )
+    .unwrap();
+    let codex = crate::native_agent::CODEX_CAPABILITY_ID;
+    // An unknown or forged reference is refused, with or without a device.
+    for forged in ["scope:0123456789abcdef", "scope:../../etc", "scope:"] {
+        assert!(
+            resolve(&h, Some(&device), &binding, codex, &codex_run(forged)).is_err(),
+            "{forged}"
+        );
+    }
+    let reference = shared_workspaces(&h.paths, &device, &binding, storage::now_ts()).unwrap()[0]
+        .scope_ref
+        .clone();
+    assert!(
+        resolve(&h, None, &binding, codex, &codex_run(&reference)).is_err(),
+        "an unproven device has no shares"
+    );
+    // A typed path keeps meaning exactly that path, for the Host's Review.
+    assert_eq!(
+        resolve(
+            &h,
+            Some(&device),
+            &binding,
+            codex,
+            &codex_run(r"C:\Users\admin\Pastey")
+        )
+        .unwrap(),
+        None
+    );
+    // A continuation naming a path instead of a reference is refused.
+    let with_path = payload(serde_json::json!({
+        "scopeRef": reference, "threadId": "thread-1", "prompt": "x", "expectedLastTurnId": null, "workspace": "/etc"
+    }));
+    assert!(resolve(
+        &h,
+        Some(&device),
+        &binding,
+        crate::native_agent::CODEX_THREAD_CAPABILITY,
+        &with_path
+    )
+    .is_err());
+    // Other capabilities are untouched.
+    assert_eq!(
+        resolve(
+            &h,
+            Some(&device),
+            &binding,
+            "agent.coding.claude_code",
+            &codex_run(&reference)
+        )
+        .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn references_differ_per_bridge_and_survive_a_reconnect() {
+    let h = FixtureV1::new();
+    storage::create_room(
+        &h.paths,
+        &[7u8; 32],
+        "87654321",
+        15,
+        crate::models::LocalRole::Creator,
+        Some("room-other".into()),
+        None,
+    )
+    .unwrap();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    h.trust(&device);
+    share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, true),
+        storage::now_ts(),
+    )
+    .unwrap();
+    let reference = shared_workspaces(&h.paths, &device, &binding, storage::now_ts()).unwrap()[0]
+        .scope_ref
+        .clone();
+    assert_ne!(
+        reference,
+        scope_ref("room-other", &h.workspace.to_string_lossy())
+    );
+
+    // The same device, proven on the other Bridge, gets nothing from it.
+    let (other_binding, other_device) = h.proven("room-other", "s9");
+    assert!(
+        shared_workspaces(&h.paths, &other_device, &other_binding, storage::now_ts())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(resolve(
+        &h,
+        Some(&other_device),
+        &other_binding,
+        crate::native_agent::CODEX_CAPABILITY_ID,
+        &codex_run(&reference)
+    )
+    .is_err());
+
+    // A new session of the same Bridge (a reconnect, or a restart there)
+    // finds the same share under the same reference once the device shows
+    // itself again; the old session's proof does not carry over.
+    let (binding2, device2) = h.proven(BRIDGE, "s2");
+    let after = shared_workspaces(&h.paths, &device2, &binding2, storage::now_ts()).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].scope_ref, reference);
+    assert!(
+        shared_workspaces(&h.paths, &device, &binding2, storage::now_ts())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn stopping_expiry_revoked_trust_and_burn_end_a_share() {
+    let h = FixtureV1::new();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    h.trust(&device);
+    let now = storage::now_ts();
+    let codex = crate::native_agent::CODEX_CAPABILITY_ID;
+    let view = share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, true),
+        now,
+    )
+    .unwrap();
+    let reference = shared_workspaces(&h.paths, &device, &binding, now).unwrap()[0]
+        .scope_ref
+        .clone();
+    // An unattended grant for the same folder ends with the share.
+    crate::unattended_access::create_grant(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &crate::unattended_access::CreateUnattendedGrantV1 {
+            device_fingerprint: device.fingerprint.clone(),
+            room_id: BRIDGE.into(),
+            workspace_path: h.workspace.to_string_lossy().into_owned(),
+            duration_hours: 1,
+            max_runs: 1,
+        },
+        now,
+    )
+    .unwrap();
+    stop_sharing(&h.paths, &view.grant_id).unwrap();
+    assert!(shared_workspaces(&h.paths, &device, &binding, now)
+        .unwrap()
+        .is_empty());
+    assert!(resolve(&h, Some(&device), &binding, codex, &codex_run(&reference)).is_err());
+    assert!(crate::unattended_access::grants(&h.paths, now)
+        .unwrap()
+        .iter()
+        .all(|grant| grant.state != crate::unattended_access::GrantStateV1::Active));
+    assert!(stop_sharing(&h.paths, &view.grant_id).is_err());
+    assert!(
+        update_share(
+            &h.paths,
+            &UpdateWorkspaceShareV1 {
+                grant_id: view.grant_id.clone(),
+                read_sessions: true,
+                share_excerpts: false,
+                agent_requests: true,
+                duration_hours: Some(24)
+            },
+            now
+        )
+        .is_err(),
+        "an ended share is not revived"
+    );
+
+    // Expired: nothing resolves, until its owner renews it.
+    let renewed = share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, true),
+        now,
+    )
+    .unwrap();
+    assert!(
+        shared_workspaces(&h.paths, &device, &binding, renewed.expires_at + 1)
+            .unwrap()
+            .is_empty()
+    );
+
+    // Revoking trust ends the share, and trusting again does not revive it.
+    crate::unattended_access::revoke_device(&h.paths, &device.fingerprint).unwrap();
+    assert!(shared_workspaces(&h.paths, &device, &binding, now)
+        .unwrap()
+        .is_empty());
+    h.trust(&device);
+    assert!(
+        shared_workspaces(&h.paths, &device, &binding, now)
+            .unwrap()
+            .is_empty(),
+        "re-trusting revives nothing"
+    );
+    assert!(bridge_shares(&h.paths, BRIDGE, now)
+        .unwrap()
+        .iter()
+        .all(|share| share.state == SessionReadGrantStateV1::Revoked));
+
+    // Burn ends it too.
+    share_with_bridge(
+        &h.paths,
+        &h.windows,
+        &[device.clone()],
+        &share_request(&h, true, true),
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        shared_workspaces(&h.paths, &device, &binding, now)
+            .unwrap()
+            .len(),
+        1
+    );
+    storage::cut_off_bridge_authority(&h.paths, BRIDGE).unwrap();
+    assert!(shared_workspaces(&h.paths, &device, &binding, now)
+        .unwrap()
+        .is_empty());
+    assert!(resolve(&h, Some(&device), &binding, codex, &codex_run(&reference)).is_err());
+}
+
+#[test]
+fn an_older_reading_permission_keeps_reading_and_allows_no_runs() {
+    let h = FixtureV1::new();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    h.trust(&device);
+    let view = h.grant(&device, false);
+    assert!(view.read_sessions && !view.agent_requests);
+    assert_eq!(
+        authorized_scopes(&h.paths, &device, &binding, storage::now_ts())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        agent_request_scopes(&h.paths, &device, &binding, storage::now_ts(), true)
+            .unwrap()
+            .is_empty()
+    );
 }

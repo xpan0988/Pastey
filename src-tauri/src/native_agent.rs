@@ -70,6 +70,16 @@ pub(crate) fn resolve_codex_thread_peer_input(
     capability::codex::thread_continuation::resolve_peer_input(input, readable)
 }
 
+/// The executing Host resolves a peer's Codex run naming a shared folder by
+/// its reference (`scope:`) among the folders that exact device may ask to
+/// run agents in now. `None`: the input names a path, unchanged.
+pub(crate) fn resolve_codex_workspace_ref(
+    input: &OpaqueCapabilityPayloadV1,
+    shared: &[(String, PathBuf)],
+) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+    capability::codex::resolve_peer_workspace_ref(input, shared)
+}
+
 /// One local lifecycle line per Native Agent transition, so a crash or a
 /// restart leaves evidence of how far a task got. Task identities and
 /// states only: never a workspace path, prompt, output or native content.
@@ -4957,6 +4967,7 @@ impl NativeAgentServiceV1 {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_remote_task(
         &mut self,
         task_id: &str,
@@ -4964,6 +4975,23 @@ impl NativeAgentServiceV1 {
         workspace: &str,
         task: &str,
     ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.queue_remote_task_labelled(task_id, target_host_ref, workspace, None, task)
+    }
+
+    fn queue_remote_task_labelled(
+        &mut self,
+        task_id: &str,
+        target_host_ref: &str,
+        workspace: &str,
+        label: Option<&str>,
+        task: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let label = label
+            .map(str::trim)
+            .filter(|label| {
+                !label.is_empty() && label.len() <= 120 && !label.chars().any(char::is_control)
+            })
+            .unwrap_or_else(|| workspace.rsplit(['/', '\\']).next().unwrap_or("workspace"));
         if task_id.trim().is_empty()
             || target_host_ref.trim().is_empty()
             || workspace.trim().is_empty()
@@ -4975,7 +5003,7 @@ impl NativeAgentServiceV1 {
             task_id,
             target_host_ref,
             CODEX_CAPABILITY_ID,
-            workspace.rsplit(['/', '\\']).next().unwrap_or("workspace"),
+            label,
             &Self::task_digest(task),
             Some(PathBuf::from(workspace)),
         )
@@ -5063,6 +5091,7 @@ impl NativeAgentServiceV1 {
         Ok(status)
     }
 
+    #[cfg(test)]
     pub(crate) fn queue_bridge_remote_task(
         &mut self,
         bridge_id: &str,
@@ -5071,8 +5100,29 @@ impl NativeAgentServiceV1 {
         workspace: &str,
         task: &str,
     ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.queue_bridge_remote_task_labelled(
+            bridge_id,
+            task_id,
+            target_host_ref,
+            workspace,
+            None,
+            task,
+        )
+    }
+
+    /// `label`: the folder's name when `workspace` is a shared folder's
+    /// reference rather than a path.
+    pub(crate) fn queue_bridge_remote_task_labelled(
+        &mut self,
+        bridge_id: &str,
+        task_id: &str,
+        target_host_ref: &str,
+        workspace: &str,
+        label: Option<&str>,
+        task: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         self.with_bridge_task_owner(bridge_id, task_id, |service| {
-            service.queue_remote_task(task_id, target_host_ref, workspace, task)
+            service.queue_remote_task_labelled(task_id, target_host_ref, workspace, label, task)
         })
     }
 

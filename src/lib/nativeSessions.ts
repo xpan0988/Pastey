@@ -1,8 +1,9 @@
 /** Presentation for native session discovery. Rust decides every status;
  * these helpers only explain it. Nothing here infers that a session runs or
  * finished from its last message. */
+import { shareLocation } from "./workspaceShares";
 import type {
-  CreateSessionReadGrant,
+  SharedWorkspace,
   EvidenceBasis,
   LocalNativeSession,
   NativeSessionFilters,
@@ -10,7 +11,6 @@ import type {
   RemoteNativeSession,
   RemoteNativeSessionResponse,
   RemoteNativeSessionSnapshot,
-  SessionReadGrant,
 } from "./tauri";
 
 /** A session as the panel shows it, whether it is on this device or another. */
@@ -90,7 +90,7 @@ export function evidenceGroups(evidence: Array<{ basis: EvidenceBasis; statement
 export function remoteOutcomeMessage(response: Pick<RemoteNativeSessionResponse, "outcome">, hostName: string): string | null {
   switch (response.outcome) {
     case "ok": return null;
-    case "not_authorized": return `${hostName} has not allowed this device to read its sessions. On ${hostName}, open Settings → Session reading, choose this device and the folder to share, then look again here.`;
+    case "not_authorized": return `${hostName} hasn't shared any session-readable workspace with this Bridge. ${shareLocation(hostName)} and choose Share a workspace, with “Sessions” on. Then look again here.`;
     case "not_found": return `${hostName} has no such session in the folders it shares with this device.`;
     case "busy": return `${hostName} is still answering an earlier request from this Bridge. Try again in a moment.`;
     case "unavailable": return `${hostName} could not read its sessions now.`;
@@ -120,29 +120,6 @@ export function snapshotActivityLine(snapshot: { historyComplete: boolean; activ
   return `${snapshot.historyComplete ? "" : "Newest part of the history: "}${activity.userTurns} prompt(s), ${activity.toolCalls} tool call(s), ${activity.commands} command(s) (${activity.failedCommands} failed), ${activity.changedFiles.length} changed file(s)${elsewhere}.`;
 }
 
-export const READ_GRANT_DURATIONS: ReadonlyArray<{ hours: number; label: string }> = [
-  { hours: 1, label: "1 hour" },
-  { hours: 24, label: "1 day" },
-  { hours: 168, label: "7 days" },
-  { hours: 720, label: "30 days" },
-];
-
-export function readGrantFormProblem(form: Partial<CreateSessionReadGrant>): string | null {
-  if (!form.deviceFingerprint || !form.roomId) return "Choose a trusted device that is connected now.";
-  if (!form.workspacePath) return "Choose the one folder whose sessions it may read.";
-  if (!READ_GRANT_DURATIONS.some((duration) => duration.hours === form.durationHours)) return "Choose how long the permission lasts.";
-  return null;
-}
-
-export function readGrantStateLabel(grant: SessionReadGrant): string {
-  switch (grant.state) {
-    case "active": return grant.shareExcerpts ? "Active · statuses and short excerpts" : "Active · statuses only";
-    case "expired": return "Expired";
-    case "revoked": return "Revoked";
-    case "unavailable": return "Not usable: the device was revoked, the Bridge ended, or the folder moved";
-  }
-}
-
 /** Whether one session may be continued from here, and why not. Mirrors the
  * Host's own check (`continuation_problem`), which runs again at the moment
  * of launch; this only explains it in advance. */
@@ -150,6 +127,9 @@ export function continuationAvailability(
   session: Pick<SessionView, "provider" | "resume" | "lastTurn">,
   onThisDevice: boolean,
   hostName = "the other device",
+  /** On another device: the share of the session's folder, as that device
+   * last listed it (`null`: no longer listed; omitted: not known). */
+  share?: Pick<SharedWorkspace, "label" | "readSessions" | "agentRequests"> | null,
 ): { allowed: boolean; reason: string } {
   if (!onThisDevice && session.provider !== "codex") {
     return { allowed: false, reason: `Continuing a Claude Code session on another device is not available: a background Claude Code session can outlive Pastey on ${hostName}, and its outcome could be lost. Continue it on ${hostName}.` };
@@ -165,6 +145,8 @@ export function continuationAvailability(
   if (session.provider === "codex") {
     if (session.lastTurn.outcome === "unreadable") return { allowed: false, reason: "This thread's history cannot be read, so it cannot be continued safely." };
     if (!onThisDevice) {
+      if (share === null) return { allowed: false, reason: `${hostName} no longer shares this folder with this Bridge. Look for sessions again.` };
+      if (share && !(share.readSessions && share.agentRequests)) return { allowed: false, reason: `${hostName} shares ${share.label} for its sessions, but not for agent requests, so a continuation would be refused. ${shareLocation(hostName)} → ${share.label}, and turn on “Agent requests”.` };
       if (!session.lastTurn.marker) return { allowed: false, reason: `${hostName} did not say which turn this thread ends with, so Pastey cannot check that it is unchanged. Update Pastey on ${hostName}.` };
       return { allowed: true, reason: `Someone on ${hostName} must Accept. Codex there refuses if the Codex app or a terminal has this thread open, and Pastey checks that it still ends where you see it.` };
     }

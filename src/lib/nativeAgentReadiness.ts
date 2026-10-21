@@ -2,13 +2,19 @@
  * user should fix it. Presentation only: Rust re-checks the Host session,
  * the capability, the invocation and every permission when it is sent, and
  * the executing device still decides (its Accept or its own unattended
- * permission). Session reading permissions are a separate authority and
- * are deliberately not an input here. */
+ * permission). Which folders it shares, and for what, comes only from
+ * that device's own answer; reading its sessions is a separate authority. */
 import type { NativeAgentTargetAvailability } from "../features/workspace/AgentTaskLifecycle";
+import type { SharedWorkspace } from "./tauri";
+import { peerShareGuidance, type PeerShareKnowledge } from "./workspaceShares";
 
 /** Where the folder Codex works in lives, for a run on another device. */
 export type CodexWorkspaceSource =
-  /** Already on the executing device: Codex works there, nothing moves. */
+  /** A folder the executing device shares with this Bridge, chosen by its
+   * name; that device resolves its own path. Nothing moves. */
+  | "shared"
+  /** Already on the executing device, by a path typed here: Codex works
+   * there, nothing moves. */
   | "on_target"
   /** On this device: Pastey reviews sending it, Codex runs on the copy,
    * and the result returns here to be applied. */
@@ -28,6 +34,9 @@ export interface CodexRunInput {
   taskText: string;
   busy: boolean;
   movementBlocksNewRun: boolean;
+  /** For "shared": what the executing device shares, and the one chosen. */
+  shares?: PeerShareKnowledge;
+  sharedWorkspace?: SharedWorkspace | null;
 }
 
 export type CodexRequirementId = "device" | "codex" | "workspace" | "task" | "movement";
@@ -79,17 +88,31 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
     reason: codexReady ? null : availabilityBlocker(availability, where),
   });
 
-  const hasWorkspace = input.workspace.trim().length > 0;
-  requirements.push({
-    id: "workspace",
-    label: action === "run_remote" ? `Folder on ${where}` : "Folder on this device",
-    met: hasWorkspace,
-    reason: hasWorkspace ? null : action === "run_remote"
-      ? `Enter the full path of the folder on ${where} where Codex should work.`
-      : action === "review_movement"
-        ? "Choose the folder on this device to send."
-        : "Choose the folder Codex should work in.",
-  });
+  if (target.kind === "remote" && input.workspaceSource === "shared") {
+    const shares = input.shares ?? { state: "unknown" };
+    const chosen = input.sharedWorkspace ?? null;
+    const problem = shares.state === "unknown"
+      ? `Asking ${where} which folders it shares with this Bridge…`
+      : peerShareGuidance(where, shares, "run", chosen) ?? (chosen ? null : `Choose one of the folders ${where} shares.`);
+    requirements.push({
+      id: "workspace",
+      label: chosen ? `${chosen.label}, shared by ${where} for agent requests` : `A folder ${where} shares for agent requests`,
+      met: problem === null,
+      reason: problem,
+    });
+  } else {
+    const hasWorkspace = input.workspace.trim().length > 0;
+    requirements.push({
+      id: "workspace",
+      label: action === "run_remote" ? `Folder on ${where}` : "Folder on this device",
+      met: hasWorkspace,
+      reason: hasWorkspace ? null : action === "run_remote"
+        ? `Enter the full path of the folder on ${where} where Codex should work.`
+        : action === "review_movement"
+          ? "Choose the folder on this device to send."
+          : "Choose the folder Codex should work in.",
+    });
+  }
 
   const hasTask = input.taskText.trim().length > 0;
   requirements.push({

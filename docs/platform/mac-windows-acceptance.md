@@ -155,12 +155,12 @@ Prerequisites:
 | # | Do | Expect |
 |---|---|---|
 | I1 | On the Mac, Bridge → Agents tab → Device Windows → Look for sessions, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. Access on Windows → Read sessions now says Needs action, with the steps on Windows. |
-| I2 | On Windows, Settings → Permissions → Session reading → Add a permission…: choose the Mac, the Demo folder, 1 day, excerpts off → Allow reading. Then repeat I1 on the Mac. | Windows's sessions in Demo are listed, with folder name "Demo" and no Windows path anywhere. Claude Code sessions show "Last turn ended" or "Running". A Codex thread shows "Unknown" while the ChatGPT desktop app or a `codex` terminal runs on Windows. Record what each row says. |
+| I2 | On Windows, open this Bridge → Bridge details → Workspaces → Share a workspace…, choose the Demo folder, turn on Sessions (excerpts off), 1 day → Share. Then repeat I1 on the Mac. | Windows's sessions in Demo are listed, with folder name "Demo" and no Windows path anywhere. Claude Code sessions show "Last turn ended" or "Running". A Codex thread shows "Unknown" while the ChatGPT desktop app or a `codex` terminal runs on Windows. Record what each row says. |
 | I3 | On the Mac, open one Claude Code session. | The report shows status, live source (`claude agents --json`), last turn, counts, changed files relative to Demo, Git facts, and facts, inferences and unknowns. It says Windows shares statuses only: no prompt or reply text. |
 | I4 | On Windows, start a Claude Code turn in that session (`claude --resume <id>` in Demo, or the desktop app). While it runs, look again from the Mac and open it. | It shows "Running" while the turn runs, and "Last turn ended" after it. The report never claims done while running. |
-| I5 | On Windows, revoke the permission (Settings → Permissions, or that Bridge's details → Allowed on this device), or revoke the Mac under Settings → Devices & trust. Look again from the Mac. | Back to "has not allowed". |
-| I6 | On Windows, allow again with excerpts on. Open the session from the Mac. | Up to 4 short excerpts, replies labelled as the agent's own account, any path shown as `<path>`. |
-| I7 | Burn the Bridge on either side, pair again, and look from the Mac. | "Has not allowed": permissions do not survive Burn. |
+| I5 | On Windows, turn Sessions off for Demo (Bridge details → Workspaces), then Stop sharing it, then (after sharing again) revoke the Mac under Settings → Devices & trust and trust it again. Look again from the Mac after each. | Each time: "hasn't shared any session-readable workspace". After re-trusting, Demo is not shared again until Windows shares it. |
+| I6 | On Windows, share again with Sessions and excerpts on. Open the session from the Mac. | Up to 4 short excerpts, replies labelled as the agent's own account, any path shown as `<path>`. |
+| I7 | Burn the Bridge on either side, pair again, and look from the Mac. | "Hasn't shared": shares do not survive Burn. |
 
 Record which rows passed. Do not paste session titles, prompts or paths into the record.
 
@@ -173,7 +173,7 @@ The UI was reorganized around Bridges ([UX and information architecture](../ux-i
 | J1 | Open Pastey at its default 760 × 760 window, then widen past 1080 px and narrow below 680 px. | At 760 px the sidebar and the Bridge fit with no overlap. Above 1080 px Bridge details dock on the right; below, they open as an overlay. Below 680 px the sidebar opens from the menu button. |
 | J2 | Settings → General → Appearance: Light, Dark, System. Restart Pastey. | Each theme applies at once and survives the restart; System follows the OS. |
 | J3 | Drag two files from Finder or Explorer onto a Bridge's Share view. | The composer shows "Drop to send…"; both files are sent to the selected device, like + → Send files…. Nothing happens on the Agents tab. |
-| J4 | Mac, Agents tab: Device Windows, and leave the folder empty. Then type the path, then the task. | The checklist and the line beside the button say what is missing; the button enables only when nothing is. |
+| J4 | Mac, Agents tab: Device Windows → Another folder on Windows, and leave the path empty. Then type the path, then the task. | The checklist and the line beside the button say what is missing; the button enables only when nothing is. |
 | J5 | With the Agents tab open on the Mac, quit Pastey on Windows, wait 20 s, open it again. | The card says Windows is not connected, then, without a click, that Codex is available again. The device choice stays Windows throughout. |
 | J6 | On Windows, while the Mac's Agents tab is open, rename `codex` off PATH (or sign out) and back. Switch focus to the Mac window. | Within about 15 s, or at once on focus, the Mac shows the new availability and the button follows it. |
 | J7 | Burn a test Bridge from its details. | A confirmation names the Bridge and what is removed. Cancel keeps it; Burn removes it. |
@@ -203,7 +203,7 @@ Use this for any crash of Pastey on the executing device, including one that alr
 
 ## M. Native session continuation (Codex threads, Claude Code sessions)
 
-Prerequisites: Codex 0.163 or later on both devices (CLI and, if installed, the ChatGPT desktop app); on Windows, Python 3 for the probe; I2 done (Windows lets the Mac read the Demo folder's sessions).
+Prerequisites: Codex 0.163 or later on both devices (CLI and, if installed, the ChatGPT desktop app); on Windows, Python 3 for the probe; Windows shares the Demo folder with this Bridge with Sessions and Agent requests on (I2, then turn on Agent requests).
 
 | # | Do | Expect / record |
 |---|---|---|
@@ -213,9 +213,28 @@ Prerequisites: Codex 0.163 or later on both devices (CLI and, if installed, the 
 | M4 | Repeat M3 but, before pressing Continue, add a turn to the thread in the app. | "This session changed since you looked at it, so nothing ran." Nothing new appears in the thread. |
 | M5 | Mac → Windows: Agents → Device: Windows → Look → open a Codex thread in Demo that the app on Windows does not have open → Continue. On Windows, Accept. | The Windows request banner says "continuing an existing thread". The run completes on Windows in the same thread, and its reply returns to the Mac card, which names Windows. |
 | M6 | M5 again, but Deny on Windows; then once with the thread open in the Windows app, Accept. | Deny: nothing runs. Open in the app: "open in another Codex client … nothing ran." |
-| M7 | On Windows, revoke the Mac's Session reading permission, then M5 from a report opened before. | Refused; nothing runs on Windows. The Mac card shows the task as indeterminate (the existing rule for a refused invocation): Stop it. |
+| M7 | On Windows, turn Agent requests off for Demo (or Stop sharing it), then M5 from a report opened before. | Refused; nothing runs on Windows. The Mac card shows the task as indeterminate (the existing rule for a refused invocation): Stop it. |
 | M8 | During M5's run, quit Pastey on Windows (Task Manager). | The Mac shows the indeterminate notice. After Windows restarts: no `codex` process from that run remains (K4), the thread is no longer locked (M2-style look shows it free), and nothing runs again on its own. |
 | M9 | Claude Code, local: in a folder with an idle Claude Code session (not open in the desktop app or a terminal), Continue with a short prompt. Then try a remote Claude Code session from the Mac. | Local: completes in the same session id. Remote: Continue is unavailable with the reason (background sessions can outlive Pastey there). |
+
+## N. Bridge workspaces: share, read, run and continue without leaving the Bridge
+
+The target flow, end to end, on real devices. Prerequisites: a Mac ↔ Windows Bridge (B1 or B4); Codex 0.163 or later on Windows; on Windows a folder `PasteySessionTest` with one Codex thread made in the ChatGPT desktop app (then switch the app to another thread, so it does not hold this one). Do not open Settings on either device during N1–N9.
+
+| # | Do | Expect / record |
+|---|---|---|
+| N1 | Open the Bridge on both devices. On Windows: Bridge details → Workspaces. | Within a few seconds Windows shows the Mac in "Shared from this device": either "Trust MacBook…" (first time) or nothing to do. It never says the Mac has not shown itself while the Mac has the Bridge open. |
+| N2 | If asked: Trust MacBook…, compare the fingerprint with the Mac's Settings → This device, It matches. Trust. | Trusted once. Nothing is shared or allowed yet. |
+| N3 | Windows: Share a workspace… | The Windows folder picker opens (a Windows dialog, Windows paths). Choose `PasteySessionTest`. |
+| N4 | In the dialog turn on Sessions and Agent requests, 1 day → Share. | The row shows the folder name, its Windows path (only here), "Sessions and agent requests", and switches. |
+| N5 | Mac: Agents, device Windows. | "Shared by Windows: PasteySessionTest (sessions and agent requests)". Access on Windows: Read sessions Ready; Continue decided there. No Windows path anywhere on the Mac. |
+| N6 | Mac: Run a task → Shared by Windows → PasteySessionTest, task "List the files", Run with Codex. On Windows, Accept. | Runs in `PasteySessionTest` on Windows without typing a path; the reply returns to the Mac. |
+| N7 | Mac: Sessions on Windows → Look for sessions → open the Codex thread → Continue session with "Reply with the word ok". | Windows shows the Review ("continuing an existing thread"). |
+| N8 | Windows: Accept. | Codex continues in the same thread (the ChatGPT app shows the new turn when you open the thread); the Mac card completes with the reply. |
+| N9 | Windows: turn Agent requests off for the folder. Mac: try N6 and N7 again. | The Mac explains, before sending, that Windows has not turned on Agent requests, with the exact place on Windows. A request sent from a stale screen is refused by Windows; nothing runs. |
+| N10 | Quit and reopen Pastey on Windows (or drop the network for 30 s). After it reconnects, look again from the Mac without any other step. | Sessions and the shared folder are back; the share survived the reconnect. |
+| N11 | Windows: Stop sharing. Mac: look again. | "Windows hasn't shared any session-readable workspace with this Bridge…"; Run offers only the typed path or this device. |
+| N12 | A second Bridge between the same devices: look there from the Mac. | Nothing from the first Bridge's shares appears. |
 
 ## Record
 
@@ -235,6 +254,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Crash diagnosis (K1–K6) | |
 | Device details (L1–L5) | |
 | Session continuation (M1–M9) | |
+| Bridge workspaces (N1–N12) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
 | Net-probe summary (part F) | |

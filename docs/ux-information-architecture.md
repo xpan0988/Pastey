@@ -11,9 +11,18 @@ How the desktop UI is organized, and why. Product rules (authority, movement, re
 | Kind | Where | Authority | Review |
 |---|---|---|---|
 | Movement: text and files, either way | **Share** tab. Send by typing, + → Send files…, or drop on the window. Get a file with + → Get a file from <device>… | Send: this device's user. Get: the other device's shared search folders only | Get a file: review the Search, then choose the one file |
-| Execution: Run Codex | **Agents** tab → Run a task | The executing device's Accept, or its own unattended permission | The other device's Accept; workspace movement reviewed here first |
-| Observation: Agent sessions | **Agents** tab → Sessions on <device> | The holding device's Session reading permission | None: read only, never starts, continues or stops a session |
-| Continuation: an existing session, in itself | **Agents** tab → a session's report → Continue session | This device's user; on another device, its Session reading permission and its Accept | The other device's Accept for each remote continuation; the session must still end where you saw it |
+| Workspace sharing: this device's folders, for one Bridge | **Bridge details → Workspaces** → Share a workspace… (this device's own folder picker), then per folder: Sessions, excerpts, Agent requests, Allow without asking…, Stop sharing | This device's user only; the Bridge's own device, trusted once (inline Trust… there) | None to share; sharing allows nothing until a switch is on |
+| Execution: Run Codex | **Agents** tab → Run a task → Shared by <device> (by name), Another folder on <device> (typed path), or On this device (movement) | The executing device's Accept, or its own unattended permission | The other device's Accept; workspace movement reviewed here first |
+| Observation: Agent sessions | **Agents** tab → Sessions on <device> | A share of that folder with Sessions on | None: read only, never starts, continues or stops a session |
+| Continuation: an existing session, in itself | **Agents** tab → a session's report → Continue session | This device's user; on another device, a share with Sessions and Agent requests on, and its Accept | The other device's Accept for each remote continuation; the session must still end where you saw it |
+
+### Inside the Bridge, not in Settings
+
+A Bridge is the collaboration context the user already set up, so everything that concerns only that Bridge is done there. Before, letting the Mac read Windows's sessions meant leaving the Bridge for Settings → Permissions → Session reading, choosing the Mac again and choosing the folder again; running Codex there meant typing the Windows path on the Mac. Now:
+- **Windows:** this Bridge → Bridge details → Workspaces → Share a workspace…, choose the folder with Windows's own picker, turn on Sessions (and Agent requests to let the Mac run or continue there). If the Mac is not trusted yet, the same place offers Trust… with the fingerprint, once.
+- **Mac:** this Bridge → Agents. The device bar shows what Windows shares; Run a task offers it by name; Sessions on Windows lists its sessions; a session's report offers Continue. Every missing permission is explained in place with the exact step on Windows, never as an unexplained grey button.
+- Each device shows its identity to the Bridge's other devices once per connection while the Bridge is open (it grants nothing), so the other device can trust it without a step here.
+- Settings → Permissions keeps the cross-Bridge view: every shared workspace (Stop sharing), unattended Codex access, and shared search folders.
 
 ### Why one Agents tab, with two sections
 
@@ -22,20 +31,22 @@ People think "what are agents doing on that device", not "execution versus obser
 The authorities stay apart inside the one tab:
 - **Run a task** (badge: Execution) holds the form and the one task Pastey started and follows: its approvals, response, movement and recovery.
 - **Sessions on <device>** lists what Claude Code and Codex already keep there. A session Pastey started is marked "Started by Pastey". Looking changes nothing. An idle session can be continued in the session itself from its report; the run is then followed under Run a task, so a run is never presented as two live things.
-- **Access on <device>** lists each authority separately (pairing, running Codex, Codex's own approval prompts, reading sessions) with what is known here, what the other device decides, and the exact steps there. There is no single trust switch, and nothing can be granted from this side.
+- **Access on <device>** lists each authority separately (pairing, running Codex, Codex's own approval prompts, reading sessions, continuing) from what that device says it shares, with what the other device decides and the exact steps there, inside this Bridge. There is no single trust switch, and nothing can be granted from this side.
 
 | Capability | Status |
 |---|---|
 | Run Codex on this or another device; continue Pastey's own conversation in a folder | Implemented |
 | Workspace movement to another device and result return | Implemented |
-| Read-only discovery and inspection of Claude Code and Codex sessions, here or on another device with its permission | Implemented |
+| Share a folder with one Bridge, from inside it, with Sessions and Agent requests chosen per folder | Implemented (Mac ↔ Windows acceptance N) |
+| Run Codex in a folder another device shares, chosen by name | Implemented: that device resolves its own path; same Review and unattended grants |
+| Read-only discovery and inspection of Claude Code and Codex sessions, here or on another device that shares the folder with Sessions on | Implemented |
 | Continue an idle Codex thread on this device, in the thread itself | Implemented: Codex's writer lock excludes other writers; checked against the turn you saw (real, macOS) |
-| Continue a Codex thread on another device | Implemented: needs Session reading there and that device's Accept per run (Windows enforcement inferred, acceptance M) |
+| Continue a Codex thread on another device | Implemented: needs a share with Sessions and Agent requests there, and that device's Accept per run (Windows enforcement inferred, acceptance M and N) |
 | Continue an idle Claude Code session on this device | Implemented: `claude --bg --resume`, copy-on-held, checked against the entry you saw |
 | Continue a Claude Code session from another device | Not enabled: a background session can outlive Pastey there (remote-continuation.md) |
 | Observe or steer a turn the Codex app is running | Not possible through supported interfaces: its app-server is private; the writer lock only shows that it has the thread open |
 
-Continuation is Execution, started from Observation: Run with Codex continues *Pastey's own* Codex conversation in a folder unless "Start a new conversation" is chosen, and a session's report offers **Continue session** for an existing Codex thread or Claude Code session. It runs in the session itself, only while the session still ends with the entry you saw, and is then followed under Run a task. Each report says why when it cannot be continued (open in another client, changed, held, unreadable, or a Claude Code session on another device). A continuation on another device also needs Session reading there and that device's Accept.
+Continuation is Execution, started from Observation: Run with Codex continues *Pastey's own* Codex conversation in a folder unless "Start a new conversation" is chosen, and a session's report offers **Continue session** for an existing Codex thread or Claude Code session. It runs in the session itself, only while the session still ends with the entry you saw, and is then followed under Run a task. Each report says why when it cannot be continued (open in another client, changed, held, unreadable, or a Claude Code session on another device). A continuation on another device also needs that folder shared with Sessions and Agent requests on, and that device's Accept.
 
 Managed Plans arrive by event and are pinned above the Share thread while open (review, readiness, execution, terminal state), because they are reviewed movement across the Bridge.
 
@@ -69,7 +80,7 @@ Device-wide, in Settings:
 | General | Appearance (System, Light, Dark; renderer-only), global shortcut, receiving folder (Open, Change…, Use default), Save received files, Save received images |
 | This device | Identity and Replace key; device profile (Refresh); runtimes (Quick or Full check); local speed test (Pastey pipeline or raw memory, 1, 5 or 15 s) |
 | Devices & trust | Trusted devices and the devices connected now (Trust… with a fingerprint check); paired devices (Forget) |
-| Permissions | What other devices may do here: Unattended Codex access, Session reading, Shared search folders. Grants first with Revoke; the add form one click away |
+| Permissions | What other devices may do here, across Bridges: Unattended Codex access (add form one click away), Shared workspaces (every share with Stop sharing; created and changed in its Bridge), Shared search folders |
 | Agents | Codex availability on this device (Check again); how approvals work; the Plan runtime and provider |
 | Advanced | Developer tools, transfer grouping, transfer window (takes effect with Developer tools), logs and last error |
 | About | Version, application data, updates |
@@ -81,7 +92,7 @@ Removed from view because the Host never reads it: "Burn defaults" (`auto_burn_a
 | Kind | Where |
 |---|---|
 | This device's own facts and checks (identity, profile, runtimes, local speed test) | Settings → This device |
-| One Bridge's connection and actions (pairing, address, devices, what it may do here, Burn) | Bridge details |
+| One Bridge's connection and actions (pairing, address, devices, shared workspaces both ways, what else it may do here, Burn) | Bridge details |
 | One device of a Bridge (session, measured link performance, what it runs, trust both ways, self-check) | Device Details |
 | Long-lived trust and grants across Bridges | Settings → Devices & trust, Settings → Permissions |
 

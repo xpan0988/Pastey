@@ -136,7 +136,7 @@ export function ShowDeviceIdentity({ room }: { room: RoomInfo }) {
     setBusy(true); setMessage(null);
     try {
       await presentDeviceIdentity(room.id, peerHostRef);
-      setMessage({ text: "Shown. On the other device, check Settings → Devices & trust.", ok: true });
+      setMessage({ text: "Shown. On the other device, this Bridge's Workspaces can now trust this one.", ok: true });
     } catch (error) {
       setMessage({ text: error instanceof Error ? error.message : "Pastey could not reach the other device.", ok: false });
     } finally { setBusy(false); }
@@ -144,8 +144,8 @@ export function ShowDeviceIdentity({ room }: { room: RoomInfo }) {
 
   return <section className="inspector-section" aria-label="Show this device">
     <h3>Let the other device trust this one</h3>
-    <p className="small muted">Shows this device's identity to the other device for this session, so its user can compare fingerprints and choose to trust it. It grants nothing by itself.</p>
-    <div><button type="button" className="btn btn-sm" disabled={busy || !peerHostRef} onClick={() => void showDevice()}>Show this device</button></div>
+    <p className="small muted">While this Bridge is open, Pastey shows this device's identity to the other device once per connection, so its user can compare fingerprints and choose to trust it. It grants nothing by itself. If the other device says it has not seen this one, show it again.</p>
+    <div><button type="button" className="btn btn-sm" disabled={busy || !peerHostRef} onClick={() => void showDevice()}>Show this device again</button></div>
     {message ? <Notice tone={message.ok ? "ok" : "bad"}>{message.text}</Notice> : null}
   </section>;
 }

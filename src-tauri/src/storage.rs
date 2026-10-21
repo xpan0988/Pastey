@@ -208,9 +208,11 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             revoked_at INTEGER
         );
 
-        -- Host-local permissions for one trusted device to read native
-        -- session summaries in one workspace over one Bridge. Separate from
-        -- unattended grants: reading never authorizes execution.
+        -- Workspaces this Host's user shares with one trusted device over
+        -- one Bridge, each with what it allows: reading native session
+        -- summaries, and asking to run native agents there (each run still
+        -- waits for this Host's Review). Separate from unattended grants:
+        -- sharing never lets anything run without that Review.
         CREATE TABLE IF NOT EXISTS session_read_grants (
             grant_id TEXT PRIMARY KEY,
             device_fingerprint TEXT NOT NULL,
@@ -313,6 +315,7 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
     ensure_room_schema(&conn)?;
     ensure_bridge_peer_schema(&conn)?;
     ensure_authorized_search_folder_schema(&conn)?;
+    ensure_workspace_share_schema(&conn)?;
     bridge_plan::init_schema(&conn)?;
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
@@ -512,6 +515,11 @@ pub(crate) fn revoke_trusted_device(paths: &AppPaths, fingerprint: &str) -> AppR
     )?;
     transaction.execute(
         "UPDATE unattended_grants SET revoked_at = ?2 WHERE device_fingerprint = ?1 AND revoked_at IS NULL",
+        params![fingerprint, now],
+    )?;
+    // Trusting the device again later must not bring its shares back.
+    transaction.execute(
+        "UPDATE session_read_grants SET revoked_at = ?2 WHERE device_fingerprint = ?1 AND revoked_at IS NULL",
         params![fingerprint, now],
     )?;
     transaction.commit()?;
@@ -735,7 +743,12 @@ pub(crate) struct StoredSessionReadGrant {
     pub(crate) peer_host_ref: String,
     pub(crate) local_host_ref: String,
     pub(crate) workspace: String,
+    /// Whether the device may read native session summaries here.
+    pub(crate) read_sessions: bool,
     pub(crate) share_excerpts: bool,
+    /// Whether the device may ask to run native agents here; each run still
+    /// waits for this Host's Review unless an unattended grant applies.
+    pub(crate) agent_requests: bool,
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
     pub(crate) revoked_at: Option<i64>,
@@ -744,7 +757,8 @@ pub(crate) struct StoredSessionReadGrant {
 pub(crate) const MAX_ACTIVE_SESSION_READ_GRANTS: i64 = 32;
 
 const SESSION_READ_COLUMNS: &str = "g.grant_id, g.device_fingerprint, g.bridge_id, g.peer_host_ref,
-    g.local_host_ref, g.workspace, g.share_excerpts, g.created_at, g.expires_at, g.revoked_at";
+    g.local_host_ref, g.workspace, g.share_excerpts, g.created_at, g.expires_at, g.revoked_at,
+    g.read_sessions, g.agent_requests";
 
 const SESSION_READ_IS_ACTIVE: &str = "g.revoked_at IS NULL AND g.expires_at > ?1
     AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = g.device_fingerprint AND d.revoked_at IS NULL)
@@ -763,6 +777,8 @@ fn row_to_session_read_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<Stored
         created_at: row.get(7)?,
         expires_at: row.get(8)?,
         revoked_at: row.get(9)?,
+        read_sessions: row.get::<_, i64>(10)? != 0,
+        agent_requests: row.get::<_, i64>(11)? != 0,
     })
 }
 
@@ -799,8 +815,9 @@ pub(crate) fn insert_session_read_grant(
     }
     transaction.execute(
         "INSERT INTO session_read_grants (grant_id, device_fingerprint, bridge_id, peer_host_ref,
-            local_host_ref, workspace, share_excerpts, created_at, expires_at, revoked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            local_host_ref, workspace, share_excerpts, created_at, expires_at, revoked_at,
+            read_sessions, agent_requests)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11)",
         params![
             &grant.grant_id,
             &grant.device_fingerprint,
@@ -810,7 +827,9 @@ pub(crate) fn insert_session_read_grant(
             &grant.workspace,
             i64::from(grant.share_excerpts),
             grant.created_at,
-            grant.expires_at
+            grant.expires_at,
+            i64::from(grant.read_sessions),
+            i64::from(grant.agent_requests)
         ],
     )?;
     transaction.commit()?;
@@ -877,11 +896,61 @@ pub(crate) fn active_session_read_grants(
     Ok(grants)
 }
 
-pub(crate) fn revoke_session_read_grant(paths: &AppPaths, grant_id: &str) -> AppResult<bool> {
+/// Changes what one unrevoked share allows, and optionally when it ends.
+/// Local only; the binding (device, Bridge, peer, Host, folder) never changes.
+pub(crate) fn update_session_read_grant(
+    paths: &AppPaths,
+    grant_id: &str,
+    read_sessions: bool,
+    share_excerpts: bool,
+    agent_requests: bool,
+    expires_at: Option<i64>,
+) -> AppResult<bool> {
     Ok(connection(paths)?.execute(
-        "UPDATE session_read_grants SET revoked_at = ?2 WHERE grant_id = ?1 AND revoked_at IS NULL",
-        params![grant_id, now_ts()],
+        "UPDATE session_read_grants SET read_sessions = ?2, share_excerpts = ?3,
+            agent_requests = ?4, expires_at = COALESCE(?5, expires_at)
+         WHERE grant_id = ?1 AND revoked_at IS NULL",
+        params![
+            grant_id,
+            i64::from(read_sessions),
+            i64::from(read_sessions && share_excerpts),
+            i64::from(agent_requests),
+            expires_at
+        ],
     )? > 0)
+}
+
+/// Stops sharing one folder with one device over one Bridge: the share, and
+/// every unattended grant that device holds for that folder on that Bridge,
+/// end together, so nothing about the folder stays reachable over it.
+pub(crate) fn stop_sharing_workspace(paths: &AppPaths, grant_id: &str) -> AppResult<bool> {
+    let mut conn = connection(paths)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let now = now_ts();
+    let share: Option<(String, String, String)> = transaction
+        .query_row(
+            "SELECT device_fingerprint, bridge_id, workspace FROM session_read_grants
+             WHERE grant_id = ?1",
+            [grant_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((fingerprint, bridge_id, workspace)) = share else {
+        return Ok(false);
+    };
+    let changed = transaction.execute(
+        "UPDATE session_read_grants SET revoked_at = ?4
+         WHERE device_fingerprint = ?1 AND bridge_id = ?2 AND workspace = ?3 AND revoked_at IS NULL",
+        params![&fingerprint, &bridge_id, &workspace, now],
+    )?;
+    transaction.execute(
+        "UPDATE unattended_grants SET revoked_at = ?4
+         WHERE device_fingerprint = ?1 AND bridge_id = ?2 AND workspace = ?3 AND revoked_at IS NULL",
+        params![&fingerprint, &bridge_id, &workspace, now],
+    )?;
+    transaction.commit()?;
+    Ok(changed > 0)
 }
 
 /// Burn: a Bridge's session read permissions end with it.
@@ -3550,6 +3619,28 @@ fn ensure_authorized_search_folder_schema(conn: &Connection) -> AppResult<()> {
     if !columns.iter().any(|column| column == "bridge_id") {
         conn.execute(
             "ALTER TABLE authorized_search_folders ADD COLUMN bridge_id TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// A session read permission made before workspace sharing keeps reading
+/// sessions, and allows no agent requests until its Host's user turns them on.
+fn ensure_workspace_share_schema(conn: &Connection) -> AppResult<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(session_read_grants)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "read_sessions") {
+        conn.execute(
+            "ALTER TABLE session_read_grants ADD COLUMN read_sessions INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|column| column == "agent_requests") {
+        conn.execute(
+            "ALTER TABLE session_read_grants ADD COLUMN agent_requests INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

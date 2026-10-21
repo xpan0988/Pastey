@@ -1039,30 +1039,63 @@ async fn remote_native_session_query(
         .resolve_current_remote_host_session(room_id, &target)
         .await
         .map_err(|error| error.message())?;
+    // The Host answers only for the device proven in this exact session, so
+    // after a reconnect or a restart there this device shows itself again
+    // first. It grants nothing: the Host's own shares decide.
+    let _ = present_device_identity_over(state.inner().clone(), session.binding()).await;
     session
         .request_native_sessions(state.inner().clone(), query)
         .await
         .map_err(|error| error.message())
 }
 
-/// This Host's session read permissions, for its own user.
+/// The workspaces one exact current Bridge Host shares with this device,
+/// each with what it allows, without looking for sessions.
 #[tauri::command]
-pub fn list_session_read_grants(
+pub async fn list_remote_shared_workspaces(
+    room_id: String,
+    target_host_ref: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::remote::RemoteSessionResponseV1, String> {
+    use crate::native_agent::sessions::remote::{RemoteSessionOperationV1, RemoteSessionQueryV1};
+    remote_native_session_query(
+        &room_id,
+        &target_host_ref,
+        RemoteSessionQueryV1 {
+            schema_version: String::new(),
+            request_id: String::new(),
+            target_host_ref: String::new(),
+            operation: RemoteSessionOperationV1::Workspaces,
+            provider: None,
+            text: None,
+            active_within_secs: None,
+            scope_ref: None,
+            session_id: None,
+        },
+        &state,
+    )
+    .await
+}
+
+/// The folders this Host shares over one Bridge, for its own user.
+#[tauri::command]
+pub fn list_bridge_workspace_shares(
+    room_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<crate::session_read_access::SessionReadGrantViewV1>, String> {
-    crate::session_read_access::grants(&state.paths, storage::now_ts())
+    crate::session_read_access::bridge_shares(&state.paths, &room_id, storage::now_ts())
         .map_err(|error| error.message())
 }
 
-/// Lets one trusted device, connected on one Bridge now, read native session
-/// summaries in one folder of this Host. Local only.
+/// Shares one folder of this Host with the trusted device of one Bridge,
+/// from inside that Bridge. Local only: nothing a peer sends reaches it.
 #[tauri::command]
-pub fn create_session_read_grant(
-    request: crate::session_read_access::CreateSessionReadGrantV1,
+pub fn share_bridge_workspace(
+    request: crate::session_read_access::ShareWorkspaceV1,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::session_read_access::SessionReadGrantViewV1, String> {
     let current = crate::host_runtime::current_verified_peer_devices(&state);
-    crate::session_read_access::create_grant(
+    crate::session_read_access::share_with_bridge(
         &state.paths,
         &state.local_host_ref,
         &current,
@@ -1073,11 +1106,29 @@ pub fn create_session_read_grant(
 }
 
 #[tauri::command]
-pub fn revoke_session_read_grant(
+pub fn update_workspace_share(
+    request: crate::session_read_access::UpdateWorkspaceShareV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::session_read_access::SessionReadGrantViewV1, String> {
+    crate::session_read_access::update_share(&state.paths, &request, storage::now_ts())
+        .map_err(|error| error.message())
+}
+
+#[tauri::command]
+pub fn stop_sharing_workspace(
     grant_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
-    crate::session_read_access::revoke_grant(&state.paths, &grant_id)
+    crate::session_read_access::stop_sharing(&state.paths, &grant_id)
+        .map_err(|error| error.message())
+}
+
+/// Every folder this Host shares, across its Bridges, for its own user.
+#[tauri::command]
+pub fn list_session_read_grants(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::session_read_access::SessionReadGrantViewV1>, String> {
+    crate::session_read_access::grants(&state.paths, storage::now_ts())
         .map_err(|error| error.message())
 }
 
@@ -1601,6 +1652,7 @@ pub async fn start_remote_native_codex_task(
     workspace: String,
     task: String,
     resume: bool,
+    workspace_label: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     let target =
@@ -1634,7 +1686,14 @@ pub async fn start_remote_native_codex_task(
     let queued = state
         .native_agents
         .lock()
-        .queue_bridge_remote_task(&room_id, &task_id, target.as_str(), &workspace, &task)
+        .queue_bridge_remote_task_labelled(
+            &room_id,
+            &task_id,
+            target.as_str(),
+            &workspace,
+            workspace_label.as_deref(),
+            &task,
+        )
         .map_err(|error| error.message())?;
     send_native_invoke(
         state.inner().clone(),

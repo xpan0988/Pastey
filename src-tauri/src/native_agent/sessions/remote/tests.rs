@@ -43,6 +43,16 @@ fn queries_are_bounded_and_inspection_names_one_session() {
     assert!(validate_query(&bad).is_err());
 }
 
+/// An older Host listed only readable folders and no capabilities.
+#[test]
+fn an_older_hosts_scope_reads_as_readable_without_agent_requests() {
+    let scope: RemoteScopeV1 = serde_json::from_value(serde_json::json!({
+        "scopeRef": "scope:0123456789abcdef", "label": "Pastey", "shareExcerpts": false
+    }))
+    .unwrap();
+    assert!(scope.read_sessions && !scope.agent_requests && scope.expires_at.is_none());
+}
+
 #[test]
 fn path_like_text_is_redacted_on_both_platforms() {
     assert_eq!(
@@ -213,8 +223,70 @@ mod with_claude_store {
             scope_ref: "scope:0123456789abcdef".into(),
             workspace: store.workspace.clone(),
             label: "Pastey".into(),
+            read_sessions: true,
             share_excerpts: excerpts,
+            agent_requests: false,
+            expires_at: storage_now() + 3_600,
         }
+    }
+
+    fn storage_now() -> i64 {
+        crate::storage::now_ts()
+    }
+
+    /// A folder shared only for agent requests is listed, with what it
+    /// allows, but its sessions are never looked at or sent.
+    #[test]
+    fn a_folder_shared_without_reading_is_listed_but_its_sessions_are_not() {
+        let store = store(2);
+        let (claude, codex) = sources(&store);
+        let run_only = SessionReadScopeV1 {
+            read_sessions: false,
+            share_excerpts: true,
+            agent_requests: true,
+            ..scope(&store, false)
+        };
+        for operation in [
+            RemoteSessionOperationV1::Discover,
+            RemoteSessionOperationV1::Workspaces,
+        ] {
+            let answer = answer(
+                &query(operation),
+                std::slice::from_ref(&run_only),
+                &claude,
+                &codex,
+                "host:windows",
+            );
+            validate_response(&answer).unwrap();
+            assert!(answer.discovery.is_none(), "{operation:?}");
+            assert_eq!(answer.scopes.len(), 1);
+            assert!(!answer.scopes[0].read_sessions && answer.scopes[0].agent_requests);
+        }
+        let discover = answer(
+            &query(RemoteSessionOperationV1::Discover),
+            std::slice::from_ref(&run_only),
+            &claude,
+            &codex,
+            "host:windows",
+        );
+        assert_eq!(discover.outcome, RemoteSessionOutcomeV1::NotAuthorized);
+        let mut inspect = query(RemoteSessionOperationV1::Inspect);
+        inspect.provider = Some(PROVIDER_CLAUDE_CODE.into());
+        inspect.session_id = Some(SESSION.into());
+        let inspected = answer(&inspect, &[run_only], &claude, &codex, "host:windows");
+        assert_eq!(inspected.outcome, RemoteSessionOutcomeV1::NotAuthorized);
+        assert!(inspected.snapshot.is_none());
+        // Listing the shared workspaces looks at no session at all.
+        let listed = answer(
+            &query(RemoteSessionOperationV1::Workspaces),
+            &[scope(&store, false)],
+            &claude,
+            &codex,
+            "host:windows",
+        );
+        assert_eq!(listed.outcome, RemoteSessionOutcomeV1::Ok);
+        assert!(listed.discovery.is_none() && listed.snapshot.is_none());
+        assert!(listed.scopes[0].read_sessions && !listed.scopes[0].agent_requests);
     }
 
     fn sources(store: &StoreV1) -> (ClaudeSessionSourceV1, CodexSessionSourceV1) {

@@ -334,10 +334,13 @@ export function denyNativeInvocationReview(taskId: string): Promise<NativeAgentT
   return invoke("deny_native_invocation_review", { taskId });
 }
 
+/** `workspace` is a full path on that Host, or the reference of a folder it
+ * shares with this device (`SharedWorkspace.scopeRef`), which that Host
+ * resolves itself; `workspaceLabel` names such a folder until it answers. */
 export function startRemoteNativeCodexTask(
-  roomId: string, peerSessionId: string, targetHostRef: string, workspace: string, task: string, resume: boolean,
+  roomId: string, peerSessionId: string, targetHostRef: string, workspace: string, task: string, resume: boolean, workspaceLabel: string | null = null,
 ): Promise<NativeAgentTaskStatus> {
-  return invoke("start_remote_native_codex_task", { roomId, peerSessionId, targetHostRef, workspace, task, resume });
+  return invoke("start_remote_native_codex_task", { roomId, peerSessionId, targetHostRef, workspace, task, resume, workspaceLabel });
 }
 
 export function proposeRemoteNativeCodexWorkspaceMovement(
@@ -798,7 +801,7 @@ export interface RemoteNativeSessionResponse {
   requestId: string;
   sourceHostRef: string;
   outcome: RemoteNativeSessionOutcome;
-  scopes: Array<{ scopeRef: string; label: string; shareExcerpts: boolean }>;
+  scopes: SharedWorkspace[];
   discovery?: {
     observedAtMs: number;
     providers: Array<{ provider: NativeSessionProvider; historyReadable: boolean; liveSource: string | null; note: string | null }>;
@@ -808,6 +811,23 @@ export interface RemoteNativeSessionResponse {
     sessionId: string | null;
   } | null;
   snapshot?: RemoteNativeSessionSnapshot | null;
+}
+
+/** A folder another Bridge Host shares with this device, as that Host
+ * describes it: its name and an opaque reference, never its path, and what
+ * its user allows there. */
+export interface SharedWorkspace {
+  scopeRef: string;
+  label: string;
+  readSessions: boolean;
+  shareExcerpts: boolean;
+  /** Runs there still wait for that Host's Accept. */
+  agentRequests: boolean;
+  expiresAt: number | null;
+}
+
+export function listRemoteSharedWorkspaces(roomId: string, targetHostRef: string): Promise<RemoteNativeSessionResponse> {
+  return invoke("list_remote_shared_workspaces", { roomId, targetHostRef });
 }
 
 export interface NativeSessionFilters {
@@ -868,38 +888,59 @@ export function continueRemoteNativeSession(request: { roomId: string; peerSessi
 
 export type SessionReadGrantState = "active" | "expired" | "revoked" | "unavailable";
 
-/** A Host-local permission for one trusted device to read native session
- * summaries in one folder over one Bridge. Trusting a device grants none. */
+/** One folder this device shares with one trusted device over one Bridge,
+ * and what it allows there. Host-local; trusting a device shares nothing. */
 export interface SessionReadGrant {
   grantId: string;
   deviceLabel: string;
+  deviceFingerprint: string;
   displayFingerprint: string;
   bridgeId: string;
+  /** This device's own path, shown only here. */
   workspace: string;
+  /** The folder's name, which the other device sees. */
+  label: string;
+  readSessions: boolean;
   shareExcerpts: boolean;
+  agentRequests: boolean;
   createdAt: number;
   expiresAt: number;
   state: SessionReadGrantState;
 }
 
-export interface CreateSessionReadGrant {
-  deviceFingerprint: string;
+export type WorkspaceShare = SessionReadGrant;
+
+export interface ShareWorkspaceRequest {
   roomId: string;
+  /** The Bridge device this device's user saw and trusted. */
+  deviceFingerprint?: string | null;
   workspacePath: string;
   durationHours: number;
+  readSessions: boolean;
   shareExcerpts: boolean;
+  agentRequests: boolean;
+}
+
+export function listBridgeWorkspaceShares(roomId: string): Promise<WorkspaceShare[]> {
+  return invoke("list_bridge_workspace_shares", { roomId });
+}
+
+/** Shares a folder with this Bridge's own, already trusted device. */
+export function shareBridgeWorkspace(request: ShareWorkspaceRequest): Promise<WorkspaceShare> {
+  return invoke("share_bridge_workspace", { request });
+}
+
+export function updateWorkspaceShare(request: { grantId: string; readSessions: boolean; shareExcerpts: boolean; agentRequests: boolean; durationHours?: number | null }): Promise<WorkspaceShare> {
+  return invoke("update_workspace_share", { request: { ...request, durationHours: request.durationHours ?? null } });
+}
+
+/** Ends the share and any unattended permission for that folder over it. */
+export function stopSharingWorkspace(grantId: string): Promise<void> {
+  return invoke("stop_sharing_workspace", { grantId });
 }
 
 export function listSessionReadGrants(): Promise<SessionReadGrant[]> {
   return invoke("list_session_read_grants");
-}
-
-export function createSessionReadGrant(request: CreateSessionReadGrant): Promise<SessionReadGrant> {
-  return invoke("create_session_read_grant", { request });
-}
-
-export function revokeSessionReadGrant(grantId: string): Promise<void> {
-  return invoke("revoke_session_read_grant", { grantId });
 }
 
 export async function listRooms(): Promise<RoomInfo[]> {

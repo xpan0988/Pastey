@@ -1,6 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useRef, useState } from "react";
-import type { SessionReadingKnowledge } from "../../lib/accessGuidance";
 import {
   continueNativeSession,
   continueRemoteNativeSession,
@@ -10,7 +9,10 @@ import {
   inspectRemoteNativeSession,
   type NativeAgentTaskStatus,
   type RemoteNativeSessionSnapshot,
+  type SharedWorkspace,
 } from "../../lib/tauri";
+import { peerShareGuidance } from "../../lib/workspaceShares";
+import type { PeerShares } from "./BridgeWorkspaces";
 import {
   ACTIVITY_FILTERS,
   continuationAvailability,
@@ -39,23 +41,22 @@ const STATUS_TONE: Record<string, Tone> = { live: "live", done: "ok", warning: "
 
 /** Claude Code and Codex sessions on this device or a connected device,
  * read only. Another device answers only for folders its own user shares
- * with this device, and sends statuses and evidence, not transcripts.
- * Looking never starts, continues or stops a session. */
-export function NativeSessionsCard({ roomId, peers, members, target, onReading, onContinued }: {
+ * with this Bridge with “Sessions” on, and sends statuses and evidence, not
+ * transcripts. Looking never starts, continues or stops a session. */
+export function NativeSessionsCard({ roomId, peers, members, target, shares, onContinued }: {
   roomId: string;
   peers: Peer[];
   members?: Peer[];
   /** "local" or the chosen device's HostRef, chosen by the Agents workspace. */
   target: string;
-  /** What looking learned about the other device's reading permission. */
-  onReading?: (knowledge: SessionReadingKnowledge) => void;
+  /** What the chosen device shares with this Bridge, as it last said. */
+  shares?: PeerShares;
   /** A continuation this device started: followed under Run a task. */
   onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void;
 }) {
   const [folder, setFolder] = useState("");
   const [form, setForm] = useState<{ provider: string; text: string; activeWithinSecs: number | null; scopeRef: string }>({ provider: "", text: "", activeWithinSecs: null, scopeRef: "" });
   const [sessions, setSessions] = useState<SessionView[] | null>(null);
-  const [scopes, setScopes] = useState<Array<{ scopeRef: string; label: string; shareExcerpts: boolean }>>([]);
   const [notes, setNotes] = useState<string[]>([]);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -68,7 +69,7 @@ export function NativeSessionsCard({ roomId, peers, members, target, onReading, 
 
   useEffect(() => {
     if (firstTarget.current) { firstTarget.current = false; return; }
-    setSessions(null); setSnapshot(null); setScopes([]); setNotes([]); setMessage(null); setForm((current) => ({ ...current, scopeRef: "" }));
+    setSessions(null); setSnapshot(null); setNotes([]); setMessage(null); setForm((current) => ({ ...current, scopeRef: "" }));
   }, [target]);
 
   async function run(action: () => Promise<void>) {
@@ -83,10 +84,11 @@ export function NativeSessionsCard({ roomId, peers, members, target, onReading, 
     const filters = sessionFilters(form);
     if (remote) {
       const response = await discoverRemoteNativeSessions(roomId, remote.hostRef!, filters);
-      setScopes(response.scopes);
-      const problem = remoteOutcomeMessage(response, hostName);
-      if (response.outcome === "not_authorized") onReading?.({ state: "not_allowed" });
-      else if (response.outcome === "ok") onReading?.({ state: "allowed", folders: response.scopes.map((scope) => scope.label) });
+      // Every answer lists what that device shares now.
+      if (response.outcome === "ok" || response.outcome === "not_authorized") shares?.adopt(response.scopes);
+      const problem = response.outcome === "not_authorized"
+        ? peerShareGuidance(hostName, { state: "known", workspaces: response.scopes }, "read") ?? remoteOutcomeMessage(response, hostName)
+        : remoteOutcomeMessage(response, hostName);
       if (problem) { setSessions(null); setMessage(problem); return; }
       setSessions(response.discovery?.sessions ?? []);
       setNotes([...(response.discovery?.providers ?? []).flatMap((provider) => provider.note ? [`${providerLabel(provider.provider)}: ${provider.note}`] : []), ...(response.discovery?.truncated ? ["Only the newest sessions were sent; narrow the search to see others."] : [])]);
@@ -116,6 +118,9 @@ export function NativeSessionsCard({ roomId, peers, members, target, onReading, 
   }
 
   const disconnected = target !== "local" && !remote;
+  const knowledge = shares?.knowledge ?? { state: "unknown" as const };
+  const readable = knowledge.state === "known" ? knowledge.workspaces.filter((share) => share.readSessions) : [];
+  const readingGuidance = target === "local" ? null : peerShareGuidance(hostName, knowledge, "read");
 
   return <div className="stack-lg" aria-label="Agent sessions">
     <section className="card">
@@ -126,9 +131,12 @@ export function NativeSessionsCard({ roomId, peers, members, target, onReading, 
         </div>
         {target === "local"
           ? <div className="row"><input className="input input-mono" readOnly value={folder} placeholder="Choose a folder on this device…" aria-label="Folder" /><button type="button" className="btn" disabled={busy} onClick={() => void chooseFolder()}><Icon name="folder" />Choose…</button></div>
-          : scopes.length > 1
-            ? <select className="select" value={form.scopeRef} onChange={(event) => setForm({ ...form, scopeRef: event.target.value })} aria-label="Shared folder"><option value="">All folders {hostName} shares</option>{scopes.map((scope) => <option key={scope.scopeRef} value={scope.scopeRef}>{scope.label}</option>)}</select>
-            : <p className="small muted">{hostName} answers only for folders it shares with this device under its Settings → Session reading.</p>}
+          : readable.length > 1
+            ? <select className="select" value={form.scopeRef} onChange={(event) => setForm({ ...form, scopeRef: event.target.value })} aria-label="Shared folder"><option value="">All folders {hostName} shares for sessions</option>{readable.map((scope) => <option key={scope.scopeRef} value={scope.scopeRef}>{scope.label}</option>)}</select>
+            : readable.length === 1
+              ? <p className="small muted">In {readable[0].label}, the folder {hostName} shares for sessions{readable[0].shareExcerpts ? ", with short excerpts" : ", statuses only"}.</p>
+              : readingGuidance ? <Notice tone="info">{readingGuidance}</Notice>
+                : <p className="small muted">{hostName} answers only for folders it shares with this Bridge with “Sessions” on.</p>}
         <div className="row">
           <input className="input" value={form.text} onChange={(event) => setForm({ ...form, text: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter") void look(); }} placeholder="Title, folder or branch contains…" aria-label="Search sessions" />
           <button type="button" className="btn btn-primary" disabled={busy || disconnected} onClick={() => void look()}><Icon name="search" />{busy ? "Looking…" : sessions ? "Look again" : "Look for sessions"}</button>
@@ -158,13 +166,13 @@ export function NativeSessionsCard({ roomId, peers, members, target, onReading, 
       </div>
     </section> : null}
 
-    {snapshot ? <SessionSnapshotView snapshot={snapshot} hostName={hostName} remote={target !== "local"} folder={folder} onContinued={onContinued} route={remote ? { roomId, peerSessionId: remote.peerSessionId, hostRef: remote.hostRef! } : null} /> : null}
+    {snapshot ? <SessionSnapshotView snapshot={snapshot} hostName={hostName} remote={target !== "local"} folder={folder} onContinued={onContinued} route={remote ? { roomId, peerSessionId: remote.peerSessionId, hostRef: remote.hostRef! } : null} share={knowledge.state === "known" ? knowledge.workspaces.find((share) => share.scopeRef === snapshot.session.scopeRef) ?? null : undefined} /> : null}
   </div>;
 }
 
 type ContinueRoute = { roomId: string; peerSessionId: string; hostRef: string } | null;
 
-function SessionSnapshotView({ snapshot, hostName, remote, folder, onContinued, route }: { snapshot: Snapshot; hostName: string; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute }) {
+function SessionSnapshotView({ snapshot, hostName, remote, folder, onContinued, route, share }: { snapshot: Snapshot; hostName: string; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute; share?: SharedWorkspace | null }) {
   const session = snapshot.session;
   const status = sessionStatusPresentation(session);
   const evidence = evidenceGroups(snapshot.evidence);
@@ -195,7 +203,7 @@ function SessionSnapshotView({ snapshot, hostName, remote, folder, onContinued, 
       {snapshot.excerptsShared
         ? snapshot.recent.length ? <div className="evidence-group"><h4>Recent conversation</h4><p className="xsmall subtle">Replies are the agent's own account, not verified.</p>{snapshot.recent.map((entry, index) => <div className="excerpt" key={index}><small>{entry.role === "user" ? "Prompt" : "Agent said"} · {relativeTime(entry.atMs)}</small>{entry.text}</div>)}</div> : null
         : <p className="xsmall subtle">{hostName} shares statuses only, not excerpts of the conversation.</p>}
-      <ContinueSession session={session} remote={remote} folder={folder} onContinued={onContinued} route={route} hostName={hostName} />
+      <ContinueSession session={session} remote={remote} folder={folder} onContinued={onContinued} route={route} hostName={hostName} share={share} />
     </div>
   </section>;
 }
@@ -203,14 +211,14 @@ function SessionSnapshotView({ snapshot, hostName, remote, folder, onContinued, 
 /** Continues this session in the session itself, with one new prompt. The
  * Host checks again at launch; nothing is retried, and no new session is
  * ever made in its place. */
-function ContinueSession({ session, remote, folder, onContinued, route, hostName }: { session: SessionView; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute; hostName: string }) {
+function ContinueSession({ session, remote, folder, onContinued, route, hostName, share }: { session: SessionView; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute; hostName: string; share?: SharedWorkspace | null }) {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [started, setStarted] = useState(false);
   const availability = remote && !route
     ? { allowed: false, reason: `${hostName} is not connected right now.` }
-    : continuationAvailability(session, !remote, hostName);
+    : continuationAvailability(session, !remote, hostName, share);
 
   async function submit() {
     if (!availability.allowed || !prompt.trim() || busy || started) return;
