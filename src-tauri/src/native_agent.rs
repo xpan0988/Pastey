@@ -1153,7 +1153,9 @@ impl Default for NativeAgentServiceV1 {
         // (local only). Tests register it explicitly with a fixture.
         #[cfg(not(test))]
         adapters.push(Arc::new(
-            capability::codex::thread_continuation::CodexThreadAdapterV1::default(),
+            capability::codex::thread_continuation::CodexThreadAdapterV1::sharing(
+                codex.own_thread_holds(),
+            ),
         ));
         Self::with_adapters(codex, adapters)
     }
@@ -1228,7 +1230,9 @@ impl NativeAgentServiceV1 {
         executable: &Path,
         codex_home: &Path,
     ) {
-        let adapter = capability::codex::thread_continuation::CodexThreadAdapterV1::default();
+        let adapter = capability::codex::thread_continuation::CodexThreadAdapterV1::sharing(
+            self.codex.own_thread_holds(),
+        );
         adapter.use_executable(executable);
         adapter.use_codex_home(codex_home);
         self.adapters.push(Arc::new(adapter));
@@ -1742,25 +1746,22 @@ impl NativeAgentServiceV1 {
                 crate::storage::update_native_agent_observed_task_if_present(paths, task_id, &task);
         }
     }
-    /// Session discovery's sources for `workspaces`, taken under the service
-    /// lock and used after the caller releases it: discovery launches
-    /// bounded read-only processes. Pastey's own live Codex sessions count
-    /// as possible holders of their workspace's threads.
+    /// Session discovery's sources, taken under the service lock and used
+    /// after the caller releases it: discovery launches bounded read-only
+    /// processes. The threads Pastey's own app-servers have open are named,
+    /// so discovery reports them as Pastey's, never as another client's.
     pub(crate) fn session_sources(
         &self,
-        workspaces: &[PathBuf],
     ) -> (
         sessions::ClaudeSessionSourceV1,
         sessions::CodexSessionSourceV1,
     ) {
-        let pastey_live = workspaces
-            .iter()
-            .filter(|workspace| self.codex.has_session(workspace))
-            .cloned()
-            .collect();
         (
             sessions::ClaudeSessionSourceV1::installed(),
-            sessions::CodexSessionSourceV1::new(self.codex.executable(), pastey_live),
+            sessions::CodexSessionSourceV1::new(
+                self.codex.executable(),
+                self.codex.own_thread_holds().observe(),
+            ),
         )
     }
 
@@ -4439,7 +4440,11 @@ impl NativeAgentServiceV1 {
                     .adapter(&pending.capability_id)
                     .map(|adapter| adapter.display_name().to_owned())
                     .unwrap_or_else(|_| pending.capability_id.clone());
-                pending.review(&display_name)
+                let shared_folder = self
+                    .review_share_requirements
+                    .get(&pending.task_id)
+                    .map(crate::session_read_access::ShareRequirementV1::folder_label);
+                pending.review(&display_name, shared_folder)
             })
             .collect::<Vec<_>>();
         reviews.sort_by(|a, b| (a.expires_at, &a.task_id).cmp(&(b.expires_at, &b.task_id)));

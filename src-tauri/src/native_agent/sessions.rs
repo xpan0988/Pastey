@@ -356,6 +356,9 @@ pub(crate) fn continuation_problem(
     }
     match (provider, session.resume.verdict) {
         (_, ResumeVerdictV1::Safe) => None,
+        (PROVIDER_CODEX, ResumeVerdictV1::Unsafe) if session.live.source == codex::PASTEY_SOURCE => {
+            Some("A Pastey task is running a turn in this Codex thread now. Wait for it to finish, then continue.".into())
+        }
         (_, ResumeVerdictV1::Unsafe) => Some(match provider {
             PROVIDER_CODEX => "This Codex thread is open in another Codex client (the Codex app or a terminal). Close it there, then continue it here.".into(),
             _ => "A Claude Code process holds this session (the desktop app, a terminal or a background session). Let it finish or close it, then continue it here.".into(),

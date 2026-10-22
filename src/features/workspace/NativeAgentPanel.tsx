@@ -2,29 +2,17 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
 import { codexRunReadiness, looksLikeFullPath, type CodexWorkspaceSource } from "../../lib/nativeAgentReadiness";
-import { nativeDecisionsAwaitUser } from "../../lib/nativeDecisions";
-import type { NativeAgentCapability, NativeAgentTaskStatus } from "../../lib/tauri";
+import type { NativeAgentCapability } from "../../lib/tauri";
 import {
-  nativeAgentAwaitingNativeDecision,
-  nativeAgentConsequenceAbandonmentRequired,
-  nativeAgentConversationLabel,
-  nativeAgentConversationUnavailable,
-  nativeAgentDisplayName,
-  nativeAgentLifecycleLabel,
   nativeAgentMovementBlocksNewRun,
-  nativeAgentRemoteReconciliationRequired,
-  nativeAgentResponse,
   nativeAgentTargetAvailability,
-  StatusBadge,
   useRemoteNativeCapabilities,
-  type LifecycleTone,
   type NativeAgentTargetAvailability,
   type useNativeAgentTask,
 } from "./AgentTaskLifecycle";
-import { NativeDecisionPanel } from "./NativeDecisionPanel";
 import type { PeerShares } from "./BridgeWorkspaces";
 import { shareSummary } from "../../lib/workspaceShares";
-import { Checklist, Dot, Field, Icon, Notice, type Tone } from "./ui";
+import { Checklist, Dot, Field, Icon, type Tone } from "./ui";
 
 export type NativeAgentController = ReturnType<typeof useNativeAgentTask>;
 
@@ -123,8 +111,6 @@ export function NativeAgentPanel({ roomId, agent, peers, members, target, shares
   }
 
   return <div className="stack-lg">
-    <NativeAgentTaskState roomId={roomId} agent={agent} peers={peers} members={members} />
-
     <section className="card" aria-label="Run with Codex">
       <div className="card-body form-grid">
         <div className="availability" role="status">
@@ -171,7 +157,7 @@ export function NativeAgentPanel({ roomId, agent, peers, members, target, shares
 
         {effectiveSource !== "send_from_here" || !targetHostRef ? <label className="check">
           <input type="checkbox" checked={agent.newConversation} onChange={(event) => agent.setNewConversation(event.target.checked)} disabled={locked} />
-          <span>Start a new conversation<small>Otherwise Codex continues your earlier conversation in this folder, if there is one.</small></span>
+          <span>Start a new conversation<small>Otherwise Codex continues the conversation Pastey keeps for you in this folder, if there is one (listed under Continue a session as “Started by Pastey”). To pick up a conversation from the Codex app or a terminal, use Continue a session instead.</small></span>
         </label> : null}
 
         {blocker && !taskActive ? <Checklist items={readiness.requirements} /> : null}
@@ -182,86 +168,6 @@ export function NativeAgentPanel({ roomId, agent, peers, members, target, shares
       </footer>
     </section>
   </div>;
-}
-
-/** The current or unresolved task: lifecycle, the Agent's own requests and
- * response, workspace movement, and the explicit repair actions. */
-function NativeAgentTaskState({ roomId, agent, peers, members }: { roomId: string; agent: NativeAgentController; peers: readonly BridgePeerSession[]; members: readonly BridgePeerSession[] }) {
-  if (!agent.status && !agent.movement && !agent.message) return null;
-  const taskHostName = agent.taskHostRef
-    ? members.find((peer) => peer.hostRef === agent.taskHostRef)?.displayName ?? "the selected device"
-    : null;
-  const taskPeer = agent.taskHostRef ? peers.find((peer) => peer.hostRef === agent.taskHostRef) ?? null : null;
-  const movementPeer = agent.movement ? peers.find((peer) => peer.hostRef === agent.movement?.targetHostRef) ?? null : null;
-  const movementHostName = agent.movement ? members.find((peer) => peer.hostRef === agent.movement?.targetHostRef)?.displayName ?? "the selected device" : null;
-  const remoteReconciliationRequired = nativeAgentRemoteReconciliationRequired(agent.status, agent.movement);
-  const consequenceAbandonmentRequired = nativeAgentConsequenceAbandonmentRequired(agent.movement);
-  const resultReturnRetryRequired = agent.movement?.code === "result_return_retry_required"
-    || (agent.movement?.state === "interrupted" && ["result_apply_interrupted", "conflict_result_retention_required", "conflict_result_retention_failed"].includes(agent.movement.code ?? ""));
-  const status = agent.status;
-  const conversation = nativeAgentConversationLabel(status);
-
-  const actions = agent.movement?.state === "awaiting_approval" && movementPeer
-    ? <button type="button" className="btn btn-primary" disabled={agent.busy} onClick={() => void agent.approveRemoteMovement(roomId, movementPeer.peerSessionId)}>Approve and send</button>
-    : remoteReconciliationRequired && !agent.recoveryTaskId
-      ? <button type="button" className="btn" disabled={agent.busy} onClick={() => void agent.refreshRecoveryProjection()}>Load recovery details</button>
-      : remoteReconciliationRequired
-        ? <>{agent.recoveryTargetHostRef ? <button type="button" className="btn btn-primary" disabled={agent.busy} onClick={() => void agent.reconcileRemote()}>Reconcile</button> : null}<button type="button" className="btn" disabled={agent.busy || !agent.recoveryTaskId} onClick={() => void agent.stopRecovery()}>Stop</button></>
-        : consequenceAbandonmentRequired
-          ? <>{resultReturnRetryRequired ? <button type="button" className="btn btn-primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button> : null}<button type="button" className="btn btn-danger" disabled={agent.busy} onClick={() => void agent.stopRecovery()}>Abandon recovery</button></>
-          : resultReturnRetryRequired
-            ? <button type="button" className="btn btn-primary" disabled={agent.busy || agent.retryingResultReturn} onClick={() => void agent.retryResultReturn()}>{agent.retryingResultReturn ? "Retrying result Return…" : "Retry result Return"}</button>
-            : agent.canCancel ? <button type="button" className="btn btn-danger" disabled={agent.busy} onClick={() => void (taskPeer ? agent.cancelRemote(roomId, taskPeer.peerSessionId, taskPeer.hostRef!) : agent.cancel())}>Stop Codex</button> : null;
-
-  return <section className="card" aria-label="Codex task">
-    {status ? <header className="card-header">
-      <div className="stack" style={{ gap: 2 }}>
-        <h3>{nativeAgentDisplayName(status.agentId)} · {status.workspaceName}</h3>
-        <span className="xsmall subtle">{taskHostName ? `On ${taskHostName}` : "On this device"}{conversation ? ` · ${conversation}` : ""}</span>
-      </div>
-      <StatusBadge tone={lifecycleTone(status)}>{nativeAgentLifecycleLabel(status)}</StatusBadge>
-    </header> : null}
-    <div className="card-body">
-      {status?.result ? <p className="small muted">{status.result}</p> : null}
-      {nativeAgentConversationUnavailable(status) ? <Notice tone="bad">{nativeAgentDisplayName(status?.agentId)} on {taskHostName ?? "this device"} could not reopen your earlier conversation, so nothing ran. Choose “Start a new conversation” to continue without that context.</Notice> : null}
-      {status ? <NativeDecisionPanel status={status} roomId={roomId} remote={!!agent.taskHostRef} hostName={taskHostName ?? "this device"} /> : null}
-      {nativeAgentAwaitingNativeDecision(status) && !nativeDecisionsAwaitUser(status!, !!agent.taskHostRef, Date.now() / 1000) ? <Notice tone="warn">{nativeAgentDisplayName(status?.agentId)} on {taskHostName ?? "this device"} is waiting for a native request that cannot be answered from here, so the task cannot continue; stop it to interrupt the turn. To run without approval prompts, change the approval policy in that device’s own Codex configuration.</Notice> : null}
-      {status ? <NativeAgentResponse status={status} hostName={taskHostName} /> : null}
-      {remoteReconciliationRequired && !agent.movement ? <Notice tone="warn" title="The remote task outcome is indeterminate.">
-        Pastey will not treat it as complete until it is reconciled or explicitly stopped. This device lost track of the run on {taskHostName ?? "the other device"}: the connection dropped, or that device's Pastey restarted, while Codex worked. Reconcile asks {taskHostName ?? "it"} what it knows now. If it lost the run too, the outcome stays unknown: check the folder there yourself, then choose Stop. Stop undoes nothing Codex already did, and Pastey never runs the task again on its own.
-      </Notice> : null}
-      {agent.movement ? <div className="stack">
-        <div className="row"><strong className="spacer">{agent.movement.state === "awaiting_approval" ? "Review workspace movement" : `Workspace movement · ${agent.movement.state.replace(/_/g, " ")}`}</strong>{agent.movement.state === "awaiting_approval" ? <StatusBadge tone="pending">Needs your approval</StatusBadge> : null}</div>
-        <p className="small muted">{agent.movement.reviewSummary}</p>
-        {agent.movement.state === "awaiting_approval" ? <ol className="small">
-          <li>Send “{agent.movement.sourceWorkspaceName}” to {movementHostName}.</li>
-          <li>Ask that device to run Codex. It runs only if that device accepts.</li>
-          <li>Return and apply the result here if the source is unchanged.</li>
-        </ol> : null}
-        {agent.movement.state === "awaiting_approval" && !movementPeer ? <Notice tone="warn">{movementHostName} is not connected. You can approve once it reconnects.</Notice> : null}
-        {remoteReconciliationRequired ? <Notice tone="warn">The remote task outcome is indeterminate. Pastey will not reuse this workspace until the task is reconciled or explicitly stopped.</Notice> : null}
-        {consequenceAbandonmentRequired ? <Notice tone="bad">{agent.movement.code === "native_agent_result_snapshot_recovery_failed" ? "Codex completed, but Pastey could not safely capture its result for return. Abandon this movement to release the original workspace; Codex will not run again." : "Pastey could not retain the returned result. Retry its exact Return or abandon this movement; the Agent’s recorded task outcome will remain unchanged."}</Notice> : null}
-        {resultReturnRetryRequired ? <Notice tone="info">The exact Agent result is durable. Pastey can retry its Return without running Codex again.</Notice> : null}
-        {agent.movement.state === "conflict_recovery_required" ? <>
-          <Notice tone="warn">Your original workspace changed while Codex was working. Pastey preserved the result and did not overwrite your changes.</Notice>
-          <div className="row"><button type="button" className="btn" disabled={agent.busy} onClick={() => void agent.revealConflictResult()}>Reveal result</button><button type="button" className="btn btn-danger" disabled={agent.busy} onClick={() => void agent.discardConflictResult()}>Discard result</button></div>
-        </> : null}
-      </div> : null}
-      {agent.message ? <p className="error-text" role="alert">{agent.message}</p> : null}
-    </div>
-    {actions ? <footer className="card-footer">{actions}</footer> : null}
-  </section>;
-}
-
-function lifecycleTone(status: NativeAgentTaskStatus): LifecycleTone {
-  if (nativeAgentAwaitingNativeDecision(status)) return "pending";
-  switch (status.state) {
-    case "running": return "live";
-    case "queued": return "pending";
-    case "completed": return "complete";
-    case "failed": case "interrupted": return "danger";
-    default: return "neutral";
-  }
 }
 
 function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {
@@ -317,21 +223,4 @@ export function availabilityCopy(availability: NativeAgentTargetAvailability, re
         ? `Codex is available on ${where}. Pastey will review sending your folder there and returning its result.`
         : `Codex is available on ${where}. It runs in a folder there after ${where} accepts; no files move.`;
   }
-}
-
-/** The Agent's returned response, kept apart from lifecycle state. Native
- * output is untrusted and possibly remote: it is shown only as escaped
- * plain text (never markup, a command, a path or a link). */
-function NativeAgentResponse({ status, hostName }: { status: NativeAgentTaskStatus; hostName: string | null }) {
-  const response = nativeAgentResponse(status);
-  if (!response) return null;
-  const agentName = nativeAgentDisplayName(status.agentId);
-  return <section className="stack" aria-label={`${agentName} response`}>
-    <span className="subhead">{agentName} response{hostName ? ` · from ${hostName}` : ""}</span>
-    {response.kind === "text"
-      ? <><pre className="agent-response-text">{response.text}</pre>{response.truncated ? <small className="subtle">Pastey shortened this response to fit its size limit.</small> : null}</>
-      : response.kind === "undisplayable"
-        ? <small className="muted">The task completed with output Pastey cannot display as text.</small>
-        : <small className="muted">The task completed, but no response text is available.</small>}
-  </section>;
 }

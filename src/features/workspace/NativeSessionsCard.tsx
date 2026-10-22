@@ -1,49 +1,54 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import {
-  continueNativeSession,
-  continueRemoteNativeSession,
   discoverNativeSessions,
   discoverRemoteNativeSessions,
   inspectNativeSession,
   inspectRemoteNativeSession,
   type NativeAgentTaskStatus,
+  type NativeSessionProvider,
   type RemoteNativeSessionSnapshot,
-  type SharedWorkspace,
 } from "../../lib/tauri";
 import { peerShareGuidance } from "../../lib/workspaceShares";
 import type { PeerShares } from "./BridgeWorkspaces";
 import {
   ACTIVITY_FILTERS,
-  continuationAvailability,
-  evidenceGroups,
+  continuationChip,
   localSessionView,
   originLabel,
   providerLabel,
   relativeTime,
   remoteOutcomeMessage,
-  resumeLabel,
   sessionFilters,
   sessionStatusPresentation,
-  snapshotActivityLine,
   type SessionView,
 } from "../../lib/nativeSessions";
-import { Badge, Dot, EmptyState, Icon, ListRow, Notice, type Tone } from "./ui";
+import { continuedSessionKey, type ContinuedSession } from "./AgentTaskLifecycle";
+import { SessionDetail } from "./SessionDetail";
+import { Badge, EmptyState, Icon, ListRow, Notice, type Tone } from "./ui";
 
 type Peer = { peerSessionId: string; displayName: string; hostRef?: string | null };
-type Snapshot = Omit<RemoteNativeSessionSnapshot, "session" | "activity" | "excerptsShared"> & {
+export type SessionSnapshot = Omit<RemoteNativeSessionSnapshot, "session" | "activity" | "excerptsShared"> & {
   session: SessionView;
   activity: RemoteNativeSessionSnapshot["activity"] | Omit<RemoteNativeSessionSnapshot["activity"], "changedElsewhere">;
   excerptsShared: boolean;
 };
 
-const STATUS_TONE: Record<string, Tone> = { live: "live", done: "ok", warning: "warn", unknown: "neutral" };
+const CHIP_TONE: Record<string, Tone> = { ok: "ok", live: "live", warn: "warn", neutral: "neutral" };
+
+/** A request to open one session, from the task that continues it. */
+export interface OpenSessionRequest {
+  provider: NativeSessionProvider;
+  sessionId: string;
+  nonce: number;
+}
 
 /** Claude Code and Codex sessions on this device or a connected device,
  * read only. Another device answers only for folders its own user shares
  * with this Bridge with “Sessions” on, and sends statuses and evidence, not
- * transcripts. Looking never starts, continues or stops a session. */
-export function NativeSessionsCard({ roomId, peers, members, target, shares, onContinued }: {
+ * transcripts. Looking never starts, continues or stops a session; only
+ * Continue session in one session's view does, once, as the user wrote it. */
+export function NativeSessionsCard({ roomId, peers, members, target, shares, active = true, onContinued, continued, openRequest, onOpenChange }: {
   roomId: string;
   peers: Peer[];
   members?: Peer[];
@@ -51,26 +56,40 @@ export function NativeSessionsCard({ roomId, peers, members, target, shares, onC
   target: string;
   /** What the chosen device shares with this Bridge, as it last said. */
   shares?: PeerShares;
-  /** A continuation this device started: followed under Run a task. */
-  onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void;
+  /** Shown now: only then does it look by itself. */
+  active?: boolean;
+  /** A continuation this device started from one session's view. */
+  onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null, session: ContinuedSession) => void;
+  /** The task continuing a session, shown inside that session's view. */
+  continued?: { key: string; ended: boolean; node: ReactNode } | null;
+  openRequest?: OpenSessionRequest | null;
+  /** The session whose view is open, by provider and id, or null. */
+  onOpenChange?: (key: string | null) => void;
 }) {
   const [folder, setFolder] = useState("");
   const [form, setForm] = useState<{ provider: string; text: string; activeWithinSecs: number | null; scopeRef: string }>({ provider: "", text: "", activeWithinSecs: null, scopeRef: "" });
   const [sessions, setSessions] = useState<SessionView[] | null>(null);
   const [notes, setNotes] = useState<string[]>([]);
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [lookedAt, setLookedAt] = useState<number | null>(null);
+  const [opening, setOpening] = useState<string | null>(null);
   // Chosen by durable HostRef, so a reconnect keeps the choice.
   const remote = target === "local" ? null : peers.find((peer) => peer.hostRef === target) ?? null;
   const targetName = target === "local" ? "this device" : (members ?? peers).find((peer) => peer.hostRef === target)?.displayName ?? "the other device";
   const hostName = remote?.displayName ?? targetName;
   const firstTarget = useRef(true);
+  const autoLooked = useRef<string | null>(null);
 
   useEffect(() => {
     if (firstTarget.current) { firstTarget.current = false; return; }
-    setSessions(null); setSnapshot(null); setNotes([]); setMessage(null); setForm((current) => ({ ...current, scopeRef: "" }));
+    setSessions(null); setSnapshot(null); setNotes([]); setMessage(null); setLookedAt(null); setForm((current) => ({ ...current, scopeRef: "" }));
+    autoLooked.current = null;
   }, [target]);
+
+  const openKey = snapshot ? continuedSessionKey(snapshot.session) : null;
+  useEffect(() => { onOpenChange?.(openKey); }, [openKey, onOpenChange]);
 
   async function run(action: () => Promise<void>) {
     setBusy(true); setMessage(null);
@@ -79,9 +98,8 @@ export function NativeSessionsCard({ roomId, peers, members, target, shares, onC
     finally { setBusy(false); }
   }
 
-  const look = () => run(async () => {
-    setSnapshot(null);
-    const filters = sessionFilters(form);
+  const look = (nextForm = form) => run(async () => {
+    const filters = sessionFilters(nextForm);
     if (remote) {
       const response = await discoverRemoteNativeSessions(roomId, remote.hostRef!, filters);
       // Every answer lists what that device shares now.
@@ -98,9 +116,15 @@ export function NativeSessionsCard({ roomId, peers, members, target, shares, onC
       setSessions(discovery.sessions.map(localSessionView));
       setNotes(discovery.providers.flatMap((provider) => provider.note ? [`${providerLabel(provider.provider)}: ${provider.note}`] : []));
     }
+    setLookedAt(Date.now());
   });
 
-  const inspect = (session: SessionView) => run(async () => {
+  const inspect = (session: { provider: NativeSessionProvider; sessionId: string }) => run(async () => {
+    setOpening(continuedSessionKey(session));
+    try { await read(session); } finally { setOpening(null); }
+  });
+
+  const read = async (session: { provider: NativeSessionProvider; sessionId: string }) => {
     if (remote) {
       const response = await inspectRemoteNativeSession(roomId, remote.hostRef!, session.provider, session.sessionId);
       const problem = remoteOutcomeMessage(response, hostName);
@@ -110,137 +134,116 @@ export function NativeSessionsCard({ roomId, peers, members, target, shares, onC
       const local = await inspectNativeSession([folder], session.provider, session.sessionId);
       setSnapshot({ ...local, session: localSessionView(local.session), excerptsShared: true });
     }
-  });
-
-  async function chooseFolder() {
-    const chosen = await open({ directory: true, multiple: false });
-    if (typeof chosen === "string") { setFolder(chosen); setSessions(null); setSnapshot(null); }
-  }
+  };
 
   const disconnected = target !== "local" && !remote;
   const knowledge = shares?.knowledge ?? { state: "unknown" as const };
   const readable = knowledge.state === "known" ? knowledge.workspaces.filter((share) => share.readSessions) : [];
   const readingGuidance = target === "local" ? null : peerShareGuidance(hostName, knowledge, "read");
 
+  // Looking is read only, so the list fills itself once there is something
+  // to look in: a folder chosen here, or a folder that device shares for
+  // sessions. Each such scope is looked in once; Look again repeats it.
+  const scopeKey = target === "local" ? (folder ? `local|${folder}` : null)
+    : remote && readable.length ? `${target}|${readable.map((share) => share.scopeRef).join(",")}` : null;
+  useEffect(() => {
+    if (!active || busy || !scopeKey || autoLooked.current === scopeKey) return;
+    autoLooked.current = scopeKey;
+    void look();
+  }, [active, scopeKey, busy]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // The task continuing a session asks to open it.
+  const handledRequest = useRef<number | null>(null);
+  useEffect(() => {
+    if (!openRequest || handledRequest.current === openRequest.nonce || disconnected) return;
+    handledRequest.current = openRequest.nonce;
+    void inspect(openRequest);
+  }, [openRequest, disconnected]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When the continuation of the open session ends, read it again: it now
+  // ends with a new turn, which the next continuation must name.
+  const continuedHere = continued && openKey === continued.key ? continued : null;
+  const wasRunning = useRef(false);
+  useEffect(() => {
+    if (!continuedHere) { wasRunning.current = false; return; }
+    if (!continuedHere.ended) { wasRunning.current = true; return; }
+    if (wasRunning.current && snapshot) { wasRunning.current = false; void inspect(snapshot.session); }
+  }, [continuedHere?.ended, continuedHere?.key]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function chooseFolder() {
+    const chosen = await open({ directory: true, multiple: false });
+    if (typeof chosen === "string") { setFolder(chosen); setSessions(null); setSnapshot(null); }
+  }
+
+  function setFilter(next: typeof form) {
+    setForm(next);
+    if (sessions) void look(next);
+  }
+
+  if (snapshot) {
+    return <div className="stack-lg" aria-label="Agent sessions">
+      {message ? <Notice tone="warn">{message}</Notice> : null}
+      <SessionDetail
+        snapshot={snapshot}
+        hostName={hostName}
+        remote={target !== "local"}
+        folder={folder}
+        route={remote ? { roomId, peerSessionId: remote.peerSessionId, hostRef: remote.hostRef! } : null}
+        share={knowledge.state === "known" ? knowledge.workspaces.find((share) => share.scopeRef === snapshot.session.scopeRef) ?? null : undefined}
+        busy={busy}
+        run={continuedHere ? { node: continuedHere.node, active: !continuedHere.ended } : null}
+        onBack={() => { setSnapshot(null); setMessage(null); }}
+        onLookAgain={() => void inspect(snapshot.session)}
+        onContinued={onContinued}
+      />
+    </div>;
+  }
+
   return <div className="stack-lg" aria-label="Agent sessions">
     <section className="card">
       <div className="card-body">
-        <div className="filters">
-          <select className="select" value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value })} aria-label="Agent"><option value="">Claude Code and Codex</option><option value="claude_code">Claude Code</option><option value="codex">Codex</option></select>
-          <select className="select" value={form.activeWithinSecs ?? ""} onChange={(event) => setForm({ ...form, activeWithinSecs: event.target.value ? Number(event.target.value) : null })} aria-label="Last activity">{ACTIVITY_FILTERS.map((filter) => <option key={filter.label} value={filter.seconds ?? ""}>{filter.label}</option>)}</select>
+        <div className="session-toolbar">
+          {target === "local"
+            ? <div className="row spacer"><input className="input input-mono" readOnly value={folder} placeholder="Choose a folder on this device…" aria-label="Folder" /><button type="button" className="btn" disabled={busy} onClick={() => void chooseFolder()}><Icon name="folder" />Choose…</button></div>
+            : readable.length > 1
+              ? <select className="select spacer" value={form.scopeRef} onChange={(event) => setFilter({ ...form, scopeRef: event.target.value })} aria-label="Shared folder"><option value="">All folders {hostName} shares for sessions</option>{readable.map((scope) => <option key={scope.scopeRef} value={scope.scopeRef}>{scope.label}</option>)}</select>
+              : readable.length === 1
+                ? <p className="small muted spacer"><Icon name="folder" small /> {readable[0].label}, the folder {hostName} shares for sessions{readable[0].shareExcerpts ? ", with short excerpts" : ", statuses only"}.</p>
+                : <span className="spacer" />}
+          <button type="button" className="btn" disabled={busy || disconnected || !scopeKey} onClick={() => void look()}><Icon name="refresh" />{busy && !opening ? "Looking…" : sessions ? "Look again" : "Look for sessions"}</button>
         </div>
-        {target === "local"
-          ? <div className="row"><input className="input input-mono" readOnly value={folder} placeholder="Choose a folder on this device…" aria-label="Folder" /><button type="button" className="btn" disabled={busy} onClick={() => void chooseFolder()}><Icon name="folder" />Choose…</button></div>
-          : readable.length > 1
-            ? <select className="select" value={form.scopeRef} onChange={(event) => setForm({ ...form, scopeRef: event.target.value })} aria-label="Shared folder"><option value="">All folders {hostName} shares for sessions</option>{readable.map((scope) => <option key={scope.scopeRef} value={scope.scopeRef}>{scope.label}</option>)}</select>
-            : readable.length === 1
-              ? <p className="small muted">In {readable[0].label}, the folder {hostName} shares for sessions{readable[0].shareExcerpts ? ", with short excerpts" : ", statuses only"}.</p>
-              : readingGuidance ? <Notice tone="info">{readingGuidance}</Notice>
-                : <p className="small muted">{hostName} answers only for folders it shares with this Bridge with “Sessions” on.</p>}
-        <div className="row">
+        {target !== "local" && !readable.length ? readingGuidance ? <Notice tone="info">{readingGuidance}</Notice>
+          : knowledge.state === "unknown" && !disconnected ? <p className="small muted">{shares?.message ?? `Asking ${hostName} which folders it shares…`}</p>
+            : <p className="small muted">{hostName} answers only for folders it shares with this Bridge with “Sessions” on.</p> : null}
+        {sessions || form.text || form.provider || form.activeWithinSecs ? <div className="filters">
           <input className="input" value={form.text} onChange={(event) => setForm({ ...form, text: event.target.value })} onKeyDown={(event) => { if (event.key === "Enter") void look(); }} placeholder="Title, folder or branch contains…" aria-label="Search sessions" />
-          <button type="button" className="btn btn-primary" disabled={busy || disconnected} onClick={() => void look()}><Icon name="search" />{busy ? "Looking…" : sessions ? "Look again" : "Look for sessions"}</button>
-        </div>
+          <select className="select" value={form.provider} onChange={(event) => setFilter({ ...form, provider: event.target.value })} aria-label="Agent"><option value="">Claude Code and Codex</option><option value="claude_code">Claude Code</option><option value="codex">Codex</option></select>
+          <select className="select" value={form.activeWithinSecs ?? ""} onChange={(event) => setFilter({ ...form, activeWithinSecs: event.target.value ? Number(event.target.value) : null })} aria-label="Last activity">{ACTIVITY_FILTERS.map((filter) => <option key={filter.label} value={filter.seconds ?? ""}>{filter.label}</option>)}</select>
+        </div> : null}
         {disconnected ? <Notice tone="warn">{targetName} is not connected right now.</Notice> : null}
-        {notes.map((note) => <p key={note} className="xsmall subtle">{note}</p>)}
         {message ? <Notice tone="warn">{message}</Notice> : null}
       </div>
     </section>
 
-    {sessions && sessions.length === 0 ? <EmptyState title="No sessions match">Try a wider time range or a different search.</EmptyState> : null}
+    {sessions && sessions.length === 0 ? <EmptyState title="No sessions match">{form.text || form.provider || form.activeWithinSecs ? "Try a wider time range or a different search." : `Claude Code and Codex have no saved session for ${target === "local" ? "this folder" : "these folders"} on ${hostName}.`}</EmptyState> : null}
     {sessions && sessions.length > 0 ? <section className="card">
-      <header className="card-header"><h3>{sessions.length === 1 ? "1 session" : `${sessions.length} sessions`}</h3>{sessions.length > 1 ? <span className="xsmall subtle">Choose one; Pastey does not pick for you.</span> : null}</header>
+      <header className="card-header"><h3>{sessions.length === 1 ? "1 session" : `${sessions.length} sessions`}<span className="xsmall subtle"> · on {hostName}{lookedAt ? `, ${relativeTime(lookedAt)}` : ""}</span></h3>{sessions.length > 1 ? <span className="xsmall subtle">Newest first. Choose one; Pastey does not pick for you.</span> : null}</header>
       <div className="list">
         {sessions.map((session) => {
           const status = sessionStatusPresentation(session);
+          const share = knowledge.state === "known" ? knowledge.workspaces.find((candidate) => candidate.scopeRef === session.scopeRef) ?? null : undefined;
+          const chip = continuationChip(session, target === "local", hostName, share);
           return <ListRow
             key={`${session.provider}-${session.sessionId}`}
-            selected={snapshot?.session.sessionId === session.sessionId}
             disabled={busy}
             onClick={() => void inspect(session)}
             title={session.title ?? "(untitled)"}
-            meta={`${providerLabel(session.provider)} · ${session.workspaceLabel}${session.gitBranch ? ` · ${session.gitBranch}` : ""} · ${originLabel(session.origin)} · ${relativeTime(session.lastActivityAtMs)}`}
-            side={<>{session.origin === "pastey" ? <Badge tone="accent">Started by Pastey</Badge> : null}<span title={status.explanation}><Badge tone={STATUS_TONE[status.tone]}>{status.label}</Badge></span></>}
+            meta={`${providerLabel(session.provider)} · ${session.workspaceLabel}${session.gitBranch ? ` · ${session.gitBranch}` : ""} · ${originLabel(session.origin)} · ${relativeTime(session.lastActivityAtMs)} · ${status.label}`}
+            side={<>{session.origin === "pastey" ? <Badge tone="accent">Started by Pastey</Badge> : null}{opening === continuedSessionKey(session) ? <span className="xsmall subtle">Opening…</span> : <Badge tone={CHIP_TONE[chip.tone]}>{chip.label}</Badge>}<Icon name="chevron" small /></>}
           />;
         })}
       </div>
+      {notes.length ? <details className="disclosure session-notes"><summary><Icon name="chevron" small />How these were read</summary><div className="disclosure-body stack">{notes.map((note) => <p key={note} className="xsmall subtle">{note}</p>)}</div></details> : null}
     </section> : null}
-
-    {snapshot ? <SessionSnapshotView snapshot={snapshot} hostName={hostName} remote={target !== "local"} folder={folder} onContinued={onContinued} route={remote ? { roomId, peerSessionId: remote.peerSessionId, hostRef: remote.hostRef! } : null} share={knowledge.state === "known" ? knowledge.workspaces.find((share) => share.scopeRef === snapshot.session.scopeRef) ?? null : undefined} /> : null}
-  </div>;
-}
-
-type ContinueRoute = { roomId: string; peerSessionId: string; hostRef: string } | null;
-
-function SessionSnapshotView({ snapshot, hostName, remote, folder, onContinued, route, share }: { snapshot: Snapshot; hostName: string; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute; share?: SharedWorkspace | null }) {
-  const session = snapshot.session;
-  const status = sessionStatusPresentation(session);
-  const evidence = evidenceGroups(snapshot.evidence);
-  const workspace = snapshot.workspace;
-  return <section className="card" aria-label="Session report">
-    <header className="card-header">
-      <div className="stack" style={{ gap: 2, minWidth: 0 }}>
-        <h3>{session.title ?? "(untitled)"}</h3>
-        <span className="xsmall subtle">{providerLabel(session.provider)} on {hostName} · {session.workspaceLabel} · session <span className="mono">{session.sessionId.slice(0, 8)}</span></span>
-      </div>
-      <Badge tone={STATUS_TONE[status.tone]}>{status.label}</Badge>
-    </header>
-    <div className="card-body">
-      <p className="small muted">{status.explanation}</p>
-      <dl className="facts">
-        <dt>Live state</dt><dd><Dot tone={session.live.state === "running" ? "live" : "neutral"} /> {session.live.state.replace("_", " ")} · from {session.live.source} · checked {relativeTime(session.live.observedAtMs)}</dd>
-        <dt>Last turn</dt><dd>{session.lastTurn.outcome.replace("_", " ")} ({session.lastTurn.source}{session.lastTurn.atMs ? `, ${relativeTime(session.lastTurn.atMs)}` : ""})</dd>
-        <dt>Activity</dt><dd>{snapshotActivityLine(snapshot)}</dd>
-        {snapshot.activity.changedFiles.length ? <><dt>Changed</dt><dd>{snapshot.activity.changedFiles.join(", ")}</dd></> : null}
-        <dt>Folder now</dt><dd>{workspace.exists ? workspace.gitBranch ? `${workspace.gitBranch} at ${workspace.head ?? "?"}, ${workspace.uncommittedPaths ?? "?"} uncommitted path(s)${workspace.commitsSinceLastActivity != null ? `, ${workspace.commitsSinceLastActivity} commit(s) since the session's last activity` : ""}.` : "Not a Git repository." : "The folder no longer exists."}</dd>
-        <dt>Continuing</dt><dd>{resumeLabel(session)}.</dd>
-      </dl>
-      <div className="evidence">
-        {evidence.facts.length ? <div className="evidence-group"><h4><Dot tone="ok" />Facts</h4><ul>{evidence.facts.map((item) => <li key={item.statement}>{item.statement} <small>({item.source})</small></li>)}</ul></div> : null}
-        {evidence.inferences.length ? <div className="evidence-group"><h4><Dot tone="warn" />Inferred</h4><ul>{evidence.inferences.map((item) => <li key={item.statement}>{item.statement} <small>({item.source})</small></li>)}</ul></div> : null}
-        {evidence.unknowns.length ? <div className="evidence-group"><h4><Dot />Not known</h4><ul>{evidence.unknowns.map((item) => <li key={item.statement}>{item.statement}</li>)}</ul></div> : null}
-      </div>
-      {snapshot.excerptsShared
-        ? snapshot.recent.length ? <div className="evidence-group"><h4>Recent conversation</h4><p className="xsmall subtle">Replies are the agent's own account, not verified.</p>{snapshot.recent.map((entry, index) => <div className="excerpt" key={index}><small>{entry.role === "user" ? "Prompt" : "Agent said"} · {relativeTime(entry.atMs)}</small>{entry.text}</div>)}</div> : null
-        : <p className="xsmall subtle">{hostName} shares statuses only, not excerpts of the conversation.</p>}
-      <ContinueSession session={session} remote={remote} folder={folder} onContinued={onContinued} route={route} hostName={hostName} share={share} />
-    </div>
-  </section>;
-}
-
-/** Continues this session in the session itself, with one new prompt. The
- * Host checks again at launch; nothing is retried, and no new session is
- * ever made in its place. */
-function ContinueSession({ session, remote, folder, onContinued, route, hostName, share }: { session: SessionView; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null) => void; route: ContinueRoute; hostName: string; share?: SharedWorkspace | null }) {
-  const [prompt, setPrompt] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [started, setStarted] = useState(false);
-  const availability = remote && !route
-    ? { allowed: false, reason: `${hostName} is not connected right now.` }
-    : continuationAvailability(session, !remote, hostName, share);
-
-  async function submit() {
-    if (!availability.allowed || !prompt.trim() || busy || started) return;
-    setBusy(true); setError(null);
-    try {
-      const status = route
-        ? await continueRemoteNativeSession({ roomId: route.roomId, peerSessionId: route.peerSessionId, targetHostRef: route.hostRef, provider: session.provider, sessionId: session.sessionId, scopeRef: session.scopeRef, prompt: prompt.trim(), expectedMarker: session.lastTurn.marker ?? null })
-        : await continueNativeSession({ workspaces: [folder], provider: session.provider, sessionId: session.sessionId, prompt: prompt.trim(), expectedMarker: session.lastTurn.marker ?? null });
-      setStarted(true);
-      onContinued?.(status, route?.hostRef ?? null);
-    } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
-    } finally { setBusy(false); }
-  }
-
-  return <div className="evidence-group" aria-label="Continue this session">
-    <h4>Continue this session</h4>
-    {availability.allowed ? <>
-      <textarea className="textarea" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={`What should ${providerLabel(session.provider)} do next in this session?`} aria-label="Next prompt" disabled={busy || started} />
-      <div className="row"><span className="spacer xsmall subtle">{availability.reason}</span><button type="button" className="btn btn-primary" disabled={busy || started || !prompt.trim()} onClick={() => void submit()}>{busy ? "Starting…" : started ? "Started" : "Continue session"}</button></div>
-      {started ? <p className="small muted">{remote ? `Sent to ${hostName}. It runs once someone there accepts.` : "Started in this session."} Follow it, answer its requests or stop it under Run a task.</p> : null}
-    </> : <p className="small muted">{availability.reason}</p>}
-    {error ? <Notice tone="bad">{error}</Notice> : null}
   </div>;
 }

@@ -297,7 +297,7 @@ Pastey can find the Claude Code and Codex sessions that already exist on this Ho
 - **Codex.**
   - History comes from Codex's own app-server, run as Pastey's read-only child from the Codex Pastey would launch (CLI or desktop app).
   - The reader may send only `thread/list` (exact `cwd` filter, state database only, so Codex repairs nothing), `thread/turns/list` and `thread/items/list`, in pages small enough for the line bound.
-  - An app-server reports thread status only for threads it loaded itself, and nothing tells another process which threads a desktop app or terminal has open. So a thread's live state is known only when no Codex process other than Pastey's own could hold it (from the process list), and is otherwise unknown. Pastey's own live session in the workspace also makes it unknown.
+  - An app-server reports thread status only for threads it loaded itself. Who has a thread open is answered, in order, by: Pastey's own app-servers, named by thread id (Pastey's conversation in a folder, idle or running a task, and any continuation in flight); Codex's per-thread writer lock where it can be read without taking it (macOS, below); otherwise the process list, which is device-wide: no Codex process other than Pastey's own children means no client can have any thread open, and any such process makes it unknown for every thread.
 - **Status.** Live facts decide execution; history only explains how a session nothing runs had ended.
   - Running and idle come only from a live source.
   - With no live process: the last recorded turn gives completed, failed or interrupted. A history that stops mid-turn becomes interrupted, as an inference.
@@ -312,6 +312,30 @@ Pastey can find the Claude Code and Codex sessions that already exist on this Ho
   - Every statement carries its basis (`fact`, `inference` or `unknown`) and source.
   - The agent's replies are labelled `agent_claim`, and the snapshot states that the work they describe is not verified.
 - **Choosing a session.** Provider, text (title, workspace folder name, branch) and recency narrow the list. One match is `unique`; several are `ambiguous` and returned as candidates, newest first. Pastey never picks among them.
+
+#### Sessions, processes and tasks
+
+What Pastey means by each, and which part of Pastey answers what. The boundaries matter because each answer comes from a different source with a different reach.
+
+- **A session is saved history, not a process.** A Codex thread is Codex's own record in that device's Codex home (`~/.codex`, its state database and rollouts); a Claude Code session is its transcript under `~/.claude/projects`. It belongs to one device and to the folder it was started in, and it outlives every client: quitting the Codex app or a terminal ends a *process* that had the thread open, not the thread. That is why Pastey still finds a thread after every Codex client on that device has quit, and why it could continue one in the real Mac → Windows acceptance after the app was closed.
+- **Four responsibilities, kept apart:**
+
+| | Answers | Source | Reach | Changes anything |
+|---|---|---|---|---|
+| Discovery | Which sessions exist in this folder | Codex: Pastey's own read-only `codex app-server` child, `thread/list` with an exact `cwd`, state database only. Claude Code: the transcript folder | The named or shared folders on that device | No |
+| History inspection | How its last turn ended, its end marker, counts, excerpts | `thread/turns/list`, `thread/items/list`; the transcript | One session | No |
+| Hold observation | Whether something has it open now | Pastey's own holds; Codex's writer lock (macOS); else the process list (device-wide); `claude agents --json` | A moment: it can change right after | No |
+| Continuation | One new turn in the session itself | `agent.coding.codex_thread` (`thread/resume` under Codex's lock) or `claude --bg --resume` | That session, once, after the Host's Accept for a peer | Yes, once |
+
+- **Discovery and inspection never decide continuation.** Their verdict (`resume`) explains in advance; the decision is taken again at launch, by the provider's own exclusion (Codex refuses a second writer; Claude Code copies a held session, which Pastey stops and reports as unknown) and by Pastey's check that the session still ends with the marker the user saw.
+- **Pastey's own holds are named.** Pastey keeps its own conversation's app-server open between tasks in a folder (New task), so its writer lock is held while idle. Discovery reports that thread as "Pastey's own Codex session" (idle: `attached`, resume `safe`; running a task: `running`, resume `unsafe`), never as another client's. A continuation of that thread first closes Pastey's *idle* session of it (`capability/codex/own_holds.rs`; nothing is lost: the conversation is saved and reopened with `thread/resume` next time), waits up to 5 s for Codex to remove the lock file, and then relies on Codex's own refusal as before. A session a Pastey task is using is never closed; that continuation is refused before anything runs. Folder exclusivity keeps a Pastey task from starting in that folder meanwhile.
+- **How each state is said.** The renderer explains each live source (`src/lib/nativeSessions.ts`, `sessionHoldLine`): the writer lock is a fact about this thread; the process list is a fact about the whole device ("no Codex app or terminal is running on Windows, so nothing has it open"; or "Codex is running there and Pastey cannot tell which threads it has open: if this one, Codex refuses and nothing runs"). The verdict is shown as what the last look found, never as a promise.
+- **When things change.**
+  - A client opens the thread after the look: Codex refuses at `thread/resume`; the task ends "Did not start · nothing ran" with that reason and the fix.
+  - The session changed: refused under the lock; "look at it again".
+  - The device disconnects before Accept: the request is not delivered (a definite non-start) or its outcome is unknown, by the existing rules; after Accept, the existing reconciliation applies. Nothing is retried.
+  - The share or a switch changed, or the Bridge session changed, before Accept: "access ended before it started · nothing ran".
+  - History unreadable: not continuable. Codex without writer locks (before 0.163): refused at launch.
 
 ### Remote session reading
 
@@ -328,17 +352,14 @@ From one device, the user can see the Claude Code and Codex sessions on another 
   - It runs the same discovery as locally, only in the permitted folders.
   - It answers without folder paths. Titles, statements and excerpts lose any path-like text, and changed files are named only relative to the folder.
   - Excerpts are sent only when permitted, and never as whole transcripts.
-- **Showing.** The card lists candidates, newest first, with provider, folder name, branch, origin and last activity. Several matches are shown as candidates, and Pastey never picks one. For the chosen session it shows:
-  - the status, explained from its basis;
-  - the live source and when it was checked;
-  - how the last recorded turn ended;
-  - activity counts and changed files;
-  - Git facts about the folder now;
-  - the evidence, split into facts, inferences and unknowns;
-  - when shared, recent excerpts, with replies labelled as the agent's own account.
+- **Showing.** Agents → Continue a session looks by itself, once per folder scope, as soon as there is a folder to look in (a folder chosen on this device, or a folder that device shares with Sessions on); Look again repeats it. The list shows candidates, newest first, with provider, folder name, branch, origin, last activity, status and whether it can be continued from here. Pastey never picks one. A session's own view leads with whether it can be continued and what happens if it is, then:
+  - its state, in words, and who has it open (with how Pastey knows);
+  - activity counts and changed files, and Git facts about the folder now;
+  - when shared, recent excerpts, with replies labelled as the agent's own account;
+  - one step away (Evidence and how Pastey knows): where the session is saved, the live source and when it was checked, how the last turn ended, its ids, and the evidence split into facts, inferences and unknowns.
 
   A session is never shown as running or done because of its last message.
-- **Windows.** Discovery uses the plain form of a canonical Windows path for Claude Code's folder name and for Codex's `cwd` filter, and for relative changed files. Codex's live state comes from a `Win32_Process` query for `codex.exe`. None of this has run on a Windows machine yet; see the [acceptance procedure](../platform/mac-windows-acceptance.md).
+- **Windows.** Discovery uses the plain form of a canonical Windows path for Claude Code's folder name and for Codex's `cwd` filter, and for relative changed files. Codex's live state comes from a `Win32_Process` query for `codex.exe` (Codex's writer lock cannot be read there without taking it). Mac → Windows discovery, inspection and continuation of a Codex Desktop thread passed on real devices (October 2026): with the app open the thread was refused by Codex's writer lock and nothing ran; with every Codex client closed it was found, continued in place (1 → 2 turns), and released. See the [acceptance procedure](../platform/mac-windows-acceptance.md).
 
 ### Native session continuation
 
@@ -366,10 +387,10 @@ This Host's user can continue one discovered **Claude Code** session with a new 
 #### Codex threads (`agent.coding.codex_thread`, `capability/codex/thread_continuation.rs`)
 
 Since Codex 0.163 every app-server that loads a thread holds an exclusive lock on `<CODEX_HOME>/thread-writer-locks/<thread>.lock` and removes it on exit, and another app-server's `thread/resume` of that thread is refused ("already has an active writer"). Measured on macOS with the CLI and with the desktop app's bundled Codex, which refuse each other ([codex-session-probe](../../tools/codex-session-probe/README.md#update-2026-10-19-codex-0163-thread-writer-locks)). Pastey builds on that, and on nothing private:
-- **Observation.** Discovery reads the lock without taking it (on macOS a POSIX `F_GETLK` reports the flock): held is "another Codex client has it open" (running when its last turn is in progress), free is a fact that none does. Elsewhere the lock cannot be read without taking it, and the earlier process-list rule applies.
-- **Continuation.** Each run opens its own app-server, used for one turn and then closed, so the lock is held exactly while Pastey's turn runs. `thread/resume` takes the lock or is refused (a definite non-start that says the thread is open in the Codex app or a terminal). Holding it, the adapter checks that the launched Codex keeps writer locks at all, that the thread's recorded folder is exactly the admitted one, that its newest turn is still the marker and not in progress. Then one `turn/start`, tagged with the task id as `clientUserMessageId`, observed like any Codex turn (native requests, Stop, response). Every refusal precedes `turn/start`; a thread is never replaced by a new one, and nothing is sent twice.
+- **Observation.** Discovery reads the lock without taking it (on macOS a POSIX `F_GETLK` reports the flock): held is "another Codex client has it open" (running when its last turn is in progress), free is a fact that none does. A thread Pastey itself has open is reported as Pastey's before the lock is read. Elsewhere the lock cannot be read without taking it, and the process-list rule applies.
+- **Continuation.** Each run opens its own app-server, used for one turn and then closed, so the lock is held exactly while Pastey's turn runs. If Pastey's own conversation has the thread open, idle, that session is closed first (above). `thread/resume` takes the lock or is refused (a definite non-start that says the thread is open in the Codex app or a terminal). Holding it, the adapter checks that the launched Codex keeps writer locks at all, that the thread's recorded folder is exactly the admitted one, that its newest turn is still the marker and not in progress. Then one `turn/start`, tagged with the task id as `clientUserMessageId`, observed like any Codex turn (native requests, Stop, response). Every refusal precedes `turn/start`; a thread is never replaced by a new one, and nothing is sent twice.
 - **Unknown outcomes.** An unknown turn's app-server is closed rather than left running unobserved; the outcome stays unknown, and the lock is released. If Pastey stops, its app-server ends with it.
-- **From another device.** The adapter advertises the generic invocation protocol. The requesting device sends the thread id, prompt and marker, and names the folder only by the `scopeRef` of the folder's share. The executing Host resolves that scope among the folders it shares with that exact device with both Sessions and Agent requests on (`session_read_access::resolve_agent_request`, from `room_control`, before admission); a path or any other scope is refused. Every such invocation waits for the Host's Review: unattended grants are per capability and exist only for `agent.coding.codex`. Reading never implies continuing; continuing needs reading, agent requests and an Accept.
+- **From another device.** The adapter advertises the generic invocation protocol. The requesting device sends the thread id, prompt and marker, and names the folder only by the `scopeRef` of the folder's share. The executing Host resolves that scope among the folders it shares with that exact device with both Sessions and Agent requests on (`session_read_access::resolve_agent_request`, from `room_control`, before admission); a path or any other scope is refused. Every such invocation waits for the Host's Review: unattended grants are per capability and exist only for `agent.coding.codex`. The Review names the Host's own shared folder it is for (`NativeInvocationReviewV1.sharedFolder`, a folder name shown only on the Host), never the request's content. Reading never implies continuing; continuing needs reading, agent requests and an Accept.
 
 #### Running in a shared folder
 

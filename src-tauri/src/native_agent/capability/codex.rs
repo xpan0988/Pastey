@@ -52,6 +52,7 @@ use crate::native_agent::{
     WORKSPACE_MOVEMENT_PROTOCOLS,
 };
 
+pub(in crate::native_agent) mod own_holds;
 pub(in crate::native_agent) mod thread_continuation;
 pub(in crate::native_agent) mod writer_lock;
 
@@ -414,6 +415,7 @@ pub(in crate::native_agent) struct CodexNativeAdapterV1 {
     executable: Mutex<PathBuf>,
     availability: AvailabilityCacheV1,
     sessions: SessionStoreV1,
+    own_holds: own_holds::OwnThreadHoldsV1,
     /// The app-server of each task. A task acts only on its own controller,
     /// never on a later session that has replaced it.
     task_sessions: Mutex<HashMap<String, Arc<CodexTaskSlotV1>>>,
@@ -424,10 +426,12 @@ pub(in crate::native_agent) struct CodexNativeAdapterV1 {
 
 impl Default for CodexNativeAdapterV1 {
     fn default() -> Self {
+        let sessions = SessionStoreV1::default();
         Self {
             executable: Mutex::new(PathBuf::from(INSTALLED_CODEX)),
             availability: Arc::default(),
-            sessions: Arc::default(),
+            own_holds: own_holds::OwnThreadHoldsV1::new(sessions.clone()),
+            sessions,
             task_sessions: Mutex::default(),
             next_sequence: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -457,8 +461,14 @@ impl CodexNativeAdapterV1 {
             .unwrap_or_else(|_| PathBuf::from(INSTALLED_CODEX))
     }
 
+    /// The threads Pastey's own app-servers have open, shared with the
+    /// thread continuation adapter and read by session discovery.
+    pub(in crate::native_agent) fn own_thread_holds(&self) -> own_holds::OwnThreadHoldsV1 {
+        self.own_holds.clone()
+    }
+
     /// Whether a Host-private session exists in a workspace (workspace
-    /// movement, and session discovery's holder check).
+    /// movement).
     pub(in crate::native_agent) fn has_session(&self, workspace: &Path) -> bool {
         self.sessions.lock().is_ok_and(|sessions| {
             sessions

@@ -1,19 +1,35 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { remoteAccessGuidance, type AccessLine } from "../../lib/accessGuidance";
 import { shareSummary, type PeerShareKnowledge } from "../../lib/workspaceShares";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
 import { getDeviceIdentity, getDeviceProfile, presentDeviceIdentity } from "../../lib/tauri";
 import type { RoomInfo } from "../../lib/types";
+import { continuedSessionKey } from "./AgentTaskLifecycle";
+import { AgentTaskTracker } from "./AgentTaskTracker";
 import { NativeAgentPanel, type NativeAgentController } from "./NativeAgentPanel";
-import { NativeSessionsCard } from "./NativeSessionsCard";
+import { NativeSessionsCard, type OpenSessionRequest } from "./NativeSessionsCard";
 import { usePeerSharedWorkspaces } from "./BridgeWorkspaces";
-import { Badge, Dot, Icon, Notice } from "./ui";
+import { Badge, Dot, Icon, Notice, Segmented } from "./ui";
 
-/** Agent work on one device of this Bridge, in one place, with its two
- * authorities kept apart: running a task (Execution, which the executing
- * device admits) and reading sessions that already exist (Observation,
- * which the holding device allows separately). Both use the folders that
- * device shares with this Bridge, by name; it resolves its own paths. */
+type AgentMode = "new" | "sessions";
+const MODE_KEY = "pastey:agents-mode-v1";
+
+function rememberedMode(roomId: string): AgentMode {
+  try { return (JSON.parse(window.localStorage.getItem(MODE_KEY) ?? "{}") as Record<string, AgentMode>)[roomId] === "sessions" ? "sessions" : "new"; }
+  catch { return "new"; }
+}
+
+function rememberMode(roomId: string, mode: AgentMode) {
+  try { window.localStorage.setItem(MODE_KEY, JSON.stringify({ ...(JSON.parse(window.localStorage.getItem(MODE_KEY) ?? "{}") as Record<string, AgentMode>), [roomId]: mode })); }
+  catch { /* a convenience only */ }
+}
+
+/** Agent work on one device of this Bridge. The page answers, top down:
+ * which device the agents work on (and what it allows), the one task this
+ * Bridge follows and where it is, then one of two things to do there:
+ * start a new task, or continue a session that already exists. Running and
+ * reading stay separate authorities, each decided by the device that holds
+ * them; both use the folders it shares with this Bridge, by name. */
 export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOpenDetails }: {
   room: RoomInfo;
   agent: NativeAgentController;
@@ -24,12 +40,17 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
 }) {
   // Prefer the other device: running there is why most people open this.
   const [target, setTarget] = useState<string>(() => members.find((peer) => peer.hostRef)?.hostRef ?? "local");
+  const [mode, setModeState] = useState<AgentMode>(() => rememberedMode(room.id));
   const [waitedForAccept, setWaitedForAccept] = useState<Record<string, boolean>>({});
+  const [openSession, setOpenSession] = useState<string | null>(null);
+  const [openRequest, setOpenRequest] = useState<OpenSessionRequest | null>(null);
   const options = useMemo(() => members.filter((peer) => peer.hostRef), [members]);
   const targetHostRef = target === "local" ? null : target;
   const targetName = targetHostRef ? options.find((peer) => peer.hostRef === targetHostRef)?.displayName ?? "the other device" : "this device";
   const connected = targetHostRef ? peers.some((peer) => peer.hostRef === targetHostRef) : true;
   const shares = usePeerSharedWorkspaces(room.id, targetHostRef, connected);
+
+  const setMode = useCallback((next: AgentMode) => { setModeState(next); rememberMode(room.id, next); }, [room.id]);
 
   // A run that waits in Review tells this device that the other one has no
   // unattended permission for it there. Nothing else is inferred.
@@ -39,41 +60,62 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
     }
   }, [agent.status, agent.taskHostRef]);
 
-  return <div className="panel-inner">
-    <div className="panel-intro">
-      <h2>Agents</h2>
-      <p>Run Codex on a device of this Bridge, or look at the Claude Code and Codex sessions already on it. Running and reading are allowed separately, by the device that does them.</p>
-    </div>
+  // The followed task is shown once: inside the session it continues while
+  // that session is open on its own device, otherwise here at the top.
+  const continuedKey = agent.continues ? continuedSessionKey(agent.continues) : null;
+  const taskOnTarget = (agent.taskHostRef ?? "local") === target;
+  const trackerInSession = mode === "sessions" && taskOnTarget && !!continuedKey && openSession === continuedKey;
+  const taskEnded = !!agent.status && !["queued", "running"].includes(agent.status.state);
+  const openContinuedSession = agent.continues ? () => {
+    setTarget(agent.taskHostRef ?? "local");
+    setMode("sessions");
+    setOpenRequest({ provider: agent.continues!.provider, sessionId: agent.continues!.sessionId, nonce: Date.now() });
+  } : undefined;
 
-    <section className="card device-bar" aria-label="Device">
-      <div className="card-body">
-        <div className="row-wrap">
-          <label className="field-label" htmlFor="agent-device">Device</label>
-          <select id="agent-device" className="select" style={{ flex: "1 1 200px", width: "auto" }} value={target} onChange={(event) => setTarget(event.target.value)}>
-            <option value="local">This device</option>
-            {options.map((peer) => <option key={peer.hostRef} value={peer.hostRef}>{peer.displayName}{peers.some((routeable) => routeable.hostRef === peer.hostRef) ? "" : " (not connected)"}</option>)}
-          </select>
-          {targetHostRef ? <button type="button" className="btn btn-sm" onClick={() => onOpenDevice(targetHostRef)}><Icon name="device" small />Device details</button> : null}
-        </div>
-        {targetHostRef ? <SharedWorkspacesLine name={targetName} knowledge={shares.knowledge} connected={connected} onOpenDetails={onOpenDetails} /> : null}
-        {targetHostRef ? <RemoteAccessSummary room={room} hostRef={targetHostRef} name={targetName} connected={connected} paired={(room.pairing_state ?? "pairing_required") === "paired"} sharing={shares.knowledge} waitedForAccept={waitedForAccept[targetHostRef] ?? null} /> : null}
+  return <div className="panel-inner">
+    <section className="agents-head" aria-label="Device">
+      <div className="agents-device">
+        <label className="field-label" htmlFor="agent-device">Agents on</label>
+        <select id="agent-device" className="select" value={target} onChange={(event) => setTarget(event.target.value)}>
+          <option value="local">This device</option>
+          {options.map((peer) => <option key={peer.hostRef} value={peer.hostRef}>{peer.displayName}{peers.some((routeable) => routeable.hostRef === peer.hostRef) ? "" : " (not connected)"}</option>)}
+        </select>
+        {targetHostRef ? <span className="row xsmall subtle"><Dot tone={connected ? "ok" : "neutral"} />{connected ? "Connected" : "Not connected"}</span> : null}
+        {targetHostRef ? <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenDevice(targetHostRef)}><Icon name="device" small />Device details</button> : null}
       </div>
+      <p className="small muted">{targetHostRef
+        ? `You are on this device. Tasks and sessions below are on ${targetName}: it runs them and reads them, and it decides what this device may do there.`
+        : "Tasks and sessions below are on this device, in folders you choose here."}</p>
+      {targetHostRef ? <SharedWorkspacesLine name={targetName} knowledge={shares.knowledge} connected={connected} onOpenDetails={onOpenDetails} /> : null}
+      {targetHostRef ? <RemoteAccessSummary room={room} hostRef={targetHostRef} name={targetName} connected={connected} paired={(room.pairing_state ?? "pairing_required") === "paired"} sharing={shares.knowledge} waitedForAccept={waitedForAccept[targetHostRef] ?? null} /> : null}
     </section>
 
-    <section className="section" aria-label="Run a task">
-      <div className="section-head">
-        <h2 className="row">Run a task <Badge tone="live">Execution</Badge></h2>
-        <p>Pastey starts Codex on {targetName} and follows this run: its approvals, its result, and any folder it moves. A run continues your earlier Pastey conversation in that folder unless you start a new one.</p>
-      </div>
+    {trackerInSession ? null : <AgentTaskTracker roomId={room.id} agent={agent} peers={peers} members={members} onOpenSession={openContinuedSession} />}
+
+    <div className="agents-modes">
+      <Segmented<AgentMode> label="What to do" value={mode} onChange={setMode} options={[{ value: "new", label: "New task" }, { value: "sessions", label: "Continue a session" }]} />
+      <span className="small muted">{mode === "new"
+        ? <>Give Codex a task in a folder on {targetName}. <Badge tone="live">Execution</Badge></>
+        : <>Pick up a Claude Code or Codex session already saved on {targetName}. Looking changes nothing. <Badge>Read, then continue</Badge></>}</span>
+    </div>
+
+    <section className="section" aria-label="Run a task" hidden={mode !== "new"}>
       <NativeAgentPanel roomId={room.id} agent={agent} peers={peers} members={members} target={target} shares={shares} onOpenDetails={onOpenDetails} />
     </section>
 
-    <section className="section" aria-label="Existing sessions">
-      <div className="section-head">
-        <h2 className="row">Sessions on {targetName} <Badge>Look or continue</Badge></h2>
-        <p>Sessions Claude Code and Codex already keep there, including ones Pastey started (marked). Looking never changes a session. You can continue an idle session in the session itself (Codex threads on another device after its user accepts); the run then appears under Run a task.</p>
-      </div>
-      <NativeSessionsCard roomId={room.id} peers={[...peers]} members={[...members]} target={target} shares={shares} onContinued={agent.adoptTask} />
+    <section className="section" aria-label="Existing sessions" hidden={mode !== "sessions"}>
+      <NativeSessionsCard
+        roomId={room.id}
+        peers={[...peers]}
+        members={[...members]}
+        target={target}
+        shares={shares}
+        active={mode === "sessions"}
+        onContinued={agent.adoptTask}
+        openRequest={openRequest}
+        onOpenChange={setOpenSession}
+        continued={continuedKey && taskOnTarget ? { key: continuedKey, ended: taskEnded, node: <AgentTaskTracker roomId={room.id} agent={agent} peers={peers} members={members} inSession onLookAgain={openContinuedSession} /> } : null}
+      />
     </section>
   </div>;
 }

@@ -12,26 +12,29 @@ How the desktop UI is organized, and why. Product rules (authority, movement, re
 |---|---|---|---|
 | Movement: text and files, either way | **Share** tab. Send by typing, + → Send files…, or drop on the window. Get a file with + → Get a file from <device>… | Send: this device's user. Get: the other device's shared search folders only | Get a file: review the Search, then choose the one file |
 | Workspace sharing: this device's folders, for one Bridge | **Bridge details → Workspaces** → Share a workspace… (this device's own folder picker), then per folder: Sessions, excerpts, Agent requests, Allow without asking…, Stop sharing | This device's user only; the Bridge's own device, trusted once (inline Trust… there) | None to share; sharing allows nothing until a switch is on |
-| Execution: Run Codex | **Agents** tab → Run a task → Shared by <device> (by name), Another folder on <device> (typed path), or On this device (movement) | The executing device's Accept, or its own unattended permission | The other device's Accept; workspace movement reviewed here first |
-| Observation: Agent sessions | **Agents** tab → Sessions on <device> | A share of that folder with Sessions on | None: read only, never starts, continues or stops a session |
-| Continuation: an existing session, in itself | **Agents** tab → a session's report → Continue session | This device's user; on another device, a share with Sessions and Agent requests on, and its Accept | The other device's Accept for each remote continuation; the session must still end where you saw it |
+| Execution: Run Codex | **Agents** tab → New task → Shared by <device> (by name), Another folder on <device> (typed path), or On this device (movement) | The executing device's Accept, or its own unattended permission | The other device's Accept; workspace movement reviewed here first |
+| Observation: Agent sessions | **Agents** tab → Continue a session (the list, and each session's view) | A share of that folder with Sessions on | None: read only, never starts, continues or stops a session |
+| Continuation: an existing session, in itself | **Agents** tab → Continue a session → a session → Continue session | This device's user; on another device, a share with Sessions and Agent requests on, and its Accept | The other device's Accept for each remote continuation; the session must still end where you saw it |
 
 ### Inside the Bridge, not in Settings
 
 A Bridge is the collaboration context the user already set up, so everything that concerns only that Bridge is done there. Before, letting the Mac read Windows's sessions meant leaving the Bridge for Settings → Permissions → Session reading, choosing the Mac again and choosing the folder again; running Codex there meant typing the Windows path on the Mac. Now:
 - **Windows:** this Bridge → Bridge details → Workspaces → Share a workspace…, choose the folder with Windows's own picker, turn on Sessions (and Agent requests to let the Mac run or continue there). If the Mac is not trusted yet, the same place offers Trust… with the fingerprint, once.
-- **Mac:** this Bridge → Agents. The device bar shows what Windows shares; Run a task offers it by name; Sessions on Windows lists its sessions; a session's report offers Continue. Every missing permission is explained in place with the exact step on Windows, never as an unexplained grey button.
+- **Mac:** this Bridge → Agents → Agents on Windows. The header shows what Windows shares; New task offers it by name; Continue a session lists its sessions by itself; a session's view offers Continue session and then follows the run in place. Every missing permission is explained in place with the exact step on Windows, never as an unexplained grey button.
 - Each device shows its identity to the Bridge's other devices once per connection while the Bridge is open (it grants nothing), so the other device can trust it without a step here.
 - Settings → Permissions keeps the cross-Bridge view: every shared workspace (Stop sharing), unattended Codex access, and shared search folders.
 
-### Why one Agents tab, with two sections
+### Agents: one device, one followed task, two things to do
 
-People think "what are agents doing on that device", not "execution versus observation". Both start from the same choice, the device, and most visits want both: start something there, or see what is already there. Two top-level tabs made users choose a Pastey category first and pick the device twice.
+People think "what are agents doing on that device", not "execution versus observation". The page answers the user's questions top down, in the order they arise:
 
-The authorities stay apart inside the one tab:
-- **Run a task** (badge: Execution) holds the form and the one task Pastey started and follows: its approvals, response, movement and recovery.
-- **Sessions on <device>** lists what Claude Code and Codex already keep there. A session Pastey started is marked "Started by Pastey". Looking changes nothing. An idle session can be continued in the session itself from its report; the run is then followed under Run a task, so a run is never presented as two live things.
-- **Access on <device>** lists each authority separately (pairing, running Codex, Codex's own approval prompts, reading sessions, continuing) from what that device says it shares, with what the other device decides and the exact steps there, inside this Bridge. There is no single trust switch, and nothing can be granted from this side.
+1. **Which device?** "Agents on [device]", with its connection, and a sentence saying that you are on this device and that the work below runs on, is read from, and is allowed by that device. What it shares follows in one line; Access on <device> (collapsed unless something needs action there) lists each authority separately (pairing, running Codex, Codex's own approval prompts, reading sessions, continuing), with the exact steps there. There is no single trust switch, and nothing can be granted from this side.
+2. **What is running?** The one task this Bridge follows, with where it is (Sent → Accepted there → Running → Result, or Started here → Running → Result on this device), what its outcome means, whether anything ran, and what to do next; then its approvals, reply, movement and repair actions. It is shown once: inside the session it continues while that session is open, otherwise here at the top, with Open the session. A finished task can be dismissed; one that needs resolution cannot.
+3. **New task or Continue a session?** One choice, one view at a time (remembered per Bridge):
+   - **New task** (badge: Execution) is the form: folder, task, and whether to continue the conversation Pastey keeps for you in that folder or start a new one. That conversation is itself a Codex thread, listed under Continue a session as "Started by Pastey"; to pick up a conversation from the Codex app or a terminal, Continue a session is the way.
+   - **Continue a session** (badge: Read, then continue) lists what Claude Code and Codex have saved there, by itself once there is a folder to look in, each row with whether it can be continued from here (Can continue, Can try, Open elsewhere, Running, Only on that device, Can't continue). Opening one shows its view: first whether it can be continued and what happens if it is, then its state in words and who has it open, its history and the folder now, recent excerpts when shared, and the evidence one step away. Continue session replaces the form with the run's progress; when the run ends the session is read again, so it shows the new turn and its new end marker.
+
+Why this shape rather than two stacked sections: the earlier page showed the device bar, the Run form, the running task, the session filters, the list and a long report on one scroll. Continuing a session meant scrolling past the Run form, and after Continue the button went grey while the run appeared in another section, far above; a refusal ("open in another Codex client") was a muted line there. Facts, Not known and Git evidence came before the Continue box. Now the decision comes first, the run stays where it was started, every terminal state says whether anything ran and what to do, and evidence is on request.
 
 | Capability | Status |
 |---|---|
@@ -40,13 +43,15 @@ The authorities stay apart inside the one tab:
 | Share a folder with one Bridge, from inside it, with Sessions and Agent requests chosen per folder | Implemented (Mac ↔ Windows acceptance N) |
 | Run Codex in a folder another device shares, chosen by name | Implemented: that device resolves its own path; same Review and unattended grants |
 | Read-only discovery and inspection of Claude Code and Codex sessions, here or on another device that shares the folder with Sessions on | Implemented |
-| Continue an idle Codex thread on this device, in the thread itself | Implemented: Codex's writer lock excludes other writers; checked against the turn you saw (real, macOS) |
-| Continue a Codex thread on another device | Implemented: needs a share with Sessions and Agent requests there, and that device's Accept per run (Windows enforcement inferred, acceptance M and N) |
+| Continue an idle Codex thread on this device, in the thread itself | Implemented: Codex's writer lock excludes other writers; checked against the turn you saw (real, macOS). A thread only Pastey's own idle conversation holds is continued after Pastey closes that session |
+| Continue a Codex thread on another device | Implemented: needs a share with Sessions and Agent requests there, and that device's Accept per run (real Mac → Windows: refused while the Codex app had it open, continued once every Codex client was closed) |
 | Continue an idle Claude Code session on this device | Implemented: `claude --bg --resume`, copy-on-held, checked against the entry you saw |
 | Continue a Claude Code session from another device | Not enabled: a background session can outlive Pastey there (remote-continuation.md) |
 | Observe or steer a turn the Codex app is running | Not possible through supported interfaces: its app-server is private; the writer lock only shows that it has the thread open |
 
-Continuation is Execution, started from Observation: Run with Codex continues *Pastey's own* Codex conversation in a folder unless "Start a new conversation" is chosen, and a session's report offers **Continue session** for an existing Codex thread or Claude Code session. It runs in the session itself, only while the session still ends with the entry you saw, and is then followed under Run a task. Each report says why when it cannot be continued (open in another client, changed, held, unreadable, or a Claude Code session on another device). A continuation on another device also needs that folder shared with Sessions and Agent requests on, and that device's Accept.
+Continuation is Execution, started from Observation: New task continues *Pastey's own* Codex conversation in a folder unless "Start a new conversation" is chosen, and a session's view offers **Continue session** for an existing Codex thread or Claude Code session. It runs in the session itself, only while the session still ends with the entry you saw, and is followed in that session's view. Each view says why when it cannot be continued (open in another client, a Pastey task running in it, changed, unreadable, or a Claude Code session on another device), and says "You can try" when Pastey cannot see whether a client has it open and Codex decides at the start. A continuation on another device also needs that folder shared with Sessions and Agent requests on, and that device's Accept, whose banner there names the shared folder it is for.
+
+A session is saved history on its device, not a running program: the Codex app or a terminal quitting ends a process that had it open, not the session. Pastey reads that history through a read-only Codex of its own, so finding a thread never needs the app, and says where each "is it open?" answer comes from (Codex's lock for this thread on macOS; the device's list of running Codex programs on Windows; Pastey's own record of what it has open). Details: [Layer 5 → Sessions, processes and tasks](layers/layer-5-agent.md#sessions-processes-and-tasks).
 
 Managed Plans arrive by event and are pinned above the Share thread while open (review, readiness, execution, terminal state), because they are reviewed movement across the Bridge.
 
@@ -121,8 +126,10 @@ Measurements are shown only after they are taken, with what they exercised and w
 | Activity (in-flight and recent transfers) | 2.0 Activity page | Share thread with live progress; Inbox for received items | Merged |
 | Burn defaults | Legacy and 2.0 Settings | — | Removed: the Host never reads it |
 | Find file | 2.0 composer mode | Share → + → Get a file from <device>… | Moved |
-| Agent sessions | 2.0 Task mode card; then Sessions tab | Agents → Sessions on <device> | Merged |
-| Run with Codex | 2.0 Task mode card; then Agent tab | Agents → Run a task | Merged |
+| Agent sessions | 2.0 Task mode card; then Sessions tab; then Agents → Sessions on <device> | Agents → Continue a session | Merged |
+| Run with Codex | 2.0 Task mode card; then Agent tab; then Agents → Run a task | Agents → New task | Merged |
+| Session report: Live state, Last turn, Facts / Inferred / Not known, ids | Agents → a session's report, always open | A session's view → Evidence and how Pastey knows | Kept, on request |
+| The followed task (approvals, reply, movement, Reconcile, Stop, Abandon, Retry Return) | Agents → Run a task, above the form | Agents, above the choice; inside the session it continues while that is open | Kept, shown once |
 
 Security information stays visible: every permission names the device, folder, Bridge and expiry; Revoke sits next to it in Settings and in that Bridge's details; Trust, Forget, Replace key and Burn each need a confirmation that says what happens.
 

@@ -90,10 +90,18 @@ pub(crate) struct NativeInvocationReviewV1 {
     pub(crate) requesting_peer_session_id: String,
     pub(crate) capability_display_name: String,
     pub(crate) expires_at: i64,
+    /// The name of this Host's own shared folder the request was admitted
+    /// through, when it named one. Shown only on this Host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) shared_folder: Option<String>,
 }
 
 impl PendingNativeInvocationV1 {
-    pub(super) fn review(&self, capability_display_name: &str) -> NativeInvocationReviewV1 {
+    pub(super) fn review(
+        &self,
+        capability_display_name: &str,
+        shared_folder: Option<String>,
+    ) -> NativeInvocationReviewV1 {
         NativeInvocationReviewV1 {
             task_id: self.task_id.clone(),
             bridge_id: self.binding.bridge_id.clone(),
@@ -101,6 +109,7 @@ impl PendingNativeInvocationV1 {
             requesting_peer_session_id: self.binding.peer_route_ref.clone(),
             capability_display_name: capability_display_name.to_owned(),
             expires_at: self.expires_at,
+            shared_folder,
         }
     }
 }

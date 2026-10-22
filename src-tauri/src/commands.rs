@@ -870,7 +870,7 @@ pub async fn discover_native_sessions(
     let workspaces =
         crate::native_agent::sessions::authorized_workspaces(&state.paths, &query.workspaces)
             .map_err(|error| error.message())?;
-    let (claude, codex) = state.native_agents.lock().session_sources(&workspaces);
+    let (claude, codex) = state.native_agents.lock().session_sources();
     tokio::task::spawn_blocking(move || {
         crate::native_agent::sessions::discover(&claude, &codex, &workspaces, &query)
     })
@@ -888,7 +888,7 @@ pub async fn inspect_native_session(
     let workspaces =
         crate::native_agent::sessions::authorized_workspaces(&state.paths, &request.workspaces)
             .map_err(|error| error.message())?;
-    let (claude, codex) = state.native_agents.lock().session_sources(&workspaces);
+    let (claude, codex) = state.native_agents.lock().session_sources();
     tokio::task::spawn_blocking(move || {
         crate::native_agent::sessions::inspect(
             &claude,
@@ -928,7 +928,7 @@ pub async fn continue_native_session(
     let workspaces =
         crate::native_agent::sessions::authorized_workspaces(&state.paths, &request.workspaces)
             .map_err(|error| error.message())?;
-    let (claude, codex) = state.native_agents.lock().session_sources(&workspaces);
+    let (claude, codex) = state.native_agents.lock().session_sources();
     let session_id = request.session_id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         crate::native_agent::sessions::inspect(&claude, &codex, &workspaces, provider, &session_id)

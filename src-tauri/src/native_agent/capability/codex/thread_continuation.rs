@@ -6,6 +6,9 @@
 //! closed, so Codex's thread writer lock (see `writer_lock`) is held exactly
 //! while Pastey's turn runs:
 //!
+//! 0. If Pastey's own conversation keeps the thread open, idle, that session
+//!    is closed first (`own_holds`): nothing is lost, and Codex's refusal
+//!    below stays the only gate. One a Pastey task is using is never closed.
 //! 1. `thread/resume` takes the lock. Codex refuses it while another client
 //!    (the Codex app or a terminal) has the thread open, and nothing runs.
 //! 2. Holding the lock, Pastey checks that the thread still ends with the
@@ -33,9 +36,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    cached_report, codex_unavailable_summary, observe_selection, workspace_exclusivity_key,
-    AvailabilityCacheV1, CodexAppServerV1, CodexTaskAttachmentV1, CodexTaskSlotV1,
-    AVAILABILITY_TTL, INSTALLED_CODEX,
+    cached_report, codex_unavailable_summary, observe_selection,
+    own_holds::{
+        wait_for_lock_release, OwnContinuationGuardV1, OwnHoldReleaseV1, OwnThreadHoldsV1,
+    },
+    workspace_exclusivity_key, AvailabilityCacheV1, CodexAppServerV1, CodexTaskAttachmentV1,
+    CodexTaskSlotV1, AVAILABILITY_TTL, INSTALLED_CODEX,
 };
 use crate::error::{AppError, AppResult};
 use crate::native_agent::capability::{
@@ -166,6 +172,9 @@ fn parse(input: &OpaqueCapabilityPayloadV1) -> AppResult<(ThreadContinueInputV1,
 
 pub(in crate::native_agent) struct CodexThreadAdapterV1 {
     executable: Mutex<PathBuf>,
+    /// The threads Pastey's own app-servers have open, shared with the
+    /// Codex adapter.
+    own_holds: OwnThreadHoldsV1,
     /// Tests: a Codex home of their own instead of this Host's.
     codex_home: Mutex<Option<PathBuf>>,
     availability: AvailabilityCacheV1,
@@ -173,10 +182,21 @@ pub(in crate::native_agent) struct CodexThreadAdapterV1 {
     next_sequence: AtomicU64,
 }
 
+impl CodexThreadAdapterV1 {
+    /// Shares the Codex adapter's record of Pastey's own thread holds.
+    pub(in crate::native_agent) fn sharing(own_holds: OwnThreadHoldsV1) -> Self {
+        Self {
+            own_holds,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for CodexThreadAdapterV1 {
     fn default() -> Self {
         Self {
             executable: Mutex::new(PathBuf::from(INSTALLED_CODEX)),
+            own_holds: OwnThreadHoldsV1::default(),
             codex_home: Mutex::default(),
             availability: Arc::default(),
             tasks: Mutex::default(),
@@ -302,6 +322,8 @@ impl NativeCapabilityAdapterV1 for CodexThreadAdapterV1 {
             run: Box::new(CodexThreadRunV1 {
                 executable: self.executable(),
                 codex_home: self.codex_home(),
+                own_holds: self.own_holds.clone(),
+                continuing: None,
                 availability: self.availability.clone(),
                 workspace,
                 thread_id: parsed.thread_id,
@@ -382,6 +404,9 @@ impl NativeCapabilityAdapterV1 for CodexThreadAdapterV1 {
 struct CodexThreadRunV1 {
     executable: PathBuf,
     codex_home: Option<PathBuf>,
+    own_holds: OwnThreadHoldsV1,
+    /// Reports the thread as Pastey's, running, while this run has it.
+    continuing: Option<OwnContinuationGuardV1>,
     availability: AvailabilityCacheV1,
     workspace: PathBuf,
     thread_id: String,
@@ -455,6 +480,20 @@ impl CodexThreadRunV1 {
                 "The workspace changed before Codex could start, so nothing ran.",
             ));
         }
+        // This run holds the folder's exclusivity, so no Pastey task in it
+        // can start using that session meanwhile.
+        match self.own_holds.release_idle(&self.thread_id) {
+            OwnHoldReleaseV1::InUse => {
+                return Err(not_started(
+                    "A Pastey task is running a turn in this Codex thread, so nothing ran. Wait for it to finish, then continue.",
+                ))
+            }
+            OwnHoldReleaseV1::Released => {
+                wait_for_lock_release(self.codex_home.as_deref(), &self.thread_id)
+            }
+            OwnHoldReleaseV1::NotHeld => {}
+        }
+        self.continuing = Some(self.own_holds.continuing(&self.thread_id));
         let controller = match CodexAppServerV1::launch(&launcher, &self.workspace) {
             Ok(controller) => Arc::new(controller),
             Err(_) => return Err(not_started("Codex could not start its native app-server.")),

@@ -6,14 +6,21 @@
 //! the CLI share the same store (`~/.codex`), so threads from both appear.
 //!
 //! Live state: an app-server reports a thread's status only for threads it
-//! has loaded itself, so Pastey's reader always sees `notLoaded`. Since
-//! Codex 0.163 every client that loads a thread holds its writer lock
-//! (`writer_lock`), which Pastey reads without taking: held means another
-//! client (the Codex app, a terminal or Pastey) has the thread open, free
-//! means none does. Where the lock cannot be read, the only live fact left is
-//! that no Codex process at all could hold a thread.
+//! has loaded itself, so Pastey's reader always sees `notLoaded`. In order:
+//! 1. Pastey's own app-servers (`own_holds`): a thread Pastey itself has
+//!    open is reported as Pastey's, by thread id, idle or running.
+//! 2. Since Codex 0.163 every client that loads a thread holds its writer
+//!    lock (`writer_lock`), which Pastey reads without taking where the
+//!    platform allows (macOS): held means another client (the Codex app or a
+//!    terminal) has this thread open, free means none does.
+//! 3. Elsewhere the lock cannot be read without taking it, and the only live
+//!    fact left is device-wide: no Codex process other than Pastey's own
+//!    runs, so none can hold any thread.
+//!
+//! None of this is needed to find a thread: its history is Codex's saved
+//! record on this Host, read whether or not any Codex client runs.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde_json::{json, Value};
 
@@ -28,12 +35,16 @@ use super::{
 use crate::error::AppResult;
 use crate::native_agent::capability::codex::{
     codex_holder_processes,
+    own_holds::OwnThreadHoldV1,
     writer_lock::{thread_writer_lock, WriterLockV1},
     CodexHistoryReaderV1, CodexHolderProcessV1, HistoryReadErrorV1,
 };
 
-const LIVE_SOURCE: &str = "process list";
+/// Live sources, as named in observations. The renderer explains each, so
+/// they are part of the presentation contract (`src/lib/nativeSessions.ts`).
+const PROCESS_SOURCE: &str = "process list";
 const LOCK_SOURCE: &str = "Codex thread writer lock";
+pub(super) const PASTEY_SOURCE: &str = "Pastey's own Codex session";
 const PAGE: u64 = 50;
 const MAX_TURN_PAGES: usize = 20;
 const MAX_RECENT: usize = 6;
@@ -41,17 +52,17 @@ const SOURCE_KINDS: [&str; 4] = ["cli", "vscode", "exec", "appServer"];
 
 pub(crate) struct CodexSessionSourceV1 {
     executable: PathBuf,
-    /// Workspaces where Pastey itself has a live Codex session now.
-    pastey_live: Vec<PathBuf>,
+    /// The threads Pastey's own app-servers have open now.
+    own_holds: Vec<OwnThreadHoldV1>,
     holders: fn() -> Option<Vec<CodexHolderProcessV1>>,
     writer_lock: fn(&str) -> WriterLockV1,
 }
 
 impl CodexSessionSourceV1 {
-    pub(crate) fn new(executable: PathBuf, pastey_live: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(executable: PathBuf, own_holds: Vec<OwnThreadHoldV1>) -> Self {
         Self {
             executable,
-            pastey_live,
+            own_holds,
             holders: codex_holder_processes,
             writer_lock: thread_writer_lock,
         }
@@ -79,14 +90,30 @@ impl CodexSessionSourceV1 {
         self
     }
 
-    /// Per thread, from its writer lock when it can be read.
-    fn live(
-        &self,
-        workspace: &Path,
-        thread_id: &str,
-        last_turn: &LastTurnObservationV1,
-    ) -> LiveObservationV1 {
+    /// Per thread: Pastey's own hold, then its writer lock when it can be
+    /// read, then the device-wide process list.
+    fn live(&self, thread_id: &str, last_turn: &LastTurnObservationV1) -> LiveObservationV1 {
         let observed_at_ms = now_ms();
+        if let Some(hold) = self
+            .own_holds
+            .iter()
+            .find(|hold| hold.thread_id == thread_id)
+        {
+            return LiveObservationV1 {
+                state: if hold.running {
+                    LiveStateV1::Running
+                } else {
+                    LiveStateV1::Attached
+                },
+                source: PASTEY_SOURCE.into(),
+                observed_at_ms,
+                detail: Some(if hold.running {
+                    "a Pastey task is running a turn in it now".into()
+                } else {
+                    "Pastey keeps it open, idle, for its own conversation in this folder".into()
+                }),
+            };
+        }
         match (self.writer_lock)(thread_id) {
             WriterLockV1::Held => {
                 let running = last_turn.outcome == LastTurnV1::InProgress;
@@ -99,10 +126,9 @@ impl CodexSessionSourceV1 {
                     source: LOCK_SOURCE.into(),
                     observed_at_ms,
                     detail: Some(if running {
-                        "another Codex client (the Codex app, a terminal or Pastey) has it open, and its last turn is in progress".into()
+                        "another Codex client (the Codex app or a terminal) has it open, and its last turn is in progress".into()
                     } else {
-                        "another Codex client (the Codex app, a terminal or Pastey) has it open"
-                            .into()
+                        "another Codex client (the Codex app or a terminal) has it open".into()
                     }),
                 };
             }
@@ -116,28 +142,26 @@ impl CodexSessionSourceV1 {
             }
             WriterLockV1::Unknown(_) => {}
         }
-        self.process_live(workspace, observed_at_ms)
+        self.process_live(observed_at_ms)
     }
 
     /// Without a readable lock: known only when no Codex process could
-    /// hold any thread.
-    fn process_live(&self, workspace: &Path, observed_at_ms: u64) -> LiveObservationV1 {
+    /// hold any thread. Pastey's own app-servers are its children and are
+    /// not counted; the threads they hold were reported above.
+    fn process_live(&self, observed_at_ms: u64) -> LiveObservationV1 {
         let unknown = |detail: String| LiveObservationV1 {
             state: LiveStateV1::Unknown,
-            source: LIVE_SOURCE.into(),
+            source: PROCESS_SOURCE.into(),
             observed_at_ms,
             detail: Some(detail),
         };
-        if self.pastey_live.iter().any(|live| live == workspace) {
-            return unknown("Pastey has its own live Codex session in this workspace".into());
-        }
         let Some(holders) = (self.holders)() else {
             return unknown("the process list could not be read".into());
         };
         if holders.is_empty() {
             return LiveObservationV1 {
                 state: LiveStateV1::NotRunning,
-                source: LIVE_SOURCE.into(),
+                source: PROCESS_SOURCE.into(),
                 observed_at_ms,
                 detail: Some("no Codex process other than Pastey's own runs on this Host".into()),
             };
@@ -221,8 +245,23 @@ impl CodexSessionSourceV1 {
         let id = thread.get("id")?.as_str()?.to_owned();
         let workspace = in_workspaces(thread.get("cwd")?.as_str()?, workspaces)?;
         let last_turn = Self::last_turn(reader, &id);
-        let live = self.live(&workspace, &id, &last_turn);
-        let (status, status_basis, resume) = derive_status(&live, &last_turn, workspace.is_dir());
+        let live = self.live(&id, &last_turn);
+        let (status, status_basis, mut resume) =
+            derive_status(&live, &last_turn, workspace.is_dir());
+        // Only Pastey's own idle session holds it: a continuation closes that
+        // session first (nothing is lost), so it does not stand in the way.
+        if live.source == PASTEY_SOURCE
+            && live.state == LiveStateV1::Attached
+            && workspace.is_dir()
+            && last_turn.outcome != LastTurnV1::Unreadable
+        {
+            resume = super::ResumeAssessmentV1 {
+                verdict: super::ResumeVerdictV1::Safe,
+                reasons: vec![
+                    "only Pastey's own idle session has it open; continuing closes that session first".into(),
+                ],
+            };
+        }
         let originator = thread
             .get("originator")
             .and_then(Value::as_str)
@@ -291,7 +330,7 @@ impl CodexSessionSourceV1 {
         let observation = ProviderObservationV1 {
             provider: PROVIDER_CODEX,
             history_readable: true,
-            live_source: Some(LIVE_SOURCE.into()),
+            live_source: Some(PROCESS_SOURCE.into()),
             note: Some(format!(
                 "History read with the {} Codex. Live state comes from each thread's Codex writer lock where it can be read.",
                 reader.backend().unwrap_or("configured")

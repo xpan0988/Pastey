@@ -37,7 +37,8 @@ import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgres
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
-import { continuationAvailability, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
+import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
+import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
 import type { NativeDecisionReview, SharedWorkspace, WorkspaceShare } from "../src/lib/tauri";
 
 function room(peerConnected: boolean): RoomInfo {
@@ -396,21 +397,24 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   assert.match(lifecycle, /getNativeAgentWorkspaceMovementStatus\(movement\.movementId\)/);
   assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(\s*roomId,\s*recoveryCorrelation\.targetHostRef,\s*recoveryCorrelation\.taskId/);
   assert.match(lifecycle, /stopBridgeNativeAgentTask\(roomId, recoveryCorrelation\.taskId\)/);
-  assert.match(card, />Load recovery details</);
-  assert.match(card, /disabled=\{agent\.busy \|\| !agent\.recoveryTaskId\} onClick=\{\(\) => void agent\.stopRecovery\(\)\}/);
-  assert.match(card, /agent\.recoveryTargetHostRef \? <button[^>]*onClick=\{\(\) => void agent\.reconcileRemote\(\)\}>Reconcile<\/button> : null/);
-  assert.match(card, /Pastey will not reuse this workspace until the task is reconciled or explicitly stopped/);
-  assert.match(card, />Reconcile</);
-  assert.match(card, />Stop</);
-  assert.match(card, />Abandon recovery</);
-  assert.match(card, /agent\.retryingResultReturn \? "Retrying result Return…" : "Retry result Return"/);
+  // The followed task's card, wherever it is shown, carries every repair.
+  const tracker = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
+  assert.doesNotMatch(card, /stopRecovery|reconcileRemote|retryResultReturn/);
+  assert.match(tracker, />Load recovery details</);
+  assert.match(tracker, /disabled=\{agent\.busy \|\| !agent\.recoveryTaskId\} onClick=\{\(\) => void agent\.stopRecovery\(\)\}/);
+  assert.match(tracker, /agent\.recoveryTargetHostRef \? <button[^>]*onClick=\{\(\) => void agent\.reconcileRemote\(\)\}>Reconcile<\/button> : null/);
+  assert.match(tracker, /Pastey will not reuse this workspace until the task is reconciled or explicitly stopped/);
+  assert.match(tracker, />Reconcile</);
+  assert.match(tracker, />Stop</);
+  assert.match(tracker, />Abandon recovery</);
+  assert.match(tracker, /agent\.retryingResultReturn \? "Retrying result Return…" : "Retry result Return"/);
   assert.match(lifecycle, /setReturnRetryObservation\(\{ roomId, movement \}\)/);
   assert.match(lifecycle, /observeNativeAgentMovementAfterReturnRetry\(/);
   assert.match(lifecycle, /RETURN_RETRY_MAX_POLLS = 20/);
   assert.match(lifecycle, /nativeAgentTaskNeedsObservation\(observedStatus\)/);
   assert.match(lifecycle, /native_agent_outcome_unknown/);
   assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(\s*roomId,\s*movement\.targetHostRef,\s*movement\.taskId,\s*movement\.movementId/);
-  assert.match(card, /Codex completed, but Pastey could not safely capture its result for return/);
+  assert.match(tracker, /Codex completed, but Pastey could not safely capture its result for return/);
   assert.match(bindings, /invoke\("get_native_agent_recovery_projection", \{ roomId \}\)/);
   const recoveryType = bindings.slice(
     bindings.indexOf("export interface NativeAgentRecoveryProjection"),
@@ -541,7 +545,7 @@ test("Native Agent responses are shown apart from lifecycle and only as escaped 
   assert.equal(nativeAgentDisplayName("agent.coding.codex_thread"), "Codex");
   assert.equal(nativeAgentDisplayName("agent.coding.claude_code"), "Claude Code");
 
-  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.doesNotMatch(card, /dangerouslySetInnerHTML|innerHTML/);
   assert.match(card, /<pre className="agent-response-text">\{response\.text\}<\/pre>/);
@@ -567,9 +571,9 @@ test("Native approval waits stay running and are explained, not hidden", () => {
   // A cancelled task is never shown as waiting, whatever its last code was.
   assert.equal(nativeAgentAwaitingNativeDecision({ ...running, state: "cancelled" }), false);
   assert.equal(nativeAgentLifecycleLabel({ ...running, state: "failed", code: "native_agent_start_failed" }), "failed · did not start");
-  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
   assert.match(card, /waiting for a native request that cannot be answered from here/);
-  assert.match(card, /agent\.canCancel \? <button[\s\S]*?>Stop Codex<\/button>/);
+  assert.match(card, /agent\.canCancel \? <button[\s\S]*?>Stop \{agentName\}<\/button>/);
 });
 
 test("A selected remote Host shows its own advertised Codex availability", () => {
@@ -631,7 +635,12 @@ test("Continued and new Agent conversations are shown only once confirmed", () =
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.doesNotMatch(card, /resumed native session/);
   assert.match(card, /Start a new conversation/);
-  assert.match(card, /could not reopen your earlier conversation, so nothing ran/);
+  // Pastey's own conversation is told apart from continuing a session.
+  assert.match(card, /continues the conversation Pastey keeps for you in this folder[\s\S]*use Continue a session instead/);
+  const outcome = taskOutcome(unavailable, { hostName: "this device", remote: false, continuing: false, agentName: "Codex" });
+  assert.match(outcome.headline, /nothing ran/);
+  assert.match(outcome.detail ?? "", /could not reopen your earlier conversation/);
+  assert.match(outcome.next ?? "", /Start a new conversation/);
   // A new conversation is only ever an explicit choice, sent as such.
   assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), taskText\.trim\(\), newConversation\)/);
   assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, taskText\.trim\(\), !newConversation, shared\?\.label \?\? null\)/);
@@ -909,7 +918,9 @@ test("a session's status comes from Rust's live facts, never from its last messa
   assert.equal(unknown.label, "Unknown");
   assert.match(unknown.explanation, /a desktop app may hold it/);
   assert.equal(sessionStatusPresentation(sessionView({ status: "interrupted", statusBasis: "inference" })).label, "Interrupted (inferred)");
-  assert.equal(resumeLabel(sessionView({ resume: { verdict: "unknown", reasons: [] } })), "Continuing is not shown to be safe");
+  // An observation at a moment, never a promise about continuing.
+  assert.equal(resumeLabel(sessionView({ resume: { verdict: "unknown", reasons: [] } })), "Whether anything had it open could not be shown");
+  assert.equal(resumeLabel(sessionView({ resume: { verdict: "safe", reasons: [] } })), "Nothing else had it open when Pastey looked");
 });
 
 test("a Host that has not shared its sessions says where to allow it", () => {
@@ -929,10 +940,13 @@ test("session filters, folder labels and evidence groups are normalized for disp
 });
 
 test("the sessions card continues only this device's own sessions and never grants anything", () => {
-  const card = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  const browser = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
   const settings = readFileSync("src/features/workspace/SessionReadingSettings.tsx", "utf8");
-  assert.match(card, /discoverRemoteNativeSessions\(roomId, remote\.hostRef!/);
-  assert.doesNotMatch(card, /startClaude|createSessionReadGrant|startRemoteNative/);
+  assert.match(browser, /discoverRemoteNativeSessions\(roomId, remote\.hostRef!/);
+  // Looking is all the list does; only one session's view continues it.
+  assert.doesNotMatch(browser, /continueNativeSession|continueRemoteNativeSession/);
+  assert.doesNotMatch(browser + card, /startClaude|createSessionReadGrant|startRemoteNative/);
   // One explicit continuation, as the user saw it: here, or on the chosen
   // device by the scope its read permission showed, never a path.
   assert.equal(card.match(/continueNativeSession\(/g)?.length, 1);
@@ -940,9 +954,11 @@ test("the sessions card continues only this device's own sessions and never gran
   assert.match(card, /continueNativeSession\(\{ workspaces: \[folder\], provider: session\.provider, sessionId: session\.sessionId, prompt: prompt\.trim\(\), expectedMarker: session\.lastTurn\.marker \?\? null \}\)/);
   assert.match(card, /continueRemoteNativeSession\(\{ roomId: route\.roomId, peerSessionId: route\.peerSessionId, targetHostRef: route\.hostRef, provider: session\.provider, sessionId: session\.sessionId, scopeRef: session\.scopeRef, prompt: prompt\.trim\(\), expectedMarker: session\.lastTurn\.marker \?\? null \}\)/);
   assert.match(card, /continuationAvailability\(session, !remote, hostName, share\)/);
-  assert.match(card, /onContinued\?\.\(status, route\?\.hostRef \?\? null\)/);
+  assert.match(card, /onContinued\?\.\(status, route\?\.hostRef \?\? null, continued\)/);
+  // The continued session is named by provider and id only, kept here.
+  assert.match(card, /const continued: ContinuedSession = \{ provider: session\.provider, sessionId: session\.sessionId, title: session\.title, workspaceLabel: session\.workspaceLabel \};/);
   assert.match(card, /disabled=\{busy \|\| started \|\| !prompt\.trim\(\)\}/);
-  assert.match(card, /Pastey does not pick for you/);
+  assert.match(browser, /Pastey does not pick for you/);
   assert.match(card, /the agent's own account, not verified/);
   assert.match(settings, /Trusting a device does not let it read anything/);
   // Settings gathers every share and can end it; creating one happens in its Bridge.
@@ -1029,8 +1045,9 @@ test("A chosen Codex Host is kept by HostRef across reconnects and never falls b
   assert.match(panel, /const remote = targetHostRef \? peers\.find\(\(peer\) => peer\.hostRef === targetHostRef\) \?\? null : null;/);
   assert.doesNotMatch(panel, /peerSessionId === target\b/);
   // Stop and Approve route to the task's own Host, not whatever is selected now.
-  assert.match(panel, /peers\.find\(\(peer\) => peer\.hostRef === agent\.taskHostRef\)/);
-  assert.match(panel, /peers\.find\(\(peer\) => peer\.hostRef === agent\.movement\?\.targetHostRef\)/);
+  const tracker = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
+  assert.match(tracker, /peers\.find\(\(peer\) => peer\.hostRef === agent\.taskHostRef\)/);
+  assert.match(tracker, /peers\.find\(\(peer\) => peer\.hostRef === agent\.movement\?\.targetHostRef\)/);
   const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   assert.match(sessions, /peers\.find\(\(peer\) => peer\.hostRef === target\)/);
   // A just-started remote task keeps its Host even when recovery is drained.
@@ -1107,13 +1124,21 @@ test("Execution, observation and continuation stay separate in the Bridge", () =
   assert.match(bridge, /\{ value: "share", label: "Share" \}/);
   assert.match(bridge, /value: "agents", label: "Agents"/);
   assert.doesNotMatch(bridge, /value: "sessions"/);
-  // One Agents workspace, two separately labelled authorities.
+  // One Agents workspace: start something new, or continue what exists,
+  // each labelled with its authority, one shown at a time.
   const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
-  assert.match(workspace, /Run a task <Badge tone="live">Execution<\/Badge>/);
-  assert.match(workspace, /Sessions on \{targetName\} <Badge>Look or continue<\/Badge>/);
+  assert.match(workspace, /\{ value: "new", label: "New task" \}, \{ value: "sessions", label: "Continue a session" \}/);
+  assert.match(workspace, /<Badge tone="live">Execution<\/Badge>/);
+  assert.match(workspace, /<Badge>Read, then continue<\/Badge>/);
+  assert.match(workspace, /aria-label="Run a task" hidden=\{mode !== "new"\}/);
+  assert.match(workspace, /aria-label="Existing sessions" hidden=\{mode !== "sessions"\}/);
   assert.match(workspace, /onContinued=\{agent\.adoptTask\}/);
+  // The followed task is shown once: in the session it continues while that
+  // session is open, otherwise at the top.
+  assert.match(workspace, /\{trackerInSession \? null : <AgentTaskTracker /);
+  assert.match(workspace, /const trackerInSession = mode === "sessions" && taskOnTarget && !!continuedKey && openSession === continuedKey;/);
   assert.match(workspace, /<NativeAgentPanel [^>]*target=\{target\} shares=\{shares\}/);
-  assert.match(workspace, /<NativeSessionsCard [^>]*target=\{target\} shares=\{shares\}/);
+  assert.match(workspace, /<NativeSessionsCard\s[^>]*target=\{target\}\s+shares=\{shares\}/);
   // One observation of what the chosen device shares, asked over its own
   // connection, serves running, reading and continuing.
   assert.match(workspace, /const shares = usePeerSharedWorkspaces\(room\.id, targetHostRef, connected\);/);
@@ -1371,4 +1396,107 @@ test("A request the other device refused before acting on it ends as not deliver
   const base = { schemaVersion: "pastey-native-agent-task-v1", taskId: "t", agentId: "agent.coding.codex_thread", workspaceName: "PasteySessionTest", sessionReused: false, state: "failed" as const, result: null, output: null, conversation: null, nativeDecisions: [] };
   assert.equal(nativeAgentLifecycleLabel({ ...base, code: "native_agent_not_delivered" }), "not delivered · nothing ran");
   assert.equal(nativeAgentLifecycleLabel({ ...base, code: "native_agent_admission_revoked" }), "failed · access ended before it started");
+});
+
+const codexLive = (state: SessionView["live"]["state"], source: string) => ({ state, source, observedAtMs: 3, detail: null });
+
+test("who has a session open is said in plain words, with how Pastey knows, per source", () => {
+  const codex = (live: SessionView["live"], extra: Partial<SessionView> = {}) => sessionView({ provider: "codex", live, ...extra });
+  // macOS: Codex's per-thread writer lock is a fact about this thread.
+  const free = sessionHoldLine(codex(codexLive("not_running", "Codex thread writer lock")), "MacBook");
+  assert.match(free.text, /Not open in any Codex client on MacBook/);
+  assert.match(free.how, /writer lock for this exact thread/);
+  assert.match(sessionHoldLine(codex(codexLive("attached", "Codex thread writer lock")), "MacBook").text, /Open in the Codex app or a terminal/);
+  // Windows: the lock cannot be read, so the fact is device-wide. Closing
+  // every Codex client is what makes it known, and it says so.
+  const closed = sessionHoldLine(codex(codexLive("not_running", "process list")), "Windows");
+  assert.match(closed.text, /No Codex app or terminal is running on Windows/);
+  assert.match(closed.how, /cannot be read without taking it[\s\S]*every Codex app and terminal on the device/);
+  const running = sessionHoldLine(codex(codexLive("unknown", "process list")), "Windows");
+  assert.match(running.text, /cannot tell which threads it has open\. If it has this one open, Codex refuses the continuation and nothing runs/);
+  // Pastey's own conversation is never blamed on another client.
+  const own = codex(codexLive("attached", "Pastey's own Codex session"), { status: "idle" });
+  assert.match(sessionHoldLine(own, "Windows").text, /Pastey's own conversation in this folder has it open, idle\. Continuing closes that first/);
+  assert.equal(sessionStatusPresentation(own).label, "Open in Pastey, idle");
+  const ownRunning = codex(codexLive("running", "Pastey's own Codex session"), { status: "running", resume: { verdict: "unsafe", reasons: [] } });
+  assert.match(continuationAvailability(ownRunning, true).reason, /A Pastey task is running a turn in this thread/);
+  assert.doesNotMatch(continuationAvailability(ownRunning, true).reason, /Codex app or a terminal/);
+  assert.deepEqual(continuationChip(ownRunning, true), { label: "Running", tone: "live" });
+  // Another client's hold names that device and what to do there.
+  const held = codex(codexLive("attached", "Codex thread writer lock"), { status: "idle", resume: { verdict: "unsafe", reasons: [] } });
+  assert.match(continuationAvailability(held, false, "Windows").reason, /open in another Codex client on Windows[\s\S]*Close it there, then look again/);
+  assert.deepEqual(continuationChip(held, true), { label: "Open elsewhere", tone: "warn" });
+  assert.deepEqual(continuationChip(sessionView({ provider: "codex" }), true), { label: "Can continue", tone: "ok" });
+  // A session is saved history on its device, never described by a path.
+  const persisted = sessionPersistenceLine(sessionView({ provider: "codex", workspaceLabel: "PasteySessionTest" }), "Windows");
+  assert.match(persisted, /Saved by Codex on Windows, for the folder PasteySessionTest[\s\S]*not a running program: it stays when the Codex app or a terminal quits/);
+  assert.doesNotMatch(persisted, /[\\/]|\.codex/);
+});
+
+test("a task's progress and outcome say where it is, whether anything ran, and what to do next", () => {
+  const remote = { hostName: "Windows", remote: true, continuing: true, agentName: "Codex" };
+  const base = { state: "queued" as const, code: "native_agent_review_required", result: null };
+  // Waiting for the Host's Accept is its own stage, not "running".
+  assert.deepEqual(taskStages(base, remote).map((stage) => stage.state), ["done", "current", "todo", "todo"]);
+  assert.match(taskOutcome(base, remote).headline, /Waiting for someone on Windows to Accept/);
+  assert.deepEqual(taskStages({ state: "running", code: null }, remote).map((stage) => stage.state), ["done", "done", "current", "todo"]);
+  const completed = { state: "completed" as const, code: null, result: null };
+  assert.ok(taskStages(completed, remote).every((stage) => stage.state === "done"));
+  assert.match(taskOutcome(completed, remote).detail ?? "", /The session on Windows now ends with this turn/);
+  // Deny and expiry end at the Accept, and nothing ran.
+  const denied = { state: "failed" as const, code: "native_agent_admission_denied", result: null };
+  assert.deepEqual(taskStages(denied, remote).map((stage) => stage.state), ["done", "stopped", "todo", "todo"]);
+  assert.equal(taskOutcome(denied, remote).nothingRan, true);
+  assert.match(taskOutcome({ ...denied, code: "native_agent_review_expired" }, remote).headline, /Nobody accepted in time · nothing ran/);
+  // Codex's own refusal (the thread was open elsewhere) ends at the start,
+  // says so in the Host's words, and says what fixes it.
+  const held = { state: "failed" as const, code: "native_agent_start_failed", result: "This Codex thread is open in another Codex client (the Codex app or a terminal), so nothing ran. Close it there, then continue it here." };
+  assert.deepEqual(taskStages(held, remote).map((stage) => stage.state), ["done", "done", "stopped", "todo"]);
+  const heldOutcome = taskOutcome(held, remote);
+  assert.equal(heldOutcome.headline, "Did not start · nothing ran");
+  assert.match(heldOutcome.detail ?? "", /open in another Codex client/);
+  assert.match(heldOutcome.next ?? "", /Close the thread in the Codex app or the terminal on Windows, then look at the session again/);
+  assert.match(taskOutcome({ ...held, result: "This session changed since you looked at it, so nothing ran." }, remote).next ?? "", /Look at the session again/);
+  // A failed turn did run: it is never reported as "nothing ran", and it
+  // says what the session now ends with.
+  const failed = taskOutcome({ state: "failed", code: "native_agent_failed", result: null }, remote);
+  assert.equal(failed.nothingRan, false);
+  assert.match(failed.headline, /Codex reported the turn failed/);
+  assert.match(failed.detail ?? "", /The session now ends with that failed turn/);
+  assert.match(failed.next ?? "", /Open the session/);
+  // An unknown outcome is never a failure or a success, and never retried.
+  const unknown = taskOutcome({ state: "interrupted", code: "native_agent_outcome_unknown", result: null }, remote);
+  assert.equal(unknown.headline, "Outcome unknown");
+  assert.match(unknown.next ?? "", /Reconcile asks Windows[\s\S]*Nothing runs again on its own/);
+  // On this device there is no Accept stage.
+  assert.deepEqual(taskStages({ state: "running", code: null }, { hostName: "this device", remote: false }).map((stage) => stage.id), ["sent", "running", "result"]);
+});
+
+test("a continuation is followed in the session it continues, and the list fills itself read only", () => {
+  const browser = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  const detail = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  // Looks once per scope while shown, only where reading is allowed.
+  assert.match(browser, /if \(!active \|\| busy \|\| !scopeKey \|\| autoLooked\.current === scopeKey\) return;/);
+  assert.match(browser, /remote && readable\.length \? `\$\{target\}\|/);
+  // While its continuation runs, it replaces the composer in the session's
+  // own view; when it ends the session is read again (it has a new turn).
+  assert.match(detail, /\{run\?\.active \? run\.node : <>/);
+  assert.match(browser, /if \(wasRunning\.current && snapshot\) \{ wasRunning\.current = false; void inspect\(snapshot\.session\); \}/);
+  // The session a task continues is remembered with the task, in this
+  // renderer only, and survives a remount.
+  assert.match(lifecycle, /rememberStartedNativeTask\(roomId, \{ taskId: started\.taskId, hostRef, continues: session \}\)/);
+  assert.match(lifecycle, /setContinues\(remembered\.continues \?\? null\)/);
+  // Only an ended task that needs nothing more can be put away.
+  assert.match(lifecycle, /const canDismiss = !!status && \["completed", "failed", "cancelled"\]\.includes\(status\.state\)\s*&& !movement && !nativeAgentRecoveryRequiresAction\(status, movement\) && !busy;/);
+  // Evidence is one step away, never in the way of deciding.
+  assert.match(detail, /<details className="disclosure">\s*<summary><Icon name="chevron" small \/>Evidence and how Pastey knows<\/summary>/);
+});
+
+test("the Host's Accept names its own shared folder, and nothing else from the request", () => {
+  const banner = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");
+  assert.match(banner, /pendingReview\.sharedFolder \? <>, in your shared folder <strong>\{pendingReview\.sharedFolder\}<\/strong><\/> : null/);
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  const review = bindings.slice(bindings.indexOf("export interface NativeInvocationReview"), bindings.indexOf("export function listNativeInvocationReviews"));
+  assert.doesNotMatch(review, /prompt|threadId|workspace:|path/i);
 });

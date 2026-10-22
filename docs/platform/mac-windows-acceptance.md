@@ -154,7 +154,7 @@ Prerequisites:
 
 | # | Do | Expect |
 |---|---|---|
-| I1 | On the Mac, Bridge → Agents tab → Device Windows → Look for sessions, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. Access on Windows → Read sessions now says Needs action, with the steps on Windows. |
+| I1 | On the Mac, Bridge → Agents → Agents on Windows → Continue a session, before any permission. | "Windows has not allowed this device to read its sessions…", with where to allow it. No session is listed. Access on Windows → Read sessions now says Needs action, with the steps on Windows. |
 | I2 | On Windows, open this Bridge → Bridge details → Workspaces → Share a workspace…, choose the Demo folder, turn on Sessions (excerpts off), 1 day → Share. Then repeat I1 on the Mac. | Windows's sessions in Demo are listed, with folder name "Demo" and no Windows path anywhere. Claude Code sessions show "Last turn ended" or "Running". A Codex thread shows "Unknown" while the ChatGPT desktop app or a `codex` terminal runs on Windows. Record what each row says. |
 | I3 | On the Mac, open one Claude Code session. | The report shows status, live source (`claude agents --json`), last turn, counts, changed files relative to Demo, Git facts, and facts, inferences and unknowns. It says Windows shares statuses only: no prompt or reply text. |
 | I4 | On Windows, start a Claude Code turn in that session (`claude --resume <id>` in Demo, or the desktop app). While it runs, look again from the Mac and open it. | It shows "Running" while the turn runs, and "Last turn ended" after it. The report never claims done while running. |
@@ -208,11 +208,11 @@ Prerequisites: Codex 0.163 or later on both devices (CLI and, if installed, the 
 | # | Do | Expect / record |
 |---|---|---|
 | M1 | On Windows: `python -I tools\codex-session-probe\writer_lock_probe.py (Get-Command codex).Source`, once with the ChatGPT app open on a Codex thread and once with `--cross-process`. | `b_resume_while_a_holds` and `resume_of_thread_held_elsewhere` say "already has an active writer"; after A exits, B resumes. This is the Windows proof of the single-writer lock the remote path relies on. Record the JSON (ids are shortened). |
-| M2 | Mac, local: Agents → Device: This device → choose a folder with a Codex thread you made in the ChatGPT app → Look → open it. With the thread still open in the app, read the report and its Continue section. | Live state "Open, idle" or "Running", source "Codex thread writer lock"; Continue explains that the thread is open in another Codex client. |
-| M3 | Close that thread in the app (open another), Look again, open it, Continue with "Reply with the word ok". | Under Run a task: one run on this device, "continued conversation", Completed with the reply. In the ChatGPT app, the thread shows the new turn. The thread id is unchanged. |
+| M2 | Mac, local: Agents on This device → Continue a session → choose a folder with a Codex thread you made in the ChatGPT app (the list fills itself) → open it. With the thread still open in the app, read the view. | Row chip "Open elsewhere"; the view says "You can't continue this session now" because it is open in another Codex client on this device; Open anywhere? says "Open in the Codex app or a terminal"; Evidence → source "Codex thread writer lock". |
+| M3 | Close that thread in the app (open another), Look again, open it, Continue with "Reply with the word ok". | The form is replaced, in the session's view, by the run: Started here → Running → Result, Completed with the reply. The view then reads the session again (one more prompt). In the ChatGPT app, the thread shows the new turn. The thread id is unchanged. |
 | M4 | Repeat M3 but, before pressing Continue, add a turn to the thread in the app. | "This session changed since you looked at it, so nothing ran." Nothing new appears in the thread. |
-| M5 | Mac → Windows: Agents → Device: Windows → Look → open a Codex thread in Demo that the app on Windows does not have open → Continue. On Windows, Accept. | The Windows request banner says "continuing an existing thread". The run completes on Windows in the same thread, and its reply returns to the Mac card, which names Windows. |
-| M6 | M5 again, but Deny on Windows; then once with the thread open in the Windows app, Accept. | Deny: nothing runs. Open in the app: "open in another Codex client … nothing ran." |
+| M5 | Mac → Windows: Agents on Windows → Continue a session → open a Codex thread in Demo that the app on Windows does not have open → Continue. On Windows, Accept. | The Windows request banner says "continuing an existing thread" and "in your shared folder Demo". On the Mac, in the session's view: Sent to Windows → Waiting for Accept → Running → Result. The reply returns there; the view then shows the new turn. |
+| M6 | M5 again, but Deny on Windows; then once with the thread open in the Windows app, Accept. | Deny: "Declined on Windows · nothing ran", the Accept stage marked Not accepted. Open in the app: "Did not start · nothing ran", the Host's reason ("open in another Codex client"), and Next: close it in the Codex app or terminal on Windows, then look again. |
 | M7 | On Windows, turn Agent requests off for Demo (or Stop sharing it), then M5 from a report opened before. | Refused; nothing runs on Windows. The Mac card shows the task as indeterminate (the existing rule for a refused invocation): Stop it. |
 | M8 | During M5's run, quit Pastey on Windows (Task Manager). | The Mac shows the indeterminate notice. After Windows restarts: no `codex` process from that run remains (K4), the thread is no longer locked (M2-style look shows it free), and nothing runs again on its own. |
 | M9 | Claude Code, local: in a folder with an idle Claude Code session (not open in the desktop app or a terminal), Continue with a short prompt. Then try a remote Claude Code session from the Mac. | Local: completes in the same session id. Remote: Continue is unavailable with the reason (background sessions can outlive Pastey there). |
@@ -228,13 +228,28 @@ The target flow, end to end, on real devices. Prerequisites: a Mac ↔ Windows B
 | N3 | Windows: Share a workspace… | The Windows folder picker opens (a Windows dialog, Windows paths). Choose `PasteySessionTest`. |
 | N4 | In the dialog turn on Sessions and Agent requests, 1 day → Share. | The row shows the folder name, its Windows path (only here), "Sessions and agent requests", and switches. |
 | N5 | Mac: Agents, device Windows. | "Shared by Windows: PasteySessionTest (sessions and agent requests)". Access on Windows: Read sessions Ready; Continue decided there. No Windows path anywhere on the Mac. |
-| N6 | Mac: Run a task → Shared by Windows → PasteySessionTest, task "List the files", Run with Codex. On Windows, Accept. | Runs in `PasteySessionTest` on Windows without typing a path; the reply returns to the Mac. |
-| N7 | Mac: Sessions on Windows → Look for sessions → open the Codex thread → Continue session with "Reply with the word ok". | Windows shows the Review ("continuing an existing thread"). |
-| N8 | Windows: Accept. | Codex continues in the same thread (the ChatGPT app shows the new turn when you open the thread); the Mac card completes with the reply. |
+| N6 | Mac: New task → Shared by Windows → PasteySessionTest, task "List the files", Run with Codex. On Windows, Accept. | Runs in `PasteySessionTest` on Windows without typing a path; the reply returns to the Mac. |
+| N7 | Mac: Continue a session (the list fills itself) → open the Codex thread → Continue session with "Reply with the word ok". | Windows shows the Review ("continuing an existing thread … in your shared folder PasteySessionTest"). The Mac shows "Waiting for someone on Windows to Accept" in the session's view. |
+| N8 | Windows: Accept. | Codex continues in the same thread (the ChatGPT app shows the new turn when you open the thread); the Mac's session view completes with the reply and then shows the thread again with one more turn. |
 | N9 | Windows: turn Agent requests off for the folder. Mac: try N6 and N7 again. | The Mac explains, before sending, that Windows has not turned on Agent requests, with the exact place on Windows. A request sent from a stale screen is refused by Windows; nothing runs. |
 | N10 | Quit and reopen Pastey on Windows (or drop the network for 30 s). After it reconnects, look again from the Mac without any other step. | Sessions and the shared folder are back; the share survived the reconnect. |
 | N11 | Windows: Stop sharing. Mac: look again. | "Windows hasn't shared any session-readable workspace with this Bridge…"; Run offers only the typed path or this device. |
 | N12 | A second Bridge between the same devices: look there from the Mac. | Nothing from the first Bridge's shares appears. |
+
+## P. Sessions outlive their clients; who has a thread open
+
+What a user sees about a session versus the programs that had it open. Prerequisites: N1–N5 done; on Windows `PasteySessionTest` has one Codex thread made in the ChatGPT desktop app.
+
+| # | Do | Expect / record |
+|---|---|---|
+| P1 | Windows: keep the ChatGPT app open (any thread). Mac: Agents on Windows → Continue a session. | The thread is listed. Row chip "Can try"; its view says "You can try: Codex decides when it starts" and Open anywhere? says Codex is running on Windows and Pastey cannot tell which threads it has open. Evidence → source "process list". Nothing on Windows changes. |
+| P2 | Windows: quit every Codex client (the ChatGPT app, `codex` terminals; check Task Manager has no `codex.exe`). Mac: Look again. | The thread is still listed: it is saved history, not a process. Chip "Can continue"; Open anywhere? "No Codex app or terminal is running on Windows, so nothing has it open"; Evidence says this is Windows's list of running programs, device-wide. |
+| P3 | Mac: continue it ("Reply with the number 73921 only"); Windows: Accept. | Completed with 73921 in the session's view, which then shows 2 turns. Look again: still "Can continue". The ChatGPT app, opened again, shows the new turn in the same thread. |
+| P4 | Mac: New task in PasteySessionTest ("List the files"), Accept on Windows. Then Continue a session → Look again. | The thread Pastey used is "Started by Pastey", "Open in Pastey, idle", chip "Can continue"; Open anywhere? says Pastey's own conversation has it open and continuing closes that first. Other threads in the folder are no longer "Unknown" merely because Pastey has its own session there; record what they show (a Codex that Pastey starts through a launcher such as npm's `codex.cmd` runs as a grandchild, which the process list cannot tell from another client). |
+| P5 | Continue that Pastey thread from the Mac; Accept on Windows. Then New task again without "Start a new conversation". | The continuation completes in the same thread. The next New task continues the same conversation (it reopens the thread). Nothing reports "open in another Codex client". |
+| P6 | While a New task runs in PasteySessionTest, open the Pastey thread from the Mac. | "Running", "A Pastey task is running a turn in it now"; Continue is unavailable with that reason. |
+
+On a Mac (local), P1 instead shows the per-thread writer lock: only the thread the app has open is "Open elsewhere"; the others are "Can continue".
 
 ## O. Control channel over a long session
 
@@ -244,7 +259,7 @@ What failed on real devices before this build: after about 64 Codex availability
 |---|---|---|
 | O1 | Leave the Mac's Agents tab open on Windows for 30 minutes (about 120 automatic checks), with Pastey on Windows running throughout. | "Codex is available on Windows" throughout. On both devices: "Accepting control messages. Nothing is backed up.", Kept for display 0 (or a few Bridge Plan events after Find file), no refusals. |
 | O2 | Then, without restarting either side, N6–N8 (run in a shared folder, continue the thread, Accept on Windows). | Each completes; the reply returns to the Mac. |
-| O3 | On the Mac, click Check again (Agents → Run a task) 30 times as fast as you can. | Most answer at once; some may take a few seconds. If any fails, it says "rate limit was reached … refused this before acting on it". Windows's Control channel shows capability checks refused for their rate budget, then, within a minute and with no action, "Accepting control messages". |
+| O3 | On the Mac, click Check again (Agents → New task) 30 times as fast as you can. | Most answer at once; some may take a few seconds. If any fails, it says "rate limit was reached … refused this before acting on it". Windows's Control channel shows capability checks refused for their rate budget, then, within a minute and with no action, "Accepting control messages". |
 | O4 | Send 9 continuations from the Mac without answering on Windows. | Windows shows 8 Reviews. The ninth's card on the Mac says "not delivered · nothing ran" with the reason; Windows's Control channel shows 8 of 8 waiting. Deny one on Windows, continue again: it waits for Accept. |
 | O5 | While a continuation waits for Accept on Windows, turn Agent requests off for the folder (Bridge details → Workspaces), then Accept. | Accept is refused; nothing runs (no new turn in the thread). The Mac card ends "access ended before it started". |
 | O6 | Quit and reopen Pastey on Windows, then repeat O1 for 5 minutes and O2 once. | Same as O1 and O2; no "inbox is full" ever. |
@@ -268,6 +283,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Crash diagnosis (K1–K6) | |
 | Device details (L1–L5) | |
 | Session continuation (M1–M9) | |
+| Sessions outlive clients; holds (P1–P6) | |
 | Bridge workspaces (N1–N12) | |
 | Control channel (O1–O7) | |
 | Throughput: C2 1 GiB each way, G1 | |

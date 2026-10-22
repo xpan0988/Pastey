@@ -10,6 +10,8 @@ use uuid::Uuid;
 use super::*;
 use crate::native_agent::capability::codex::codex_holder_kind;
 #[cfg(unix)]
+use crate::native_agent::capability::codex::own_holds::OwnThreadHoldV1;
+#[cfg(unix)]
 use crate::native_agent::capability::codex::CodexHolderProcessV1;
 
 fn live(state: LiveStateV1) -> LiveObservationV1 {
@@ -676,13 +678,49 @@ fn codex_threads_come_from_its_app_server_scoped_by_workspace_and_live_state_sta
         .iter()
         .all(|s| s.live.state == LiveStateV1::Unknown
             && s.resume.verdict == ResumeVerdictV1::Unknown));
-    // Nor while Pastey's own session in the workspace may hold it.
-    let (sessions, _) = CodexSessionSourceV1::new(agent.clone(), vec![workspace.clone()])
+    // Pastey's own conversation keeps t-live open, idle: that thread is
+    // reported as Pastey's (and a continuation would close that session
+    // first), and the folder's other threads keep their own live facts.
+    let idle = vec![OwnThreadHoldV1 {
+        thread_id: "t-live".into(),
+        running: false,
+    }];
+    let (sessions, _) = CodexSessionSourceV1::new(agent.clone(), idle)
         .with_holders(no_holders)
         .discover(&[workspace.clone()]);
-    assert!(sessions
-        .iter()
-        .all(|s| s.status == SessionStatusV1::Unknown));
+    let held = sessions.iter().find(|s| s.session_id == "t-live").unwrap();
+    assert_eq!(
+        (held.live.state, held.live.source.as_str(), held.status),
+        (
+            LiveStateV1::Attached,
+            "Pastey's own Codex session",
+            SessionStatusV1::Idle
+        )
+    );
+    assert_eq!(held.resume.verdict, ResumeVerdictV1::Safe);
+    assert!(held.resume.reasons[0].contains("closes that session first"));
+    assert_eq!(continuation_problem(PROVIDER_CODEX, held, None), None);
+    let other = sessions.iter().find(|s| s.session_id == "t-done").unwrap();
+    assert_eq!(
+        (other.live.state, other.resume.verdict),
+        (LiveStateV1::NotRunning, ResumeVerdictV1::Safe)
+    );
+    // A Pastey task runs a turn in it: running, and not continuable now.
+    let running = vec![OwnThreadHoldV1 {
+        thread_id: "t-live".into(),
+        running: true,
+    }];
+    let (sessions, _) = CodexSessionSourceV1::new(agent.clone(), running)
+        .with_holders(no_holders)
+        .discover(&[workspace.clone()]);
+    let busy = sessions.iter().find(|s| s.session_id == "t-live").unwrap();
+    assert_eq!(
+        (busy.status, busy.resume.verdict),
+        (SessionStatusV1::Running, ResumeVerdictV1::Unsafe)
+    );
+    assert!(continuation_problem(PROVIDER_CODEX, busy, None)
+        .unwrap()
+        .contains("A Pastey task is running a turn"));
 
     let snapshot = source
         .inspect(&[workspace.clone()], "t-done")

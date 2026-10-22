@@ -465,6 +465,11 @@ pub(crate) struct ShareRequirementV1 {
 }
 
 impl ShareRequirementV1 {
+    /// The shared folder's own name, for this Host's Review.
+    pub(crate) fn folder_label(&self) -> String {
+        folder_label(&self.workspace)
+    }
+
     /// For a request `resolve_agent_request` resolved to `input`.
     pub(crate) fn of_resolved(
         device: &VerifiedPeerDevice,

@@ -2459,15 +2459,8 @@ pub async fn receive_room_control_event_handler(
                     let answer = match remote::begin_answer(&answer_room) {
                         None => remote::busy(&query, &local_host_ref),
                         Some(guard) => {
-                            let workspaces: Vec<_> = scopes
-                                .iter()
-                                .filter(|scope| scope.read_sessions)
-                                .map(|scope| scope.workspace.clone())
-                                .collect();
-                            let (claude, codex) = answer_state
-                                .native_agents
-                                .lock()
-                                .session_sources(&workspaces);
+                            let (claude, codex) =
+                                answer_state.native_agents.lock().session_sources();
                             let blocking_host = local_host_ref.clone();
                             let blocking_query = query.clone();
                             let answer = tokio::task::spawn_blocking(move || {

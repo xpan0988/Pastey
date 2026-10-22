@@ -260,6 +260,22 @@ export interface RememberedNativeTask {
   taskId: string;
   hostRef: string | null;
   movementId?: string | null;
+  /** The session this task continues, as this device saw it. */
+  continues?: ContinuedSession | null;
+}
+
+/** An existing session a task continues, as this device's user chose it
+ * from discovery. Kept only in this renderer; the task's own status never
+ * carries a native identifier. */
+export interface ContinuedSession {
+  provider: "claude_code" | "codex";
+  sessionId: string;
+  title: string | null;
+  workspaceLabel: string;
+}
+
+export function continuedSessionKey(session: Pick<ContinuedSession, "provider" | "sessionId">): string {
+  return `${session.provider}:${session.sessionId}`;
 }
 
 const STARTED_TASKS_KEY = "pastey:native-started-tasks-v1";
@@ -271,6 +287,15 @@ export function rememberStartedNativeTask(roomId: string, task: RememberedNative
     const stored = JSON.parse(window.sessionStorage.getItem(STARTED_TASKS_KEY) ?? "{}") as Record<string, RememberedNativeTask>;
     window.sessionStorage.setItem(STARTED_TASKS_KEY, JSON.stringify({ ...stored, [roomId]: task }));
   } catch { /* memory still holds it for this window */ }
+}
+
+export function forgetStartedNativeTask(roomId: string) {
+  startedTasks.delete(roomId);
+  try {
+    const stored = JSON.parse(window.sessionStorage.getItem(STARTED_TASKS_KEY) ?? "{}") as Record<string, RememberedNativeTask>;
+    delete stored[roomId];
+    window.sessionStorage.setItem(STARTED_TASKS_KEY, JSON.stringify(stored));
+  } catch { /* memory no longer holds it */ }
 }
 
 export function rememberedNativeTask(roomId: string): RememberedNativeTask | null {
@@ -459,6 +484,8 @@ export function useNativeAgentTask(roomId: string) {
   const [busy, setBusy] = useState(false);
   /** The remote Host the shown task runs on, or null for this device. */
   const [taskHostRef, setTaskHostRef] = useState<string | null>(null);
+  /** The existing session the shown task continues, if it does. */
+  const [continues, setContinues] = useState<ContinuedSession | null>(null);
   const recoveryCorrelation = movement
     ? { taskId: movement.taskId, movementId: movement.movementId, targetHostRef: movement.targetHostRef }
     : recoveryProjection
@@ -490,6 +517,8 @@ export function useNativeAgentTask(roomId: string) {
     if (!isCurrent()) return null;
     setRecoveryProjection(projection);
     if (projection) {
+      const remembered = rememberedNativeTask(roomId);
+      setContinues(remembered?.taskId === projection.task.taskId ? remembered.continues ?? null : null);
       setStatus(projection.task);
       setMovement(projection.movement ?? null);
       setTaskHostRef(projection.targetHostRef ?? null);
@@ -497,6 +526,7 @@ export function useNativeAgentTask(roomId: string) {
       setStatus(null);
       setMovement(null);
       setTaskHostRef(null);
+      setContinues(null);
     }
     return projection;
   }, [roomId]);
@@ -521,7 +551,7 @@ export function useNativeAgentTask(roomId: string) {
         remembered.movementId ? getNativeAgentWorkspaceMovementStatus(remembered.movementId).catch(() => null) : Promise.resolve(null),
       ]);
       if (cancelled) return;
-      if (rememberedStatus) { setStatus(rememberedStatus); setTaskHostRef(remembered.hostRef); }
+      if (rememberedStatus) { setStatus(rememberedStatus); setTaskHostRef(remembered.hostRef); setContinues(remembered.continues ?? null); }
       if (rememberedMovement) setMovement(rememberedMovement);
     }).catch((error) => {
       if (!cancelled) setMessage(error instanceof Error ? error.message : "Pastey could not recover unresolved native Agent work.");
@@ -607,7 +637,7 @@ export function useNativeAgentTask(roomId: string) {
     setBusy(true); setMessage(null);
     try {
       const started = await startNativeCodexTask(workspace.trim(), taskText.trim(), newConversation);
-      setStatus(started); setTaskHostRef(null); setNewConversation(false);
+      setStatus(started); setTaskHostRef(null); setContinues(null); setNewConversation(false);
       rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef: null });
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start Codex."); }
@@ -625,6 +655,7 @@ export function useNativeAgentTask(roomId: string) {
       rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
       setNewConversation(false);
       setTaskHostRef(hostRef);
+      setContinues(null);
       try {
         const projection = await loadRecoveryProjection();
         // A drained projection clears the shown task; the task just started
@@ -646,6 +677,7 @@ export function useNativeAgentTask(roomId: string) {
     try {
       const proposed = await proposeRemoteNativeCodexWorkspaceMovement(hostRef, workspace.trim(), taskText.trim(), roomId);
       setMovement(proposed);
+      setContinues(null);
       rememberStartedNativeTask(roomId, { taskId: proposed.taskId, hostRef, movementId: proposed.movementId });
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not prepare the workspace review."); }
@@ -749,18 +781,33 @@ export function useNativeAgentTask(roomId: string) {
   }, [busy, movement]);
 
   /** A task this device started elsewhere in the Agents workspace (a
-   * continued session): shown and followed here like any other run. */
-  const adoptTask = useCallback((started: NativeAgentTaskStatus, hostRef: string | null = null) => {
+   * continued session): shown and followed like any other run, with the
+   * session it continues. */
+  const adoptTask = useCallback((started: NativeAgentTaskStatus, hostRef: string | null = null, session: ContinuedSession | null = null) => {
     setStatus(started);
     setTaskHostRef(hostRef);
     setMovement(null);
     setMessage(null);
-    rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
+    setContinues(session);
+    rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef, continues: session });
   }, [roomId]);
+
+  /** Puts away a finished task's card. Only a task that has ended and needs
+   * nothing more: its record stays with the Host, and nothing is undone. */
+  const canDismiss = !!status && ["completed", "failed", "cancelled"].includes(status.state)
+    && !movement && !nativeAgentRecoveryRequiresAction(status, movement) && !busy;
+  const dismiss = useCallback(() => {
+    if (!canDismiss) return;
+    setStatus(null);
+    setTaskHostRef(null);
+    setContinues(null);
+    setMessage(null);
+    forgetStartedNativeTask(roomId);
+  }, [canDismiss, roomId]);
 
   const retryingResultReturn = returnRetryObservation?.roomId === roomId
     && returnRetryObservation.movement.movementId === movement?.movementId;
-  return { adoptTask, capabilities, workspace, setWorkspace, taskText, setTaskText, newConversation, setNewConversation, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
+  return { adoptTask, continues, canDismiss, dismiss, capabilities, workspace, setWorkspace, taskText, setTaskText, newConversation, setNewConversation, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
 }
 
 const BADGE_TONE: Record<LifecycleTone, string> = { neutral: "", pending: "warn", live: "live", danger: "bad", complete: "ok" };

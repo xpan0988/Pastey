@@ -6,6 +6,17 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+### Changed
+
+- Agents is reorganized around what you came to do. The top says which device the agents work on (and that it decides what this device may do there); below it, the one task this Bridge follows; then one choice: **New task** or **Continue a session**, one view at a time.
+  - Continue a session lists the sessions by itself once there is a folder to look in, each with whether it can be continued from here. A session's view starts with that answer and what happens if you continue, then its state in plain words and who has it open; facts, unknowns, live sources and ids are one step away under Evidence and how Pastey knows.
+  - Continue session is followed where you started it: the form is replaced by the run's progress (Sent → Accepted there → Running → Result), and when it ends the session is read again, showing the new turn.
+  - Every outcome says whether anything ran and what to do next: "Did not start · nothing ran" with the other device's reason and the fix (for example, close the thread in the Codex app there), "Declined on Windows · nothing ran", "Nobody accepted in time", "Codex reported the turn failed" (it did run; the session now ends with that turn), or "Outcome unknown" with Reconcile. A finished task can be dismissed.
+  - New task says that it continues the conversation Pastey keeps in that folder (listed as "Started by Pastey"), and points to Continue a session for conversations from the Codex app or a terminal.
+- Who has a session open is said with how Pastey knows it: Codex's writer lock for that thread (macOS), the device's list of running Codex programs (Windows, where the lock cannot be read; it covers every client at once), or Pastey itself. When Pastey cannot tell, the view says "You can try: Codex decides when it starts" instead of "You can continue".
+- A thread that only Pastey's own idle conversation has open is reported as such, not as "open in another Codex client", and can be continued: Pastey closes its own idle session of that thread first (nothing is lost) and Codex's writer lock still decides. A thread a Pastey task is running in is reported as running and is not continued. On Windows, Pastey's own session no longer makes every other thread in that folder "Unknown".
+- The Accept request on the executing device names its own shared folder the request is for.
+
 ### Added
 
 - Room Control rate budgets per kind of message: capability checks, their answers, Agent requests and statuses, Bridge Plans and membership each have their own, so a polling UI cannot use up what a running task needs. A refusal for the budget is retried automatically, with a fresh message, for a few seconds where it is safe (it proves nothing was done).

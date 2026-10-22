@@ -320,6 +320,8 @@ export interface NativeInvocationReview {
   requestingPeerSessionId: string;
   capabilityDisplayName: string;
   expiresAt: number;
+  /** This device's own shared folder the request names, by its name. */
+  sharedFolder?: string | null;
 }
 
 export function listNativeInvocationReviews(): Promise<NativeInvocationReview[]> {
