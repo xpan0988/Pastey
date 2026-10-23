@@ -1832,7 +1832,7 @@ pub(crate) async fn invoke_remote_native_capability(
 
 /// Sends one recorded invocation over the selected peer's current Room
 /// Control session. A delivery failure leaves the task for reconciliation.
-async fn send_native_invoke(
+pub(crate) async fn send_native_invoke(
     state: Arc<AppState>,
     room_id: &str,
     peer_session_id: &str,
@@ -1840,12 +1840,28 @@ async fn send_native_invoke(
     payload: Value,
     queued: crate::native_agent::NativeAgentTaskStatusV1,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
-    let context = crate::room_control::room_control_session_context_for_peer(
+    // The task is already recorded as queued. If the peer's session is gone
+    // before the request is made, nothing was sent: end the task as a
+    // definite non-start the caller shows, rather than leave a queued
+    // record nothing will ever answer.
+    let context = match crate::room_control::room_control_session_context_for_peer(
         &state,
         room_id,
         peer_session_id,
-    )
-    .map_err(|error| error.message())?;
+    ) {
+        Ok(context) => context,
+        Err(_) => {
+            return state
+                .native_agents
+                .lock()
+                .fail_remote_undelivered(
+                    task_id,
+                    "native_agent_not_delivered",
+                    "The connection to that device ended before the request was sent, so nothing was sent and nothing ran.",
+                )
+                .map_err(|error| error.message())
+        }
+    };
     // The task id, not the event, identifies the invocation: the Host
     // answers a repeat of it with the existing task. A fresh event is sent
     // again only after a refusal for its rate budget, which proves the

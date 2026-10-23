@@ -16369,7 +16369,7 @@ if [ "$1" = "--version" ]; then echo "codex-cli 0.163.0"; exit 0; fi
 if [ "$2" = "--help" ]; then exit 0; fi
 while IFS= read -r line; do
   case "$line" in
-    *'"id":1,'*) echo '{{"id":1,"result":{{}}}}' ;;
+    *'"id":1,'*) echo '{{"id":1,"result":{{"userAgent":"Pastey/0.163.0 (fixture)"}}}}' ;;
     *'"id":9,'*) echo '{{"id":9,"result":{{"data":[{{"id":"thread-1","cwd":"{ws}"}}],"nextCursor":null}}}}' ;;
     *'"id":6,'*) touch '{lock}'; echo '{{"id":6,"result":{{"thread":{{"id":"thread-1"}}}}}}' ;;
     *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"thread-1","cwd":"{ws}"}}}}}}' ;;

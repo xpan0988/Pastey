@@ -41,7 +41,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    cached_report, codex_unavailable_summary, observe_selection,
+    cached_report, codex_unavailable_summary, keeps_writer_locks, observe_selection,
     own_holds::{
         wait_for_lock_release, OwnContinuationGuardV1, OwnHoldReleaseV1, OwnThreadHoldsV1,
     },
@@ -496,6 +496,22 @@ impl CodexThreadRunV1 {
         };
         // From here on, the run owns this app-server and closes it.
         self.controller = Some(controller.clone());
+        // Only a Codex that keeps thread writer locks refuses a second
+        // writer, so the version this very app-server reports must be one;
+        // a lock file seen later could be another client's or left behind.
+        match controller.version() {
+            Some(version) if keeps_writer_locks(version) => {}
+            Some(version) => {
+                return Err(not_started(&format!(
+                    "This Codex ({version}) is older than 0.163, the first to keep thread writer locks, so Pastey cannot rule out another client writing to the same thread, and nothing ran. Update Codex."
+                )))
+            }
+            None => {
+                return Err(not_started(
+                    "This Codex did not report its version, so Pastey cannot tell that it keeps thread writer locks, and nothing ran. Update Codex.",
+                ))
+            }
+        }
         // Codex's own record decides which folder the thread is in, before
         // it is taken or anything of Pastey's is closed for it.
         match controller.thread_recorded_in(&self.thread_id, &self.workspace) {
@@ -774,7 +790,7 @@ mod tests {
             "held" => format!(
                 r#"echo '{{"id":6,"error":{{"code":-32600,"message":"thread {THREAD} already has an active writer"}}}}'"#
             ),
-            "ok-nolock" => {
+            "ok-nolock" | "old-codex" | "no-version" => {
                 format!(r#"echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}'"#)
             }
             // Codex's own refusal, modelled: refused while another process
@@ -801,7 +817,7 @@ if [ "$2" = "--help" ]; then exit 0; fi
 while IFS= read -r line; do
   printf '%s\n' "$line" >> '{log}'
   case "$line" in
-    *'"id":1,'*) echo '{{"id":1,"result":{{}}}}' ;;
+    *'"id":1,'*) echo '{{"id":1,"result":{init}}}' ;;
     *'"id":6,'*) {resume_reply} ;;
     *'"id":7,'*) {turns_reply} ;;
     *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"{THREAD}","cwd":"{cwd}"}}}}}}' ;;
@@ -814,6 +830,12 @@ done
 printf 'closed\n' >> '{log}'
 "#,
             log = log.display(),
+            init = match resume {
+                // An older Codex, which keeps no writer locks.
+                "old-codex" => r#"{"userAgent":"Pastey/0.162.0-alpha.17.2 (fixture)"}"#,
+                "no-version" => "{}",
+                _ => r#"{"userAgent":"Pastey/0.163.0 (fixture)"}"#,
+            },
             cwd = thread_cwd.map(str::to_owned).unwrap_or_else(|| workspace
                 .canonicalize()
                 .unwrap()
@@ -935,6 +957,41 @@ printf 'closed\n' >> '{log}'
         );
         assert!(fixture.home.exists());
         let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    /// An older Codex resumes a thread whatever lock is held, and a lock
+    /// file seen afterwards may be another client's, live or left behind.
+    /// So only the version the launched app-server reports counts, and the
+    /// run refuses before the thread is listed, taken or anything closed.
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_that_keeps_no_writer_locks_is_refused_even_with_a_lock_file_present() {
+        for (mode, reason) in [
+            ("old-codex", "older than 0.163"),
+            ("no-version", "did not report its version"),
+        ] {
+            let fixture = fixture(mode, "turn-old", "completed");
+            // A lock file another, newer client holds or left behind.
+            std::fs::write(
+                fixture
+                    .home
+                    .join("thread-writer-locks")
+                    .join(format!("{THREAD}.lock")),
+                b"",
+            )
+            .unwrap();
+            let outcome = continue_once(&fixture, Some("turn-old"));
+            assert_eq!(outcome.kind, NativeTurnOutcomeV1::NotStarted, "{mode}");
+            assert!(outcome.summary.unwrap().contains(reason), "{mode}");
+            let log = received(&fixture);
+            assert!(
+                !log.contains("thread/list")
+                    && !log.contains("thread/resume")
+                    && !log.contains("turn/start"),
+                "{mode}: {log}"
+            );
+            let _ = std::fs::remove_dir_all(&fixture.root);
+        }
     }
 
     #[test]

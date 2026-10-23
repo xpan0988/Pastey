@@ -296,7 +296,7 @@ if [ "$1" = "--version" ]; then echo "codex-cli 0.163.0"; exit 0; fi
 if [ "$2" = "--help" ]; then exit 0; fi
 while IFS= read -r line; do
   case "$line" in
-    *'"id":1,'*) echo '{{"id":1,"result":{{}}}}' ;;
+    *'"id":1,'*) echo '{{"id":1,"result":{{"userAgent":"Pastey/0.163.0 (fixture)"}}}}' ;;
     *'"id":6,'*) touch '{lock}'; echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}' ;;
     *'"id":7,'*) echo '{{"id":7,"result":{{"data":[{{"id":"{MARKER}","status":"completed"}}]}}}}' ;;
     *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"{THREAD}","cwd":"{cwd}"}}}}}}' ;;
@@ -598,6 +598,77 @@ async fn a_shared_thread_is_continued_once_and_the_mac_learns_the_outcome() {
         pair.windows_accepts(&queued.task_id).is_err(),
         "Accept applies once"
     );
+}
+
+/// The Mac records a continuation as queued, then finds the Windows session
+/// gone before it can send it: nothing was sent, so the task ends as not
+/// delivered, which the Mac shows and keeps; it is never left queued with
+/// nobody to answer it, and its identity is not reused.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_never_sent_ends_as_not_delivered_instead_of_staying_queued() {
+    use crate::native_agent::NativeAgentTaskStateV1;
+    let pair = RuntimePairV1::new().await;
+    let codex = install_windows_codex(&pair);
+    pair.windows_shares(&codex, true, true).await;
+    let scope = pair.mac_lists_shares().await.unwrap().scopes[0]
+        .scope_ref
+        .clone();
+    let input = crate::native_agent::codex_thread_peer_input(
+        &scope,
+        THREAD,
+        "Reply with the word ok",
+        Some(MARKER),
+    )
+    .unwrap();
+    let task_id = "native-agent:never-sent";
+    let windows = pair.windows.host_ref();
+    let queued = pair
+        .mac
+        .runtime
+        .native_agents
+        .lock()
+        .queue_bridge_remote_invocation(
+            ROOM,
+            task_id,
+            windows.as_str(),
+            crate::native_agent::CODEX_THREAD_CAPABILITY,
+            &input,
+        )
+        .unwrap();
+    assert_eq!(queued.state, NativeAgentTaskStateV1::Queued);
+    let ended = crate::commands::send_native_invoke(
+        pair.mac.runtime.clone(),
+        ROOM,
+        "peer-session-that-ended",
+        task_id,
+        serde_json::json!({}),
+        queued,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Failed);
+    assert_eq!(ended.code.as_deref(), Some("native_agent_not_delivered"));
+    assert!(ended.result.unwrap().contains("nothing was sent"));
+    // Windows never saw it, and nothing ran there.
+    assert!(pair.windows_reviews().is_empty());
+    assert_eq!(codex.turn_starts(), 0);
+    // The Mac keeps the outcome; the same identity is not queued again.
+    let mut mac = pair.mac.runtime.native_agents.lock();
+    assert_eq!(
+        mac.task_status(task_id).unwrap().code.as_deref(),
+        Some("native_agent_not_delivered")
+    );
+    let again = mac
+        .queue_bridge_remote_invocation(
+            ROOM,
+            task_id,
+            windows.as_str(),
+            crate::native_agent::CODEX_THREAD_CAPABILITY,
+            &input,
+        )
+        .unwrap();
+    assert_eq!(again.state, NativeAgentTaskStateV1::Failed);
 }
 
 /// Session and share queries as often as every two seconds, for 200 rounds,

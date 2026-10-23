@@ -28,7 +28,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, Weak,
+        mpsc, Arc, Mutex, OnceLock, Weak,
     },
     thread,
     time::{Duration, Instant},
@@ -85,6 +85,68 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound for one app-server line Pastey parses. A longer line (for example a
 /// long command transcript) is skipped unread without ending observation.
 const MAX_OBSERVED_LINE_BYTES: usize = 1024 * 1024;
+
+/// The Codex version in an app-server's `initialize` answer, whose
+/// `userAgent` reads `<client name>/<codex version> (<platform>) ...`
+/// (measured with Codex 0.163.0).
+fn user_agent_version(user_agent: &str) -> Option<String> {
+    let (_, rest) = user_agent.split_once('/')?;
+    let version = rest.split_whitespace().next()?;
+    (!version.is_empty() && version.len() <= 64).then(|| version.to_owned())
+}
+
+/// Whether a Codex version keeps per-thread writer locks: 0.163 does. The
+/// earliest build measured to keep them (and to refuse a second writer) is
+/// the desktop app's `0.163.0-alpha.10.2`; `0.162.0-alpha.17.2` did not
+/// (`tools/codex-session-probe/README.md`). Anything unparseable does not.
+pub(in crate::native_agent) fn keeps_writer_locks(version: &str) -> bool {
+    use std::cmp::Ordering::{Equal, Greater};
+    let version = version.split('+').next().unwrap_or_default();
+    let (core, prerelease) = match version.split_once('-') {
+        Some((core, prerelease)) => (core, Some(prerelease)),
+        None => (version, None),
+    };
+    let parts: Option<Vec<u64>> = core.split('.').map(|part| part.parse().ok()).collect();
+    let Some(&[major, minor, patch]) = parts.as_deref() else {
+        return false;
+    };
+    match (major, minor, patch).cmp(&(0, 163, 0)) {
+        Greater => true,
+        Equal => prerelease.is_none_or(|prerelease| {
+            matches!(
+                semver_prerelease_cmp(prerelease, "alpha.10.2"),
+                Some(Greater | Equal)
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Semantic Versioning's precedence of two pre-release tags.
+fn semver_prerelease_cmp(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let mut left = left.split('.');
+    let mut right = right.split('.');
+    loop {
+        return match (left.next(), right.next()) {
+            (None, None) => Some(std::cmp::Ordering::Equal),
+            (None, Some(_)) => Some(std::cmp::Ordering::Less),
+            (Some(_), None) => Some(std::cmp::Ordering::Greater),
+            (Some(a), Some(b)) if a.is_empty() || b.is_empty() => None,
+            (Some(a), Some(b)) => {
+                let ordering = match (a.parse::<u64>(), b.parse::<u64>()) {
+                    (Ok(a), Ok(b)) => a.cmp(&b),
+                    (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                    (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                    (Err(_), Err(_)) => a.cmp(b),
+                };
+                if ordering == std::cmp::Ordering::Equal {
+                    continue;
+                }
+                Some(ordering)
+            }
+        };
+    }
+}
 
 /// The thread sources discovery lists, and a continuation looks among.
 pub(in crate::native_agent) const LISTED_SOURCE_KINDS: [&str; 4] =
@@ -1912,6 +1974,8 @@ pub(in crate::native_agent) struct CodexAppServerV1 {
     /// Native requests of the active turn its requesting user may decide,
     /// by Pastey's review reference. Cleared when each turn begins and ends.
     decisions: Mutex<HashMap<String, PendingNativeDecisionV1>>,
+    /// The Codex version this app-server reported when it started.
+    version: OnceLock<String>,
 }
 
 /// One native request awaiting its requesting user, as only this adapter
@@ -2226,13 +2290,21 @@ impl CodexAppServerV1 {
             interrupt_requested: AtomicBool::new(false),
             in_use: AtomicBool::new(false),
             decisions: Mutex::default(),
+            version: OnceLock::new(),
         };
         controller.send(json!({"id": INITIALIZE_ID, "method": "initialize", "params": {"clientInfo": {"name": "Pastey", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
-        controller.await_result(
+        let initialized = controller.await_result(
             INITIALIZE_ID,
             Instant::now() + NATIVE_AGENT_RPC_TIMEOUT,
             false,
         )?;
+        if let Some(version) = initialized
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .and_then(user_agent_version)
+        {
+            let _ = controller.version.set(version);
+        }
         controller.send(json!({"method": "initialized", "params": {}}))?;
         Ok(controller)
     }
@@ -2274,6 +2346,11 @@ impl CodexAppServerV1 {
             return invalid("Codex reopened a different conversation.");
         }
         Ok(())
+    }
+
+    /// The Codex version this app-server reported, if it did.
+    pub(in crate::native_agent) fn version(&self) -> Option<&str> {
+        self.version.get().map(String::as_str)
     }
 
     /// Whether the app-server process has exited.
@@ -2982,6 +3059,46 @@ fn codex_completed_turn_outcome(
         Some("cancelled") => NativeTurnOutcomeV1::Cancelled,
         Some("inProgress") => NativeTurnOutcomeV1::Unknown,
         _ => NativeTurnOutcomeV1::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod writer_lock_version_tests {
+    use super::*;
+
+    #[test]
+    fn only_codex_versions_measured_to_keep_writer_locks_count() {
+        assert_eq!(
+            user_agent_version("Pastey/0.163.0 (Mac OS 26.5.2; arm64) unknown (Pastey; 2.0.0)")
+                .as_deref(),
+            Some("0.163.0")
+        );
+        assert_eq!(user_agent_version("no version here"), None);
+        for keeps in [
+            "0.163.0",
+            "0.163.0-alpha.10.2",
+            "0.163.0-alpha.11",
+            "0.163.0-beta.1",
+            "0.163.1",
+            "0.164.0-alpha.1",
+            "1.0.0",
+            "0.163.0+build.7",
+        ] {
+            assert!(keeps_writer_locks(keeps), "{keeps}");
+        }
+        for not in [
+            "0.162.0",
+            "0.162.0-alpha.17.2",
+            "0.163.0-alpha.10",
+            "0.163.0-alpha.9",
+            "0.163",
+            "",
+            "unknown",
+            "0.163.0-",
+            "v0.163.0",
+        ] {
+            assert!(!keeps_writer_locks(not), "{not}");
+        }
     }
 }
 
