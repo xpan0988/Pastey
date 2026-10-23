@@ -6,9 +6,14 @@
 //! closed, so Codex's thread writer lock (see `writer_lock`) is held exactly
 //! while Pastey's turn runs:
 //!
-//! 0. If Pastey's own conversation keeps the thread open, idle, that session
-//!    is closed first (`own_holds`): nothing is lost, and Codex's refusal
-//!    below stays the only gate. One a Pastey task is using is never closed.
+//! 0. Before anything is taken or closed, the thread must be one Codex
+//!    records for exactly this folder (`thread/list` with an exact `cwd`
+//!    filter, as discovery reads it). A peer names the folder only by its
+//!    share, and the thread id is its own claim: this keeps a request for
+//!    another folder's thread from touching it. Then, if Pastey's own
+//!    conversation keeps the thread open, idle, in this folder, that session
+//!    is closed (`own_holds`): nothing is lost, and Codex's refusal below
+//!    stays the only gate. One a Pastey task is using is never closed.
 //! 1. `thread/resume` takes the lock. Codex refuses it while another client
 //!    (the Codex app or a terminal) has the thread open, and nothing runs.
 //! 2. Holding the lock, Pastey checks that the thread still ends with the
@@ -41,7 +46,7 @@ use super::{
         wait_for_lock_release, OwnContinuationGuardV1, OwnHoldReleaseV1, OwnThreadHoldsV1,
     },
     workspace_exclusivity_key, AvailabilityCacheV1, CodexAppServerV1, CodexTaskAttachmentV1,
-    CodexTaskSlotV1, AVAILABILITY_TTL, INSTALLED_CODEX,
+    CodexTaskSlotV1, AVAILABILITY_TTL, INSTALLED_CODEX, LISTED_SOURCE_KINDS,
 };
 use crate::error::{AppError, AppResult};
 use crate::native_agent::capability::{
@@ -58,6 +63,11 @@ use crate::native_agent::{
 pub(in crate::native_agent) const CODEX_THREAD_CAPABILITY_ID: &str = "agent.coding.codex_thread";
 const THREAD_TURNS_ID: u64 = 7;
 const THREAD_READ_ID: u64 = 8;
+const THREAD_LIST_ID: u64 = 9;
+const THREAD_LIST_PAGE: u64 = 50;
+/// Up to 2,000 of the folder's threads, newest first.
+const THREAD_LIST_PAGES: usize = 40;
+const ANOTHER_FOLDER: &str = "This Codex thread belongs to another folder, so nothing ran.";
 /// Codex's own refusal while another client holds the thread.
 const ACTIVE_WRITER: &str = "already has an active writer";
 
@@ -480,26 +490,39 @@ impl CodexThreadRunV1 {
                 "The workspace changed before Codex could start, so nothing ran.",
             ));
         }
-        // This run holds the folder's exclusivity, so no Pastey task in it
-        // can start using that session meanwhile.
-        match self.own_holds.release_idle(&self.thread_id) {
-            OwnHoldReleaseV1::InUse => {
-                return Err(not_started(
-                    "A Pastey task is running a turn in this Codex thread, so nothing ran. Wait for it to finish, then continue.",
-                ))
-            }
-            OwnHoldReleaseV1::Released => {
-                wait_for_lock_release(self.codex_home.as_deref(), &self.thread_id)
-            }
-            OwnHoldReleaseV1::NotHeld => {}
-        }
-        self.continuing = Some(self.own_holds.continuing(&self.thread_id));
         let controller = match CodexAppServerV1::launch(&launcher, &self.workspace) {
             Ok(controller) => Arc::new(controller),
             Err(_) => return Err(not_started("Codex could not start its native app-server.")),
         };
         // From here on, the run owns this app-server and closes it.
         self.controller = Some(controller.clone());
+        // Codex's own record decides which folder the thread is in, before
+        // it is taken or anything of Pastey's is closed for it.
+        match controller.thread_recorded_in(&self.thread_id, &self.workspace) {
+            Ok(true) => {}
+            Ok(false) => return Err(not_started(ANOTHER_FOLDER)),
+            Err(_) => {
+                return Err(not_started(
+                    "Codex could not list this folder's threads, so nothing ran.",
+                ))
+            }
+        }
+        // This run holds the folder's exclusivity, so no Pastey task in it
+        // can start using that session meanwhile; the store's lock covers
+        // the check and the removal.
+        match self.own_holds.release_idle(&self.thread_id, &self.workspace) {
+            OwnHoldReleaseV1::InUse => {
+                return Err(not_started(
+                    "A Pastey task is running a turn in this Codex thread, so nothing ran. Wait for it to finish, then continue.",
+                ))
+            }
+            OwnHoldReleaseV1::HeldElsewhere => return Err(not_started(ANOTHER_FOLDER)),
+            OwnHoldReleaseV1::Released => {
+                wait_for_lock_release(self.codex_home.as_deref(), &self.thread_id)
+            }
+            OwnHoldReleaseV1::NotHeld => {}
+        }
+        self.continuing = Some(self.own_holds.continuing(&self.thread_id));
         if let Err(error) = controller.resume_thread(&self.thread_id, &self.workspace) {
             return Err(not_started(if error.message().contains(ACTIVE_WRITER) {
                 "This Codex thread is open in another Codex client (the Codex app or a terminal), so nothing ran. Close it there, then continue it here."
@@ -527,11 +550,7 @@ impl CodexThreadRunV1 {
         match controller.thread_cwd(&self.thread_id) {
             Ok(Some(cwd))
                 if Path::new(&cwd).canonicalize().ok().as_ref() == Some(&self.workspace) => {}
-            Ok(_) => {
-                return Err(not_started(
-                    "This Codex thread belongs to another folder, so nothing ran.",
-                ))
-            }
+            Ok(_) => return Err(not_started(ANOTHER_FOLDER)),
             Err(_) => {
                 return Err(not_started(
                     "Codex could not read this thread, so nothing ran.",
@@ -621,6 +640,42 @@ impl Drop for CodexThreadRunV1 {
 }
 
 impl CodexAppServerV1 {
+    /// Whether Codex records `thread_id` for exactly `workspace`, from its
+    /// state database, without loading the thread.
+    fn thread_recorded_in(&self, thread_id: &str, workspace: &Path) -> AppResult<bool> {
+        let filter = dunce::simplified(workspace).to_string_lossy().into_owned();
+        let mut cursor = Value::Null;
+        for _ in 0..THREAD_LIST_PAGES {
+            self.send(json!({"id": THREAD_LIST_ID, "method": "thread/list", "params": {"cwd": [filter], "limit": THREAD_LIST_PAGE, "cursor": cursor, "sortKey": "updated_at", "sourceKinds": LISTED_SOURCE_KINDS, "useStateDbOnly": true}}))?;
+            let page = self.await_result(
+                THREAD_LIST_ID,
+                Instant::now() + NATIVE_AGENT_RPC_TIMEOUT,
+                false,
+            )?;
+            for thread in page
+                .get("data")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if thread.get("id").and_then(Value::as_str) == Some(thread_id) {
+                    // The server filtered already; check again here.
+                    return Ok(thread
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .and_then(|cwd| Path::new(cwd).canonicalize().ok())
+                        .as_deref()
+                        == Some(workspace));
+                }
+            }
+            cursor = page.get("nextCursor").cloned().unwrap_or(Value::Null);
+            if cursor.is_null() {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
+
     /// The folder Codex recorded for the thread.
     fn thread_cwd(&self, thread_id: &str) -> AppResult<Option<String>> {
         self.send(json!({"id": THREAD_READ_ID, "method": "thread/read", "params": {"threadId": thread_id}}))?;
@@ -682,6 +737,7 @@ mod tests {
         home: PathBuf,
         log: PathBuf,
         adapter: CodexThreadAdapterV1,
+        program: PathBuf,
     }
 
     const THREAD: &str = "thread-1";
@@ -721,6 +777,12 @@ mod tests {
             "ok-nolock" => {
                 format!(r#"echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}'"#)
             }
+            // Codex's own refusal, modelled: refused while another process
+            // holds an exclusive flock on the thread's lock file.
+            "ok-unless-locked" => format!(
+                r#"if /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, "<", $ARGV[0]) or exit 0; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' '{lock}'; then touch '{lock}'; echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}'; else echo '{{"id":6,"error":{{"code":-32600,"message":"thread {THREAD} already has an active writer"}}}}'; fi"#,
+                lock = lock.display()
+            ),
             _ => format!(
                 r#"touch '{}'; echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}'"#,
                 lock.display()
@@ -743,6 +805,7 @@ while IFS= read -r line; do
     *'"id":6,'*) {resume_reply} ;;
     *'"id":7,'*) {turns_reply} ;;
     *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"{THREAD}","cwd":"{cwd}"}}}}}}' ;;
+    *'"id":9,'*) echo '{{"id":9,"result":{{"data":[{{"id":"{THREAD}","cwd":"{cwd}"}}],"nextCursor":null}}}}' ;;
     *'"id":3,'*) echo '{{"id":3,"result":{{"turn":{{"id":"turn-new"}}}}}}'
       echo '{{"method":"item/completed","params":{{"threadId":"{THREAD}","turnId":"turn-new","item":{{"type":"agentMessage","id":"m1","text":"continued","phase":"final_answer"}}}}}}'
       echo '{{"method":"turn/completed","params":{{"threadId":"{THREAD}","turn":{{"id":"turn-new","items":[],"status":"completed","error":null}}}}}}' ;;
@@ -769,6 +832,7 @@ printf 'closed\n' >> '{log}'
             home,
             log,
             adapter,
+            program,
         }
     }
 
@@ -958,7 +1022,7 @@ printf 'closed\n' >> '{log}'
 
     #[cfg(unix)]
     #[test]
-    fn a_thread_recorded_in_another_folder_is_refused() {
+    fn a_thread_recorded_in_another_folder_is_refused_before_it_is_taken() {
         let fixture = fixture_in("ok", "turn-old", "completed", Some("/somewhere/else"));
         let outcome = continue_once(&fixture, Some("turn-old"));
         assert_eq!(outcome.kind, NativeTurnOutcomeV1::NotStarted);
@@ -966,7 +1030,215 @@ printf 'closed\n' >> '{log}'
             .summary
             .unwrap()
             .contains("belongs to another folder"));
-        assert!(!received(&fixture).contains("turn/start"));
+        let log = received(&fixture);
+        // Codex's own record of its folder is read first, without loading it.
+        assert!(log.contains("thread/list"));
+        assert!(!log.contains("thread/resume"), "never taken");
+        assert!(!log.contains("turn/start"));
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    /// Pastey's own session of the thread, as the Codex adapter keeps it:
+    /// an app-server that holds the thread's writer lock (a real exclusive
+    /// flock) until it is closed. `workspace` is the folder it is for.
+    #[cfg(unix)]
+    fn pastey_session(
+        fixture: &Fixture,
+        workspace: &Path,
+        in_use: bool,
+    ) -> (OwnThreadHoldsV1, u32) {
+        use super::super::{CodexLauncherV1, NativeCodexSessionV1, SessionStoreV1};
+        use std::os::unix::fs::PermissionsExt;
+        let lock = fixture
+            .home
+            .join("thread-writer-locks")
+            .join(format!("{THREAD}.lock"));
+        let pid_file = fixture.root.join("holder.pid");
+        let holder = fixture.root.join("pastey-holder");
+        std::fs::write(
+            &holder,
+            format!(
+                r#"#!/bin/sh
+echo $$ > '{pid}'
+exec /usr/bin/perl -e 'use Fcntl qw(:flock); $| = 1; open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; while (my $line = <STDIN>) {{ print qq({{"id":1,"result":{{}}}}\n) if $line =~ /"id":1,/; }}' '{lock}'
+"#,
+                pid = pid_file.display(),
+                lock = lock.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&holder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launcher = CodexLauncherV1 {
+            program: holder,
+            search_path: None,
+            backend: "configured",
+            version: None,
+        };
+        let controller = Arc::new(CodexAppServerV1::launch(&launcher, &fixture.workspace).unwrap());
+        controller.in_use.store(in_use, Ordering::Release);
+        // Holding: the lock is taken before initialize is answered.
+        assert_eq!(
+            super::super::writer_lock::observe(&fixture.home, THREAD),
+            super::super::writer_lock::WriterLockV1::Held
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let sessions = SessionStoreV1::default();
+        sessions.lock().unwrap().insert(
+            "pastey-conversation".into(),
+            NativeCodexSessionV1 {
+                workspace: workspace.to_path_buf(),
+                controller,
+                thread_id: THREAD.into(),
+                last_used: Instant::now(),
+            },
+        );
+        (OwnThreadHoldsV1::new(sessions), pid)
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[cfg(unix)]
+    fn sharing(fixture: &Fixture, holds: OwnThreadHoldsV1) -> CodexThreadAdapterV1 {
+        let adapter = CodexThreadAdapterV1::sharing(holds);
+        adapter.use_executable(&fixture.program);
+        adapter.use_codex_home(&fixture.home);
+        adapter
+    }
+
+    #[cfg(unix)]
+    fn continue_with(
+        adapter: &CodexThreadAdapterV1,
+        fixture: &Fixture,
+    ) -> NativeInvocationOutcomeV1 {
+        let input = continue_input(
+            &fixture.workspace,
+            THREAD,
+            "run the tests",
+            Some("turn-old"),
+        )
+        .unwrap();
+        let mut started = adapter.start("native-agent:task-2", &input, None).unwrap();
+        let outcome = started.run.run(&Progress);
+        drop(started);
+        outcome
+    }
+
+    /// The own_holds branch, end to end. Pastey's idle session holds the
+    /// thread's lock, and the fake Codex refuses `thread/resume` while any
+    /// process holds it, as Codex does: the continuation completes only
+    /// because that session was closed after the folder check and before
+    /// the resume. One in use, or one for another folder, is left alone,
+    /// still holding, and nothing is taken.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pastey_s_own_idle_session_is_closed_only_after_the_folder_check() {
+        let fixture = fixture("ok-unless-locked", "turn-old", "completed");
+        let canonical = fixture.workspace.canonicalize().unwrap();
+        let (holds, holder) = pastey_session(&fixture, &canonical, false);
+        let held = holds.observe();
+        assert_eq!((held.len(), held[0].running), (1, false));
+        let started = Instant::now();
+        let outcome = continue_with(&sharing(&fixture, holds.clone()), &fixture);
+        assert_eq!(
+            outcome.kind,
+            NativeTurnOutcomeV1::Completed,
+            "{:?}",
+            outcome.summary
+        );
+        assert!(!alive(holder), "Pastey's idle app-server was closed");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the released lock is seen at once, not waited out"
+        );
+        assert!(holds.observe().is_empty());
+        let log = received(&fixture);
+        assert!(log.find("thread/list").unwrap() < log.find("thread/resume").unwrap());
+        assert_eq!(log.matches("turn/start").count(), 1);
+        let _ = std::fs::remove_dir_all(&fixture.root);
+
+        // In use by a Pastey task: refused before anything is taken.
+        let fixture = self::fixture("ok-unless-locked", "turn-old", "completed");
+        let canonical = fixture.workspace.canonicalize().unwrap();
+        let (holds, holder) = pastey_session(&fixture, &canonical, true);
+        let outcome = continue_with(&sharing(&fixture, holds.clone()), &fixture);
+        assert_eq!(outcome.kind, NativeTurnOutcomeV1::NotStarted);
+        assert!(outcome
+            .summary
+            .unwrap()
+            .contains("A Pastey task is running a turn"));
+        assert!(alive(holder), "a session in use is never closed");
+        let log = received(&fixture);
+        assert!(
+            !log.contains("thread/resume") && !log.contains("turn/start"),
+            "{log}"
+        );
+        let _ = std::process::Command::new("kill")
+            .arg(holder.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&fixture.root);
+
+        // Pastey has it open for another folder: refused, left alone.
+        let fixture = self::fixture("ok-unless-locked", "turn-old", "completed");
+        let (holds, holder) = pastey_session(&fixture, &fixture.root, false);
+        let outcome = continue_with(&sharing(&fixture, holds.clone()), &fixture);
+        assert_eq!(outcome.kind, NativeTurnOutcomeV1::NotStarted);
+        assert!(outcome
+            .summary
+            .unwrap()
+            .contains("belongs to another folder"));
+        assert!(alive(holder), "not closed");
+        assert!(!received(&fixture).contains("thread/resume"));
+        let _ = std::process::Command::new("kill")
+            .arg(holder.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    /// Another client holds the lock (not Pastey): the continuation is
+    /// refused by Codex at `thread/resume`, nothing of Pastey's is closed,
+    /// and no turn is sent.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_lock_another_client_holds_refuses_at_resume_and_nothing_runs() {
+        use std::io::{BufRead, BufReader};
+        let fixture = fixture("ok-unless-locked", "turn-old", "completed");
+        let lock = fixture
+            .home
+            .join("thread-writer-locks")
+            .join(format!("{THREAD}.lock"));
+        std::fs::write(&lock, b"").unwrap();
+        let mut client = std::process::Command::new("/usr/bin/perl")
+            .args(["-e", "use Fcntl qw(:flock); open(my $f, '<', $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print \"held\\n\"; sleep 30;"])
+            .arg(&lock)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(client.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let outcome = continue_once(&fixture, Some("turn-old"));
+        assert_eq!(outcome.kind, NativeTurnOutcomeV1::NotStarted);
+        assert!(outcome
+            .summary
+            .unwrap()
+            .contains("open in another Codex client"));
+        let log = received(&fixture);
+        assert!(log.contains("thread/resume") && !log.contains("turn/start"));
+        client.kill().unwrap();
+        client.wait().unwrap();
         let _ = std::fs::remove_dir_all(&fixture.root);
     }
 

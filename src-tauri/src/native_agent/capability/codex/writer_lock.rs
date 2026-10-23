@@ -16,13 +16,23 @@
 use std::path::{Path, PathBuf};
 
 /// Whether another Codex client has a thread open for writing.
+///
+/// Four different pieces of evidence, kept apart:
+/// - the lock file is held (`Held`) or tested and not held (`Free`): macOS;
+/// - the lock file does not exist: `Free` on macOS, where Codex was measured
+///   to keep the lock on exactly this file and remove it on exit; elsewhere
+///   `Unknown`, because where Codex keeps its lock there is not measured;
+/// - the file exists but cannot be tested without taking it: `Unknown`;
+/// - and, separately and only at launch, Codex's own `thread/resume`
+///   refusal, which is the only one that decides anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WriterLockV1 {
     /// A process holds the thread's writer lock now. Only observable on
     /// macOS so far.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Held,
-    /// No process holds it.
+    /// No process holds it. Only observable on macOS so far.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Free,
     /// It cannot be read here without taking it.
     Unknown(&'static str),
@@ -63,10 +73,23 @@ pub(crate) fn observe(codex_home: &Path, thread_id: &str) -> WriterLockV1 {
     }
     let path = directory.join(format!("{thread_id}.lock"));
     if !path.exists() {
-        // A lock cannot be held on a file that does not exist.
-        return WriterLockV1::Free;
+        return absent();
     }
     held(&path)
+}
+
+/// A lock cannot be held on a file that does not exist, and on macOS Codex
+/// was measured to lock exactly this file.
+#[cfg(target_os = "macos")]
+fn absent() -> WriterLockV1 {
+    WriterLockV1::Free
+}
+
+/// Elsewhere Codex's lock file was not measured, so its absence is not
+/// shown to mean that no client has the thread open.
+#[cfg(not(target_os = "macos"))]
+fn absent() -> WriterLockV1 {
+    WriterLockV1::Unknown("no lock file for this thread, which is not measured to mean no Codex client has it open on this system")
 }
 
 #[cfg(target_os = "macos")]
@@ -113,12 +136,14 @@ mod tests {
     }
 
     #[test]
-    fn no_lock_file_is_free_and_no_lock_directory_is_unknown() {
+    fn no_lock_file_is_free_only_where_measured_and_no_lock_directory_is_unknown() {
         let root = home();
-        assert_eq!(
-            observe(&root, "01a140f0-6af4-7ef3-b799-dcd84c0275a6"),
-            WriterLockV1::Free
-        );
+        let absent = observe(&root, "01a140f0-6af4-7ef3-b799-dcd84c0275a6");
+        if cfg!(target_os = "macos") {
+            assert_eq!(absent, WriterLockV1::Free);
+        } else {
+            assert!(matches!(absent, WriterLockV1::Unknown(_)), "{absent:?}");
+        }
         let bare =
             std::env::temp_dir().join(format!("pastey-codex-nolocks-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&bare).unwrap();

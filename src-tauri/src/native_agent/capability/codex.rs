@@ -86,6 +86,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// long command transcript) is skipped unread without ending observation.
 const MAX_OBSERVED_LINE_BYTES: usize = 1024 * 1024;
 
+/// The thread sources discovery lists, and a continuation looks among.
+pub(in crate::native_agent) const LISTED_SOURCE_KINDS: [&str; 4] =
+    ["cli", "vscode", "exec", "appServer"];
 const INITIALIZE_ID: u64 = 1;
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;

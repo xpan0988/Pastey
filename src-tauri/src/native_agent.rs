@@ -4939,6 +4939,10 @@ impl NativeAgentServiceV1 {
                 // A different task must not overlap possible execution.
                 run.wait_until_observation_lost();
             }
+            // The run lets go of what it holds first: its occupancy of a
+            // reused session, or a continuation's own app-server and with it
+            // Codex's writer lock. Only then may another task take the folder.
+            drop(run);
             // Always release only after the native observer exits, including
             // when cancellation had already revoked visible authority.
             if let Some(key) = held_key {
@@ -16340,6 +16344,104 @@ done
                 .unwrap()
                 .is_none()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Two continuations of one Codex thread at almost the same moment, and
+    /// a replay of the first: the folder's exclusivity, checked and taken
+    /// under the service's one lock, admits exactly one writer; the replay
+    /// returns the same task and sends nothing again; nothing is retried.
+    #[cfg(unix)]
+    #[test]
+    fn one_thread_takes_one_continuation_at_a_time_and_a_replay_runs_nothing() {
+        let root = std::env::temp_dir().join(format!("pastey-thread-race-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let home = root.join("codex-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(home.join("thread-writer-locks")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let lock = home.join("thread-writer-locks").join("thread-1.lock");
+        let starts = root.join("turn-starts");
+        // A Codex whose turn starts and never ends until it is interrupted.
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.163.0"; exit 0; fi
+if [ "$2" = "--help" ]; then exit 0; fi
+while IFS= read -r line; do
+  case "$line" in
+    *'"id":1,'*) echo '{{"id":1,"result":{{}}}}' ;;
+    *'"id":9,'*) echo '{{"id":9,"result":{{"data":[{{"id":"thread-1","cwd":"{ws}"}}],"nextCursor":null}}}}' ;;
+    *'"id":6,'*) touch '{lock}'; echo '{{"id":6,"result":{{"thread":{{"id":"thread-1"}}}}}}' ;;
+    *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"thread-1","cwd":"{ws}"}}}}}}' ;;
+    *'"id":7,'*) echo '{{"id":7,"result":{{"data":[{{"id":"turn-old","status":"completed"}}]}}}}' ;;
+    *'"id":3,'*) echo turn >> '{starts}'; echo '{{"id":3,"result":{{"turn":{{"id":"turn-new"}}}}}}' ;;
+    *'"id":4,'*) echo '{{"id":4,"result":{{}}}}'
+      echo '{{"method":"turn/completed","params":{{"threadId":"thread-1","turn":{{"id":"turn-new","items":[],"status":"interrupted","error":null}}}}}}' ;;
+  esac
+done
+"#,
+            ws = workspace.display(),
+            lock = lock.display(),
+            starts = starts.display(),
+        );
+        let program = root.join("codex-fixture");
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut service = NativeAgentServiceV1::default();
+        service.add_codex_thread_adapter_for_test(&program, &home);
+        let input = capability::codex::thread_continuation::continue_input(
+            &workspace,
+            "thread-1",
+            "first",
+            Some("turn-old"),
+        )
+        .unwrap();
+        let first = service
+            .start_local_invocation(CODEX_THREAD_CAPABILITY, "native-agent:first", &input)
+            .unwrap();
+        let turn_started = || {
+            fs::read_to_string(&starts)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        for _ in 0..300 {
+            if turn_started() == 1 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(turn_started(), 1, "the first continuation runs");
+        // A second, independent continuation of the same thread is refused
+        // before any adapter sees it: one writer.
+        let second =
+            service.start_codex_thread_task(&workspace, "thread-1", "second", Some("turn-old"));
+        assert!(second
+            .unwrap_err()
+            .message()
+            .contains("unresolved invocation"));
+        // The first one delivered again: the same task, nothing sent again.
+        let replay = service
+            .start_local_invocation(CODEX_THREAD_CAPABILITY, "native-agent:first", &input)
+            .unwrap();
+        assert_eq!(replay.task_id, first.task_id);
+        // The same task id with other input is refused, not merged.
+        let other = capability::codex::thread_continuation::continue_input(
+            &workspace,
+            "thread-1",
+            "different",
+            Some("turn-old"),
+        )
+        .unwrap();
+        assert!(service
+            .start_local_invocation(CODEX_THREAD_CAPABILITY, "native-agent:first", &other)
+            .is_err());
+        assert_eq!(turn_started(), 1, "nothing ran twice");
+        // Stop ends the running turn; the folder is free again afterwards.
+        service.cancel_task(&first.task_id).unwrap();
+        let ended = wait_for_terminal(&service, &first.task_id);
+        assert_eq!(ended.state, NativeAgentTaskStateV1::Cancelled, "{ended:?}");
+        wait_for_workspace_release(&service, &workspace);
+        assert_eq!(turn_started(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }

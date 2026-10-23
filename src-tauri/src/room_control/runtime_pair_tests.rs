@@ -300,6 +300,7 @@ while IFS= read -r line; do
     *'"id":6,'*) touch '{lock}'; echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}' ;;
     *'"id":7,'*) echo '{{"id":7,"result":{{"data":[{{"id":"{MARKER}","status":"completed"}}]}}}}' ;;
     *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"{THREAD}","cwd":"{cwd}"}}}}}}' ;;
+    *'"id":9,'*) echo '{{"id":9,"result":{{"data":[{{"id":"{THREAD}","cwd":"{cwd}"}}],"nextCursor":null}}}}' ;;
     *'"id":3,'*) echo turn >> '{starts}'
       echo '{{"id":3,"result":{{"turn":{{"id":"turn-new"}}}}}}'
       echo '{{"method":"item/completed","params":{{"threadId":"{THREAD}","turnId":"turn-new","item":{{"type":"agentMessage","id":"m1","text":"continued","phase":"final_answer"}}}}}}'

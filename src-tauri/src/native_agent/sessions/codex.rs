@@ -37,7 +37,7 @@ use crate::native_agent::capability::codex::{
     codex_holder_processes,
     own_holds::OwnThreadHoldV1,
     writer_lock::{thread_writer_lock, WriterLockV1},
-    CodexHistoryReaderV1, CodexHolderProcessV1, HistoryReadErrorV1,
+    CodexHistoryReaderV1, CodexHolderProcessV1, HistoryReadErrorV1, LISTED_SOURCE_KINDS,
 };
 
 /// Live sources, as named in observations. The renderer explains each, so
@@ -48,7 +48,6 @@ pub(super) const PASTEY_SOURCE: &str = "Pastey's own Codex session";
 const PAGE: u64 = 50;
 const MAX_TURN_PAGES: usize = 20;
 const MAX_RECENT: usize = 6;
-const SOURCE_KINDS: [&str; 4] = ["cli", "vscode", "exec", "appServer"];
 
 pub(crate) struct CodexSessionSourceV1 {
     executable: PathBuf,
@@ -202,7 +201,7 @@ impl CodexSessionSourceV1 {
                 .request(
                     "thread/list",
                     json!({"cwd": filter, "limit": PAGE, "cursor": cursor, "sortKey": "updated_at",
-                           "sourceKinds": SOURCE_KINDS, "useStateDbOnly": true}),
+                           "sourceKinds": LISTED_SOURCE_KINDS, "useStateDbOnly": true}),
                 )
                 .map_err(read_error)?;
             for thread in page

@@ -16,6 +16,8 @@ The current development changes belong in `Unreleased`. Each release archives th
 - Who has a session open is said with how Pastey knows it: Codex's writer lock for that thread (macOS), the device's list of running Codex programs (Windows, where the lock cannot be read; it covers every client at once), or Pastey itself. When Pastey cannot tell, the view says "You can try: Codex decides when it starts" instead of "You can continue".
 - A thread that only Pastey's own idle conversation has open is reported as such, not as "open in another Codex client", and can be continued: Pastey closes its own idle session of that thread first (nothing is lost) and Codex's writer lock still decides. A thread a Pastey task is running in is reported as running and is not continued. On Windows, Pastey's own session no longer makes every other thread in that folder "Unknown".
 - The Accept request on the executing device names its own shared folder the request is for.
+- Continuing a Codex thread now checks, before the thread is taken or anything of Pastey's is closed, that Codex records it for exactly the folder admitted (a peer's thread id is only its claim); Pastey's own idle session is closed only for that same folder. After closing it, Pastey waits for the lock itself on macOS rather than the lock file, which a killed app-server leaves behind, so the continuation no longer stalls for 5 s. A run lets go of its app-server and lock before its folder is free for the next task.
+- On Windows and Linux a missing Codex lock file is no longer reported as "not open in any Codex client": where Codex keeps its lock there is not measured, so the device's process list decides what is shown. Starting a continuation never relied on it.
 
 ### Added
 
