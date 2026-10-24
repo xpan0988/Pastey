@@ -89,7 +89,7 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
         <div className="page" hidden={tab !== "share"}>
           <ShareView room={room} items={items} queueItems={queueItems} transfers={transfers} peers={peers} task={task} active={tab === "share"} onRefresh={onRefresh} onEnqueue={onEnqueue} onRevealInFolder={onRevealInFolder} />
         </div>
-        <div className="panel-scroll" hidden={tab !== "agents"}><AgentWorkspace room={room} agent={agent} peers={peers} members={members} onOpenDevice={setDeviceOpen} onOpenDetails={() => setDetailsOpen(true)} /></div>
+        <div className="page" hidden={tab !== "agents"}><AgentWorkspace room={room} agent={agent} peers={peers} members={members} onOpenDevice={setDeviceOpen} onOpenDetails={() => setDetailsOpen(true)} /></div>
       </>}
     </section>
     {detailsOpen ? <>

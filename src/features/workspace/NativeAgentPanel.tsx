@@ -1,18 +1,17 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
 import { codexRunReadiness, looksLikeFullPath, type CodexWorkspaceSource } from "../../lib/nativeAgentReadiness";
-import type { NativeAgentCapability } from "../../lib/tauri";
 import {
   nativeAgentMovementBlocksNewRun,
-  nativeAgentTargetAvailability,
-  useRemoteNativeCapabilities,
+  type ConversationPlace,
   type NativeAgentTargetAvailability,
   type useNativeAgentTask,
 } from "./AgentTaskLifecycle";
+import { PastTurnView, TaskTurn } from "./AgentTaskTracker";
 import type { PeerShares } from "./BridgeWorkspaces";
-import { shareSummary } from "../../lib/workspaceShares";
-import { Checklist, Dot, Field, Icon, type Tone } from "./ui";
+import { Composer, ConversationHeader, ConversationThread } from "./Conversation";
+import { Checklist, Dot, Icon, type Tone } from "./ui";
 
 export type NativeAgentController = ReturnType<typeof useNativeAgentTask>;
 
@@ -20,68 +19,92 @@ const WORKSPACE_MEMORY_KEY = "pastey:codex-workspaces-v1";
 
 /** The last folder used per target, so a path typed for another device does
  * not have to be typed again. Kept only in this device's renderer storage. */
-function rememberedWorkspace(key: string): string {
+export function rememberedWorkspace(key: string): string {
   try { return (JSON.parse(window.localStorage.getItem(WORKSPACE_MEMORY_KEY) ?? "{}") as Record<string, string>)[key] ?? ""; }
   catch { return ""; }
 }
 
-function rememberWorkspace(key: string, path: string) {
+export function rememberWorkspace(key: string, path: string) {
   try {
     const current = JSON.parse(window.localStorage.getItem(WORKSPACE_MEMORY_KEY) ?? "{}") as Record<string, string>;
     window.localStorage.setItem(WORKSPACE_MEMORY_KEY, JSON.stringify({ ...current, [key]: path }));
   } catch { /* storage is a convenience only */ }
 }
 
-/** Run Codex on this device or on one device of this Bridge. The device is
- * chosen by its durable HostRef, so a reconnect (a new peer session) keeps
- * the choice instead of silently falling back to this device. */
-export function NativeAgentPanel({ roomId, agent, peers, members, target, shares, onOpenDetails }: {
+/** Where a new conversation can run, as the navigator offers it. */
+export type PlaceChoice =
+  | { kind: "shared"; scopeRef: string }
+  | { kind: "path" }
+  | { kind: "send" }
+  | { kind: "local"; path: string };
+
+export function folderLabel(path: string): string {
+  const parts = path.trim().split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path.trim();
+}
+
+/** A new conversation with Codex in one place on the chosen device, and its
+ * turns. The first message always begins a new Codex conversation: it never
+ * continues another one in the same folder (that is Continue a session,
+ * which names the session). Later messages in this same view continue the
+ * conversation this view began. The device is chosen by its durable HostRef,
+ * so a reconnect keeps it instead of falling back to this device. */
+export function NewConversation({ roomId, agent, peers, members, target, choice, shares, availability, onRecheck, current, onNewDraft, onBack }: {
   roomId: string;
   agent: NativeAgentController;
   /** Routeable now. */
   peers: readonly BridgePeerSession[];
   /** Every member, connected or not, for names. */
   members: readonly BridgePeerSession[];
-  /** "local" or the chosen device's HostRef, chosen by the Agents workspace. */
+  /** "local" or the chosen device's HostRef. */
   target: string;
-  /** What the chosen device shares with this Bridge, as it last said. */
+  /** Where a new conversation would run. */
+  choice: PlaceChoice | null;
   shares?: PeerShares;
-  onOpenDetails?: () => void;
+  availability: NativeAgentTargetAvailability;
+  onRecheck: () => void;
+  /** Show the conversation this Bridge follows, rather than a new draft. */
+  current: boolean;
+  onNewDraft: () => void;
+  onBack?: () => void;
 }) {
-  const codex = agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex");
-  const [source, setSource] = useState<CodexWorkspaceSource>("shared");
-  const [sharedRef, setSharedRef] = useState("");
   const targetHostRef = target === "local" ? null : target;
-  const targetMember = targetHostRef ? members.find((peer) => peer.hostRef === targetHostRef) ?? null : null;
   const remote = targetHostRef ? peers.find((peer) => peer.hostRef === targetHostRef) ?? null : null;
-  const targetName = targetMember?.displayName ?? remote?.displayName ?? "the other device";
-  const remoteCapabilities = useRemoteNativeCapabilities(roomId, remote ? targetHostRef : null);
-  const availability: NativeAgentTargetAvailability = targetHostRef
-    ? nativeAgentTargetAvailability("agent.coding.codex", remoteCapabilities.observation)
-    : localAvailability(codex);
-  const effectiveSource: CodexWorkspaceSource = targetHostRef ? source : "send_from_here";
-  const memoryKey = `${targetHostRef ?? "local"}:${effectiveSource}`;
-  const taskActive = agent.status?.state === "running" || agent.status?.state === "queued";
-  const movementBlocksNewRun = nativeAgentMovementBlocksNewRun(agent.movement);
-
-  useEffect(() => {
-    if (effectiveSource === "shared") setSharedRef(rememberedWorkspace(memoryKey));
-    else agent.setWorkspace(rememberedWorkspace(memoryKey));
-  }, [memoryKey]); // eslint-disable-line react-hooks/exhaustive-deps
-
+  const targetName = targetHostRef ? members.find((peer) => peer.hostRef === targetHostRef)?.displayName ?? remote?.displayName ?? "the other device" : "this device";
+  const conversationPlace = current && agent.origin?.kind === "new" ? agent.origin.place : null;
   const knowledge = shares?.knowledge ?? { state: "unknown" as const };
   const sharedList = knowledge.state === "known" ? knowledge.workspaces : [];
-  // A remembered or chosen folder counts only while that device still lists
-  // it; otherwise the first folder it shares for agent requests.
-  const sharedWorkspace = sharedList.find((share) => share.scopeRef === sharedRef)
-    ?? sharedList.find((share) => share.agentRequests)
-    ?? sharedList[0]
-    ?? null;
+  const sharedScope = conversationPlace?.kind === "shared" ? conversationPlace.scopeRef : choice?.kind === "shared" ? choice.scopeRef : null;
+  const sharedWorkspace = sharedScope ? sharedList.find((share) => share.scopeRef === sharedScope) ?? null : null;
+  const kind = conversationPlace?.kind ?? choice?.kind ?? (targetHostRef ? "shared" : "local");
+  const source: CodexWorkspaceSource = !targetHostRef ? "send_from_here" : kind === "path" ? "on_target" : kind === "send" ? "send_from_here" : "shared";
+  const memoryKey = `${targetHostRef ?? "local"}:${source}`;
+  const taskActive = agent.status?.state === "running" || agent.status?.state === "queued";
+  const movementBlocksNewRun = nativeAgentMovementBlocksNewRun(agent.movement);
+  const fixedPath = conversationPlace && conversationPlace.kind !== "shared" ? conversationPlace.path : choice?.kind === "local" ? choice.path : null;
+
+  // The folder a message runs in: fixed for a local folder and for a
+  // conversation already begun; typed or chosen otherwise, remembered.
+  useEffect(() => {
+    if (fixedPath !== null) agent.setWorkspace(fixedPath);
+    else if (kind === "path" || kind === "send") agent.setWorkspace(rememberedWorkspace(memoryKey));
+  }, [fixedPath, kind, memoryKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const place: ConversationPlace | null = conversationPlace ?? (
+    kind === "shared" ? sharedWorkspace ? { kind: "shared", scopeRef: sharedWorkspace.scopeRef, label: sharedWorkspace.label } : null
+      : agent.workspace.trim() ? { kind: kind as "path" | "send" | "local", path: agent.workspace.trim(), label: folderLabel(agent.workspace) } : null
+  );
+  const label = place?.label ?? (kind === "path" ? "a folder by path" : kind === "send" ? "a folder from this device" : "a folder");
+
+  // Later messages continue this conversation, once it has a turn that ran.
+  const conversationRan = current && agent.origin?.kind === "new"
+    && (agent.status?.state === "completed" || agent.pastTurns.some((turn) => turn.status.state === "completed"));
+  const followUp = conversationRan && kind !== "send";
 
   const readiness = codexRunReadiness({
     target: targetHostRef ? { kind: "remote", name: targetName, connected: !!remote?.hostRef } : { kind: "local" },
     availability,
-    workspaceSource: effectiveSource,
+    workspaceSource: source,
     workspace: agent.workspace,
     taskText: agent.taskText,
     busy: agent.busy,
@@ -89,7 +112,7 @@ export function NativeAgentPanel({ roomId, agent, peers, members, target, shares
     shares: knowledge,
     sharedWorkspace,
   });
-  const blocker = taskActive ? "Codex is working on the current task. Stop it or wait for it to finish." : readiness.blocker;
+  const blocker = taskActive ? `${current ? "Codex is working on this" : "Codex is working on another task in this Bridge"}. Wait for it, or stop it.` : readiness.blocker;
   const locked = taskActive || agent.busy;
 
   async function chooseFolder() {
@@ -98,80 +121,72 @@ export function NativeAgentPanel({ roomId, agent, peers, members, target, shares
   }
 
   function run() {
-    if (!readiness.ready || taskActive) return;
-    if (!remote || !targetHostRef) { rememberWorkspace(memoryKey, agent.workspace.trim()); void agent.start(); return; }
-    if (readiness.action === "review_movement") { rememberWorkspace(memoryKey, agent.workspace.trim()); void agent.proposeRemoteMovement(roomId, targetHostRef); return; }
-    if (effectiveSource === "shared" && sharedWorkspace) {
-      rememberWorkspace(memoryKey, sharedWorkspace.scopeRef);
-      void agent.startRemote(roomId, remote.peerSessionId, targetHostRef, { scopeRef: sharedWorkspace.scopeRef, label: sharedWorkspace.label });
-      return;
-    }
-    rememberWorkspace(memoryKey, agent.workspace.trim());
-    void agent.startRemote(roomId, remote.peerSessionId, targetHostRef);
+    if (!readiness.ready || taskActive || !place) return;
+    if (place.kind !== "shared") rememberWorkspace(memoryKey, agent.workspace.trim());
+    if (!remote || !targetHostRef) { void agent.start(place, followUp); return; }
+    if (readiness.action === "review_movement") { void agent.proposeRemoteMovement(roomId, targetHostRef, place); return; }
+    void agent.startRemote(roomId, remote.peerSessionId, targetHostRef, place, followUp);
   }
 
-  return <div className="stack-lg">
-    <section className="card" aria-label="Run with Codex">
-      <div className="card-body form-grid">
+  const showTurns = current && (agent.origin?.kind === "new" || (!agent.origin && (agent.status || agent.movement)));
+  const firstPrompt = agent.pastTurns[0]?.prompt ?? agent.prompt;
+  const above = conversationPlace ? null
+    : kind === "path" ? <div className="field">
+      <input className="input input-mono" value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="C:\Users\you\Projects\app" aria-label="Codex workspace" disabled={locked} spellCheck={false} autoComplete="off" />
+      <span className="field-hint">{agent.workspace.trim() && !looksLikeFullPath(agent.workspace) ? `This does not look like a full path. ${targetName} looks for exactly this folder.` : `The full path of the folder on ${targetName}. Pastey cannot browse that device.`}</span>
+    </div>
+      : kind === "send" || (kind === "local" && !fixedPath) ? <div className="row">
+        <input className="input input-mono" value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="Choose a folder on this device…" aria-label="Codex workspace" disabled={locked} spellCheck={false} autoComplete="off" />
+        <button type="button" className="btn btn-sm" disabled={locked} onClick={() => void chooseFolder()}><Icon name="folder" />Choose…</button>
+      </div> : null;
+
+  return <section className="conversation" aria-label="Run with Codex">
+    <ConversationHeader
+      onBack={onBack}
+      title={showTurns && firstPrompt ? truncate(firstPrompt, 70) : "New conversation"}
+      subtitle={<>Codex · {label} · {targetHostRef ? targetName : "this device"}</>}
+      side={showTurns ? <button type="button" className="btn btn-sm" disabled={taskActive} onClick={onNewDraft}><Icon name="plus" small />New</button> : null}
+    />
+    <ConversationThread follow={`${agent.pastTurns.length}:${agent.status?.state}:${agent.status?.code}:${agent.movement?.state}`}>
+      {showTurns ? <>
+        {agent.pastTurns.map((turn) => <PastTurnView key={turn.taskId} turn={turn} hostName={agent.taskHostRef ? targetName : "this device"} />)}
+        <TaskTurn roomId={roomId} agent={agent} peers={peers} members={members} />
+      </> : <div className="conversation-intro">
+        <h3>Start a new conversation</h3>
+        <p>{kind === "send"
+          ? `Pastey shows you exactly what it sends to ${targetName}, and sends nothing until you approve. Codex works on the copy there, and the result comes back to be applied here.`
+          : `Codex starts fresh in ${label}${targetHostRef ? ` on ${targetName}` : ""}. It does not see your other conversations there; to pick one of those up, open it from the list.`}
+          {targetHostRef && kind !== "send" ? ` ${targetName}'s user accepts each request, unless they allowed this device to run there without asking. No files move.` : ""}</p>
         <div className="availability" role="status">
           <Dot tone={availabilityTone(availability, targetHostRef !== null && !remote)} pulse={availability.state === "checking"} />
-          <span className="spacer">{targetHostRef && !remote ? `${targetName} is not connected right now.` : availabilityCopy(availability, targetHostRef ? targetName : null, effectiveSource === "send_from_here")}</span>
-          {remote ? <button type="button" className="btn btn-link small" disabled={availability.state === "checking"} onClick={() => void remoteCapabilities.refresh()}>Check again</button>
-            : !targetHostRef && availability.state !== "available" ? <button type="button" className="btn btn-link small" onClick={() => void agent.refreshCapabilities()}>Check again</button> : null}
+          <span className="spacer">{targetHostRef && !remote ? `${targetName} is not connected right now.` : availabilityCopy(availability, targetHostRef ? targetName : null, kind === "send")}</span>
+          {availability.state !== "available" || targetHostRef ? <button type="button" className="btn btn-link small" disabled={availability.state === "checking"} onClick={onRecheck}>Check again</button> : null}
         </div>
-
-        {targetHostRef ? <Field label="Where is the folder?">
-          <div className="choices" role="radiogroup" aria-label="Where is the folder?">
-            <label className={`choice${source === "shared" ? " selected" : ""}`}>
-              <input type="radio" name="codex-source" checked={source === "shared"} onChange={() => setSource("shared")} disabled={locked || movementBlocksNewRun} />
-              <span><strong>Shared by {targetName}</strong><small>Pick a folder {targetName} shares with this Bridge, by name. Codex works there in place; no files move.</small></span>
-            </label>
-            <label className={`choice${source === "on_target" ? " selected" : ""}`}>
-              <input type="radio" name="codex-source" checked={source === "on_target"} onChange={() => setSource("on_target")} disabled={locked || movementBlocksNewRun} />
-              <span><strong>Another folder on {targetName}</strong><small>Type its full path there. Codex works in place; no files move.</small></span>
-            </label>
-            <label className={`choice${source === "send_from_here" ? " selected" : ""}`}>
-              <input type="radio" name="codex-source" checked={source === "send_from_here"} onChange={() => setSource("send_from_here")} disabled={locked || movementBlocksNewRun} />
-              <span><strong>On this device</strong><small>Pastey sends a copy after you review it. Codex works on the copy and the result comes back to be applied here.</small></span>
-            </label>
-          </div>
-        </Field> : null}
-
-        {effectiveSource === "shared" ? <Field label={`Folder shared by ${targetName}`} htmlFor="codex-shared-workspace" hint={sharedWorkspace ? `${shareSummary(sharedWorkspace)}. ${targetName} finds the folder itself; this device never sees its path.` : undefined}>
-          {sharedList.length ? <select id="codex-shared-workspace" className="select" value={sharedWorkspace?.scopeRef ?? ""} onChange={(event) => setSharedRef(event.target.value)} disabled={locked} aria-label="Shared workspace">
-            {sharedList.map((share) => <option key={share.scopeRef} value={share.scopeRef}>{share.label}{share.agentRequests ? "" : " (agent requests off)"}</option>)}
-          </select> : <p className="small muted">{knowledge.state === "unknown" ? shares?.message ?? `Asking ${targetName} which folders it shares…` : `${targetName} shares no folder with this Bridge yet.`}</p>}
-          <div className="row">{onOpenDetails ? <button type="button" className="btn btn-link small" onClick={onOpenDetails}>Workspaces in Bridge details</button> : null}{shares ? <button type="button" className="btn btn-link small" disabled={shares.loading} onClick={() => void shares.refresh()}>{shares.loading ? "Asking…" : "Check again"}</button> : null}</div>
-        </Field> : effectiveSource === "on_target" ? <Field label={`Folder path on ${targetName}`} htmlFor="codex-workspace" hint={agent.workspace.trim() && !looksLikeFullPath(agent.workspace) ? `This does not look like a full path. ${targetName} looks for exactly this folder.` : `Type the full path as it appears on ${targetName}, for example C:\\Users\\you\\Projects\\app. Pastey cannot browse that device.`}>
-          <input id="codex-workspace" className="input input-mono" value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="C:\Users\you\Projects\app" aria-label="Codex workspace" disabled={locked} spellCheck={false} autoComplete="off" />
-        </Field> : <Field label="Folder on this device" htmlFor="codex-workspace">
-          <div className="row">
-            <input id="codex-workspace" className="input input-mono" value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="Choose a folder…" aria-label="Codex workspace" disabled={locked} spellCheck={false} autoComplete="off" />
-            <button type="button" className="btn" disabled={locked} onClick={() => void chooseFolder()}><Icon name="folder" />Choose…</button>
-          </div>
-        </Field>}
-
-        <Field label="Task" htmlFor="codex-task">
-          <textarea id="codex-task" className="textarea" value={agent.taskText} onChange={(event) => agent.setTaskText(event.target.value)} placeholder="What should Codex do?" aria-label="Codex task" disabled={locked} />
-        </Field>
-
-        {effectiveSource !== "send_from_here" || !targetHostRef ? <label className="check">
-          <input type="checkbox" checked={agent.newConversation} onChange={(event) => agent.setNewConversation(event.target.checked)} disabled={locked} />
-          <span>Start a new conversation<small>Otherwise Codex continues the conversation Pastey keeps for you in this folder, if there is one (listed under Continue a session as “Started by Pastey”). To pick up a conversation from the Codex app or a terminal, use Continue a session instead.</small></span>
-        </label> : null}
-
-        {blocker && !taskActive ? <Checklist items={readiness.requirements} /> : null}
-      </div>
-      <footer className="card-footer">
-        <span className="blocker spacer small muted" role="status">{blocker ?? readiness.next}</span>
-        <button type="button" className="btn btn-primary" disabled={!readiness.ready || taskActive} title={blocker ?? undefined} onClick={run}>{readiness.actionLabel}</button>
-      </footer>
-    </section>
-  </div>;
+        {readiness.blocker && readiness.requirements.some((requirement) => !requirement.met && requirement.id !== "task") ? <Checklist items={readiness.requirements} /> : null}
+      </div>}
+    </ConversationThread>
+    <Composer
+      label="Message Codex"
+      value={agent.taskText}
+      onChange={agent.setTaskText}
+      onSend={run}
+      canSend={readiness.ready && !taskActive && !!place}
+      disabled={locked}
+      sending={agent.busy}
+      placeholder={followUp ? "Reply to continue this conversation…" : "What should Codex do?"}
+      above={above}
+      bar={<><Icon name="agent" small />Codex · {label}{targetHostRef ? ` · ${targetName}` : ""}</>}
+      hint={blocker && (agent.taskText.trim() || taskActive || readiness.requirements.some((requirement) => !requirement.met && requirement.id !== "task")) ? blocker
+        : followUp ? `Continues this conversation in ${label}. ${targetHostRef ? `${targetName} asks its user to accept unless you hold an unattended permission there.` : ""}`
+          : showTurns && current ? `Starts a new conversation in ${label}.` : readiness.next}
+      hintTone={blocker && (agent.taskText.trim() || taskActive) ? "warn" : undefined}
+    />
+  </section>;
 }
 
-function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {
-  return { state: codex?.state ?? "unavailable", reason: codex?.reason ?? null, detail: codex?.detail ?? null, backend: codex?.backend ?? null };
+function truncate(text: string, limit: number): string {
+  const line = text.trim().split("\n")[0];
+  return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
 }
 
 function availabilityTone(availability: NativeAgentTargetAvailability, disconnected: boolean): Tone {

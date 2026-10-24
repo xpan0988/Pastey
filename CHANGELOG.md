@@ -8,6 +8,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Changed
 
+- Agents is organised as the work is: **Agents on [device]**, the **workspaces** it shares with this Bridge (each with what it allows, Sessions and Agents), and, in a workspace, **New conversation** and its **sessions**. One conversation is open beside the navigator, or alone with a back button at the default window size.
+  - A session opens as a conversation: its prompts and replies (this device's sessions: the newest 40 messages; another device's: the short excerpts its Host shares, if any), then your turns in it, then a composer that continues that session. State, who has it open, ids and evidence are under Details.
+  - Each turn shows where it is (waiting for Accept, running, an approval it asks for) and then the reply, inside the conversation; failures say whether anything ran and what to do, with Reconcile, Stop and the other repair actions in the turn. Pastey does not show a reply before it has one: Codex's partial output is never read.
+  - A **New conversation always starts a new Codex conversation**; it no longer continues Pastey's earlier conversation in that folder by default, and the "Start a new conversation" checkbox is gone. Replying in the same view continues that conversation; Pastey's earlier conversations are listed as sessions and continued from there.
+  - The followed task is shown once, in its conversation; a banner in the navigator leads back to it while it runs or needs action.
+
 - Agents is reorganized around what you came to do. The top says which device the agents work on (and that it decides what this device may do there); below it, the one task this Bridge follows; then one choice: **New task** or **Continue a session**, one view at a time.
   - Continue a session lists the sessions by itself once there is a folder to look in, each with whether it can be continued from here. A session's view starts with that answer and what happens if you continue, then its state in plain words and who has it open; facts, unknowns, live sources and ids are one step away under Evidence and how Pastey knows.
   - Continue session is followed where you started it: the form is replaced by the run's progress (Sent → Accepted there → Running → Result), and when it ends the session is read again, showing the new turn.

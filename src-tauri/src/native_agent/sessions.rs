@@ -36,8 +36,13 @@ pub(crate) const PROVIDER_CODEX: &str = "codex";
 const MAX_WORKSPACES: usize = 8;
 /// At most this many sessions per provider and query.
 const MAX_SESSIONS: usize = 200;
-/// Bound on text quoted from a history.
-const MAX_QUOTE_CHARS: usize = 600;
+/// Bound on each message quoted from a history on this device. A session
+/// read from another device is cut much further (`remote.rs`: at most 4
+/// excerpts of 300 characters, and only when its Host allows excerpts).
+const MAX_QUOTE_CHARS: usize = 4000;
+/// The newest messages a snapshot of this device's own session carries, so
+/// its view reads as the conversation it is.
+const MAX_RECENT: usize = 40;
 const MAX_TITLE_CHARS: usize = 120;
 const MAX_CHANGED_FILES: usize = 20;
 

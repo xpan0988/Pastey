@@ -548,10 +548,9 @@ test("Native Agent responses are shown apart from lifecycle and only as escaped 
   const card = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.doesNotMatch(card, /dangerouslySetInnerHTML|innerHTML/);
-  assert.match(card, /<pre className="agent-response-text">\{response\.text\}<\/pre>/);
-  const responseCard = card.slice(card.indexOf("function NativeAgentResponse"));
-  assert.ok(responseCard.length > 0);
-  assert.doesNotMatch(responseCard, /<a\b|href=|onClick|open\(|invoke\(/);
+  // A reply is a message in the conversation, as plain text and nothing else.
+  assert.equal(card.match(/<div className="turn-reply">\{response\.text\}<\/div>/g)?.length, 2);
+  assert.doesNotMatch(card, /<a\b|href=|dangerously/);
   assert.match(bindings, /output\?: unknown;/);
 });
 
@@ -596,20 +595,21 @@ test("A selected remote Host shows its own advertised Codex availability", () =>
     nativeAgentTargetAvailability("agent.coding.codex", { roomId: "room", hostRef: "host:windows", state: "error", message: "no response" }),
     { state: "unknown", message: "no response" },
   );
-  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  const card = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  const composer = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   // A chosen remote target never falls back to this device's local Codex
   // state, even while it is disconnected (it is chosen by HostRef).
-  assert.match(card, /const availability: NativeAgentTargetAvailability = targetHostRef\s*\? nativeAgentTargetAvailability\("agent\.coding\.codex", remoteCapabilities\.observation\)\s*: localAvailability\(codex\);/);
-  assert.match(card, /disabled=\{!readiness\.ready \|\| taskActive\}/);
+  assert.match(card, /const availability: NativeAgentTargetAvailability = targetHostRef\s*\? nativeAgentTargetAvailability\("agent\.coding\.codex", remoteCapabilities\.observation\)\s*: localAvailability\(agent\.capabilities\.find\(\(capability\) => capability\.agentId === "agent\.coding\.codex"\)\);/);
+  assert.match(composer, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
   assert.match(lifecycle, /listRemoteNativeAgentCapabilities\(roomId, hostRef\)/);
   assert.match(bindings, /invoke\("list_remote_native_agent_capabilities", \{ roomId, targetHostRef \}\)/);
   // A finished task stays visible (with its response) when recovery drains.
   assert.match(lifecycle, /loadRecoveryProjection\(undefined, true\)/);
 });
 
-test("Continued and new Agent conversations are shown only once confirmed", () => {
+test("Continued and new Agent conversations are shown only once confirmed, and a new task never inherits a thread", () => {
   const status = {
     schemaVersion: "pastey-native-agent-task-v1" as const,
     taskId: "task-conversation",
@@ -629,21 +629,32 @@ test("Continued and new Agent conversations are shown only once confirmed", () =
   assert.equal(nativeAgentConversationUnavailable(unavailable), true);
   assert.equal(nativeAgentLifecycleLabel(unavailable), "failed · conversation unavailable");
   assert.equal(nativeAgentConversationUnavailable({ ...unavailable, code: "native_agent_start_failed" }), false);
-
-  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
-  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
-  assert.doesNotMatch(card, /resumed native session/);
-  assert.match(card, /Start a new conversation/);
-  // Pastey's own conversation is told apart from continuing a session.
-  assert.match(card, /continues the conversation Pastey keeps for you in this folder[\s\S]*use Continue a session instead/);
   const outcome = taskOutcome(unavailable, { hostName: "this device", remote: false, continuing: false, agentName: "Codex" });
   assert.match(outcome.headline, /nothing ran/);
   assert.match(outcome.detail ?? "", /could not reopen your earlier conversation/);
   assert.match(outcome.next ?? "", /Start a new conversation/);
-  // A new conversation is only ever an explicit choice, sent as such.
-  assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), taskText\.trim\(\), newConversation\)/);
-  assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, taskText\.trim\(\), !newConversation, shared\?\.label \?\? null\)/);
+
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  assert.doesNotMatch(card, /resumed native session|newConversation/);
+  assert.match(card, /Start a new conversation/);
+  assert.match(card, /It does not see your other conversations there/);
+  // A new task always begins a new Codex conversation. Only a later message
+  // in the same view, after a turn of it ran, continues it; a folder sent
+  // from this device never does.
+  assert.match(card, /const conversationRan = current && agent\.origin\?\.kind === "new"/);
+  assert.match(card, /const followUp = conversationRan && kind !== "send";/);
+  assert.match(card, /agent\.start\(place, followUp\)/);
+  assert.match(card, /agent\.startRemote\(roomId, remote\.peerSessionId, targetHostRef, place, followUp\)/);
+  assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), sent, !followUp\)/);
+  assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, sent, followUp, shared\?\.label \?\? null\)/);
+  assert.match(lifecycle, /const start = useCallback\(async \(place: ConversationPlace, followUp = false\)/);
+  assert.match(lifecycle, /const startRemote = useCallback\(async \(roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false\)/);
+  // A follow-up stays in the conversation its view began; anything else
+  // begins a new one, with its own id.
+  assert.match(lifecycle, /const sameConversation = followUp && origin\?\.kind === "new" \? origin : null;/);
+  assert.match(lifecycle, /const conversationId = sameConversation\?\.conversationId \?\? crypto\.randomUUID\(\);/);
   // A shared folder is sent by its reference only, never a path from here.
   assert.match(lifecycle, /const target = shared \? shared\.scopeRef : workspace\.trim\(\);/);
   assert.match(bindings, /invoke\("start_native_codex_task", \{ workspace, task, newConversation \}\)/);
@@ -944,22 +955,24 @@ test("the sessions card continues only this device's own sessions and never gran
   const card = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
   const settings = readFileSync("src/features/workspace/SessionReadingSettings.tsx", "utf8");
   assert.match(browser, /discoverRemoteNativeSessions\(roomId, remote\.hostRef!/);
-  // Looking is all the list does; only one session's view continues it.
-  assert.doesNotMatch(browser, /continueNativeSession|continueRemoteNativeSession/);
-  assert.doesNotMatch(browser + card, /startClaude|createSessionReadGrant|startRemoteNative/);
-  // One explicit continuation, as the user saw it: here, or on the chosen
-  // device by the scope its read permission showed, never a path.
+  // Looking is all the list does, and it never opens one for the user.
+  assert.doesNotMatch(browser, /continueNativeSession|continueRemoteNativeSession|sessions\[0\]/);
+  assert.doesNotMatch(browser + card, /startClaude|createSessionReadGrant|startRemoteNative|startNativeCodexTask/);
+  // One explicit continuation of the session named here, as it was read:
+  // on this device, or on the chosen device by the scope its read
+  // permission showed, never a path.
   assert.equal(card.match(/continueNativeSession\(/g)?.length, 1);
   assert.equal(card.match(/continueRemoteNativeSession\(/g)?.length, 1);
-  assert.match(card, /continueNativeSession\(\{ workspaces: \[folder\], provider: session\.provider, sessionId: session\.sessionId, prompt: prompt\.trim\(\), expectedMarker: session\.lastTurn\.marker \?\? null \}\)/);
-  assert.match(card, /continueRemoteNativeSession\(\{ roomId: route\.roomId, peerSessionId: route\.peerSessionId, targetHostRef: route\.hostRef, provider: session\.provider, sessionId: session\.sessionId, scopeRef: session\.scopeRef, prompt: prompt\.trim\(\), expectedMarker: session\.lastTurn\.marker \?\? null \}\)/);
-  assert.match(card, /continuationAvailability\(session, !remote, hostName, share\)/);
-  assert.match(card, /onContinued\?\.\(status, route\?\.hostRef \?\? null, continued\)/);
-  // The continued session is named by provider and id only, kept here.
-  assert.match(card, /const continued: ContinuedSession = \{ provider: session\.provider, sessionId: session\.sessionId, title: session\.title, workspaceLabel: session\.workspaceLabel \};/);
-  assert.match(card, /disabled=\{busy \|\| started \|\| !prompt\.trim\(\)\}/);
-  assert.match(browser, /Pastey does not pick for you/);
-  assert.match(card, /the agent's own account, not verified/);
+  assert.match(card, /continueNativeSession\(\{ workspaces: \[folder\], provider: view\.provider, sessionId: view\.sessionId, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null \}\)/);
+  assert.match(card, /continueRemoteNativeSession\(\{ roomId: route\.roomId, peerSessionId: route\.peerSessionId, targetHostRef: route\.hostRef, provider: view\.provider, sessionId: view\.sessionId, scopeRef: view\.scopeRef, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null \}\)/);
+  assert.match(card, /continuationAvailability\(view, !route, hostName, share\)/);
+  assert.match(card, /agent\.adoptTask\(started, route\?\.hostRef \?\? null, continued, text\)/);
+  // The continued session is named by provider and id, kept here only.
+  assert.match(card, /const continued: ContinuedSession = \{ provider: view\.provider, sessionId: view\.sessionId, title: view\.title, workspaceLabel: view\.workspaceLabel, scopeRef: view\.scopeRef \};/);
+  // Nothing is sent twice from here: not while sending, not while a turn of
+  // this session or another task runs, and not when it cannot be continued.
+  assert.match(card, /if \(!view \|\| !availability\?\.allowed \|\| !prompt\.trim\(\) \|\| sending \|\| active \|\| otherActive \|\| !snapshot\) return;/);
+  assert.match(card, /its own account, not verified/);
   assert.match(settings, /Trusting a device does not let it read anything/);
   // Settings gathers every share and can end it; creating one happens in its Bridge.
   assert.match(settings, /stopSharingWorkspace\(share\.grantId\)/);
@@ -1034,10 +1047,11 @@ test("Native execution readiness never depends on Session reading permissions", 
   for (const source of [readiness, panel]) {
     assert.doesNotMatch(source, /SessionReadGrant|listSessionReadGrants|readGrant|discoverRemoteNativeSessions/);
   }
-  // The button is disabled only by the readiness model, which shows its reason.
-  assert.match(panel, /disabled=\{!readiness\.ready \|\| taskActive\} title=\{blocker \?\? undefined\}/);
+  // Send is enabled only by the readiness model, which says why not.
+  assert.match(panel, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
   assert.match(panel, /<Checklist items=\{readiness\.requirements\} \/>/);
-  assert.match(panel, /\{blocker \?\? readiness\.next\}/);
+  assert.match(panel, /readiness\.next/);
+  assert.match(panel, /const blocker = taskActive \?/);
 });
 
 test("A chosen Codex Host is kept by HostRef across reconnects and never falls back to this device", () => {
@@ -1052,7 +1066,9 @@ test("A chosen Codex Host is kept by HostRef across reconnects and never falls b
   assert.match(sessions, /peers\.find\(\(peer\) => peer\.hostRef === target\)/);
   // A just-started remote task keeps its Host even when recovery is drained.
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  assert.match(lifecycle, /if \(!projection\) \{ setStatus\(started\); setTaskHostRef\(hostRef\); \}/);
+  assert.match(lifecycle, /if \(!projection\) \{ setStatus\(started\); setTaskHostRef\(hostRef\); restoreOrigin\(rememberedNativeTask\(roomId\), started\.taskId\); \}/);
+  // The open session reads and continues on the device chosen by HostRef.
+  assert.match(readFileSync("src/features/workspace/SessionDetail.tsx", "utf8"), /const remote = target === "local" \? null : peers\.find\(\(peer\) => peer\.hostRef === target\) \?\? null;/);
 });
 
 test("A remote Host's capability is observed again in the background without flashing back to checking", () => {
@@ -1071,7 +1087,7 @@ test("A remote Host's capability is observed again in the background without fla
   assert.match(lifecycle, /window\.addEventListener\("focus", onFocus\)/);
   assert.match(lifecycle, /window\.clearInterval\(timer\)/);
   // A reconnecting Host is queried again as soon as it is routeable.
-  assert.match(readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8"), /useRemoteNativeCapabilities\(roomId, remote \? targetHostRef : null\)/);
+  assert.match(readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8"), /useRemoteNativeCapabilities\(room\.id, remote \? targetHostRef : null\)/);
 });
 
 test("Settings are device-wide sections and every permission can be found and revoked", () => {
@@ -1124,25 +1140,25 @@ test("Execution, observation and continuation stay separate in the Bridge", () =
   assert.match(bridge, /\{ value: "share", label: "Share" \}/);
   assert.match(bridge, /value: "agents", label: "Agents"/);
   assert.doesNotMatch(bridge, /value: "sessions"/);
-  // One Agents workspace: start something new, or continue what exists,
-  // each labelled with its authority, one shown at a time.
   const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
-  assert.match(workspace, /\{ value: "new", label: "New task" \}, \{ value: "sessions", label: "Continue a session" \}/);
-  assert.match(workspace, /<Badge tone="live">Execution<\/Badge>/);
-  assert.match(workspace, /<Badge>Read, then continue<\/Badge>/);
-  assert.match(workspace, /aria-label="Run a task" hidden=\{mode !== "new"\}/);
-  assert.match(workspace, /aria-label="Existing sessions" hidden=\{mode !== "sessions"\}/);
-  assert.match(workspace, /onContinued=\{agent\.adoptTask\}/);
-  // The followed task is shown once: in the session it continues while that
-  // session is open, otherwise at the top.
-  assert.match(workspace, /\{trackerInSession \? null : <AgentTaskTracker /);
-  assert.match(workspace, /const trackerInSession = mode === "sessions" && taskOnTarget && !!continuedKey && openSession === continuedKey;/);
-  assert.match(workspace, /<NativeAgentPanel [^>]*target=\{target\} shares=\{shares\}/);
-  assert.match(workspace, /<NativeSessionsCard\s[^>]*target=\{target\}\s+shares=\{shares\}/);
+  // A device, the workspaces it shares (each with what it allows), and in
+  // the chosen one: a new conversation, or one of its sessions by id.
+  assert.match(workspace, /type AgentView = \{ kind: "new" \} \| \{ kind: "current" \} \| \{ kind: "session"; session: SessionRef \};/);
+  assert.match(workspace, /<span className=\{share\.readSessions \? "grant on" : "grant"\}>/);
+  assert.match(workspace, /<span className=\{share\.agentRequests \? "grant on" : "grant"\}>/);
+  // A new conversation is offered only where that device allows agent
+  // requests, and says why not.
+  assert.match(workspace, /placeBody\(workspace\.agentRequests, peerShareGuidance\(targetName, shares\.knowledge, "run", workspace\)\)/);
+  assert.match(workspace, /<SessionConversation key=\{`\$\{target\}:\$\{openKey\}`\} [^>]*session=\{shownView\.session\}/);
+  assert.match(workspace, /<NewConversation [^>]*target=\{target\} choice=\{choice\} shares=\{shares\}/);
+  // The followed task is shown once, in its own conversation; elsewhere a
+  // banner leads back to it while it needs attention.
+  assert.match(workspace, /\{taskNeedsAttention && !taskShown \? <TaskBanner /);
   // One observation of what the chosen device shares, asked over its own
   // connection, serves running, reading and continuing.
   assert.match(workspace, /const shares = usePeerSharedWorkspaces\(room\.id, targetHostRef, connected\);/);
-  const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  assert.doesNotMatch(workspace, /createUnattendedGrant|createSessionReadGrant|shareBridgeWorkspace|updateWorkspaceShare|trustPeerDevice/);
+  const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8") + readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
   // Continuing never starts a new run in place of the session.
   assert.doesNotMatch(sessions, /startRemoteNativeCodexTask|startNativeCodexTask/);
 });
@@ -1322,7 +1338,7 @@ test("Device details, network tests and this device's diagnostics are reachable 
 test("Sessions follow the Agents device and mark the ones Pastey started", () => {
   const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   assert.doesNotMatch(sessions, /aria-label="Device"/);
-  assert.match(sessions, /session\.origin === "pastey" \? <Badge tone="accent">Started by Pastey<\/Badge>/);
+  assert.match(sessions, /session\.origin === "pastey" \? " · by Pastey" : ""/);
   // Every answer reports what the device shares now; nothing is guessed.
   assert.match(sessions, /if \(response\.outcome === "ok" \|\| response\.outcome === "not_authorized"\) shares\?\.adopt\(response\.scopes\);/);
 });
@@ -1476,21 +1492,26 @@ test("a continuation is followed in the session it continues, and the list fills
   const browser = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   const detail = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  // Looks once per scope while shown, only where reading is allowed.
-  assert.match(browser, /if \(!active \|\| busy \|\| !scopeKey \|\| autoLooked\.current === scopeKey\) return;/);
-  assert.match(browser, /remote && readable\.length \? `\$\{target\}\|/);
-  // While its continuation runs, it replaces the composer in the session's
-  // own view; when it ends the session is read again (it has a new turn).
-  assert.match(detail, /\{run\?\.active \? run\.node : <>/);
-  assert.match(browser, /if \(wasRunning\.current && snapshot\) \{ wasRunning\.current = false; void inspect\(snapshot\.session\); \}/);
-  // The session a task continues is remembered with the task, in this
-  // renderer only, and survives a remount.
-  assert.match(lifecycle, /rememberStartedNativeTask\(roomId, \{ taskId: started\.taskId, hostRef, continues: session \}\)/);
-  assert.match(lifecycle, /setContinues\(remembered\.continues \?\? null\)/);
+  // Looks once per workspace while shown, only where reading is allowed.
+  assert.match(browser, /if \(!active \|\| busy \|\| !scopeKey \|\| looked\.current === scopeKey\) return;/);
+  assert.match(browser, /choice\?\.kind === "shared" && remote && share\?\.readSessions \? `\$\{target\}\|\$\{choice\.scopeRef\}` : null/);
+  // This device's turns are shown in the session's own thread, under the
+  // session as it was read before them, so no turn shows twice.
+  assert.match(detail, /const ours = agent\.origin\?\.kind === "session" && continuedSessionKey\(agent\.origin\.session\) === key && \(agent\.taskHostRef \?\? "local"\) === target;/);
+  assert.match(detail, /const shown = ours && base \? base : snapshot;/);
+  assert.match(detail, /<TaskTurn roomId=\{roomId\} agent=\{agent\}/);
+  // When its turn ends, the session is read again: it has a new end marker.
+  assert.match(detail, /if \(wasActive\.current\) \{ wasActive\.current = false; void read\(\); \}/);
+  // The task's origin and prompt are remembered with it, in this renderer
+  // only, and survive a remount.
+  assert.match(lifecycle, /rememberStartedNativeTask\(roomId, \{ taskId: started\.taskId, hostRef, origin: nextOrigin, prompt: sent \}\)/);
+  assert.match(lifecycle, /restoreOrigin\(remembered, rememberedStatus\.taskId\)/);
+  // A session's turns are kept by that session and device; another starts its own.
+  assert.match(lifecycle, /const conversationId = `session:\$\{hostRef \?\? "local"\}:\$\{continuedSessionKey\(session\)\}`;/);
   // Only an ended task that needs nothing more can be put away.
   assert.match(lifecycle, /const canDismiss = !!status && \["completed", "failed", "cancelled"\]\.includes\(status\.state\)\s*&& !movement && !nativeAgentRecoveryRequiresAction\(status, movement\) && !busy;/);
-  // Evidence is one step away, never in the way of deciding.
-  assert.match(detail, /<details className="disclosure">\s*<summary><Icon name="chevron" small \/>Evidence and how Pastey knows<\/summary>/);
+  // Evidence is one step away, never in the way of the conversation.
+  assert.match(detail, /\{details && snapshot \? <SessionDetails snapshot=\{snapshot\} hostName=\{hostName\} \/> : null\}/);
 });
 
 test("the Host's Accept names its own shared folder, and nothing else from the request", () => {
@@ -1499,4 +1520,27 @@ test("the Host's Accept names its own shared folder, and nothing else from the r
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   const review = bindings.slice(bindings.indexOf("export interface NativeInvocationReview"), bindings.indexOf("export function listNativeInvocationReviews"));
   assert.doesNotMatch(review, /prompt|threadId|workspace:|path/i);
+});
+
+test("a conversation shows only what arrived: no invented reply, and history only as far as the Host allows", () => {
+  const conversation = readFileSync("src/features/workspace/Conversation.tsx", "utf8");
+  const turn = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
+  const detail = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
+  // What this device's user wrote on the right, the Agent on the left.
+  assert.match(conversation, /className=\{`msg \$\{from === "me" \? "out" : "in"\}`\}/);
+  // Pastey receives a turn's reply only when it ends: until then the turn
+  // shows where the task is, never partial text.
+  assert.doesNotMatch(turn, /delta|partial|stream/i);
+  assert.match(turn, /\{status && response\?\.kind !== "text" \? <div className="turn-status">/);
+  assert.match(turn, /\{status && status\.state !== "completed" \? <TaskStages /);
+  // A session's messages are shown only when its Host shares excerpts, and
+  // say when earlier ones are missing.
+  assert.match(detail, /shares this session's status only, not its messages/);
+  assert.match(detail, /\{snapshot\.excerptsShared \? snapshot\.recent\.map\(/);
+  assert.match(detail, /Earlier messages are not shown here/);
+  // Another device still sends at most 4 short excerpts; only this device's
+  // own sessions are read further.
+  const remote = readFileSync("src-tauri/src/native_agent/sessions/remote.rs", "utf8");
+  assert.match(remote, /const MAX_EXCERPTS: usize = 4;/);
+  assert.match(remote, /const MAX_EXCERPT_CHARS: usize = 300;/);
 });

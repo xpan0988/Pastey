@@ -154,7 +154,7 @@ export function taskOutcome(status: Pick<NativeAgentTaskStatus, "state" | "code"
     case "native_agent_start_rejected":
       return { tone: "danger", headline: `${hostName === "this device" ? "Pastey" : hostName} could not start it · nothing ran`, detail: result ?? `It was accepted, but ${agentName} refused its input or could not start.`, next: reread, nothingRan: true };
     case "native_agent_conversation_unavailable":
-      return { tone: "danger", headline: "Conversation unavailable · nothing ran", detail: `${agentName}${there} could not reopen your earlier conversation in this folder.`, next: "Choose “Start a new conversation” to run without that context.", nothingRan: true };
+      return { tone: "danger", headline: "Conversation unavailable · nothing ran", detail: `${agentName}${there} could not reopen your earlier conversation in this folder.`, next: "Start a new conversation to run without that context.", nothingRan: true };
     case "native_agent_interrupted_on_restart":
       return { tone: "danger", headline: "Stopped when Pastey quit", detail: `Pastey quit while ${agentName} worked, and ${agentName} stopped with it. Whatever it did before then stays in the folder; it does not run again on its own.`, next: reread, nothingRan: false };
     case "native_agent_failed":

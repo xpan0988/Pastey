@@ -29,8 +29,8 @@ use super::{
     derive_status, in_workspaces, now_ms, quote, workspace_evidence, workspace_statements,
     ActivitySummaryV1, EvidenceBasisV1, EvidenceV1, LastTurnObservationV1, LastTurnV1,
     LiveObservationV1, LiveStateV1, NativeSessionSnapshotV1, NativeSessionV1,
-    ProviderObservationV1, SnapshotEntryV1, MAX_CHANGED_FILES, MAX_QUOTE_CHARS, MAX_SESSIONS,
-    MAX_TITLE_CHARS, PROVIDER_CODEX,
+    ProviderObservationV1, SnapshotEntryV1, MAX_CHANGED_FILES, MAX_QUOTE_CHARS, MAX_RECENT,
+    MAX_SESSIONS, MAX_TITLE_CHARS, PROVIDER_CODEX,
 };
 use crate::error::AppResult;
 use crate::native_agent::capability::codex::{
@@ -47,7 +47,6 @@ const LOCK_SOURCE: &str = "Codex thread writer lock";
 pub(super) const PASTEY_SOURCE: &str = "Pastey's own Codex session";
 const PAGE: u64 = 50;
 const MAX_TURN_PAGES: usize = 20;
-const MAX_RECENT: usize = 6;
 
 pub(crate) struct CodexSessionSourceV1 {
     executable: PathBuf,

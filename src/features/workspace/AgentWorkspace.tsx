@@ -1,35 +1,65 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { remoteAccessGuidance, type AccessLine } from "../../lib/accessGuidance";
-import { shareSummary, type PeerShareKnowledge } from "../../lib/workspaceShares";
+import { peerShareGuidance, shareSummary, type PeerShareKnowledge } from "../../lib/workspaceShares";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
-import { getDeviceIdentity, getDeviceProfile, presentDeviceIdentity } from "../../lib/tauri";
+import { getDeviceIdentity, getDeviceProfile, presentDeviceIdentity, type NativeAgentCapability, type SharedWorkspace } from "../../lib/tauri";
 import type { RoomInfo } from "../../lib/types";
-import { continuedSessionKey } from "./AgentTaskLifecycle";
-import { AgentTaskTracker } from "./AgentTaskTracker";
-import { NativeAgentPanel, type NativeAgentController } from "./NativeAgentPanel";
-import { NativeSessionsCard, type OpenSessionRequest } from "./NativeSessionsCard";
+import {
+  continuedSessionKey,
+  nativeAgentRecoveryRequiresAction,
+  nativeAgentTargetAvailability,
+  useRemoteNativeCapabilities,
+  type ConversationPlace,
+  type NativeAgentTargetAvailability,
+} from "./AgentTaskLifecycle";
+import { TaskBanner } from "./AgentTaskTracker";
+import { availabilityCopy, folderLabel, NewConversation, type NativeAgentController, type PlaceChoice } from "./NativeAgentPanel";
+import { SessionListView, useSessionList, type SessionList, type SessionRef } from "./NativeSessionsCard";
+import { SessionConversation } from "./SessionDetail";
 import { usePeerSharedWorkspaces } from "./BridgeWorkspaces";
-import { Badge, Dot, Icon, Notice, Segmented } from "./ui";
+import { Badge, Dialog, Dot, EmptyState, Icon, Notice } from "./ui";
 
-type AgentMode = "new" | "sessions";
-const MODE_KEY = "pastey:agents-mode-v1";
+/** What the main pane shows: a new conversation, the conversation this
+ * Bridge follows, or one existing session, named by provider and id. */
+type AgentView = { kind: "new" } | { kind: "current" } | { kind: "session"; session: SessionRef };
 
-function rememberedMode(roomId: string): AgentMode {
-  try { return (JSON.parse(window.localStorage.getItem(MODE_KEY) ?? "{}") as Record<string, AgentMode>)[roomId] === "sessions" ? "sessions" : "new"; }
-  catch { return "new"; }
+const PLACE_KEY = "pastey:agents-place-v1";
+const LOCAL_FOLDERS_KEY = "pastey:agents-local-folders-v1";
+
+function readStored<T>(key: string, fallback: T): T {
+  try { return (JSON.parse(window.localStorage.getItem(key) ?? "null") as T | null) ?? fallback; }
+  catch { return fallback; }
 }
 
-function rememberMode(roomId: string, mode: AgentMode) {
-  try { window.localStorage.setItem(MODE_KEY, JSON.stringify({ ...(JSON.parse(window.localStorage.getItem(MODE_KEY) ?? "{}") as Record<string, AgentMode>), [roomId]: mode })); }
+function writeStored(key: string, value: unknown) {
+  try { window.localStorage.setItem(key, JSON.stringify(value)); }
   catch { /* a convenience only */ }
 }
 
-/** Agent work on one device of this Bridge. The page answers, top down:
- * which device the agents work on (and what it allows), the one task this
- * Bridge follows and where it is, then one of two things to do there:
- * start a new task, or continue a session that already exists. Running and
- * reading stay separate authorities, each decided by the device that holds
- * them; both use the folders it shares with this Bridge, by name. */
+function placeKey(choice: PlaceChoice | null): string | null {
+  if (!choice) return null;
+  switch (choice.kind) {
+    case "shared": return `shared:${choice.scopeRef}`;
+    case "local": return `local:${choice.path}`;
+    default: return choice.kind;
+  }
+}
+
+function choiceOf(place: ConversationPlace): PlaceChoice {
+  switch (place.kind) {
+    case "shared": return { kind: "shared", scopeRef: place.scopeRef };
+    case "local": return { kind: "local", path: place.path };
+    default: return { kind: place.kind };
+  }
+}
+
+/** Agent work on one device of this Bridge, laid out as the user thinks of
+ * it: that device, the folders it lets this device work in (its
+ * workspaces, each with what it allows), the sessions in a workspace, and
+ * one open conversation. A new conversation and an existing session are
+ * different things and never stand in for each other. Running and reading
+ * stay separate authorities, decided by the device that holds them. */
 export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOpenDetails }: {
   room: RoomInfo;
   agent: NativeAgentController;
@@ -40,17 +70,57 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
 }) {
   // Prefer the other device: running there is why most people open this.
   const [target, setTarget] = useState<string>(() => members.find((peer) => peer.hostRef)?.hostRef ?? "local");
-  const [mode, setModeState] = useState<AgentMode>(() => rememberedMode(room.id));
+  const [choice, setChoice] = useState<PlaceChoice | null>(null);
+  const [view, setView] = useState<AgentView | null>(null);
+  const [accessOpen, setAccessOpen] = useState(false);
+  const [localFolders, setLocalFolders] = useState<string[]>(() => readStored<string[]>(LOCAL_FOLDERS_KEY, []));
   const [waitedForAccept, setWaitedForAccept] = useState<Record<string, boolean>>({});
-  const [openSession, setOpenSession] = useState<string | null>(null);
-  const [openRequest, setOpenRequest] = useState<OpenSessionRequest | null>(null);
   const options = useMemo(() => members.filter((peer) => peer.hostRef), [members]);
   const targetHostRef = target === "local" ? null : target;
   const targetName = targetHostRef ? options.find((peer) => peer.hostRef === targetHostRef)?.displayName ?? "the other device" : "this device";
-  const connected = targetHostRef ? peers.some((peer) => peer.hostRef === targetHostRef) : true;
+  const remote = targetHostRef ? peers.find((peer) => peer.hostRef === targetHostRef) ?? null : null;
+  const connected = targetHostRef ? !!remote : true;
   const shares = usePeerSharedWorkspaces(room.id, targetHostRef, connected);
+  const remoteCapabilities = useRemoteNativeCapabilities(room.id, remote ? targetHostRef : null);
+  const availability: NativeAgentTargetAvailability = targetHostRef
+    ? nativeAgentTargetAvailability("agent.coding.codex", remoteCapabilities.observation)
+    : localAvailability(agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex"));
+  const sharedList = shares.knowledge.state === "known" ? shares.knowledge.workspaces : [];
 
-  const setMode = useCallback((next: AgentMode) => { setModeState(next); rememberMode(room.id, next); }, [room.id]);
+  // The workspace shown: the one last chosen while it is still offered,
+  // else the first shared one (sessions and agents first).
+  const storedKey = `${room.id}:${target}`;
+  useEffect(() => {
+    const remembered = readStored<Record<string, PlaceChoice>>(PLACE_KEY, {})[storedKey] ?? null;
+    const offered = (candidate: PlaceChoice | null) => !!candidate && (candidate.kind === "shared"
+      ? sharedList.some((share) => share.scopeRef === candidate.scopeRef)
+      : candidate.kind === "local" ? !targetHostRef : !!targetHostRef);
+    const best = [...sharedList].sort((a, b) => Number(b.readSessions && b.agentRequests) - Number(a.readSessions && a.agentRequests))[0];
+    setChoice((current) => offered(current) ? current : offered(remembered) ? remembered : targetHostRef
+      ? best ? { kind: "shared", scopeRef: best.scopeRef } : null
+      : localFolders[0] ? { kind: "local", path: localFolders[0] } : null);
+  }, [storedKey, shares.knowledge, localFolders]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const choose = useCallback((next: PlaceChoice) => {
+    setChoice(next);
+    setView(null);
+    writeStored(PLACE_KEY, { ...readStored<Record<string, PlaceChoice>>(PLACE_KEY, {}), [storedKey]: next });
+  }, [storedKey]);
+
+  function changeTarget(next: string) {
+    setTarget(next);
+    setChoice(null);
+    setView(null);
+  }
+
+  async function addLocalFolder() {
+    const chosen = await open({ directory: true, multiple: false });
+    if (typeof chosen !== "string") return;
+    const next = [chosen, ...localFolders.filter((folder) => folder !== chosen)].slice(0, 8);
+    setLocalFolders(next);
+    writeStored(LOCAL_FOLDERS_KEY, next);
+    choose({ kind: "local", path: chosen });
+  }
 
   // A run that waits in Review tells this device that the other one has no
   // unattended permission for it there. Nothing else is inferred.
@@ -60,73 +130,158 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
     }
   }, [agent.status, agent.taskHostRef]);
 
-  // The followed task is shown once: inside the session it continues while
-  // that session is open on its own device, otherwise here at the top.
-  const continuedKey = agent.continues ? continuedSessionKey(agent.continues) : null;
-  const taskOnTarget = (agent.taskHostRef ?? "local") === target;
-  const trackerInSession = mode === "sessions" && taskOnTarget && !!continuedKey && openSession === continuedKey;
-  const taskEnded = !!agent.status && !["queued", "running"].includes(agent.status.state);
-  const openContinuedSession = agent.continues ? () => {
-    setTarget(agent.taskHostRef ?? "local");
-    setMode("sessions");
-    setOpenRequest({ provider: agent.continues!.provider, sessionId: agent.continues!.sessionId, nonce: Date.now() });
-  } : undefined;
+  // A message sent from a new-conversation draft begins that conversation:
+  // show it, rather than a fresh draft.
+  const conversationId = agent.origin?.kind === "new" ? agent.origin.conversationId : null;
+  useEffect(() => {
+    if (conversationId) setView((current) => current?.kind === "new" ? { kind: "current" } : current);
+  }, [conversationId]);
 
-  return <div className="panel-inner">
-    <section className="agents-head" aria-label="Device">
-      <div className="agents-device">
-        <label className="field-label" htmlFor="agent-device">Agents on</label>
-        <select id="agent-device" className="select" value={target} onChange={(event) => setTarget(event.target.value)}>
-          <option value="local">This device</option>
+  const list = useSessionList({ roomId: room.id, peers, members, target, shares, choice, active: true });
+  const share = choice?.kind === "shared" ? sharedList.find((candidate) => candidate.scopeRef === choice.scopeRef) ?? null : null;
+
+  // The followed task: which conversation it belongs to, and whether that
+  // conversation is the one open. It is shown once, in its conversation;
+  // elsewhere a banner leads back to it while it needs attention.
+  const taskTarget = agent.taskHostRef ?? "local";
+  const ownsCurrent = agent.origin?.kind === "new" && taskTarget === target && placeKey(choiceOf(agent.origin.place)) === placeKey(choice);
+  const taskActive = !!agent.status && ["queued", "running"].includes(agent.status.state);
+  const liveKey = agent.origin?.kind === "session" && taskTarget === target ? continuedSessionKey(agent.origin.session) : null;
+  const shownView: AgentView | null = view ?? (ownsCurrent ? { kind: "current" } : null);
+  const openKey = shownView?.kind === "session" ? continuedSessionKey(shownView.session) : null;
+  const taskShown = (shownView?.kind === "current" && ownsCurrent) || (openKey !== null && openKey === liveKey);
+  const taskNeedsAttention = !!agent.movement || nativeAgentRecoveryRequiresAction(agent.status, agent.movement)
+    || taskActive;
+
+  function openTask() {
+    const origin = agent.origin;
+    if (taskTarget !== target) setTarget(taskTarget);
+    if (origin?.kind === "session") {
+      if (origin.session.scopeRef) setChoice(taskTarget === "local" ? { kind: "local", path: origin.session.scopeRef } : { kind: "shared", scopeRef: origin.session.scopeRef });
+      setView({ kind: "session", session: { provider: origin.session.provider, sessionId: origin.session.sessionId } });
+    } else {
+      if (origin?.kind === "new") setChoice(choiceOf(origin.place));
+      setView({ kind: "current" });
+    }
+  }
+
+  const openSession = (session: SessionRef) => setView({ kind: "session", session: { provider: session.provider, sessionId: session.sessionId } });
+  const placeBody = (canRun: boolean, runBlocked: string | null) => <PlaceBody canRun={canRun} runBlocked={runBlocked} agent={agent} ownsCurrent={ownsCurrent} shownView={shownView} onNew={() => setView({ kind: "new" })} onCurrent={() => setView({ kind: "current" })} list={list} target={target} openKey={openKey} liveKey={taskActive ? liveKey : null} onOpenSession={openSession} />;
+  const back = () => setView(null);
+  const main = shownView?.kind === "session"
+    ? <SessionConversation key={`${target}:${openKey}`} roomId={room.id} agent={agent} peers={peers} members={members} target={target} session={shownView.session} folder={choice?.kind === "local" ? choice.path : ""} share={targetHostRef ? share : undefined} onBack={back} />
+    : choice || shownView?.kind === "current"
+      ? <NewConversation key={`${target}:${placeKey(choice)}:${shownView?.kind === "current"}`} roomId={room.id} agent={agent} peers={peers} members={members} target={target} choice={choice} shares={shares} availability={availability} onRecheck={() => void (remote ? remoteCapabilities.refresh() : agent.refreshCapabilities())} current={shownView?.kind === "current"} onNewDraft={() => setView({ kind: "new" })} onBack={back} />
+      : <div className="conversation conversation-empty"><EmptyState title={targetHostRef ? `Nothing to work in on ${targetName} yet` : "Choose a folder"}>{targetHostRef
+        ? peerShareGuidance(targetName, shares.knowledge, "run") ?? `Choose a workspace ${targetName} shares, or a folder by path.`
+        : "Add a folder on this device to see its sessions and start conversations there."}</EmptyState></div>;
+
+  return <div className="agents"><div className="agents-layout" data-open={view !== null || undefined}>
+    <aside className="agents-nav" aria-label="Agents">
+      {taskNeedsAttention && !taskShown ? <TaskBanner agent={agent} members={members} onOpen={openTask} /> : null}
+
+      <div className="nav-host">
+        <label className="nav-label" htmlFor="agent-device">Agents on</label>
+        <select id="agent-device" className="select" value={target} onChange={(event) => changeTarget(event.target.value)}>
           {options.map((peer) => <option key={peer.hostRef} value={peer.hostRef}>{peer.displayName}{peers.some((routeable) => routeable.hostRef === peer.hostRef) ? "" : " (not connected)"}</option>)}
+          <option value="local">This device</option>
         </select>
-        {targetHostRef ? <span className="row xsmall subtle"><Dot tone={connected ? "ok" : "neutral"} />{connected ? "Connected" : "Not connected"}</span> : null}
-        {targetHostRef ? <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenDevice(targetHostRef)}><Icon name="device" small />Device details</button> : null}
+        <div className="nav-host-status" role="status">
+          <Dot tone={!connected ? "neutral" : availability.state === "available" ? "ok" : availability.state === "checking" ? "neutral" : "warn"} pulse={availability.state === "checking"} />
+          <span>{!connected ? "Not connected" : availability.state === "available" ? targetHostRef ? "Connected · Codex ready" : "Codex ready" : availabilityCopy(availability, targetHostRef ? targetName : null, false)}</span>
+        </div>
+        {targetHostRef ? <div className="row nav-host-actions">
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setAccessOpen(true)}><Icon name="shield" small />Access</button>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenDevice(targetHostRef)}><Icon name="device" small />Device</button>
+        </div> : null}
       </div>
-      <p className="small muted">{targetHostRef
-        ? `You are on this device. Tasks and sessions below are on ${targetName}: it runs them and reads them, and it decides what this device may do there.`
-        : "Tasks and sessions below are on this device, in folders you choose here."}</p>
-      {targetHostRef ? <SharedWorkspacesLine name={targetName} knowledge={shares.knowledge} connected={connected} onOpenDetails={onOpenDetails} /> : null}
-      {targetHostRef ? <RemoteAccessSummary room={room} hostRef={targetHostRef} name={targetName} connected={connected} paired={(room.pairing_state ?? "pairing_required") === "paired"} sharing={shares.knowledge} waitedForAccept={waitedForAccept[targetHostRef] ?? null} /> : null}
-    </section>
 
-    {trackerInSession ? null : <AgentTaskTracker roomId={room.id} agent={agent} peers={peers} members={members} onOpenSession={openContinuedSession} />}
+      <div className="nav-section-head">
+        <span>{targetHostRef ? "Shared workspaces" : "Folders on this device"}</span>
+        {targetHostRef ? <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Ask again" title="Ask again which folders it shares" disabled={shares.loading || !connected} onClick={() => void shares.refresh()}><Icon name="refresh" small /></button>
+          : <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Add a folder" title="Add a folder on this device" onClick={() => void addLocalFolder()}><Icon name="plus" small /></button>}
+      </div>
+      <ul className="nav-places">
+        {targetHostRef
+          ? sharedList.map((workspace) => <PlaceItem key={workspace.scopeRef} label={workspace.label} grants={<Grants share={workspace} />} title={shareSummary(workspace)} selected={choice?.kind === "shared" && choice.scopeRef === workspace.scopeRef} onSelect={() => choose({ kind: "shared", scopeRef: workspace.scopeRef })}>
+            {placeBody(workspace.agentRequests, peerShareGuidance(targetName, shares.knowledge, "run", workspace))}
+          </PlaceItem>)
+          : localFolders.map((folder) => <PlaceItem key={folder} label={folderLabel(folder)} grants={<span className="mono">{folder}</span>} title={folder} selected={choice?.kind === "local" && choice.path === folder} onSelect={() => choose({ kind: "local", path: folder })}>
+            {placeBody(true, null)}
+          </PlaceItem>)}
+      </ul>
+      {targetHostRef && !sharedList.length ? <p className="nav-note">{!connected ? `${targetName} is not connected right now.` : shares.knowledge.state === "unknown" ? shares.message ?? `Asking ${targetName} which folders it shares…` : <>{peerShareGuidance(targetName, shares.knowledge, "read")}{onOpenDetails ? <> <button type="button" className="btn btn-link small" onClick={onOpenDetails}>Bridge details</button></> : null}</>}</p> : null}
+      {!targetHostRef && !localFolders.length ? <p className="nav-note">Add a folder on this device to see its sessions and start conversations there. <button type="button" className="btn btn-link small" onClick={() => void addLocalFolder()}>Add a folder…</button></p> : null}
 
-    <div className="agents-modes">
-      <Segmented<AgentMode> label="What to do" value={mode} onChange={setMode} options={[{ value: "new", label: "New task" }, { value: "sessions", label: "Continue a session" }]} />
-      <span className="small muted">{mode === "new"
-        ? <>Give Codex a task in a folder on {targetName}. <Badge tone="live">Execution</Badge></>
-        : <>Pick up a Claude Code or Codex session already saved on {targetName}. Looking changes nothing. <Badge>Read, then continue</Badge></>}</span>
-    </div>
+      {targetHostRef ? <>
+        <div className="nav-section-head"><span>Other places</span></div>
+        <ul className="nav-places">
+          <PlaceItem label={`A folder by path on ${targetName}`} grants={<span>Type its path · no sessions</span>} selected={choice?.kind === "path"} onSelect={() => choose({ kind: "path" })}>
+            {placeBody(true, null)}
+          </PlaceItem>
+          <PlaceItem label="A folder from this device" grants={<span>Sent after your review · no sessions</span>} selected={choice?.kind === "send"} onSelect={() => choose({ kind: "send" })}>
+            {placeBody(true, null)}
+          </PlaceItem>
+        </ul>
+      </> : null}
+    </aside>
 
-    <section className="section" aria-label="Run a task" hidden={mode !== "new"}>
-      <NativeAgentPanel roomId={room.id} agent={agent} peers={peers} members={members} target={target} shares={shares} onOpenDetails={onOpenDetails} />
-    </section>
+    <main className="agents-main">{main}</main>
 
-    <section className="section" aria-label="Existing sessions" hidden={mode !== "sessions"}>
-      <NativeSessionsCard
-        roomId={room.id}
-        peers={[...peers]}
-        members={[...members]}
-        target={target}
-        shares={shares}
-        active={mode === "sessions"}
-        onContinued={agent.adoptTask}
-        openRequest={openRequest}
-        onOpenChange={setOpenSession}
-        continued={continuedKey && taskOnTarget ? { key: continuedKey, ended: taskEnded, node: <AgentTaskTracker roomId={room.id} agent={agent} peers={peers} members={members} inSession onLookAgain={openContinuedSession} /> } : null}
-      />
-    </section>
-  </div>;
+    {accessOpen && targetHostRef ? <Dialog title={`Access on ${targetName}`} description={`What this device may do on ${targetName}, authority by authority, and where each is decided. Nothing here can be granted from this device.`} onClose={() => setAccessOpen(false)}>
+      <RemoteAccessSummary room={room} hostRef={targetHostRef} name={targetName} connected={connected} paired={(room.pairing_state ?? "pairing_required") === "paired"} sharing={shares.knowledge} waitedForAccept={waitedForAccept[targetHostRef] ?? null} onOpenDetails={onOpenDetails ? () => { setAccessOpen(false); onOpenDetails(); } : undefined} />
+    </Dialog> : null}
+  </div></div>;
 }
 
-/** The folders the chosen device shares with this Bridge, at a glance. */
-function SharedWorkspacesLine({ name, knowledge, connected, onOpenDetails }: { name: string; knowledge: PeerShareKnowledge; connected: boolean; onOpenDetails?: () => void }) {
-  const text = !connected ? `${name} is not connected right now.`
-    : knowledge.state === "unknown" ? `Asking ${name} which folders it shares…`
-      : knowledge.workspaces.length ? knowledge.workspaces.map((share) => `${share.label} (${shareSummary(share).toLowerCase()})`).join(" · ")
-        : `${name} shares no folder with this Bridge yet. On ${name}, open this Bridge and choose Share a workspace in Bridge details.`;
-  return <div className="row"><Icon name="folder" small /><span className="small spacer"><strong>Shared by {name}:</strong> {text}</span>{onOpenDetails ? <button type="button" className="btn btn-link small" onClick={onOpenDetails}>Workspaces</button> : null}</div>;
+/** One workspace in the navigator: its name and what it allows; selected,
+ * it opens to show its conversations and sessions. */
+function PlaceItem({ label, grants, title, selected, onSelect, children }: { label: string; grants: ReactNode; title?: string; selected: boolean; onSelect: () => void; children: ReactNode }) {
+  return <li className={`nav-place${selected ? " selected" : ""}`}>
+    <button type="button" className="nav-place-head" aria-expanded={selected} title={title} onClick={onSelect}>
+      <Icon name="folder" small />
+      <span className="nav-place-text"><span className="nav-place-name">{label}</span><span className="nav-place-grants">{grants}</span></span>
+    </button>
+    {selected ? <div className="nav-place-body">{children}</div> : null}
+  </li>;
+}
+
+/** What a workspace allows this device, in words. Each is the Host's own
+ * switch for this Bridge; continuing a session needs both. */
+function Grants({ share }: { share: SharedWorkspace }) {
+  return <>
+    <span className={share.readSessions ? "grant on" : "grant"}>{share.readSessions ? "Sessions" : "No sessions"}</span>
+    <span className={share.agentRequests ? "grant on" : "grant"}>{share.agentRequests ? "Agents" : "No agents"}</span>
+  </>;
+}
+
+/** Inside the selected workspace: start something new, return to the
+ * conversation this device began there, or open one of its sessions. */
+function PlaceBody({ canRun, runBlocked, agent, ownsCurrent, shownView, onNew, onCurrent, list, target, openKey, liveKey, onOpenSession }: {
+  canRun: boolean;
+  runBlocked: string | null;
+  agent: NativeAgentController;
+  ownsCurrent: boolean;
+  shownView: AgentView | null;
+  onNew: () => void;
+  onCurrent: () => void;
+  list: SessionList;
+  target: string;
+  openKey: string | null;
+  liveKey: string | null;
+  onOpenSession: (session: SessionRef) => void;
+}) {
+  const currentTitle = agent.pastTurns[0]?.prompt ?? agent.prompt ?? "Conversation";
+  const active = !!agent.status && ["queued", "running"].includes(agent.status.state);
+  return <>
+    <button type="button" className={`nav-new${shownView === null || shownView.kind === "new" ? " selected" : ""}`} disabled={!canRun} title={canRun ? undefined : runBlocked ?? undefined} onClick={onNew}><Icon name="plus" small />New conversation</button>
+    {!canRun && runBlocked ? <p className="nav-note">{runBlocked}</p> : null}
+    {ownsCurrent ? <button type="button" className={`nav-session${shownView?.kind === "current" ? " selected" : ""}`} onClick={onCurrent}>
+      <span className="nav-session-title">{active ? <Dot tone="live" pulse /> : null}{currentTitle}</span>
+      <span className="nav-session-meta">Codex · your new conversation, from this device</span>
+    </button> : null}
+    <SessionListView list={list} target={target} openKey={openKey} liveKey={liveKey} onOpen={onOpenSession} />
+  </>;
 }
 
 const ACCESS_TONE: Record<AccessLine["state"], "ok" | "warn" | "neutral" | "live"> = { ok: "ok", needs_action: "warn", decided_there: "live", unknown: "neutral" };
@@ -134,7 +289,7 @@ const ACCESS_LABEL: Record<AccessLine["state"], string> = { ok: "Ready", needs_a
 
 /** Per authority: what is known here, what the other device decides, and
  * the exact steps there. No single "trust" switch. */
-function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, waitedForAccept }: {
+function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, waitedForAccept, onOpenDetails }: {
   room: RoomInfo;
   hostRef: string;
   name: string;
@@ -142,6 +297,7 @@ function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, 
   paired: boolean;
   sharing: PeerShareKnowledge;
   waitedForAccept: boolean | null;
+  onOpenDetails?: () => void;
 }) {
   const [me, setMe] = useState<{ name: string; fingerprint: string | null }>({ name: "this device", fingerprint: null });
   const [shown, setShown] = useState<{ text: string; ok: boolean } | null>(null);
@@ -160,18 +316,20 @@ function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, 
     catch (error) { setShown({ text: error instanceof Error ? error.message : `Pastey could not reach ${name}.`, ok: false }); }
   }
 
-  return <details className="disclosure access-summary" open={lines.some((line) => line.state === "needs_action") || undefined}>
-    <summary><Icon name="chevron" small />Access on {name}{connected ? "" : " (not connected)"}</summary>
-    <div className="disclosure-body stack">
-      <ul className="access-lines">
-        {lines.map((line) => <li key={line.id}>
-          <div className="row"><Dot tone={ACCESS_TONE[line.state] === "live" ? "live" : ACCESS_TONE[line.state]} /><strong className="spacer">{line.label}</strong><Badge tone={ACCESS_TONE[line.state]}>{ACCESS_LABEL[line.state]}</Badge></div>
-          <p className="small muted">{line.detail}</p>
-          {line.steps.length && line.state !== "ok" ? <details className="disclosure"><summary><Icon name="chevron" small />How to allow it</summary><ol className="small disclosure-body">{line.steps.map((step) => <li key={step}>{step}</li>)}</ol></details> : null}
-        </li>)}
-      </ul>
-      <div className="row"><button type="button" className="btn btn-sm" disabled={!connected} onClick={() => void showDevice()}>Show this device to {name} again</button><span className="xsmall subtle spacer">{connected ? `Pastey does this when the Bridge opens, so ${name}'s user can trust this device. It grants nothing.` : `${name} is not connected right now.`}</span></div>
-      {shown ? <Notice tone={shown.ok ? "ok" : "bad"}>{shown.text}</Notice> : null}
-    </div>
-  </details>;
+  return <div className="stack access-summary">
+    <ul className="access-lines">
+      {lines.map((line) => <li key={line.id}>
+        <div className="row"><Dot tone={ACCESS_TONE[line.state] === "live" ? "live" : ACCESS_TONE[line.state]} /><strong className="spacer">{line.label}</strong><Badge tone={ACCESS_TONE[line.state]}>{ACCESS_LABEL[line.state]}</Badge></div>
+        <p className="small muted">{line.detail}</p>
+        {line.steps.length && line.state !== "ok" ? <details className="disclosure"><summary><Icon name="chevron" small />How to allow it</summary><ol className="small disclosure-body">{line.steps.map((step) => <li key={step}>{step}</li>)}</ol></details> : null}
+      </li>)}
+    </ul>
+    <div className="row"><button type="button" className="btn btn-sm" disabled={!connected} onClick={() => void showDevice()}>Show this device to {name} again</button><span className="xsmall subtle spacer">{connected ? `Pastey does this when the Bridge opens, so ${name}'s user can trust this device. It grants nothing.` : `${name} is not connected right now.`}</span></div>
+    {onOpenDetails ? <button type="button" className="btn btn-link small" onClick={onOpenDetails}>This device's own shares: Bridge details → Workspaces</button> : null}
+    {shown ? <Notice tone={shown.ok ? "ok" : "bad"}>{shown.text}</Notice> : null}
+  </div>;
+}
+
+function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {
+  return { state: codex?.state ?? "unavailable", reason: codex?.reason ?? null, detail: codex?.detail ?? null, backend: codex?.backend ?? null };
 }

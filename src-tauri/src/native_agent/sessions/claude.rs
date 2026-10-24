@@ -27,8 +27,8 @@ use super::{
     derive_status, in_workspaces, now_ms, quote, workspace_evidence, workspace_statements,
     ActivitySummaryV1, EvidenceBasisV1, EvidenceV1, LastTurnObservationV1, LastTurnV1,
     LiveObservationV1, LiveStateV1, NativeSessionSnapshotV1, NativeSessionV1,
-    ProviderObservationV1, SnapshotEntryV1, MAX_CHANGED_FILES, MAX_QUOTE_CHARS, MAX_SESSIONS,
-    MAX_TITLE_CHARS, PROVIDER_CLAUDE_CODE,
+    ProviderObservationV1, SnapshotEntryV1, MAX_CHANGED_FILES, MAX_QUOTE_CHARS, MAX_RECENT,
+    MAX_SESSIONS, MAX_TITLE_CHARS, PROVIDER_CLAUDE_CODE,
 };
 use crate::error::AppResult;
 
@@ -36,7 +36,6 @@ const LIVE_SOURCE: &str = "claude agents --json";
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Transcripts larger than this are read only up to it.
 const MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
-const MAX_RECENT: usize = 6;
 const COMMAND_TOOLS: [&str; 2] = ["Bash", "PowerShell"];
 const EDIT_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 

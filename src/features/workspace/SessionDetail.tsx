@@ -1,156 +1,212 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { BridgePeerSession } from "../../lib/bridgePeers";
 import {
   continueNativeSession,
   continueRemoteNativeSession,
-  type NativeAgentTaskStatus,
+  inspectNativeSession,
+  inspectRemoteNativeSession,
   type SharedWorkspace,
 } from "../../lib/tauri";
 import {
   continuationAvailability,
   evidenceGroups,
+  localSessionView,
   originLabel,
   providerLabel,
   relativeTime,
+  remoteOutcomeMessage,
   resumeLabel,
   sessionHoldLine,
   sessionPersistenceLine,
   sessionStatusPresentation,
   snapshotActivityLine,
-  type SessionView,
 } from "../../lib/nativeSessions";
-import type { ContinuedSession } from "./AgentTaskLifecycle";
-import type { SessionSnapshot } from "./NativeSessionsCard";
-import { Badge, Dot, Icon, Notice, type Tone } from "./ui";
+import { continuedSessionKey, type ContinuedSession } from "./AgentTaskLifecycle";
+import { PastTurnView, TaskTurn } from "./AgentTaskTracker";
+import { Bubble, Composer, ConversationHeader, ConversationThread, SystemLine } from "./Conversation";
+import type { NativeAgentController } from "./NativeAgentPanel";
+import type { SessionRef, SessionSnapshot } from "./NativeSessionsCard";
+import { Badge, Dot, Icon, type Tone } from "./ui";
 
 const STATUS_TONE: Record<string, Tone> = { live: "live", done: "ok", warning: "warn", unknown: "neutral" };
 
-export type ContinueRoute = { roomId: string; peerSessionId: string; hostRef: string } | null;
-
-/** One session, read only, laid out for the question people open it with:
- * can I continue it, and what happens if I do? Its state follows in plain
- * words; the evidence behind every statement is one step away. */
-export function SessionDetail({ snapshot, hostName, remote, folder, route, share, busy, run, onBack, onLookAgain, onContinued }: {
-  snapshot: SessionSnapshot;
-  hostName: string;
-  remote: boolean;
+/** One existing Claude Code or Codex session as a conversation: what it
+ * holds (as much of it as this device may read), then what this device
+ * sends it and what comes back, then a composer that continues it. The
+ * session is always the one named here, by provider and id; continuing it
+ * runs in the session itself, once, only while it still ends where it was
+ * read, and on another device only after its user accepts. */
+export function SessionConversation({ roomId, agent, peers, members, target, session, folder, share, onBack }: {
+  roomId: string;
+  agent: NativeAgentController;
+  peers: readonly BridgePeerSession[];
+  members: readonly BridgePeerSession[];
+  /** "local" or the chosen device's HostRef. */
+  target: string;
+  session: SessionRef;
   /** This device's folder the session was read in (this device only). */
   folder: string;
-  route: ContinueRoute;
   /** On another device: the share of the session's folder, as that device
    * last listed it (`null`: no longer listed; omitted: not known). */
   share?: SharedWorkspace | null;
-  busy: boolean;
-  /** The task continuing this session, when there is one: shown here, in
-   * place of the composer, while it runs. */
-  run: { node: ReactNode; active: boolean } | null;
-  onBack: () => void;
-  onLookAgain: () => void;
-  onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null, session: ContinuedSession) => void;
+  onBack?: () => void;
 }) {
-  const session = snapshot.session;
-  const status = sessionStatusPresentation(session);
-  const hold = sessionHoldLine(session, hostName);
-  const workspace = snapshot.workspace;
-  return <section className="card session-detail" aria-label="Session report">
-    <header className="card-header">
-      <button type="button" className="btn btn-ghost btn-sm" onClick={onBack}><Icon name="back" small />All sessions</button>
-      <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={onLookAgain}><Icon name="refresh" small />{busy ? "Looking…" : "Look again"}</button>
-    </header>
-    <div className="card-body">
-      <div className="session-title">
-        <div className="stack" style={{ gap: 2, minWidth: 0 }}>
-          <h3>{session.title ?? "(untitled)"}</h3>
-          <span className="xsmall subtle">{providerLabel(session.provider)} on {hostName} · {session.workspaceLabel}{session.gitBranch ? ` · ${session.gitBranch}` : ""} · started in the {originLabel(session.origin)} · active {relativeTime(session.lastActivityAtMs)}</span>
-        </div>
-        <span className="row">{session.origin === "pastey" ? <Badge tone="accent">Started by Pastey</Badge> : null}<span title={status.explanation}><Badge tone={STATUS_TONE[status.tone]}>{status.label}</Badge></span></span>
-      </div>
-
-      {run?.active ? run.node : <>
-        {run ? run.node : null}
-        <ContinueSession session={session} remote={remote} folder={folder} onContinued={onContinued} route={route} hostName={hostName} share={share} />
-      </>}
-
-      {run?.active ? <p className="xsmall subtle">Below is the session as Pastey read it before your continuation; it is read again when the continuation ends.</p> : null}
-      <dl className="facts session-facts">
-        <dt>State</dt><dd>{status.explanation}</dd>
-        <dt>Open anywhere?</dt><dd>{hold.text}</dd>
-        <dt>History</dt><dd>{snapshotActivityLine(snapshot)}{snapshot.activity.changedFiles.length ? ` Changed: ${snapshot.activity.changedFiles.join(", ")}.` : ""}</dd>
-        <dt>Folder now</dt><dd>{workspace.exists ? workspace.gitBranch ? `${workspace.gitBranch} at ${workspace.head ?? "?"}, ${workspace.uncommittedPaths ?? "?"} uncommitted path(s)${workspace.commitsSinceLastActivity != null ? `, ${workspace.commitsSinceLastActivity} commit(s) since the session's last activity` : ""}.` : "Not a Git repository." : "The folder no longer exists."}</dd>
-      </dl>
-
-      {snapshot.excerptsShared
-        ? snapshot.recent.length ? <div className="evidence-group"><h4>Recent conversation</h4><p className="xsmall subtle">Replies are the agent's own account, not verified.</p>{snapshot.recent.map((entry, index) => <div className="excerpt" key={index}><small>{entry.role === "user" ? "Prompt" : "Agent said"} · {relativeTime(entry.atMs)}</small>{entry.text}</div>)}</div> : null
-        : <p className="xsmall subtle">{hostName} shares statuses only, not excerpts of the conversation.</p>}
-
-      <SessionEvidence snapshot={snapshot} hostName={hostName} howOpen={hold.how} />
-    </div>
-  </section>;
-}
-
-/** Where each statement above comes from. Collapsed: needed to check a
- * statement or report a problem, not to decide. */
-function SessionEvidence({ snapshot, hostName, howOpen }: { snapshot: SessionSnapshot; hostName: string; howOpen: string }) {
-  const session = snapshot.session;
-  const evidence = evidenceGroups(snapshot.evidence);
-  return <details className="disclosure">
-    <summary><Icon name="chevron" small />Evidence and how Pastey knows</summary>
-    <div className="disclosure-body stack">
-      <p className="small muted">{sessionPersistenceLine(session, hostName)}</p>
-      <dl className="facts">
-        <dt>Open anywhere?</dt><dd>{howOpen} {resumeLabel(session)}, {relativeTime(session.live.observedAtMs)}. Continuing checks again at the moment it starts.</dd>
-        <dt>Live state</dt><dd><Dot tone={session.live.state === "running" ? "live" : "neutral"} /> {session.live.state.replace("_", " ")} · from {session.live.source}{session.live.detail ? ` · ${session.live.detail}` : ""}</dd>
-        <dt>Last turn</dt><dd>{session.lastTurn.outcome.replace("_", " ")} ({session.lastTurn.source}{session.lastTurn.atMs ? `, ${relativeTime(session.lastTurn.atMs)}` : ""})</dd>
-        <dt>Ids</dt><dd className="mono">{session.provider === "codex" ? "thread" : "session"} {session.sessionId}{session.lastTurn.marker ? ` · ends with ${session.lastTurn.marker}` : ""}</dd>
-      </dl>
-      <div className="evidence">
-        {evidence.facts.length ? <div className="evidence-group"><h4><Dot tone="ok" />Facts</h4><ul>{evidence.facts.map((item) => <li key={item.statement}>{item.statement} <small>({item.source})</small></li>)}</ul></div> : null}
-        {evidence.inferences.length ? <div className="evidence-group"><h4><Dot tone="warn" />Inferred</h4><ul>{evidence.inferences.map((item) => <li key={item.statement}>{item.statement} <small>({item.source})</small></li>)}</ul></div> : null}
-        {evidence.unknowns.length ? <div className="evidence-group"><h4><Dot />Not known</h4><ul>{evidence.unknowns.map((item) => <li key={item.statement}>{item.statement}</li>)}</ul></div> : null}
-      </div>
-    </div>
-  </details>;
-}
-
-/** Continues this session in the session itself, with one new prompt. The
- * Host checks again at launch; nothing is retried, and no new session is
- * ever made in its place. Its progress then replaces this form. */
-function ContinueSession({ session, remote, folder, onContinued, route, hostName, share }: { session: SessionView; remote: boolean; folder: string; onContinued?: (status: NativeAgentTaskStatus, hostRef: string | null, session: ContinuedSession) => void; route: ContinueRoute; hostName: string; share?: SharedWorkspace | null }) {
-  const [prompt, setPrompt] = useState("");
+  const remote = target === "local" ? null : peers.find((peer) => peer.hostRef === target) ?? null;
+  const hostName = target === "local" ? "this device" : remote?.displayName ?? members.find((peer) => peer.hostRef === target)?.displayName ?? "the other device";
+  const route = remote ? { roomId, peerSessionId: remote.peerSessionId, hostRef: remote.hostRef! } : null;
+  const key = continuedSessionKey(session);
+  const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
+  // The session as read when this device began sending to it: shown above
+  // what it sent since, so a turn is never shown twice.
+  const [base, setBase] = useState<SessionSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [started, setStarted] = useState(false);
-  const availability = remote && !route
-    ? { allowed: false, reason: `${hostName} is not connected right now.` }
-    : continuationAvailability(session, !remote, hostName, share);
+  const [message, setMessage] = useState<string | null>(null);
+  const [prompt, setPrompt] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [details, setDetails] = useState(false);
 
-  async function submit() {
-    if (!availability.allowed || !prompt.trim() || busy || started) return;
-    setBusy(true); setError(null);
+  async function read() {
+    setBusy(true); setMessage(null);
     try {
-      const status = route
-        ? await continueRemoteNativeSession({ roomId: route.roomId, peerSessionId: route.peerSessionId, targetHostRef: route.hostRef, provider: session.provider, sessionId: session.sessionId, scopeRef: session.scopeRef, prompt: prompt.trim(), expectedMarker: session.lastTurn.marker ?? null })
-        : await continueNativeSession({ workspaces: [folder], provider: session.provider, sessionId: session.sessionId, prompt: prompt.trim(), expectedMarker: session.lastTurn.marker ?? null });
-      setStarted(true);
-      const continued: ContinuedSession = { provider: session.provider, sessionId: session.sessionId, title: session.title, workspaceLabel: session.workspaceLabel };
-      onContinued?.(status, route?.hostRef ?? null, continued);
-    } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : String(nextError));
+      if (route) {
+        const response = await inspectRemoteNativeSession(roomId, route.hostRef, session.provider, session.sessionId);
+        const problem = remoteOutcomeMessage(response, hostName);
+        if (problem || !response.snapshot) { setMessage(problem ?? `${hostName} sent no report.`); return; }
+        setSnapshot(response.snapshot);
+      } else if (target === "local") {
+        const local = await inspectNativeSession([folder], session.provider, session.sessionId);
+        setSnapshot({ ...local, session: localSessionView(local.session), excerptsShared: true });
+      } else {
+        setMessage(`${hostName} is not connected right now.`);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
     } finally { setBusy(false); }
   }
 
-  const steps = remote
-    ? [`${hostName} asks its user to Accept.`, `${providerLabel(session.provider)} there reopens this thread; it refuses if the Codex app or a terminal has it open.`, "Pastey checks it still ends with the turn you see here, then sends your prompt as one turn.", "You follow it here, with its reply."]
-    : session.provider === "codex"
-      ? ["Codex reopens this thread; it refuses if the Codex app or a terminal has it open.", "Pastey checks it still ends with the turn you see here, then sends your prompt as one turn.", "You follow it here, with its reply."]
-      : ["Claude Code resumes this session only if nothing holds it.", "Pastey checks it still ends with the entry you see here, then sends your prompt.", "You follow it here, with its reply."];
+  useEffect(() => { setSnapshot(null); setBase(null); setSendError(null); void read(); }, [key, target]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  return <div className={`continue-panel${availability.allowed ? "" : " blocked"}`} aria-label="Continue this session">
-    <div className="row"><Dot tone={availability.allowed ? session.resume.verdict === "safe" ? "ok" : "neutral" : "warn"} /><strong className="spacer">{!availability.allowed ? "You can't continue this session now" : session.resume.verdict === "safe" ? "You can continue this session" : `You can try: ${providerLabel(session.provider)} decides when it starts`}</strong></div>
-    {availability.allowed ? <>
-      <textarea className="textarea" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={`What should ${providerLabel(session.provider)} do next in this session?`} aria-label="Next prompt" disabled={busy || started} />
-      <div className="row"><details className="disclosure spacer"><summary><Icon name="chevron" small />What happens</summary><ol className="small disclosure-body">{steps.map((step) => <li key={step}>{step}</li>)}</ol></details><button type="button" className="btn btn-primary" disabled={busy || started || !prompt.trim()} onClick={() => void submit()}>{busy ? "Sending…" : "Continue session"}</button></div>
-      <p className="xsmall subtle">{availability.reason}</p>
-    </> : <p className="small muted">{availability.reason}</p>}
-    {error ? <Notice tone="bad" title={remote ? undefined : "Nothing ran."}>{error}</Notice> : null}
+  // This device's turns in this session: the one it follows, and the ones
+  // before it in this sitting.
+  const ours = agent.origin?.kind === "session" && continuedSessionKey(agent.origin.session) === key && (agent.taskHostRef ?? "local") === target;
+  const active = ours && !!agent.status && ["queued", "running"].includes(agent.status.state);
+  const otherActive = !ours && !!agent.status && ["queued", "running"].includes(agent.status.state);
+
+  // When its turn ends, read the session again: it now ends with a new
+  // turn, which the next continuation must name.
+  const wasActive = useRef(false);
+  useEffect(() => {
+    if (active) { wasActive.current = true; return; }
+    if (wasActive.current) { wasActive.current = false; void read(); }
+  }, [active]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const view = snapshot?.session ?? null;
+  const shown = ours && base ? base : snapshot;
+  const status = view ? sessionStatusPresentation(view) : null;
+  const availability = !view ? null
+    : remote === null && target !== "local" ? { allowed: false, reason: `${hostName} is not connected right now.` }
+      : continuationAvailability(view, !route, hostName, share);
+  const certain = view?.resume.verdict === "safe";
+
+  async function send() {
+    if (!view || !availability?.allowed || !prompt.trim() || sending || active || otherActive || !snapshot) return;
+    setSending(true); setSendError(null);
+    const text = prompt.trim();
+    try {
+      const started = route
+        ? await continueRemoteNativeSession({ roomId: route.roomId, peerSessionId: route.peerSessionId, targetHostRef: route.hostRef, provider: view.provider, sessionId: view.sessionId, scopeRef: view.scopeRef, prompt: prompt.trim(), expectedMarker: view.lastTurn.marker ?? null })
+        : await continueNativeSession({ workspaces: [folder], provider: view.provider, sessionId: view.sessionId, prompt: prompt.trim(), expectedMarker: view.lastTurn.marker ?? null });
+      const continued: ContinuedSession = { provider: view.provider, sessionId: view.sessionId, title: view.title, workspaceLabel: view.workspaceLabel, scopeRef: view.scopeRef };
+      if (!ours || !base) setBase(snapshot);
+      agent.adoptTask(started, route?.hostRef ?? null, continued, text);
+      setPrompt("");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : String(error));
+    } finally { setSending(false); }
+  }
+
+  const blocked = !availability ? (busy ? "Reading the session…" : message ?? "")
+    : !availability.allowed ? availability.reason
+      : active ? `${providerLabel(session.provider)} is working on your last message. Wait for it, or stop it.`
+        : otherActive ? "Codex is working on another task in this Bridge. Wait for it, or stop it there." : null;
+
+  return <section className="conversation" aria-label="Session">
+    <ConversationHeader
+      onBack={onBack}
+      title={view?.title ?? (busy ? "Opening…" : "(untitled)")}
+      subtitle={view ? <>{providerLabel(view.provider)} · {view.workspaceLabel}{view.gitBranch ? ` · ${view.gitBranch}` : ""} · {hostName}</> : hostName}
+      side={<>
+        {status ? <span title={status.explanation}><Badge tone={STATUS_TONE[status.tone]}>{status.label}</Badge></span> : null}
+        <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Look again" title="Read the session again" disabled={busy} onClick={() => void read()}><Icon name="refresh" /></button>
+        <button type="button" className={`btn btn-ghost btn-icon btn-sm${details ? " active" : ""}`} aria-label="Details" title="Details and evidence" aria-pressed={details} onClick={() => setDetails(!details)}><Icon name="info" /></button>
+      </>}
+    />
+    {details && snapshot ? <SessionDetails snapshot={snapshot} hostName={hostName} /> : null}
+    <ConversationThread follow={`${shown?.recent.length}:${agent.pastTurns.length}:${agent.status?.state}:${ours}`}>
+      {shown ? <SessionHistory snapshot={shown} hostName={hostName} /> : message ? <SystemLine tone="bad">{message}</SystemLine> : <SystemLine>Reading the session on {hostName}…</SystemLine>}
+      {ours ? <>
+        {agent.pastTurns.map((turn) => <PastTurnView key={turn.taskId} turn={turn} hostName={hostName} />)}
+        <TaskTurn roomId={roomId} agent={agent} peers={peers} members={members} />
+      </> : null}
+    </ConversationThread>
+    <Composer
+      label="Continue this session"
+      value={prompt}
+      onChange={setPrompt}
+      onSend={() => void send()}
+      canSend={!blocked && !!prompt.trim() && !sending}
+      disabled={!availability?.allowed || active || otherActive}
+      sending={sending}
+      placeholder={availability?.allowed ? `Continue this ${providerLabel(session.provider)} session…` : "This session can't be continued right now"}
+      bar={<><Icon name="agent" small />{providerLabel(session.provider)} · in this session{route ? ` · ${hostName}` : ""}</>}
+      hint={sendError ? sendError : blocked ? blocked : certain ? availability?.reason : <>You can try: {providerLabel(session.provider)} decides when it starts. {availability?.reason}</>}
+      hintTone={sendError ? "bad" : blocked ? "warn" : undefined}
+    />
+  </section>;
+}
+
+/** What the session holds, as a conversation, with how much of it is here. */
+function SessionHistory({ snapshot, hostName }: { snapshot: SessionSnapshot; hostName: string }) {
+  const session = snapshot.session;
+  const prompts = snapshot.activity.userTurns;
+  const shownPrompts = snapshot.recent.filter((entry) => entry.role === "user").length;
+  const summary = `${prompts} prompt${prompts === 1 ? "" : "s"}, ${snapshot.activity.toolCalls} tool call${snapshot.activity.toolCalls === 1 ? "" : "s"}`;
+  return <>
+    <SystemLine>Started in the {originLabel(session.origin)}{session.createdAtMs ? ` · ${relativeTime(session.createdAtMs)}` : ""} · {snapshot.historyComplete ? summary : `at least ${summary}`}</SystemLine>
+    {!snapshot.excerptsShared
+      ? <SystemLine>{hostName} shares this session's status only, not its messages.</SystemLine>
+      : snapshot.recent.length && (shownPrompts < prompts || !snapshot.historyComplete)
+        ? <SystemLine>Earlier messages are not shown here: {hostName === "this device" ? "the newest" : `${hostName} shares only short excerpts of the newest`} messages.</SystemLine>
+        : null}
+    {snapshot.excerptsShared ? snapshot.recent.map((entry, index) => <Bubble key={index} from={entry.role === "user" ? "me" : "agent"} meta={<>{entry.role === "user" ? "Prompt" : `${providerLabel(session.provider)} said`}{entry.atMs ? ` · ${relativeTime(entry.atMs)}` : ""}{entry.role === "user" ? "" : " · its own account, not verified"}</>}>{entry.text}</Bubble>) : null}
+    <SystemLine>{sessionStatusPresentation(session).label}{session.lastTurn.atMs ? ` · ${relativeTime(session.lastTurn.atMs)}` : ""}</SystemLine>
+  </>;
+}
+
+/** Everything the report knows and where it comes from. On request: it
+ * is needed to check a statement or report a problem, not to continue. */
+function SessionDetails({ snapshot, hostName }: { snapshot: SessionSnapshot; hostName: string }) {
+  const session = snapshot.session;
+  const status = sessionStatusPresentation(session);
+  const hold = sessionHoldLine(session, hostName);
+  const evidence = evidenceGroups(snapshot.evidence);
+  const workspace = snapshot.workspace;
+  return <div className="conversation-details" aria-label="Session details">
+    <p className="small muted">{sessionPersistenceLine(session, hostName)}</p>
+    <dl className="facts">
+      <dt>State</dt><dd>{status.explanation}</dd>
+      <dt>Open anywhere?</dt><dd>{hold.text} <span className="subtle">({hold.how} {resumeLabel(session)}, {relativeTime(session.live.observedAtMs)}. Continuing checks again when it starts.)</span></dd>
+      <dt>History</dt><dd>{snapshotActivityLine(snapshot)}{snapshot.activity.changedFiles.length ? ` Changed: ${snapshot.activity.changedFiles.join(", ")}.` : ""}</dd>
+      <dt>Folder now</dt><dd>{workspace.exists ? workspace.gitBranch ? `${workspace.gitBranch} at ${workspace.head ?? "?"}, ${workspace.uncommittedPaths ?? "?"} uncommitted path(s)${workspace.commitsSinceLastActivity != null ? `, ${workspace.commitsSinceLastActivity} commit(s) since the session's last activity` : ""}.` : "Not a Git repository." : "The folder no longer exists."}</dd>
+      <dt>Live state</dt><dd><Dot tone={session.live.state === "running" ? "live" : "neutral"} /> {session.live.state.replace("_", " ")} · from {session.live.source}{session.live.detail ? ` · ${session.live.detail}` : ""}</dd>
+      <dt>Last turn</dt><dd>{session.lastTurn.outcome.replace("_", " ")} ({session.lastTurn.source}{session.lastTurn.atMs ? `, ${relativeTime(session.lastTurn.atMs)}` : ""})</dd>
+      <dt>Ids</dt><dd className="mono">{session.provider === "codex" ? "thread" : "session"} {session.sessionId}{session.lastTurn.marker ? ` · ends with ${session.lastTurn.marker}` : ""}</dd>
+    </dl>
+    <div className="evidence">
+      {evidence.facts.length ? <div className="evidence-group"><h4><Dot tone="ok" />Facts</h4><ul>{evidence.facts.map((item) => <li key={item.statement}>{item.statement} <small>({item.source})</small></li>)}</ul></div> : null}
+      {evidence.inferences.length ? <div className="evidence-group"><h4><Dot tone="warn" />Inferred</h4><ul>{evidence.inferences.map((item) => <li key={item.statement}>{item.statement} <small>({item.source})</small></li>)}</ul></div> : null}
+      {evidence.unknowns.length ? <div className="evidence-group"><h4><Dot />Not known</h4><ul>{evidence.unknowns.map((item) => <li key={item.statement}>{item.statement}</li>)}</ul></div> : null}
+    </div>
   </div>;
 }

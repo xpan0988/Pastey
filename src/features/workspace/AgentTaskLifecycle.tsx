@@ -260,8 +260,49 @@ export interface RememberedNativeTask {
   taskId: string;
   hostRef: string | null;
   movementId?: string | null;
-  /** The session this task continues, as this device saw it. */
-  continues?: ContinuedSession | null;
+  /** What the task belongs to: a new conversation, or a named session. */
+  origin?: TaskOrigin | null;
+  /** The prompt it carried, as this device's user wrote it. */
+  prompt?: string | null;
+}
+
+/** Where a new conversation runs, as this device's user chose it. A shared
+ * folder is named by its reference only; the executing device resolves it. */
+export type ConversationPlace =
+  | { kind: "shared"; scopeRef: string; label: string }
+  | { kind: "path"; path: string; label: string }
+  | { kind: "send"; path: string; label: string }
+  | { kind: "local"; path: string; label: string };
+
+/** What a task belongs to. A new conversation is identified here only, by
+ * an id this renderer makes; a session by its provider and id. The two are
+ * never mixed: a new conversation never continues another session, and a
+ * continuation always names its session. */
+export type TaskOrigin =
+  | { kind: "new"; conversationId: string; place: ConversationPlace }
+  | { kind: "session"; conversationId: string; session: ContinuedSession };
+
+/** An earlier turn of the new conversation this Bridge follows. */
+export interface PastTurn {
+  taskId: string;
+  prompt: string;
+  status: NativeAgentTaskStatus;
+}
+
+const CONVERSATION_KEY = "pastey:native-conversation-v1";
+
+function savedPastTurns(roomId: string, conversationId: string): PastTurn[] {
+  try {
+    const stored = (JSON.parse(window.sessionStorage.getItem(CONVERSATION_KEY) ?? "{}") as Record<string, { conversationId: string; turns: PastTurn[] }>)[roomId];
+    return stored?.conversationId === conversationId && Array.isArray(stored.turns) ? stored.turns : [];
+  } catch { return []; }
+}
+
+function savePastTurns(roomId: string, conversationId: string, turns: PastTurn[]) {
+  try {
+    const stored = JSON.parse(window.sessionStorage.getItem(CONVERSATION_KEY) ?? "{}") as Record<string, unknown>;
+    window.sessionStorage.setItem(CONVERSATION_KEY, JSON.stringify({ ...stored, [roomId]: { conversationId, turns } }));
+  } catch { /* a convenience: the turns stay in memory */ }
 }
 
 /** An existing session a task continues, as this device's user chose it
@@ -272,6 +313,9 @@ export interface ContinuedSession {
   sessionId: string;
   title: string | null;
   workspaceLabel: string;
+  /** Its workspace as this device names it: a shared folder's reference,
+   * or a folder on this device. */
+  scopeRef?: string;
 }
 
 export function continuedSessionKey(session: Pick<ContinuedSession, "provider" | "sessionId">): string {
@@ -471,8 +515,6 @@ export function useNativeAgentTask(roomId: string) {
   const [capabilities, setCapabilities] = useState<NativeAgentCapability[]>([]);
   const [workspace, setWorkspace] = useState("");
   const [taskText, setTaskText] = useState("");
-  /** Explicitly begin a new Agent conversation instead of continuing. */
-  const [newConversation, setNewConversation] = useState(false);
   const [status, setStatus] = useState<NativeAgentTaskStatus | null>(null);
   const [movement, setMovement] = useState<NativeAgentWorkspaceMovement | null>(null);
   const [recoveryProjection, setRecoveryProjection] = useState<NativeAgentRecoveryProjection | null>(null);
@@ -484,8 +526,18 @@ export function useNativeAgentTask(roomId: string) {
   const [busy, setBusy] = useState(false);
   /** The remote Host the shown task runs on, or null for this device. */
   const [taskHostRef, setTaskHostRef] = useState<string | null>(null);
-  /** The existing session the shown task continues, if it does. */
-  const [continues, setContinues] = useState<ContinuedSession | null>(null);
+  /** What the shown task belongs to, the prompt it carried, and the earlier
+   * turns of its new conversation. */
+  const [origin, setOrigin] = useState<TaskOrigin | null>(null);
+  const [prompt, setPrompt] = useState<string | null>(null);
+  const [pastTurns, setPastTurns] = useState<PastTurn[]>([]);
+  const continues = origin?.kind === "session" ? origin.session : null;
+  const restoreOrigin = useCallback((remembered: RememberedNativeTask | null, taskId: string) => {
+    const known = remembered?.taskId === taskId ? remembered : null;
+    setOrigin(known?.origin ?? null);
+    setPrompt(known?.prompt ?? null);
+    setPastTurns(known?.origin ? savedPastTurns(roomId, known.origin.conversationId) : []);
+  }, [roomId]);
   const recoveryCorrelation = movement
     ? { taskId: movement.taskId, movementId: movement.movementId, targetHostRef: movement.targetHostRef }
     : recoveryProjection
@@ -517,8 +569,7 @@ export function useNativeAgentTask(roomId: string) {
     if (!isCurrent()) return null;
     setRecoveryProjection(projection);
     if (projection) {
-      const remembered = rememberedNativeTask(roomId);
-      setContinues(remembered?.taskId === projection.task.taskId ? remembered.continues ?? null : null);
+      restoreOrigin(rememberedNativeTask(roomId), projection.task.taskId);
       setStatus(projection.task);
       setMovement(projection.movement ?? null);
       setTaskHostRef(projection.targetHostRef ?? null);
@@ -526,10 +577,12 @@ export function useNativeAgentTask(roomId: string) {
       setStatus(null);
       setMovement(null);
       setTaskHostRef(null);
-      setContinues(null);
+      setOrigin(null);
+      setPrompt(null);
+      setPastTurns([]);
     }
     return projection;
-  }, [roomId]);
+  }, [restoreOrigin, roomId]);
 
   useEffect(() => {
     void refreshCapabilities();
@@ -551,7 +604,7 @@ export function useNativeAgentTask(roomId: string) {
         remembered.movementId ? getNativeAgentWorkspaceMovementStatus(remembered.movementId).catch(() => null) : Promise.resolve(null),
       ]);
       if (cancelled) return;
-      if (rememberedStatus) { setStatus(rememberedStatus); setTaskHostRef(remembered.hostRef); setContinues(remembered.continues ?? null); }
+      if (rememberedStatus) { setStatus(rememberedStatus); setTaskHostRef(remembered.hostRef); restoreOrigin(remembered, rememberedStatus.taskId); }
       if (rememberedMovement) setMovement(rememberedMovement);
     }).catch((error) => {
       if (!cancelled) setMessage(error instanceof Error ? error.message : "Pastey could not recover unresolved native Agent work.");
@@ -632,35 +685,56 @@ export function useNativeAgentTask(roomId: string) {
     return () => { cancelled = true; };
   }, [returnRetryObservation, roomId]);
 
-  const start = useCallback(async () => {
-    if (!workspace.trim() || !taskText.trim() || busy) return;
+  /** Records a turn this device just started. A follow-up stays in the
+   * new conversation the shown task belongs to, after its earlier turns;
+   * anything else begins a new conversation. */
+  const beginTurn = useCallback((taskId: string, hostRef: string | null, place: ConversationPlace, followUp: boolean, sent: string, movementId: string | null = null) => {
+    const sameConversation = followUp && origin?.kind === "new" ? origin : null;
+    const conversationId = sameConversation?.conversationId ?? crypto.randomUUID();
+    const turns = sameConversation && status && prompt !== null ? [...pastTurns, { taskId: status.taskId, prompt, status }] : [];
+    const nextOrigin: TaskOrigin = { kind: "new", conversationId, place };
+    setOrigin(nextOrigin);
+    setPrompt(sent);
+    setPastTurns(turns);
+    savePastTurns(roomId, conversationId, turns);
+    setTaskText("");
+    rememberStartedNativeTask(roomId, { taskId, hostRef, movementId, origin: nextOrigin, prompt: sent });
+  }, [origin, pastTurns, prompt, roomId, status]);
+
+  /** Starts Codex on this device. A new conversation unless `followUp`,
+   * which continues the conversation the shown task belongs to. */
+  const start = useCallback(async (place: ConversationPlace, followUp = false) => {
+    const sent = taskText.trim();
+    if (!workspace.trim() || !sent || busy) return;
     setBusy(true); setMessage(null);
     try {
-      const started = await startNativeCodexTask(workspace.trim(), taskText.trim(), newConversation);
-      setStatus(started); setTaskHostRef(null); setContinues(null); setNewConversation(false);
-      rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef: null });
+      const started = await startNativeCodexTask(workspace.trim(), sent, !followUp);
+      setStatus(started); setTaskHostRef(null);
+      beginTurn(started.taskId, null, place, followUp, sent);
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start Codex."); }
     finally { setBusy(false); }
-  }, [busy, newConversation, roomId, taskText, workspace]);
+  }, [beginTurn, busy, taskText, workspace]);
 
-  /** `shared`: a folder that Host shares with this device, named by its
-   * reference, which that Host resolves itself; otherwise the typed path. */
-  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string, shared: { scopeRef: string; label: string } | null = null) => {
+  /** A shared place names a folder that Host shares with this device by its
+   * reference, which that Host resolves itself; otherwise the typed path.
+   * A new conversation unless `followUp`. */
+  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false) => {
+    const shared = place.kind === "shared" ? { scopeRef: place.scopeRef, label: place.label } : null;
     const target = shared ? shared.scopeRef : workspace.trim();
-    if (!roomId || !peerSessionId || !hostRef || !target || !taskText.trim() || busy) return;
+    const sent = taskText.trim();
+    if (!roomId || !peerSessionId || !hostRef || !target || !sent || busy) return;
     setBusy(true); setMessage(null);
     try {
-      const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, target, taskText.trim(), !newConversation, shared?.label ?? null);
+      const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, target, sent, followUp, shared?.label ?? null);
       rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
-      setNewConversation(false);
       setTaskHostRef(hostRef);
-      setContinues(null);
+      beginTurn(started.taskId, hostRef, place, followUp, sent);
       try {
         const projection = await loadRecoveryProjection();
         // A drained projection clears the shown task; the task just started
         // still runs on the Host it was sent to.
-        if (!projection) { setStatus(started); setTaskHostRef(hostRef); }
+        if (!projection) { setStatus(started); setTaskHostRef(hostRef); restoreOrigin(rememberedNativeTask(roomId), started.taskId); }
       } catch (error) {
         setStatus(started);
         setTaskHostRef(hostRef);
@@ -669,20 +743,24 @@ export function useNativeAgentTask(roomId: string) {
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start remote Codex."); }
     finally { setBusy(false); }
-  }, [busy, loadRecoveryProjection, newConversation, taskText, workspace]);
+  }, [beginTurn, busy, loadRecoveryProjection, restoreOrigin, taskText, workspace]);
 
-  const proposeRemoteMovement = useCallback(async (roomId: string, hostRef: string) => {
-    if (!roomId || !hostRef || !workspace.trim() || !taskText.trim() || busy) return;
+  /** Sending a folder from this device is always its own new conversation. */
+  const proposeRemoteMovement = useCallback(async (roomId: string, hostRef: string, place: ConversationPlace) => {
+    const sent = taskText.trim();
+    if (!roomId || !hostRef || !workspace.trim() || !sent || busy) return;
     setBusy(true); setMessage(null);
     try {
-      const proposed = await proposeRemoteNativeCodexWorkspaceMovement(hostRef, workspace.trim(), taskText.trim(), roomId);
+      const proposed = await proposeRemoteNativeCodexWorkspaceMovement(hostRef, workspace.trim(), sent, roomId);
       setMovement(proposed);
-      setContinues(null);
+      setStatus(null);
+      setTaskHostRef(hostRef);
       rememberStartedNativeTask(roomId, { taskId: proposed.taskId, hostRef, movementId: proposed.movementId });
+      beginTurn(proposed.taskId, hostRef, place, false, sent, proposed.movementId);
     }
     catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not prepare the workspace review."); }
     finally { setBusy(false); }
-  }, [busy, taskText, workspace]);
+  }, [beginTurn, busy, taskText, workspace]);
 
   const approveRemoteMovement = useCallback(async (roomId: string, peerSessionId: string) => {
     if (!movement || movement.state !== "awaiting_approval" || busy) return;
@@ -783,14 +861,23 @@ export function useNativeAgentTask(roomId: string) {
   /** A task this device started elsewhere in the Agents workspace (a
    * continued session): shown and followed like any other run, with the
    * session it continues. */
-  const adoptTask = useCallback((started: NativeAgentTaskStatus, hostRef: string | null = null, session: ContinuedSession | null = null) => {
+  const adoptTask = useCallback((started: NativeAgentTaskStatus, hostRef: string | null, session: ContinuedSession, sent: string) => {
+    // A session's turns from this device are kept together, by the session
+    // and the device it is on; another session starts its own.
+    const conversationId = `session:${hostRef ?? "local"}:${continuedSessionKey(session)}`;
+    const same = origin?.kind === "session" && origin.conversationId === conversationId && status && prompt !== null;
+    const turns = same ? [...pastTurns, { taskId: status.taskId, prompt, status }] : [];
+    const nextOrigin: TaskOrigin = { kind: "session", conversationId, session };
     setStatus(started);
     setTaskHostRef(hostRef);
     setMovement(null);
     setMessage(null);
-    setContinues(session);
-    rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef, continues: session });
-  }, [roomId]);
+    setOrigin(nextOrigin);
+    setPrompt(sent);
+    setPastTurns(turns);
+    savePastTurns(roomId, conversationId, turns);
+    rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef, origin: nextOrigin, prompt: sent });
+  }, [origin, pastTurns, prompt, roomId, status]);
 
   /** Puts away a finished task's card. Only a task that has ended and needs
    * nothing more: its record stays with the Host, and nothing is undone. */
@@ -800,14 +887,16 @@ export function useNativeAgentTask(roomId: string) {
     if (!canDismiss) return;
     setStatus(null);
     setTaskHostRef(null);
-    setContinues(null);
+    setOrigin(null);
+    setPrompt(null);
+    setPastTurns([]);
     setMessage(null);
     forgetStartedNativeTask(roomId);
   }, [canDismiss, roomId]);
 
   const retryingResultReturn = returnRetryObservation?.roomId === roomId
     && returnRetryObservation.movement.movementId === movement?.movementId;
-  return { adoptTask, continues, canDismiss, dismiss, capabilities, workspace, setWorkspace, taskText, setTaskText, newConversation, setNewConversation, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
+  return { adoptTask, origin, prompt, pastTurns, continues, canDismiss, dismiss, capabilities, workspace, setWorkspace, taskText, setTaskText, status, movement, taskHostRef, recoveryTargetHostRef: recoveryCorrelation?.targetHostRef ?? null, recoveryTaskId: recoveryCorrelation?.taskId ?? null, message, busy, canCancel: !!cancellableTaskId, retryingResultReturn, start, startRemote, proposeRemoteMovement, approveRemoteMovement, cancel, cancelRemote, stopRecovery, reconcileRemote, retryResultReturn, revealConflictResult, discardConflictResult, refreshCapabilities, refreshRecoveryProjection };
 }
 
 const BADGE_TONE: Record<LifecycleTone, string> = { neutral: "", pending: "warn", live: "live", danger: "bad", complete: "ok" };
