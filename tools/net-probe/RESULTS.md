@@ -10,7 +10,7 @@ Evidence levels:
 
 ### This network (real network)
 
-- **NAT mapping:** the STUN probe (`docs/research/native-nat-traversal-poc/stun_probe.py`) saw one public IP and the same mapped port toward Google and Cloudflare STUN, so the mapping is endpoint independent. The port is not preserved. Filtering behaviour cannot be measured this way.
+- **NAT mapping:** the STUN probe (`tools/net-probe/stun_probe.py`) saw one public IP and the same mapped port toward Google and Cloudflare STUN, so the mapping is endpoint independent. The port is not preserved. Filtering behaviour cannot be measured this way.
 - **IPv6:** no global address.
 - **Home relay:** iroh picked n0 US-West (`usw1-1`) in 7 of 7 default runs. Plain ICMP from here averaged 187 ms to US-West and 207 ms to Asia-Pacific (`aps1-1`), so US-West is the nearer relay from this network.
 

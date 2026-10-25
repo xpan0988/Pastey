@@ -1,6 +1,6 @@
 # Layer 1 — Secure transfer substrate
 
-Layer 1 owns the encrypted byte-oriented LAN transfer path used when an Agent task needs resources or results to cross Hosts. Transfer supports execution placement when capability and resource locations differ; it does not define Pastey's product identity. This is the canonical documentation for binary-v1 mechanics and transfer lifecycle. Scheduling and capacity admission belong to [Layer 3](layer-3-orchestration.md); Bridge target resolution belongs to [Layer 4](layer-4-bridge.md); managed step continuation belongs to [Layer 5](layer-5-agent.md).
+Layer 1 owns the encrypted byte-oriented transfer path used when an Agent task needs resources or results to cross Hosts. Transfer supports execution placement when capability and resource locations differ; it does not define Pastey's product identity. This is the canonical documentation for binary-v1 mechanics and transfer lifecycle. Scheduling and capacity admission belong to [Layer 3](layer-3-orchestration.md); Bridge target resolution belongs to [Layer 4](layer-4-bridge.md); managed step continuation belongs to [Layer 5](layer-5-agent.md).
 
 ## Transport model
 
@@ -30,6 +30,6 @@ Startup recovery clears stale active-transfer state and partial files. It does n
 
 ## Compatibility and limits
 
-The current stack is LAN-only. It has no cloud relay, WebRTC/TURN fallback, mobile release support, binary-v2 stream multiplexing, archive/folder bundling, whole-file hash exchange beyond authenticated chunks and finalize metadata, or second independent transfer stack.
+Transfer runs over whatever path the Bridge session uses: the LAN, an overlay address, or the optional internet carrier, which tunnels the same HTTP routes and may fall back to a relay ([Connectivity](layer-4-connectivity.md)). Over a relay it is slow, and an interrupted transfer fails rather than resuming. There is no WebRTC/TURN path, mobile release support, binary-v2 stream multiplexing, archive/folder bundling, whole-file hash exchange beyond authenticated chunks and finalize metadata, or second independent transfer stack.
 
 For protocol and lifecycle names, see [reference.md](../reference.md). For automated and manual validation, see [development.md](../development.md).

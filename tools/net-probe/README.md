@@ -16,6 +16,10 @@ Every run prints exactly one JSON line. Field definitions are in `src/lib.rs` (`
 
 The probe keys (`*.key`) are throwaway keys for this tool only, separate from Pastey's device identity. Never reuse them.
 
+A separate STUN check, `stun_probe.py`, sends binding requests from one UDP socket to Google and Cloudflare STUN servers and reports whether this network's NAT mapping is endpoint independent: `python3 -I tools/net-probe/stun_probe.py`.
+
+Pastey itself now has an internet carrier built on iroh ([Connectivity](../../docs/layers/layer-4-connectivity.md)). This probe stays separate: it measures raw paths and is useful when a Bridge across the internet misbehaves.
+
 ## Build
 
 macOS (Rust via rustup):

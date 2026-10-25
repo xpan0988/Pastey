@@ -1,14 +1,14 @@
 # Mac ↔ Windows physical acceptance
 
-One procedure for the physical evidence that automated tests cannot give: secure pairing, LAN Bridge operation, reconnection, representative Agent and file workflows, and native P2P reachability across networks. Each step says what to do, what must happen, and what to record.
+One procedure for the physical evidence that automated tests cannot give: secure pairing, LAN Bridge operation, reconnection, representative Agent and file workflows, and Bridges across the internet. Each step says what to do, what must happen, and what to record.
 
 Until a step is run on real devices and recorded, it is **untested**, whatever the automated suites say. Deterministic evidence is described in [development](../development.md).
 
 ## Scope and boundaries
 
-- **Production paths:** pairing, LAN Bridge, overlay (Tailscale/WireGuard) reach, Agent and Transfer. These are exercised through the packaged app.
-- **Native P2P traversal (iroh):** exercised only with the isolated `tools/net-probe`. iroh is **not** in the production app. Part F measures whether a production integration would be worth building; it is not a test of Pastey's Bridge.
-- **Infrastructure:** n0's free public relays bootstrap the probe, under their development and hobby terms. Nothing paid is required.
+- **Production paths:** pairing, LAN Bridge, overlay (Tailscale/WireGuard) reach, the internet carrier (part W), Agent and Transfer. These are exercised through the packaged app.
+- **Raw path measurement:** the isolated `tools/net-probe` (part F) measures iroh paths between the two devices without Pastey. Use it to explain a part W result, not instead of part W.
+- **Infrastructure:** n0's free public relays, under their development and hobby terms, for both the carrier's default and the probe. Nothing paid is required. Part W5 optionally uses your own `iroh-relay`.
 
 ## Prerequisites
 
@@ -19,6 +19,7 @@ Until a step is run on real devices and recorded, it is **untested**, whatever t
   - a shared Wi-Fi network;
   - a phone hotspot;
   - for C3, C5 and parts of F, a second fixed network (university, office, or a remote location).
+  - for part W, two networks that are not the same LAN: home Wi-Fi and a phone hotspot at minimum; a university or office network if available.
   - Optional: Tailscale on both, for part G.
 - **Test files, created on each device:**
   - a 1 GiB random file;
@@ -100,7 +101,7 @@ After each step, send one text and the small file both ways.
 | E6 | Unattended access. On Windows, Settings → Devices & trust: compare the Mac's fingerprint (A2, now under Settings → This device) and trust it; then Settings → Permissions → Unattended Codex access: grant one folder. Start a task from the Mac. | It runs without Accept. Revoke the grant: the next task waits for Accept again. |
 | E7 | Re-pair this Bridge with a **different** device's code (or after D6), then repeat E1 from that device. | Earlier tasks, conversations and folder shares from before the re-pair are gone. Unattended runs need a grant for the new device. |
 
-## F. Native P2P traversal across networks (isolated probe)
+## F. Raw iroh paths across networks (isolated probe, optional)
 
 Run the `tools/net-probe` matrix in [its README](../../tools/net-probe/README.md):
 
@@ -123,19 +124,47 @@ Run every cell in both directions, with `--http`, so the room-shaped HTTP-over-Q
 python3 -I tools/net-probe/summarize.py tools/net-probe/results/*.jsonl
 ```
 
-These are the decision bars for a later production integration. They are measurement, not a test of the Bridge:
+These bars describe the networks, not Pastey; part W is the test of the Bridge:
 - C2 reaches direct in at least 8 of 10 runs within 10 s.
 - 100% of digests intact.
 - Relay-only runs report `relay` truthfully.
 - Every R-cell outage recovers or is reported open.
 - The unlisted key in M1 is rejected.
 
-## G. Cross-network Bridge today (overlay, production path)
+## G. Cross-network Bridge through an overlay address (optional)
 
 | # | Do | Expect |
 |---|---|---|
 | G1 | Tailscale on both; the Mac on a phone hotspot, Windows at home. Mac: Create Bridge. Windows: Join with "another network" and the Mac's Tailscale name. | Pairs. A 256 MiB file transfers with matching hashes. |
 | G2 | Set the remembered address on both. Switch the Mac's network, or quit and relaunch Pastey. | Reconnects through the overlay address. |
+
+## W. Bridge across the internet (internet carrier)
+
+Run on packaged builds of the same commit. Until W1–W14 are recorded, Pastey makes no claim that Bridges work across real networks. Keep each device's Settings → General → Across the internet line in view, and the Bridge's details → Reach it on another network line ("Across the internet: …"), which shows **In use: directly** or **In use: through a relay**.
+
+Setup:
+1. Both devices on the same Wi-Fi. Pair a new Bridge by code (part B). Send one text both ways.
+2. On both: Settings → General → Across the internet → turn on **Connect across the internet** (leave the relay as n0's). On Windows, record what the firewall asks and what you allow.
+3. Wait 10 s. In the Bridge's details on each device the line reads "Ready. Used when the other device is not on this network." (If it says the other device has not turned it on, wait for the next reconnect or send a text, then check again.)
+
+| # | Do | Expect |
+|---|---|---|
+| W1 | Move the Mac to the phone hotspot (Windows stays on home Wi-Fi). Wait up to 60 s. | The Bridge shows Reconnecting, then Connected. Bridge details: "In use: directly" or "In use: through a relay"; record which and how long it took. |
+| W2 | Send a text and the small file both ways; then a 256 MiB file Mac → Windows. | Text and small file arrive. The 256 MiB file arrives with a matching hash (`shasum -a 256` / `Get-FileHash`). Record the time and the path. Over a relay expect about 1 MiB/s; that is a limit, not a failure. |
+| W3 | Agents: continue a shared Codex thread on Windows from the Mac (as M1), Accept on Windows. | Runs once; the reply arrives on the Mac; Windows's Codex shows exactly one new turn. |
+| W4 | Start another continuation; while the Review waits on Windows, turn the hotspot off for 20 s, then on. Then Accept. | Nothing runs before Accept. After the network returns the Bridge reconnects (or stays Connected), and Accept runs it once. If Accept was not possible in time, it ends as not accepted; nothing runs twice. |
+| W5 | Start a continuation, Accept it, and while it runs turn the hotspot off for 60 s, then on. | On the Mac the task ends as completed or as needing Reconcile. Reconcile shows the true outcome. Windows's Codex shows one turn for it, never two. |
+| W6 | While Connected over the internet, switch the Mac from the hotspot to a different network (e.g. university or a second hotspot) without quitting Pastey. | Within about 60 s it is Connected again; a text goes both ways. Record whether the session stayed Connected throughout (path change only) or reconnected. |
+| W7 | Quit and relaunch Pastey on the Mac (still on the other network). | Connected again within about 60 s with no code; record the time. |
+| W8 | Sleep the Mac for 5 minutes on the other network, then wake it. | Connected within about 60 s of waking. |
+| W9 | Restart Windows (Pastey starts at login, or start it). | Connected again after Pastey starts on Windows. |
+| W10 | Network where UDP is blocked or the hotspot of a provider with strict NAT, if available (university Wi-Fi often qualifies). | Connected "through a relay", or not reachable across the internet. Never shows "directly" when the relay carries it. Record which. |
+| W11 | On Windows only, turn Connect across the internet off. | Within about 30 s the Mac shows the Bridge not reachable (or reconnecting); nothing is sent. Turn it back on: Connected again within about 60 s. |
+| W12 | Bring both back to the same Wi-Fi. Then quit and relaunch Pastey on the Mac. | Stays Connected. Before the relaunch the session may still run over the carrier ("In use: directly", now on the local network). After the relaunch it reconnects over the LAN and the line reads "Ready…". Send a 1 GiB file and compare with C2's time: within 10%. |
+| W13 | With the Mac on the hotspot and Connected over the internet, Burn the Bridge on Windows. | The Mac shows the peer departed (or not reachable) and does not reconnect, across the internet or the LAN. A new Bridge needs a new pairing on the same network. |
+| W14 | Optional: run your own `iroh-relay` (see iroh's documentation), set its `https://` address on both under Relay, and block n0's relays (or the direct path) to force the relay. Repeat W1–W2. | Connected through your relay; nothing contacts n0 (check the relay's log for both devices). |
+
+Record for each of W1–W14: networks (type and provider; no IPs), path shown, times, hashes, and the Windows firewall choice.
 
 ## H. Burn and departure
 
@@ -303,4 +332,5 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Control channel (O1–O7) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
+| Internet carrier (W1–W14): networks, path shown, times |
 | Net-probe summary (part F) | |

@@ -1,6 +1,12 @@
 # Native cross-NAT connectivity for Pastey — technical decision report
 
-Status: research and decision, 2026-10-12. Nothing here is built into Pastey.
+Status: research and decision, 2026-10-12, kept as the record of why iroh was chosen and what was measured. **Historical:** the internet carrier now exists, and [Connectivity](../layers/layer-4-connectivity.md) is the current design. It differs from this report in four ways:
+- **Relay fallback carries Bridge traffic.** There is no direct-only gate (§5 item 6, §7 D): the product goal became "works across networks, direct where possible". The UI says which path is in use.
+- **No separate signature on the binding.** The carrier card travels as Room Control `bridge_membership.carrier_card` and is trusted because that session's keys were established by the pinned device key (§5 item 2).
+- **Address lookup with n0's relays.** With the default relays the endpoint publishes its home relay on n0's DNS so a peer whose relay changed is still found; with a custom relay nothing is published (§5 item 1, §6 Metadata).
+- **The setting is device-wide** under Settings → General, not per Bridge (§5 item 7).
+
+The Phase 0 experiment crate has been removed: `tools/net-probe` supersedes it (direct, relay-only and unpinned-key scenarios, plus HTTP over QUIC and recovery), and its STUN probe is now `tools/net-probe/stun_probe.py`. It remains in git history.
 
 Evidence levels used below:
 - **Measured**: run on this Mac for this report.
@@ -169,7 +175,7 @@ n0 reports about 9 in 10 connections going direct and about 95% of data volume d
 
 ## 8. PoC plan and acceptance criteria
 
-Phase 0 is done; the experiment sources are next to this report in `native-nat-traversal-poc/`.
+Phase 0 is done (its crate is superseded by `tools/net-probe`; see Status).
 
 - **Phase 0, on this Mac (done):** a STUN probe, and an iroh experiment using real n0 relays with two endpoints in one process. Results:
 

@@ -99,6 +99,14 @@ The generated transfer fixture corpus is documented in [tests/fixtures/transfer-
 
 For a single-machine dual-instance smoke, create/join a Bridge and exercise selected-peer ordinary data, Room Control, Search/Transfer Review & Run, disconnect/reconnect, and Burn.
 
+The internet carrier's contract ([Connectivity](layers/layer-4-connectivity.md)) is tested in `connectivity::tests`: two real Hosts from the Room Control pair harness (production room routers on loopback) joined by the in-memory carrier, covering card validation and pinning, per-Bridge stream admission, reconnect and `/join` through the tunnel, a session surviving a carrier outage and a path change, a continuation running once across an outage, and revocation by Burn, forgetting a device and re-pairing; plus one test of real iroh QUIC on loopback with relays off (unpinned key refused, pinned key carries streams both ways). They bind loopback sockets:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey connectivity::
+```
+
+They do not exercise NAT traversal, relays, real networks or Windows; part W of the [physical acceptance](platform/mac-windows-acceptance.md) does.
+
 ## Automated, local, and physical evidence
 
 - Rust and TypeScript tests cover deterministic composition, alias resolution, immutable correlation, whole-Plan readiness, replay, Worker/provider streaming, effect enforcement, Core results, exact Transfer receipt, cancellation/revocation races, restart, and Burn.
@@ -154,8 +162,9 @@ The consolidated physical procedure is [Mac ↔ Windows acceptance](platform/mac
 - reconnection;
 - representative Agent and file workflows;
 - overlay reach;
+- Bridges across the internet through the carrier (part W);
 - Burn;
-- native P2P traversal measurements with the isolated `tools/net-probe` (iroh is not in the app).
+- raw path measurements with the isolated `tools/net-probe`.
 
 Each step stays untested until it is recorded on real devices.
 

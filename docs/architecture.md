@@ -2,7 +2,7 @@
 
 Pastey is cross-device infrastructure for general-capability Agents. A Host is a device and execution locality; a capability is an ability that Host exposes; and an Agent is an intelligence or execution participant that makes or proposes task decisions over capabilities and resources. A general-capability Agent is not architecturally confined to one Host, tool, provider, model, capability family, or local execution environment. Hosts expose capabilities and resources, Agents reason over them, and Pastey makes authorized decisions executable across devices.
 
-This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a capability-neutral native capability path, with Codex as its only shipped adapter, and a distinct Generic Managed Worker path over a LAN-oriented current-session Bridge. Source code, validators, and tests are authoritative. The repository is at `2.0.0-beta.2`; its beta status does not establish physical Mac ↔ Windows Native Agent acceptance.
+This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a capability-neutral native capability path, with Codex as its only shipped adapter, and a distinct Generic Managed Worker path over a current-session Bridge that runs on the LAN, an overlay address, or an optional internet carrier (direct P2P with relay fallback). Source code, validators, and tests are authoritative. The repository is at `2.0.0-beta.2`; its beta status does not establish physical Mac ↔ Windows Native Agent acceptance.
 
 ## Agent execution across Hosts
 
@@ -15,7 +15,7 @@ An Agent or product flow can identify the capability a task needs, select its ow
 | 1 — Secure transfer substrate | Encrypted byte movement when cross-Host placement requires it; framing, integrity, acknowledgement, and finalization. |
 | 2 — Host and capability observation | Factual device, link, liveness, bounded capability observations, and the read-only Bridge NodeList projection. |
 | 3 — Execution and transfer orchestration | Ordinary queues and shared Rust transfer-capacity admission; no Agent-level Host or capability reasoning. |
-| 4 — Cross-device session and control fabric | Current-session Bridge membership, routes, encrypted control delivery, replay, reconnect, departure, and Burn boundaries. |
+| 4 — Cross-device session and control fabric | Current-session Bridge membership, routes, encrypted control delivery, replay, reconnect, departure, and Burn boundaries; beneath them, the paths a session runs on (LAN, overlay, internet carrier). |
 | 5 — Agent execution | Native Host capability invocation and the separate managed path with immutable object flow, Review/approval, Host admission, attempt/step authority, execution, and continuation. |
 
 Dependencies point downward. Layer 5 decides semantic eligibility before Layer 3 admits transfer capacity; Layer 4 supplies a current authenticated route; Layer 1 moves bytes when required. A lower layer never creates, approves, repairs, or advances a Plan. Layer 2 facts and Layer 4 delivery are observations, not authority. Transfer is supporting infrastructure for the difference between capability placement and resource placement.
@@ -149,6 +149,11 @@ and any malformed or mismatched terminal notification stay non-DONE.
   device safety, and HOW.
 - An unknown outcome is never promoted to success, and restart never reruns
   native work.
+- Connectivity is not authority. The internet carrier, its relays and its
+  address lookup only move a Bridge session's encrypted bytes to a carrier
+  key pinned through that session; a path change or carrier loss is a
+  transport event that never admits, resends or reruns anything
+  ([Connectivity](layers/layer-4-connectivity.md)).
 
 ## Host and capability observations
 

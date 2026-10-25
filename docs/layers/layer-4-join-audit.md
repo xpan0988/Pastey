@@ -1,6 +1,6 @@
 # Layer 4 — Bridge join and reconnect audit (2026-10)
 
-Status: audit of commit `eaf2e1e` (sections 1–6, kept as found), followed by the Stage 1 remediation (section 7) that implements option A. [Layer 4](layer-4-bridge.md) and the [reference](../reference.md#bridge-authentication-facts) are the authoritative description of the current behaviour.
+Status: audit of commit `eaf2e1e` (sections 1–6, kept as found), followed by the Stage 1 remediation (section 7) that implements option A. "Stage 3" below (Bridge traffic through a relay over QUIC) now exists as the optional internet carrier ([Connectivity](layer-4-connectivity.md)); LAN and overlay routes stay on TCP, so the Stage 1 fixes still apply to them. [Layer 4](layer-4-bridge.md) and the [reference](../reference.md#bridge-authentication-facts) are the authoritative description of the current behaviour.
 
 Evidence labels: **Source** (read in code at the cited line), **Test** (a `characterization_*` test asserts the behaviour), **Estimate** (reasoned, not measured). No finding here was observed on a physical network.
 

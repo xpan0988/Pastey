@@ -29,6 +29,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Added
 
+- **Bridges across the internet** (Settings → General → Across the internet, off by default). Devices already paired on the same network can reach each other from different networks: directly through NATs when the networks allow it, otherwise through a relay. Both devices must turn it on. It uses iroh (QUIC); the relay is n0's public relays (for development and hobby use) or one you run.
+  - The Bridge itself is unchanged: the same pairing, signed reconnect, encrypted Room Control, Reviews and permissions. The internet path only carries a Bridge's encrypted traffic to a device key learned over that Bridge's authenticated session, and it is revoked with the Bridge (Burn, departure, forgetting the device, pairing another).
+  - Bridge details and Device details → Connection say whether the internet path is in use, and whether directly or through a relay. A relay is slow for large files (about 1 MiB/s measured on n0's free relays).
+  - A network change or a dropped path never reruns or resends Agent work; an uncertain outcome is reconciled as before, and nothing waits to be sent later.
+  - Not yet validated across separate physical networks; part W of the Mac ↔ Windows acceptance is the procedure.
+
 - Room Control rate budgets per kind of message: capability checks, their answers, Agent requests and statuses, Bridge Plans and membership each have their own, so a polling UI cannot use up what a running task needs. A refusal for the budget is retried automatically, with a fresh message, for a few seconds where it is safe (it proves nothing was done).
 - A request the other device refused before acting on it (its rate budget, its limit of 8 requests waiting for Accept, or this device's authority) now ends as "not delivered · nothing ran" with that device's reason, instead of an unknown outcome to reconcile.
 - Device Details → Advanced → Control channel: what this device accepted and refused over the Bridge, by kind and reason, current backpressure, what it could not deliver, and the requests waiting for Accept. Counts only.

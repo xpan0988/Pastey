@@ -356,6 +356,22 @@ The receiver verifies it against its remembered key and the requester's `device_
 
 Storage: `bridge_peer_pins` (Bridge id → peer HostRef and device key) and `bridge_pairing_windows` (open time, expiry, answered count, close time). Both are deleted at the Burn authority cutoff; an authenticated departure deletes the pin. `RoomInfo.pairing_state` is `paired`, `awaiting_peer` or `pairing_required`. Commands: `open_bridge_pairing` (fresh code for an existing Bridge), `repair_bridge` (pair an existing Bridge with the other device's code), `request_nearby_join` (returns a pending request), `complete_nearby_join` (request id and code).
 
+## Internet carrier facts
+
+Design and contract: [Connectivity](layers/layer-4-connectivity.md). Source: `src-tauri/src/connectivity.rs`, `connectivity/iroh_carrier.rs`.
+
+| Item | Value |
+| --- | --- |
+| Setting | `config.internet = { enabled, relayUrl }` (off and `null` by default); commands `get_internet_connectivity`, `set_internet_connectivity(enabled, relayUrl)`, `get_bridge_internet_status(roomId)` → `{ carrierRunning, peerReachableByCarrier, path: "direct" \| "relayed" \| "unknown" \| null }` |
+| Carrier | `iroh` 1.3 (features `tls-ring`, `portmapper`, `fast-apple-datapath`), ALPN `pastey/bridge-tunnel/1`; default relays n0's public relays with n0 DNS address publishing, or `RelayMode::Custom` with the user's `https://` relay and no publishing |
+| Carrier key | Ed25519, one per installation and carrier, in `carrier_identity`, wrapped by the installation master key; separate from the device identity key |
+| Card | `CarrierCardV1 { schemaVersion: "pastey-carrier-card-v1", carrier, endpointId, relayUrl?, directAddrs[] }`, unknown fields refused. `carrier` must be known (`iroh`); `endpointId` 1–128 of `[A-Za-z0-9-]`; at most 8 `directAddrs`, each a socket address; `relayUrl` `https://`, at most 512 characters |
+| Card event | Room Control `bridge_membership.carrier_card`, payload `{ schemaVersion: "pastey-bridge-membership-v1", card }`, Membership rate class (30/min, burst 8). Pinned for the session's authenticated peer HostRef only when the Bridge's `bridge_peer_pins` row names it; otherwise refused with `carrier_card_refused`. Announced to connected peers when the card changed, at most every 30 s per peer session |
+| Pin storage | `bridge_carrier_pins (room_id, peer_host_ref, carrier, endpoint_id, relay_url, direct_addrs, updated_at)`; read only joined to a live `bridge_peer_pins` row for the same HostRef on an unburned Bridge; deleted at the Burn cutoff and on departure |
+| Tunnel stream | First a header: big-endian u16 length, then JSON `{ protocol: "pastey-bridge-tunnel-v1", kind: "room" \| "reconnect", bridgeId }`, at most 1,024 bytes, within 10 s. `room`: raw bytes to that Bridge's room server. `reconnect`: one big-endian u32-length JSON `reconnect_query` (at most 16 KiB) whose Bridge id and requester HostRef must match the header and the pin; the answer is one `reconnect_offer`, or an empty message for none |
+| Timeouts | Carrier connect 12 s; reconnect answer 12 s; tunnel liveness probe 5 s, 4 failures (LAN 1.8 s, 3) |
+| Endpoint | The peer endpoint of a tunnelled session is `127.0.0.1:<forwarder port>`, one forwarder per (Bridge, peer carrier key), stable across path changes and carrier reconnects |
+
 ## Developer Terminal protocol and bounds
 
 Protocol family/version: `developer_terminal` / `pastey-developer-terminal-v0`.

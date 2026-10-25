@@ -91,7 +91,7 @@ Device-wide, in Settings:
 
 | Section | Contents |
 |---|---|
-| General | Appearance (System, Light, Dark; renderer-only), global shortcut, receiving folder (Open, Change…, Use default), Save received files, Save received images |
+| General | Appearance (System, Light, Dark; renderer-only), global shortcut, receiving folder (Open, Change…, Use default), Save received files, Save received images; Across the internet (Connect across the internet, off by default; relay: n0's or your own) |
 | This device | Identity and Replace key; device profile (Refresh); runtimes (Quick or Full check); local speed test (Pastey pipeline or raw memory, 1, 5 or 15 s) |
 | Devices & trust | Trusted devices and the devices connected now (Trust… with a fingerprint check); paired devices (Forget) |
 | Permissions | What other devices may do here, across Bridges: Unattended Codex access (add form one click away), Shared workspaces (every share with Stop sharing; created and changed in its Bridge), Shared search folders |
@@ -125,6 +125,7 @@ Measurements are shown only after they are taken, with what they exercised and w
 | Bridge member list and liveness | 2.0 Devices page, right context panel | Bridge details → Devices | Kept |
 | Pairing, new code, pair with code | 2.0 network panel | Bridge details → Connection | Kept |
 | Private-network address | 2.0 network panel | Bridge details → Reach it on another network | Kept |
+| Internet path of one Bridge (direct, through a relay, ready, off) | New | Bridge details → Reach it on another network; Device Details → Connection | Added |
 | Show this device | 2.0 network panel | Bridge details, Agents → Access, Device Details hint | Kept |
 | Change receiving folder | Legacy Settings → Receiving | Settings → General → Receiving | Restored |
 | Open receiving folder | Legacy and 2.0 Settings | Settings → General; Inbox → Open folder | Kept |

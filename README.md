@@ -16,7 +16,7 @@ Pastey observes available Hosts and bounded capability facts. A task can select 
 
 ## Current implementation
 
-Pastey 2.0 has a LAN-oriented, current-session Bridge; factual Host and capability observations; a Native Agent lifecycle for native Host capabilities, whose current production adapter is Codex; and a separate Generic Managed Worker path. Native work can run in the selected Host's original workspace or, after requester movement approval, use encrypted outbound workspace movement, native execution, exact result Return, and requester-side apply. A remote invocation or moved workspace starts only after the executing Host's own executor Review accepts it. The managed path has immutable Plans, Review and approval, managed Host admission, Search / Transform / Transfer / Execute steps, explicit cross-Host movement, and Core-owned result acceptance. These four steps are the **current managed semantic model**, not universal verbs for every Host capability.
+Pastey 2.0 has a current-session Bridge that works on the LAN and, optionally, across networks (an overlay address, or an internet carrier with direct P2P and relay fallback, not yet validated across physical networks); factual Host and capability observations; a Native Agent lifecycle for native Host capabilities, whose current production adapter is Codex; and a separate Generic Managed Worker path. Native work can run in the selected Host's original workspace or, after requester movement approval, use encrypted outbound workspace movement, native execution, exact result Return, and requester-side apply. A remote invocation or moved workspace starts only after the executing Host's own executor Review accepts it. The managed path has immutable Plans, Review and approval, managed Host admission, Search / Transform / Transfer / Execute steps, explicit cross-Host movement, and Core-owned result acceptance. These four steps are the **current managed semantic model**, not universal verbs for every Host capability.
 
 ## Native capabilities
 
@@ -38,7 +38,8 @@ Native task completion is separate from result capture, Return, and apply. Paste
 - [Native and managed Agent execution in Layer 5](docs/layers/layer-5-agent.md)
 - [Development, validation, and release](docs/development.md)
 - [Concrete reference and configuration facts](docs/reference.md)
-- [Layer 1 transfer](docs/layers/layer-1-transfer.md), [Layer 2 observation](docs/layers/layer-2-device-intelligence.md), [Layer 3 orchestration](docs/layers/layer-3-orchestration.md), and [Layer 4 Bridge](docs/layers/layer-4-bridge.md)
+- [Layer 1 transfer](docs/layers/layer-1-transfer.md), [Layer 2 observation](docs/layers/layer-2-device-intelligence.md), [Layer 3 orchestration](docs/layers/layer-3-orchestration.md), [Layer 4 Bridge](docs/layers/layer-4-bridge.md), and [Layer 4 connectivity: LAN, overlay, internet](docs/layers/layer-4-connectivity.md)
+- [Mac ↔ Windows physical acceptance](docs/platform/mac-windows-acceptance.md)
 - [Changelog](CHANGELOG.md)
 
 ## Development
