@@ -48,17 +48,23 @@ test("native-v2 lifecycle polling is scoped to one opened revision and cleaned u
 });
 
 test("Send and Agent Task keep their routing semantics separate", () => {
-  const component = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
-  assert.match(component, /Send mode targets one selected device/);
-  assert.match(component, /Agent Tasks use the whole Plan scope/);
-  assert.match(component, /target: \{ kind: "selected_peer"/);
-  assert.match(component, /bridgeTargetKind: "selected_peer"/);
+  // Share sends to the one selected device's exact current session...
+  const share = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  assert.match(share, /target: \{ kind: "selected_peer"/);
+  assert.match(share, /bridgeTargetKind: "selected_peer"/);
+  // ...and never starts Agent work, which is addressed separately: to the
+  // exact Host (HostRef) the Agents tab chose, over its current session.
+  assert.doesNotMatch(share, /startRemoteNative\w*Task\(/);
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef,/);
 });
 
 test("an active workspace movement exposes Stop Codex through its task identity", () => {
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  const bridge = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const tracker = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
   assert.match(lifecycle, /movement\?\.state === "agent_running"\s*\? movement\.taskId/);
   assert.match(lifecycle, /canCancel: !!cancellableTaskId/);
-  assert.match(bridge, /agent\.canCancel[\s\S]*Stop Codex/);
+  // The turn's Stop button names its Agent; for Codex tasks that is "Stop Codex".
+  assert.match(tracker, /agent\.canCancel \? <button[^>]*>[\s\S]*?>Stop \{agentName\}<\/button>/);
+  assert.match(lifecycle, /"agent\.coding\.codex": "Codex"/);
 });
