@@ -6468,6 +6468,7 @@ pub(crate) fn purge_bridge_runtime_authority(
     state.room_control.lock().purge_room(room_id);
     state.bridge_auth.lock().purge_room(room_id);
     state.purge_room(room_id);
+    crate::connectivity::forget_bridge(state, room_id);
 
     let mut candidates = state.bridge_plan_candidate_store.lock();
     // Direct requester sources are never durable. Clearing the small
@@ -7213,6 +7214,76 @@ fn resolve_user_path(input: &str) -> AppResult<PathBuf> {
     Ok(PathBuf::from(input))
 }
 
+/// This device's internet connectivity setting and whether its carrier runs.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InternetConnectivityViewV1 {
+    enabled: bool,
+    /// A relay the user runs; None means n0's public relays.
+    relay_url: Option<String>,
+    running: bool,
+    /// Why it could not start, when it is on but not running.
+    problem: Option<String>,
+}
+
+fn internet_connectivity_view(
+    state: &AppState,
+    problem: Option<String>,
+) -> InternetConnectivityViewV1 {
+    let config = state.config.read().internet.clone();
+    InternetConnectivityViewV1 {
+        enabled: config.enabled,
+        relay_url: config.relay_url,
+        running: crate::connectivity::local_card(state).is_some(),
+        problem,
+    }
+}
+
+#[tauri::command]
+pub fn get_internet_connectivity(
+    state: State<'_, Arc<AppState>>,
+) -> Result<InternetConnectivityViewV1, String> {
+    Ok(internet_connectivity_view(&state, None))
+}
+
+/// Turns internet connectivity on or off for this device, with n0's public
+/// relays or one relay the user runs. It changes only how this device can
+/// be reached; every Bridge still authenticates and authorizes as before.
+#[tauri::command]
+pub async fn set_internet_connectivity(
+    enabled: bool,
+    relay_url: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<InternetConnectivityViewV1, String> {
+    let relay_url = relay_url
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty());
+    if let Some(url) = &relay_url {
+        if !url.starts_with("https://") || url.len() > 512 || url.chars().any(char::is_whitespace) {
+            return Err("Use the relay's https:// address.".into());
+        }
+    }
+    {
+        let mut config = state.config.write();
+        config.internet = config::InternetConfig { enabled, relay_url };
+        config::save(&state.paths, &config).map_err(|error| error.message())?;
+    }
+    let problem = crate::connectivity::apply_settings(state.inner())
+        .await
+        .err()
+        .map(|error| error.message());
+    Ok(internet_connectivity_view(&state, problem))
+}
+
+/// How one Bridge's peer is reached across the internet now, if it is.
+#[tauri::command]
+pub fn get_bridge_internet_status(
+    room_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::connectivity::BridgeInternetStatusV1, String> {
+    Ok(crate::connectivity::bridge_status(&state, &room_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7246,6 +7317,7 @@ mod tests {
             shortcut: "test".into(),
             app_secret: crate::crypto::encode_key(&[7_u8; 32]),
             device_id: "native-dispatch-test".into(),
+            internet: Default::default(),
         }
     }
 

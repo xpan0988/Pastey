@@ -1761,6 +1761,7 @@ mod tests {
             shortcut: "test".into(),
             app_secret: crate::crypto::encode_key(&[44u8; 32]),
             device_id: "prompt-host".into(),
+            internet: Default::default(),
         };
         let state = Arc::new(
             AppState::new(

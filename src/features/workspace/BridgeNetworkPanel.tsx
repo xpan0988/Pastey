@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { bridgeReachability, peerAddressProblem } from "../../lib/bridgeAddress";
-import { getBridgePeerAddress, openBridgePairing, presentDeviceIdentity, repairBridge, setBridgePeerAddress } from "../../lib/tauri";
+import { bridgeInternetLine } from "../../lib/internetStatus";
+import { getBridgeInternetStatus, getBridgePeerAddress, openBridgePairing, presentDeviceIdentity, repairBridge, setBridgePeerAddress, type BridgeInternetStatus } from "../../lib/tauri";
 import { bridgeCode, roomPeers } from "./workspaceViewModel";
 import type { RoomInfo } from "../../lib/types";
 import { Badge, Dot, Field, Icon, Notice, type Tone } from "./ui";
@@ -35,6 +36,17 @@ export function BridgeConnectionSection({ room, onPairingChanged }: { room: Room
   const reachability = bridgeReachability(room);
   const pairing = room.pairing_state ?? "pairing_required";
   const [pairCode, setPairCode] = useState("");
+  const [internet, setInternet] = useState<BridgeInternetStatus | null>(null);
+
+  // The path can change at any time (a network change, the relay taking
+  // over): asked again every few seconds while this panel is open.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = () => void getBridgeInternetStatus(room.id).then((status) => { if (!cancelled) setInternet(status); }).catch(() => undefined);
+    refresh();
+    const timer = window.setInterval(refresh, 5_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [room.id]);
 
   async function act(action: () => Promise<string>, failure: string) {
     setBusy(true); setMessage(null);
@@ -107,7 +119,8 @@ export function BridgeConnectionSection({ room, onPairingChanged }: { room: Room
 
     <section className="inspector-section" aria-label="Another network">
       <h3>Reach it on another network</h3>
-      <p className="small muted">{saved ? <>Pastey also looks for it at <span className="mono">{saved}</span>.</> : "Only on this network."} An address gives the other device no permissions.</p>
+      <p className="small muted"><strong>Across the internet:</strong> {bridgeInternetLine(internet)}</p>
+      <p className="small muted">{saved ? <>Pastey also looks for it at <span className="mono">{saved}</span>.</> : "No private-network address."} An address gives the other device no permissions.</p>
       <details className="disclosure" open={!!saved}>
         <summary><Icon name="chevron" small />{saved ? "Change address" : "Add a private-network address"}</summary>
         <div className="disclosure-body stack">

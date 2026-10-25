@@ -25,6 +25,10 @@ chacha20poly1305 = { version = "0.10", features = ["std"] }
 dirs = "6"
 dunce = "1.0.5"
 futures-util = "0.3"
+# Internet connectivity carrier (QUIC, NAT traversal, relay fallback) for
+# the Bridge tunnel in `connectivity`. Never an authority; see
+# docs/layers/layer-4-bridge.md.
+iroh = { version = "1.3", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
 hex = "0.4"
 hkdf = "0.12"
 ring = "0.17.14"

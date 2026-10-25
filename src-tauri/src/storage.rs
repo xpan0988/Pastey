@@ -252,6 +252,32 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             paired_at INTEGER NOT NULL
         );
 
+        -- How to reach a Bridge's pinned peer across the internet: its
+        -- carrier key and hints, as that peer announced them over an
+        -- authenticated Bridge session. Where to look, never authority. A
+        -- row counts only while the Bridge is unburned and its
+        -- bridge_peer_pins row names the same peer HostRef.
+        CREATE TABLE IF NOT EXISTS bridge_carrier_pins (
+            room_id TEXT NOT NULL,
+            peer_host_ref TEXT NOT NULL,
+            carrier TEXT NOT NULL,
+            endpoint_id TEXT NOT NULL,
+            relay_url TEXT,
+            direct_addrs TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (room_id, peer_host_ref)
+        );
+
+        -- This installation's own carrier key, wrapped by its master key.
+        -- Separate from the device identity key; it authenticates only the
+        -- connection, which the Bridge then authenticates again.
+        CREATE TABLE IF NOT EXISTS carrier_identity (
+            carrier TEXT PRIMARY KEY,
+            wrapped_secret TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+
         -- Devices this one has paired with by code. A remembered device may
         -- start a new Bridge again by proving its identity key, without a
         -- code; forgetting it (revoked_at) also ends its pinned Bridges.
@@ -1022,6 +1048,106 @@ pub(crate) fn get_bridge_peer_address(
         )
         .optional()
         .map_err(AppError::from)
+}
+
+/// A Bridge peer's carrier card, valid only while the Bridge pins that
+/// same peer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BridgeCarrierPin {
+    pub(crate) peer_host_ref: String,
+    pub(crate) card: crate::connectivity::CarrierCardV1,
+}
+
+const LIVE_CARRIER_PIN: &str = "FROM bridge_carrier_pins c
+     JOIN bridge_peer_pins p ON p.room_id = c.room_id AND p.peer_host_ref = c.peer_host_ref
+     JOIN rooms r ON r.id = c.room_id
+     WHERE r.status != 'burned'
+       AND NOT EXISTS (SELECT 1 FROM burned_bridges b WHERE b.room_id = c.room_id)";
+
+fn carrier_pin_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BridgeCarrierPin> {
+    let direct: String = row.get(5)?;
+    Ok(BridgeCarrierPin {
+        peer_host_ref: row.get(0)?,
+        card: crate::connectivity::CarrierCardV1 {
+            schema_version: crate::connectivity::CARD_SCHEMA.into(),
+            carrier: row.get(1)?,
+            endpoint_id: row.get(2)?,
+            relay_url: row.get(3)?,
+            direct_addrs: serde_json::from_str(&direct).unwrap_or_default(),
+        },
+    })
+}
+
+/// Stores the carrier card a Bridge's peer announced. Refused unless the
+/// Bridge is live and pinned to exactly `peer_host_ref`.
+pub(crate) fn pin_bridge_carrier(
+    paths: &AppPaths,
+    room_id: &str,
+    peer_host_ref: &str,
+    card: &crate::connectivity::CarrierCardV1,
+) -> AppResult<()> {
+    let conn = connection(paths)?;
+    let pinned: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM bridge_peer_pins p JOIN rooms r ON r.id = p.room_id
+             WHERE p.room_id = ?1 AND p.peer_host_ref = ?2 AND r.status != 'burned'
+               AND NOT EXISTS (SELECT 1 FROM burned_bridges b WHERE b.room_id = ?1)",
+            params![room_id, peer_host_ref],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if pinned.is_none() {
+        return Err(AppError::InvalidInput(
+            "This Bridge is not pinned to that device.".into(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO bridge_carrier_pins (room_id, peer_host_ref, carrier, endpoint_id, relay_url, direct_addrs, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(room_id, peer_host_ref) DO UPDATE SET carrier = excluded.carrier, endpoint_id = excluded.endpoint_id,
+           relay_url = excluded.relay_url, direct_addrs = excluded.direct_addrs, updated_at = excluded.updated_at",
+        params![
+            room_id,
+            peer_host_ref,
+            card.carrier,
+            card.endpoint_id,
+            card.relay_url,
+            serde_json::to_string(&card.direct_addrs)?,
+            now_ts()
+        ],
+    )?;
+    Ok(())
+}
+
+/// The live carrier pin of a Bridge's peer.
+pub(crate) fn bridge_carrier_pin(
+    paths: &AppPaths,
+    room_id: &str,
+) -> AppResult<Option<BridgeCarrierPin>> {
+    connection(paths)?
+        .query_row(
+            &format!("SELECT c.peer_host_ref, c.carrier, c.endpoint_id, c.relay_url, c.updated_at, c.direct_addrs {LIVE_CARRIER_PIN} AND c.room_id = ?1"),
+            [room_id],
+            carrier_pin_from_row,
+        )
+        .optional()
+        .map_err(AppError::from)
+}
+
+/// The live Bridges whose peer is reached by this carrier key.
+pub(crate) fn bridges_pinning_carrier(
+    paths: &AppPaths,
+    carrier: &str,
+    endpoint_id: &str,
+) -> AppResult<Vec<String>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT c.room_id {LIVE_CARRIER_PIN} AND c.carrier = ?1 AND c.endpoint_id = ?2"
+    ))?;
+    let rooms = statement
+        .query_map(params![carrier, endpoint_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rooms)
 }
 
 /// The peer device a Bridge is pinned to.
@@ -1865,6 +1991,10 @@ pub fn remove_departed_bridge_peer(
     // The departed device is no longer this Bridge's peer: it may come back
     // only by pairing again.
     tx.execute("DELETE FROM bridge_peer_pins WHERE room_id = ?1", [room_id])?;
+    tx.execute(
+        "DELETE FROM bridge_carrier_pins WHERE room_id = ?1",
+        [room_id],
+    )?;
 
     let remaining_members = tx.query_row(
         "SELECT COUNT(*) FROM bridge_peers WHERE room_id = ?1 AND liveness IN ('connected', 'reconnecting', 'disconnected')",
@@ -2783,6 +2913,10 @@ pub fn cut_off_bridge_authority(paths: &AppPaths, room_id: &str) -> AppResult<bo
     // The pinned peer identity and any open pairing code are authority:
     // neither may outlive the cutoff.
     conn.execute("DELETE FROM bridge_peer_pins WHERE room_id = ?1", [room_id])?;
+    conn.execute(
+        "DELETE FROM bridge_carrier_pins WHERE room_id = ?1",
+        [room_id],
+    )?;
     conn.execute(
         "DELETE FROM bridge_pairing_windows WHERE room_id = ?1",
         [room_id],

@@ -5110,6 +5110,7 @@ mod tests {
                     shortcut: "test".into(),
                     app_secret: crate::crypto::encode_key(&[19u8; 32]),
                     device_id: device_id.into(),
+                    internet: Default::default(),
                 },
                 Arc::new(NoopEventSink),
                 Arc::new(NoopTaskSpawner),

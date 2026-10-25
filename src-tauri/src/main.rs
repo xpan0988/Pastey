@@ -8,6 +8,7 @@ mod chunk_frame;
 mod cleanup;
 mod commands;
 mod config;
+mod connectivity;
 mod crypto;
 mod dev_tools;
 mod developer_terminal;
@@ -81,22 +82,22 @@ use crate::{
         deny_developer_terminal, deny_native_invocation_review,
         discard_native_agent_conflict_result, discover_native_sessions,
         discover_remote_native_sessions, enter_developer_mode, forget_known_device,
-        get_bridge_node_list_projection, get_bridge_peer_address, get_config,
-        get_developer_terminal_workspace, get_device_capabilities, get_device_identity,
-        get_device_profile, get_file_transfer_metadata, get_last_benchmark_results,
-        get_managed_worker_provider_settings, get_native_agent_recovery_projection,
-        get_native_agent_task_status, get_native_agent_workspace_movement_status,
-        get_native_v2_plan_status, get_room, get_room_control_diagnostics,
-        get_room_control_session_context, inspect_native_session, inspect_remote_native_session,
-        join_room, join_room_at, list_authorized_search_folders, list_bridge_plan_workspace,
-        list_bridge_workspace_shares, list_known_devices, list_managed_runtime_options,
-        list_native_agent_capabilities, list_native_invocation_reviews, list_nearby_devices,
-        list_received_room_control_events, list_remote_native_agent_capabilities,
-        list_remote_shared_workspaces, list_room_items, list_rooms, list_seen_peer_devices,
-        list_session_read_grants, list_trusted_devices, list_unattended_grants,
-        log_frontend_diagnostic, mark_bridge_peer_pairing_rotation_required,
-        mark_join_prompt_rendered, open_bridge_pairing, open_logs_folder, pair_bridge_peer,
-        pending_join_requests, present_device_identity,
+        get_bridge_internet_status, get_bridge_node_list_projection, get_bridge_peer_address,
+        get_config, get_developer_terminal_workspace, get_device_capabilities, get_device_identity,
+        get_device_profile, get_file_transfer_metadata, get_internet_connectivity,
+        get_last_benchmark_results, get_managed_worker_provider_settings,
+        get_native_agent_recovery_projection, get_native_agent_task_status,
+        get_native_agent_workspace_movement_status, get_native_v2_plan_status, get_room,
+        get_room_control_diagnostics, get_room_control_session_context, inspect_native_session,
+        inspect_remote_native_session, join_room, join_room_at, list_authorized_search_folders,
+        list_bridge_plan_workspace, list_bridge_workspace_shares, list_known_devices,
+        list_managed_runtime_options, list_native_agent_capabilities,
+        list_native_invocation_reviews, list_nearby_devices, list_received_room_control_events,
+        list_remote_native_agent_capabilities, list_remote_shared_workspaces, list_room_items,
+        list_rooms, list_seen_peer_devices, list_session_read_grants, list_trusted_devices,
+        list_unattended_grants, log_frontend_diagnostic,
+        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_bridge_pairing,
+        open_logs_folder, pair_bridge_peer, pending_join_requests, present_device_identity,
         propose_remote_native_codex_workspace_movement, reconcile_remote_native_agent_task,
         refresh_selected_peer_capabilities, reject_nearby_join, repair_bridge,
         request_developer_terminal, request_nearby_join, resize_developer_terminal,
@@ -107,11 +108,12 @@ use crate::{
         run_loopback_benchmark, run_peer_link_benchmark, select_bridge_plan_search_candidate,
         select_managed_execute_runtime, select_managed_worker_provider,
         send_developer_terminal_input, send_file_to_room, send_text_to_room,
-        set_bridge_peer_address, share_bridge_workspace, start_bridge_plan_attempt,
-        start_native_codex_task, start_native_v2_plan_attempt, start_remote_native_capability_task,
-        start_remote_native_codex_task, stop_bridge_native_agent_task, stop_sharing_workspace,
-        trust_peer_device, update_config, update_managed_worker_provider, update_transfer_window,
-        update_workspace_share, withdraw_bridge_plan_revision, write_temp_file,
+        set_bridge_peer_address, set_internet_connectivity, share_bridge_workspace,
+        start_bridge_plan_attempt, start_native_codex_task, start_native_v2_plan_attempt,
+        start_remote_native_capability_task, start_remote_native_codex_task,
+        stop_bridge_native_agent_task, stop_sharing_workspace, trust_peer_device, update_config,
+        update_managed_worker_provider, update_transfer_window, update_workspace_share,
+        withdraw_bridge_plan_revision, write_temp_file,
     },
     error::{AppError, AppResult},
     host_runtime::{HostEvent, HostEventSink, HostRuntime, RuntimeTask, RuntimeTaskSpawner},
@@ -180,6 +182,11 @@ fn main() {
             state.spawn(async move {
                 bridge_lifecycle::start(lifecycle_state).await;
             });
+            // Internet connectivity, only if this device's user turned it on.
+            let connectivity_state = state.clone();
+            state.spawn(async move {
+                connectivity::start(connectivity_state).await;
+            });
             install_global_shortcut(app.handle())?;
             install_tray(app.handle())?;
             cleanup::start_cleanup_scheduler(state);
@@ -247,6 +254,9 @@ fn main() {
             discover_native_sessions,
             inspect_native_session,
             continue_native_session,
+            get_internet_connectivity,
+            set_internet_connectivity,
+            get_bridge_internet_status,
             continue_remote_native_session,
             discover_remote_native_sessions,
             inspect_remote_native_session,

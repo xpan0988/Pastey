@@ -1,6 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { benchmarkFacts, benchmarkScope, type FactRow } from "../../lib/deviceDiagnostics";
+import { bridgeInternetLine } from "../../lib/internetStatus";
 import {
+  getBridgeInternetStatus,
   getBridgeNodeListProjection,
   getBridgePeerAddress,
   getDeviceIdentity,
@@ -13,6 +15,7 @@ import {
   runBridgeDeviceSelfCheck,
   trustPeerDevice,
   revokeTrustedDevice,
+  type BridgeInternetStatus,
   type NativeAgentCapability,
   type RoomControlDiagnostics,
   type SeenPeerDevice,
@@ -42,6 +45,7 @@ export function DeviceDetails({ room, hostRef, onClose, onOpenSettings }: {
   const [seen, setSeen] = useState<SeenPeerDevice | null>(null);
   const [known, setKnown] = useState<KnownDevice[]>([]);
   const [address, setAddress] = useState<string | null>(null);
+  const [internet, setInternet] = useState<BridgeInternetStatus | null>(null);
   const [myFingerprint, setMyFingerprint] = useState<string | null>(null);
 
   async function refreshTrust() {
@@ -54,6 +58,7 @@ export function DeviceDetails({ room, hostRef, onClose, onOpenSettings }: {
     let cancelled = false;
     void getBridgeNodeListProjection(room.id).then((projection) => { if (!cancelled) setNodeList(projection); }).catch(() => undefined);
     void getBridgePeerAddress(room.id).then((value) => { if (!cancelled) setAddress(value); }).catch(() => undefined);
+    void getBridgeInternetStatus(room.id).then((value) => { if (!cancelled) setInternet(value); }).catch(() => undefined);
     void getDeviceIdentity().then((identity) => { if (!cancelled) setMyFingerprint(identity.displayFingerprint); }).catch(() => undefined);
     void refreshTrust();
     return () => { cancelled = true; };
@@ -81,7 +86,7 @@ export function DeviceDetails({ room, hostRef, onClose, onOpenSettings }: {
       ["Trusted here", seen ? (seen.trusted ? "Yes" : "No") : "Unknown until it shows its identity"],
       ["Paired before", seen ? (known.some((device) => device.fingerprint === seen.fingerprint) ? "Yes · connects without a code nearby" : "No") : "Unknown"],
     ]} /> : null}
-    {section === "connection" ? <ConnectionSection connected={connected} liveness={String(liveness)} observedAt={node?.currentSession?.observedAt ?? null} link={link} address={address} /> : null}
+    {section === "connection" ? <ConnectionSection connected={connected} liveness={String(liveness)} observedAt={node?.currentSession?.observedAt ?? null} link={link} address={address} internet={internet} /> : null}
     {section === "performance" ? <PerformanceSection room={room} hostRef={hostRef} name={name} connected={connected} linkBenchmark={link?.benchmark ?? null} /> : null}
     {section === "agents" ? <AgentsSection room={room} hostRef={hostRef} name={name} connected={connected} capabilities={node?.capabilities ?? []} /> : null}
     {section === "trust" ? <TrustSection room={room} name={name} seen={seen} myFingerprint={myFingerprint} onChanged={refreshTrust} onOpenSettings={onOpenSettings} /> : null}
@@ -93,14 +98,15 @@ function Facts({ rows }: { rows: FactRow[] }) {
   return <dl className="facts">{rows.map(([label, value]) => <Fragment key={label}><dt>{label}</dt><dd>{value}</dd></Fragment>)}</dl>;
 }
 
-function ConnectionSection({ connected, liveness, observedAt, link, address }: { connected: boolean; liveness: string; observedAt: number | null; link: BridgeNodeListProjectionV1["links"][number] | null; address: string | null }) {
+function ConnectionSection({ connected, liveness, observedAt, link, address, internet }: { connected: boolean; liveness: string; observedAt: number | null; link: BridgeNodeListProjectionV1["links"][number] | null; address: string | null; internet: BridgeInternetStatus | null }) {
   return <div className="stack-lg">
     <Facts rows={[
       ["Session", connected ? "Current, verified" : liveness],
       ["Last observed", observedAt ? new Date(observedAt * 1000).toLocaleString() : "Not observed"],
       ["Control channel", link ? diagnosticStateLabel(link.connection.controlChannel) : "Not observed"],
       ["Data path", link ? diagnosticStateLabel(link.connection.dataPath) : "Not observed"],
-      ["Private-network address", address ?? "None · this network only"],
+      ["Private-network address", address ?? "None"],
+      ["Across the internet", bridgeInternetLine(internet)],
     ]} />
     <p className="xsmall subtle">Observed from this device's current session; nothing here is a measurement. Pair, re-pair or set the address in Bridge details.</p>
   </div>;

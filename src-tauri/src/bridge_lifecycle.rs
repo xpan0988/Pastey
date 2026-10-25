@@ -23,6 +23,14 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_millis(1_800);
 /// probe is jitter, not a lost peer; liveness never authorizes anything, and
 /// every use of a session still requires the transport-key proof.
 const LIVENESS_FAILURES_BEFORE_INVALIDATION: u8 = 3;
+/// The same for a session that runs through an internet tunnel: a relay
+/// adds hundreds of milliseconds, and a path change takes seconds while
+/// the carrier finds the new path. The tunnel's endpoint does not change
+/// meanwhile, so tolerating it keeps the session instead of rotating its
+/// keys; a session that is really gone still ends within about half a
+/// minute (4 rounds of a probe and the 2 s cadence).
+const TUNNEL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+const TUNNEL_LIVENESS_FAILURES_BEFORE_INVALIDATION: u8 = 4;
 const DISCONNECTED_AFTER_ATTEMPTS: u8 = 2;
 
 #[derive(Deserialize)]
@@ -339,7 +347,11 @@ async fn bootstrap_room_servers(state: Arc<AppState>) -> AppResult<()> {
 
 async fn reconcile_once(state: Arc<AppState>) -> AppResult<()> {
     invalidate_unreachable_sessions(state.clone()).await?;
-    reconnect_preserved_bridges(state).await
+    reconnect_preserved_bridges(state.clone()).await?;
+    // Tell connected peers how to reach this device across the internet,
+    // when that changed. Never authority; the peer pins it per Bridge.
+    crate::connectivity::announce_card(&state).await;
+    Ok(())
 }
 
 async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> {
@@ -352,11 +364,17 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
                 continue;
             }
             let failure_key = format!("{}\n{}", room.id, peer.peer_session_id);
-            if probe_exact_peer(&state, &room, &peer).await {
+            let tunnel = through_tunnel(&state, &peer);
+            if probe_exact_peer(&state, &room, &peer, tunnel).await {
                 state.bridge_liveness_failures.lock().remove(&failure_key);
                 continue;
             }
-            if !liveness_failure_confirmed(&state, &failure_key) {
+            let threshold = if tunnel {
+                TUNNEL_LIVENESS_FAILURES_BEFORE_INVALIDATION
+            } else {
+                LIVENESS_FAILURES_BEFORE_INVALIDATION
+            };
+            if !liveness_failure_confirmed(&state, &failure_key, threshold) {
                 continue;
             }
             if storage::mark_bridge_peer_reconnecting(
@@ -383,12 +401,21 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
     Ok(())
 }
 
+/// Whether a peer's stored endpoint is one of this device's internet
+/// tunnels rather than the peer's own address.
+fn through_tunnel(state: &AppState, peer: &StoredBridgePeerEndpoint) -> bool {
+    match (peer.endpoint_host.as_deref(), peer.endpoint_port) {
+        (Some(host), Some(port)) => crate::connectivity::is_tunnel_endpoint(state, host, port),
+        _ => false,
+    }
+}
+
 /// Counts one failed probe; true once enough consecutive ones confirm it.
-fn liveness_failure_confirmed(state: &AppState, failure_key: &str) -> bool {
+fn liveness_failure_confirmed(state: &AppState, failure_key: &str, threshold: u8) -> bool {
     let mut failures = state.bridge_liveness_failures.lock();
     let count = failures.entry(failure_key.to_owned()).or_default();
     *count = count.saturating_add(1);
-    if *count >= LIVENESS_FAILURES_BEFORE_INVALIDATION {
+    if *count >= threshold {
         failures.remove(failure_key);
         true
     } else {
@@ -405,6 +432,7 @@ async fn probe_exact_peer(
     state: &AppState,
     room: &StoredRoom,
     peer: &StoredBridgePeerEndpoint,
+    tunnel: bool,
 ) -> bool {
     let (Some(host), Some(port), Some(expected_key)) = (
         peer.endpoint_host.as_deref(),
@@ -417,7 +445,12 @@ async fn probe_exact_peer(
     else {
         return false;
     };
-    let client = match reqwest::Client::builder().timeout(LIVENESS_TIMEOUT).build() {
+    let timeout = if tunnel {
+        TUNNEL_LIVENESS_TIMEOUT
+    } else {
+        LIVENESS_TIMEOUT
+    };
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(client) => client,
         Err(_) => return false,
     };
@@ -474,7 +507,7 @@ impl AppState {
             .collect::<Vec<_>>();
         let mut live = Vec::new();
         for peer in candidates {
-            if probe_exact_peer(self, &room, &peer).await {
+            if probe_exact_peer(self, &room, &peer, through_tunnel(self, &peer)).await {
                 live.push(peer);
             }
         }
@@ -612,9 +645,27 @@ async fn reconnect_room(state: Arc<AppState>, room: &StoredRoom) -> AppResult<()
         },
         None => None,
     };
-    let (source, verified) = match unicast {
-        Some(found) => found,
-        None => discovery::discover_reconnect(&attempt, &discovery::DiscoveryTargets::Lan).await?,
+    // On the LAN and, when both devices have it on, across the internet at
+    // the same time. A LAN answer wins; either is authenticated the same
+    // way (an offer signed by the pinned device key for this attempt).
+    let (peer_host, peer_port, verified) = match unicast {
+        Some((source, verified)) => (source.ip().to_string(), verified.offer.port, verified),
+        None => {
+            let lan = discovery::discover_reconnect(&attempt, &discovery::DiscoveryTargets::Lan);
+            let internet = async {
+                if crate::connectivity::local_card(&state).is_none() {
+                    return Err(AppError::Network("Internet connectivity is off.".into()));
+                }
+                crate::connectivity::discover_reconnect(&state, &room.id, &attempt).await
+            };
+            match tokio::join!(lan, internet) {
+                (Ok((source, verified)), _) => {
+                    (source.ip().to_string(), verified.offer.port, verified)
+                }
+                (Err(_), Ok(found)) => found,
+                (Err(error), Err(_)) => return Err(error),
+            }
+        }
     };
     let identity = {
         let master_key = {
@@ -625,21 +676,15 @@ async fn reconnect_room(state: Arc<AppState>, room: &StoredRoom) -> AppResult<()
     };
     let mut request = transfer::local_join_request(&state, &room.id)?;
     let digest = attempt.authenticate_join(&identity, &verified, &mut request);
-    let response = transfer::post_join(
-        &source.ip().to_string(),
-        verified.offer.port,
-        &room.id,
-        &request,
-    )
-    .await?;
+    let response = transfer::post_join(&peer_host, peer_port, &room.id, &request).await?;
     attempt.verify_ack(&verified, &digest, &response)?;
     let peer_host_ref =
         HostRef::parse_peer(verified.offer.host_ref.clone(), &state.local_host_ref)?;
     storage::update_room_peer(
         &state.paths,
         &room.id,
-        Some(&source.ip().to_string()),
-        Some(verified.offer.port),
+        Some(&peer_host),
+        Some(peer_port),
         Some(&response.device_name),
         Some(&verified.offer.transport_public_key),
         RoomStatus::Active,
@@ -785,6 +830,7 @@ mod tests {
             shortcut: "test".into(),
             app_secret: crate::crypto::encode_key(&app_secret),
             device_id: format!("local-{label}"),
+            internet: Default::default(),
         }
     }
 
@@ -933,9 +979,9 @@ mod tests {
         .await;
         let mut peer = fixture.peer("echo-route", BridgePeerLiveness::Connected);
         peer.endpoint_port = Some(port);
-        assert!(!probe_exact_peer(&fixture.runtime, &fixture.room, &peer).await);
+        assert!(!probe_exact_peer(&fixture.runtime, &fixture.room, &peer, false).await);
         let genuine = fixture.peer("genuine-route", BridgePeerLiveness::Connected);
-        assert!(probe_exact_peer(&fixture.runtime, &fixture.room, &genuine).await);
+        assert!(probe_exact_peer(&fixture.runtime, &fixture.room, &genuine, false).await);
         let _ = shutdown.send(());
     }
 
@@ -1202,5 +1248,12 @@ mod tests {
         assert!(LIVENESS_TIMEOUT < RECONCILE_INTERVAL);
         // One slow probe across the internet is jitter, not a lost peer.
         assert!(LIVENESS_FAILURES_BEFORE_INVALIDATION >= 3);
+        // Through an internet tunnel: more tolerant, still bounded.
+        assert!(
+            TUNNEL_LIVENESS_FAILURES_BEFORE_INVALIDATION >= LIVENESS_FAILURES_BEFORE_INVALIDATION
+        );
+        let worst = (TUNNEL_LIVENESS_TIMEOUT + RECONCILE_INTERVAL)
+            * u32::from(TUNNEL_LIVENESS_FAILURES_BEFORE_INVALIDATION);
+        assert!(worst <= Duration::from_secs(30));
     }
 }

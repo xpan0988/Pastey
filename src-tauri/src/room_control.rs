@@ -165,6 +165,7 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "developer_terminal.exit",
     "developer_terminal.close",
     "bridge_membership.departure",
+    "bridge_membership.carrier_card",
     "native_agent.invoke",
     "native_agent.status",
     "native_agent.cancel",
@@ -366,6 +367,33 @@ pub(crate) fn bridge_departure_event(
         "payload": {
             "schemaVersion": BRIDGE_MEMBERSHIP_SCHEMA,
             "departureKind": kind.as_str(),
+        },
+    }))
+}
+
+/// This device's internet carrier card, for one Bridge peer: how to reach
+/// this device across networks. It grants nothing; the peer pins it only
+/// because it arrived over this authenticated session (`connectivity`).
+pub(crate) fn bridge_carrier_card_event(
+    card: &crate::connectivity::CarrierCardV1,
+    context: &RoomControlSessionContext,
+) -> AppResult<Value> {
+    let now = OffsetDateTime::now_utc();
+    let invalid = || AppError::InvalidInput("Invalid carrier card event time.".into());
+    Ok(serde_json::json!({
+        "schemaVersion": ROOM_CONTROL_SCHEMA,
+        "eventId": format!("bridge-membership-event-{}", uuid::Uuid::new_v4()),
+        "kind": "bridge_membership.carrier_card",
+        "protocolFamily": BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY,
+        "roomRef": context.room_id,
+        "sourceDeviceRef": context.local_session_ref,
+        "targetPeerRef": context.peer_session_ref,
+        "createdAt": now.format(&Rfc3339).map_err(|_| invalid())?,
+        "expiresAt": (now + time::Duration::seconds(MAX_EVENT_LIFETIME_SECONDS)).format(&Rfc3339).map_err(|_| invalid())?,
+        "previewOnly": false,
+        "payload": {
+            "schemaVersion": BRIDGE_MEMBERSHIP_SCHEMA,
+            "card": card,
         },
     }))
 }
@@ -1709,6 +1737,53 @@ pub async fn receive_room_control_event_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "membership_cleanup_failed",
                 "Bridge membership cleanup failed.",
+            );
+        }
+        return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
+    }
+    if validated.kind == "bridge_membership.carrier_card" {
+        {
+            let mut runtime = ctx.state.room_control.lock();
+            let now = runtime.limiter_now();
+            let room_state = runtime.rooms.entry(room_id.clone()).or_default();
+            if let Err(refused) = admit_received_event(
+                room_state,
+                &validated,
+                ControlClassV1::Membership,
+                now,
+                &room_id,
+            ) {
+                return refused;
+            }
+        }
+        // Pinned for the peer this session authenticated, and only while
+        // the Bridge is pinned to that same device.
+        let stored = crate::host_runtime::current_host_session_binding(
+            &ctx.state,
+            &room_id,
+            &inbound_peer.peer_session_id,
+        )
+        .and_then(|binding| {
+            let card = serde_json::from_value::<crate::connectivity::CarrierCardV1>(
+                validated
+                    .event
+                    .get("payload")
+                    .and_then(|payload| payload.get("card"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            )?;
+            crate::connectivity::receive_card(
+                &ctx.state,
+                &room_id,
+                binding.peer_host_ref.as_str(),
+                &card,
+            )
+        });
+        if stored.is_err() {
+            return control_error(
+                StatusCode::FORBIDDEN,
+                "carrier_card_refused",
+                "This Bridge does not pin the device that sent the carrier card.",
             );
         }
         return encrypted_receipt_response(&event_key, &validated.event_id, &now_iso());
@@ -3528,6 +3603,24 @@ fn validate_control_event(
                 "Invalid Bridge departure event.".into(),
             ));
         }
+        (None, None)
+    } else if kind == "bridge_membership.carrier_card" {
+        if string_field(object, "protocolFamily")? != BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY
+            || object.get("previewOnly") != Some(&Value::Bool(false))
+        {
+            return Err(AppError::InvalidInput(
+                "Invalid Bridge membership protocol event.".into(),
+            ));
+        }
+        require_exact_fields(payload, &["schemaVersion", "card"])?;
+        if string_field(payload, "schemaVersion")? != BRIDGE_MEMBERSHIP_SCHEMA {
+            return Err(AppError::InvalidInput("Invalid carrier card event.".into()));
+        }
+        let card = serde_json::from_value::<crate::connectivity::CarrierCardV1>(
+            payload.get("card").cloned().unwrap_or(Value::Null),
+        )
+        .map_err(|_| AppError::InvalidInput("Invalid carrier card event.".into()))?;
+        crate::connectivity::validate_card(&card)?;
         (None, None)
     } else {
         return Err(AppError::InvalidInput(
@@ -5955,4 +6048,4 @@ mod tests {
 #[cfg(all(test, unix))]
 mod native_session_pair_tests;
 #[cfg(test)]
-mod runtime_pair_tests;
+pub(crate) mod runtime_pair_tests;

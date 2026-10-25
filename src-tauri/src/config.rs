@@ -30,6 +30,21 @@ pub struct StoredConfig {
     pub app_secret: String,
     #[serde(default)]
     pub device_id: String,
+    /// Reaching this device's Bridges across the internet. Off unless the
+    /// user turns it on; a connection carrier only, never authority.
+    #[serde(default)]
+    pub internet: InternetConfig,
+}
+
+/// Internet connectivity for Bridges (`connectivity`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct InternetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// A relay the user runs. None: n0's public relays.
+    #[serde(default)]
+    pub relay_url: Option<String>,
 }
 
 pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfig> {
@@ -70,6 +85,7 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
         shortcut: shortcut.to_string(),
         app_secret: crypto::encode_key(&crypto::random_key()),
         device_id: uuid::Uuid::new_v4().to_string(),
+        internet: Default::default(),
     };
 
     save(paths, &stored)?;
@@ -325,6 +341,7 @@ mod tests {
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
+            internet: Default::default(),
         };
 
         assert_eq!(
@@ -379,6 +396,7 @@ mod tests {
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
+            internet: Default::default(),
         };
 
         let public = public_config_with_dev_tools(&paths, &stored, false);
@@ -405,6 +423,7 @@ mod tests {
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
+            internet: Default::default(),
         };
 
         let public = public_config_with_dev_tools(&paths, &stored, true);
@@ -431,6 +450,7 @@ mod tests {
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
+            internet: Default::default(),
         };
         save(&paths, &stored).unwrap();
         let incoming = public_config_with_dev_tools(&paths, &stored, false);
@@ -499,6 +519,7 @@ mod tests {
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
+            internet: Default::default(),
         };
 
         let public = public_config_with_dev_tools(&paths, &stored, false);
@@ -525,6 +546,7 @@ mod tests {
             shortcut: "Ctrl+Shift+V".into(),
             app_secret: "abc".into(),
             device_id: "device".into(),
+            internet: Default::default(),
         };
 
         let public = public_config_with_dev_tools(&paths, &stored, true);

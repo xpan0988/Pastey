@@ -35,6 +35,7 @@ import { rememberedNativeTask, rememberStartedNativeTask } from "../src/features
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
 import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
+import { bridgeInternetLine, internetSettingLine, relayUrlProblem } from "../src/lib/internetStatus";
 import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
 import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
@@ -1543,4 +1544,33 @@ test("a conversation shows only what arrived: no invented reply, and history onl
   const remote = readFileSync("src-tauri/src/native_agent/sessions/remote.rs", "utf8");
   assert.match(remote, /const MAX_EXCERPTS: usize = 4;/);
   assert.match(remote, /const MAX_EXCERPT_CHARS: usize = 300;/);
+});
+
+test("internet connectivity is described without implying any authority", () => {
+  assert.equal(relayUrlProblem(""), null, "empty means n0's relays");
+  assert.equal(relayUrlProblem("https://relay.example.com"), null);
+  assert.notEqual(relayUrlProblem("http://relay.example.com"), null, "a relay is reached over TLS");
+  assert.notEqual(relayUrlProblem("https://relay example.com"), null);
+  assert.notEqual(relayUrlProblem(`https://${"a".repeat(520)}`), null);
+  // The same rule as Rust's set_internet_connectivity.
+  const commands = readFileSync("src-tauri/src/commands.rs", "utf8");
+  assert.match(commands, /!url\.starts_with\("https:\/\/"\) \|\| url\.len\(\) > 512/);
+
+  assert.equal(internetSettingLine(null).text, "Checking…");
+  assert.match(internetSettingLine({ enabled: false, relayUrl: null, running: false, problem: null }).text, /^Off/);
+  assert.deepEqual(internetSettingLine({ enabled: true, relayUrl: null, running: true, problem: null }), { text: "On, with n0's public relays.", tone: "ok" });
+  assert.equal(internetSettingLine({ enabled: true, relayUrl: "https://r.example", running: true, problem: null }).text, "On, with your relay.");
+  const failed = internetSettingLine({ enabled: true, relayUrl: null, running: false, problem: "no UDP" });
+  assert.equal(failed.tone, "warn");
+  assert.match(failed.text, /no UDP/);
+
+  const status = { carrierRunning: true, peerReachableByCarrier: true, path: null };
+  assert.match(bridgeInternetLine({ ...status, carrierRunning: false }), /Not running on this device/);
+  assert.match(bridgeInternetLine({ ...status, peerReachableByCarrier: false }), /other device has not turned it on/);
+  assert.match(bridgeInternetLine({ ...status, path: "direct" }), /directly/);
+  assert.match(bridgeInternetLine({ ...status, path: "relayed" }), /relay, which sees only encrypted/);
+  assert.match(bridgeInternetLine(status), /^Ready/);
+  for (const line of [bridgeInternetLine({ ...status, path: "relayed" }), internetSettingLine({ enabled: true, relayUrl: null, running: true, problem: null }).text]) {
+    assert.doesNotMatch(line, /trust|allow|permission|approve/i);
+  }
 });

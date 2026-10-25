@@ -82,6 +82,9 @@ pub struct HostRuntime {
     /// Consecutive failed liveness probes per Bridge peer session.
     pub(crate) bridge_liveness_failures: Mutex<HashMap<String, u8>>,
     pub(crate) bridge_reconnect_rotations: Mutex<HashSet<String>>,
+    /// Internet carrier state: its connections and loopback tunnels.
+    /// Process-local, and never authority (`connectivity`).
+    pub(crate) connectivity: crate::connectivity::ConnectivityService,
     /// Pairing and reconnect handshake state. Process-local.
     pub(crate) bridge_auth: Mutex<crate::bridge_auth::BridgeAuthState>,
     pub nearby_devices: Mutex<HashMap<String, discovery::NearbyDeviceRecord>>,
@@ -211,6 +214,7 @@ impl HostRuntime {
             bridge_liveness_failures: Mutex::new(HashMap::new()),
             verified_peer_devices: Mutex::new(Vec::new()),
             bridge_reconnect_rotations: Mutex::new(HashSet::new()),
+            connectivity: Default::default(),
             bridge_auth: Mutex::new(crate::bridge_auth::BridgeAuthState::default()),
             nearby_devices: Mutex::new(HashMap::new()),
             pending_join_requests: Mutex::new(HashMap::new()),
@@ -744,6 +748,7 @@ mod tests {
             shortcut: "test".into(),
             app_secret: crate::crypto::encode_key(&[7u8; 32]),
             device_id: "test-device".into(),
+            internet: Default::default(),
         }
     }
 

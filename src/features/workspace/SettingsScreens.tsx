@@ -25,6 +25,7 @@ import {
 import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot, NativeAgentCapability } from "../../lib/tauri";
 import type { AppConfig, RoomInfo } from "../../lib/types";
 import { DeviceTrustSettings } from "./DeviceTrustSettings";
+import { InternetSettings } from "./InternetSettings";
 import { KnownDevicesSettings } from "./KnownDevicesSettings";
 import { availabilityCopy } from "./NativeAgentPanel";
 import { SessionReadingSettings } from "./SessionReadingSettings";
@@ -120,6 +121,7 @@ function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConf
       </div>
       {error ? <p className="error-text" role="alert">{error}</p> : null}
     </section>
+    <InternetSettings />
   </>;
 }
 

@@ -2976,6 +2976,17 @@ async fn join_handler(
 
     let snapshot = room_server_snapshot(&ctx.state, &room_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // A join through an internet tunnel came from this device's loopback:
+    // the peer is reached back through this device's tunnel toward it, and
+    // only if the tunnel's carrier key is pinned to the device joining.
+    let tunnel_endpoint = crate::connectivity::tunnel_peer_endpoint(
+        &ctx.state,
+        &room_id,
+        source,
+        request_host_ref.as_str(),
+    )
+    .await
+    .map_err(|_| StatusCode::FORBIDDEN)?;
     let ack = match &request.auth {
         Some(crate::bridge_auth::JoinAuth::Pair { .. }) => {
             let admitted = crate::bridge_auth::accept_pair_join(
@@ -3033,11 +3044,13 @@ async fn join_handler(
         None => return Err(StatusCode::FORBIDDEN),
     };
     crate::room_control::clear_room_control_state(&ctx.state, &room_id);
+    let (peer_host, peer_port) =
+        tunnel_endpoint.unwrap_or_else(|| (source.ip().to_string(), request.port));
     storage::update_room_peer(
         &ctx.state.paths,
         &room_id,
-        Some(&source.ip().to_string()),
-        Some(request.port),
+        Some(&peer_host),
+        Some(peer_port),
         Some(&request.device_name),
         Some(&request.transport_public_key),
         RoomStatus::Active,
@@ -6665,6 +6678,7 @@ mod join_authentication {
                 shortcut: "test".into(),
                 app_secret: crypto::encode_key(&app_secret),
                 device_id: format!("host-{label}"),
+                internet: Default::default(),
             };
             let state = Arc::new(
                 AppState::new(

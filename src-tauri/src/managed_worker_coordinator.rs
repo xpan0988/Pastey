@@ -2082,6 +2082,7 @@ mod tests {
                     shortcut: "test".into(),
                     app_secret: crate::crypto::encode_key(&[13u8; 32]),
                     device_id: "live-worker-local".into(),
+                    internet: Default::default(),
                 },
                 sink.clone(),
                 Arc::new(NoopSpawner),

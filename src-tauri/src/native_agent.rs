@@ -7465,6 +7465,7 @@ mod tests {
             shortcut: "test".into(),
             app_secret: crate::crypto::encode_key(&[9u8; 32]),
             device_id: "native-return-test".into(),
+            internet: Default::default(),
         }
     }
 

@@ -661,6 +661,44 @@ export function setBridgePeerAddress(roomId: string, address: string | null): Pr
   return invoke("set_bridge_peer_address", { roomId, address });
 }
 
+/** This device's internet connectivity: whether it is on, which relay it
+ * uses (null: n0's public relays), and whether it runs now. */
+export interface InternetConnectivity {
+  enabled: boolean;
+  relayUrl: string | null;
+  running: boolean;
+  /** Why it could not start, when it is on but not running. */
+  problem: string | null;
+}
+
+export function getInternetConnectivity(): Promise<InternetConnectivity> {
+  return invoke("get_internet_connectivity");
+}
+
+/** Turns internet connectivity on or off. It changes only how this device
+ * can be reached; every Bridge still authenticates and authorizes as on a
+ * LAN. */
+export function setInternetConnectivity(enabled: boolean, relayUrl: string | null): Promise<InternetConnectivity> {
+  return invoke("set_internet_connectivity", { enabled, relayUrl });
+}
+
+export type InternetPath = "direct" | "relayed" | "unknown";
+
+/** How one Bridge's peer is reached across the internet now. */
+export interface BridgeInternetStatus {
+  /** This device has internet connectivity on and running. */
+  carrierRunning: boolean;
+  /** The other device said how to reach it across the internet. */
+  peerReachableByCarrier: boolean;
+  /** The session runs over the internet now, and on which path; null when
+   * it does not (on the LAN, or not connected). */
+  path: InternetPath | null;
+}
+
+export function getBridgeInternetStatus(roomId: string): Promise<BridgeInternetStatus> {
+  return invoke("get_bridge_internet_status", { roomId });
+}
+
 /** This device's durable identity, to compare on another device. */
 export interface DeviceIdentity {
   fingerprint: string;

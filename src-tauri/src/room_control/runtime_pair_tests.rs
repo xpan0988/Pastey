@@ -21,7 +21,7 @@ use crate::{
     storage::{self, AppPaths},
 };
 
-pub(super) const ROOM: &str = "room-control-pair";
+pub(crate) const ROOM: &str = "room-control-pair";
 
 struct SilentEvents;
 
@@ -40,15 +40,15 @@ impl RuntimeTaskSpawner for TokioSpawner {
     }
 }
 
-pub(super) struct PairHostV1 {
-    pub(super) runtime: Arc<HostRuntime>,
-    pub(super) name: &'static str,
-    port: u16,
+pub(crate) struct PairHostV1 {
+    pub(crate) runtime: Arc<HostRuntime>,
+    pub(crate) name: &'static str,
+    pub(crate) port: u16,
     secret: [u8; 32],
 }
 
 impl PairHostV1 {
-    pub(super) fn host_ref(&self) -> HostRef {
+    pub(crate) fn host_ref(&self) -> HostRef {
         self.runtime.local_host_ref.clone()
     }
 
@@ -56,7 +56,7 @@ impl PairHostV1 {
         crate::crypto::encode_key(&crate::crypto::transport_public_key(&self.secret))
     }
 
-    pub(super) fn route_ref(&self) -> String {
+    pub(crate) fn route_ref(&self) -> String {
         format!("route-{}", self.name)
     }
 }
@@ -66,11 +66,11 @@ impl PairHostV1 {
 /// probe every request makes has a 1.8 s bound).
 static ONE_PAIR_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub(super) struct RuntimePairV1 {
+pub(crate) struct RuntimePairV1 {
     _turn: tokio::sync::MutexGuard<'static, ()>,
-    pub(super) root: PathBuf,
-    pub(super) mac: PairHostV1,
-    pub(super) windows: PairHostV1,
+    pub(crate) root: PathBuf,
+    pub(crate) mac: PairHostV1,
+    pub(crate) windows: PairHostV1,
 }
 
 fn config(device_id: &str) -> StoredConfig {
@@ -87,6 +87,7 @@ fn config(device_id: &str) -> StoredConfig {
         shortcut: "test".into(),
         app_secret: crate::crypto::encode_key(&[23u8; 32]),
         device_id: device_id.into(),
+        internet: Default::default(),
     }
 }
 
@@ -165,6 +166,12 @@ async fn serve(host: &mut PairHostV1) {
 
 /// `local` records `peer` as its connected Bridge peer.
 fn introduce(local: &PairHostV1, peer: &PairHostV1) {
+    introduce_at(local, peer, peer.port);
+}
+
+/// `local` records `peer` as its connected Bridge peer, reached at `port`
+/// on loopback: its room server, or a tunnel toward it.
+pub(crate) fn introduce_at(local: &PairHostV1, peer: &PairHostV1, port: u16) {
     storage::upsert_bridge_peer_endpoint(
         &local.runtime.paths,
         &StoredBridgePeerEndpoint {
@@ -172,7 +179,7 @@ fn introduce(local: &PairHostV1, peer: &PairHostV1) {
             peer_session_id: peer.route_ref(),
             display_name: Some(peer.name.into()),
             endpoint_host: Some("127.0.0.1".into()),
-            endpoint_port: Some(peer.port),
+            endpoint_port: Some(port),
             transport_public_key: Some(peer.public_key()),
             liveness: BridgePeerLiveness::Connected,
             join_method: BridgePeerJoinMethod::ManualCode,
@@ -185,7 +192,7 @@ fn introduce(local: &PairHostV1, peer: &PairHostV1) {
 }
 
 impl RuntimePairV1 {
-    pub(super) async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let turn = ONE_PAIR_AT_A_TIME.lock().await;
         let root = std::env::temp_dir().join(format!("pastey-rc-pair-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -202,7 +209,7 @@ impl RuntimePairV1 {
     }
 
     /// Moves both rate limiters' clocks forward.
-    pub(super) fn advance(&self, seconds: i64) {
+    pub(crate) fn advance(&self, seconds: i64) {
         for host in [&self.mac, &self.windows] {
             host.runtime.room_control.lock().limiter_skew_seconds += seconds;
         }
@@ -210,7 +217,7 @@ impl RuntimePairV1 {
 
     /// Windows restarts its room server (Pastey restart or Room Repair):
     /// new port and transport key, which the Mac learns as on reconnect.
-    pub(super) async fn restart_windows_server(&mut self) {
+    pub(crate) async fn restart_windows_server(&mut self) {
         crate::room_control::clear_room_control_state(&self.windows.runtime, ROOM);
         serve(&mut self.windows).await;
         introduce(&self.mac, &self.windows);
@@ -218,7 +225,7 @@ impl RuntimePairV1 {
 
     /// The real "Check Codex" path: resolve the exact current remote Host
     /// session, then ask it for its capabilities and wait for the answer.
-    pub(super) async fn mac_checks_windows_capabilities(
+    pub(crate) async fn mac_checks_windows_capabilities(
         &self,
     ) -> AppResult<crate::peer_capabilities::PeerCapabilityProjection> {
         let session = self
@@ -231,7 +238,7 @@ impl RuntimePairV1 {
             .await
     }
 
-    pub(super) async fn windows_checks_mac_capabilities(
+    pub(crate) async fn windows_checks_mac_capabilities(
         &self,
     ) -> AppResult<crate::peer_capabilities::PeerCapabilityProjection> {
         let session = self
@@ -245,15 +252,15 @@ impl RuntimePairV1 {
     }
 }
 
-pub(super) const THREAD: &str = "019a0000-0000-7000-8000-000000000001";
-pub(super) const MARKER: &str = "turn-0042";
+pub(crate) const THREAD: &str = "019a0000-0000-7000-8000-000000000001";
+pub(crate) const MARKER: &str = "turn-0042";
 
 /// A fake Codex on Windows with one idle thread in `PasteySessionTest`.
 /// It answers the availability probes and Codex's app-server protocol as
 /// Codex 0.163 does for a continuation, takes the thread's writer lock
 /// while it runs, and records each `turn/start` it receives.
-pub(super) struct WindowsCodexV1 {
-    pub(super) workspace: PathBuf,
+pub(crate) struct WindowsCodexV1 {
+    pub(crate) workspace: PathBuf,
     turn_starts: PathBuf,
 }
 
@@ -266,7 +273,7 @@ impl Drop for WindowsCodexV1 {
 }
 
 impl WindowsCodexV1 {
-    pub(super) fn turn_starts(&self) -> usize {
+    pub(crate) fn turn_starts(&self) -> usize {
         std::fs::read_to_string(&self.turn_starts)
             .map(|text| text.lines().count())
             .unwrap_or(0)
@@ -274,7 +281,7 @@ impl WindowsCodexV1 {
 }
 
 #[cfg(unix)]
-fn install_windows_codex(pair: &RuntimePairV1) -> WindowsCodexV1 {
+pub(crate) fn install_windows_codex(pair: &RuntimePairV1) -> WindowsCodexV1 {
     use std::os::unix::fs::PermissionsExt;
     // Under the crate, as other share tests do: a temporary folder may be
     // refused as too broad to share.
@@ -337,7 +344,7 @@ impl RuntimePairV1 {
 
     /// The Mac shows its identity to Windows over the current session, as
     /// the Bridge view and every session query do.
-    pub(super) async fn mac_presents_identity(&self) -> AppResult<()> {
+    pub(crate) async fn mac_presents_identity(&self) -> AppResult<()> {
         let session = self.mac_session().await?;
         crate::commands::present_device_identity_over(self.mac.runtime.clone(), session.binding())
             .await
@@ -349,7 +356,7 @@ impl RuntimePairV1 {
 
     /// On Windows, inside this Bridge: trust the Mac (once) and share
     /// `PasteySessionTest` with it.
-    pub(super) async fn windows_shares(
+    pub(crate) async fn windows_shares(
         &self,
         codex: &WindowsCodexV1,
         read_sessions: bool,
@@ -388,7 +395,7 @@ impl RuntimePairV1 {
 
     /// The Mac asks which folders Windows shares, as the Agents tab does:
     /// identity first, then the query.
-    pub(super) async fn mac_lists_shares(
+    pub(crate) async fn mac_lists_shares(
         &self,
     ) -> AppResult<crate::native_agent::sessions::remote::RemoteSessionResponseV1> {
         use crate::native_agent::sessions::remote::{
@@ -416,7 +423,7 @@ impl RuntimePairV1 {
 
     /// The Mac asks Windows to continue the thread, exactly as Continue
     /// session does (capability check, identity, invocation).
-    pub(super) async fn mac_continues(
+    pub(crate) async fn mac_continues(
         &self,
         scope_ref: &str,
     ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
@@ -437,7 +444,7 @@ impl RuntimePairV1 {
         .await
     }
 
-    pub(super) fn windows_reviews(&self) -> Vec<String> {
+    pub(crate) fn windows_reviews(&self) -> Vec<String> {
         self.windows
             .runtime
             .native_agents
@@ -448,7 +455,7 @@ impl RuntimePairV1 {
             .collect()
     }
 
-    pub(super) async fn windows_review_appears(&self, task_id: &str) {
+    pub(crate) async fn windows_review_appears(&self, task_id: &str) {
         for _ in 0..200 {
             if self.windows_reviews().iter().any(|id| id == task_id) {
                 return;
@@ -459,7 +466,7 @@ impl RuntimePairV1 {
     }
 
     /// Windows's user clicks Accept, through the product's Accept path.
-    pub(super) fn windows_accepts(
+    pub(crate) fn windows_accepts(
         &self,
         task_id: &str,
     ) -> AppResult<crate::native_agent::NativeAgentTaskStatusV1> {
@@ -468,7 +475,7 @@ impl RuntimePairV1 {
 
     /// Waits until the Mac's record of `task_id` is final, from Windows's
     /// own status events.
-    pub(super) async fn mac_task_ends(
+    pub(crate) async fn mac_task_ends(
         &self,
         task_id: &str,
     ) -> crate::native_agent::NativeAgentTaskStatusV1 {
@@ -491,7 +498,7 @@ impl RuntimePairV1 {
         panic!("the Mac never learned how {task_id} ended: {last:?}");
     }
 
-    pub(super) fn diagnostics(&self, host: &PairHostV1) -> serde_json::Value {
+    pub(crate) fn diagnostics(&self, host: &PairHostV1) -> serde_json::Value {
         serde_json::to_value(crate::room_control::room_control_diagnostics(
             &host.runtime,
             ROOM,
@@ -501,13 +508,13 @@ impl RuntimePairV1 {
 }
 
 /// Accepted count of one class in a diagnostics snapshot.
-pub(super) fn accepted(diagnostics: &serde_json::Value, class: &str) -> u64 {
+pub(crate) fn accepted(diagnostics: &serde_json::Value, class: &str) -> u64 {
     class_entry(diagnostics, class)["accepted"]
         .as_u64()
         .unwrap()
 }
 
-pub(super) fn refused(diagnostics: &serde_json::Value, class: &str, reason: &str) -> u64 {
+pub(crate) fn refused(diagnostics: &serde_json::Value, class: &str, reason: &str) -> u64 {
     class_entry(diagnostics, class)["refused"]
         .as_array()
         .unwrap()
