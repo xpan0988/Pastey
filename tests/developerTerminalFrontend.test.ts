@@ -175,7 +175,7 @@ test("Developer Terminal focus is explicit and uses the emulator cursor", () => 
 
 test("Developer Terminal resize uses FitAddon and a bounded debounce", () => {
   const component = readFileSync("src/components/DeveloperTerminalViewport.tsx", "utf8");
-  const styles = readFileSync("src/features/workspace/workspace-v2.css", "utf8");
+  const styles = readFileSync("src/styles.css", "utf8");
 
   assert.match(component, /new FitAddon\(\)/);
   assert.match(component, /terminal\.onResize\(\(\{ cols, rows \}\)/);
@@ -191,7 +191,7 @@ test("Developer Terminal resize uses FitAddon and a bounded debounce", () => {
   assert.match(component, /terminal\.write\(bytes, \(\) => \{/);
   assert.match(component, /postOutputFitPending = false/);
   assert.match(component, /terminal\.write\(output, \(\) => fitRequestRef\.current\(\)\)/);
-  assert.match(styles, /\.developer-terminal-xterm > \.xterm[\s\S]*padding: 12px/);
+  assert.match(styles, /\.developer-terminal-xterm > \.xterm \{[^}]*padding: 12px/);
   assert.match(styles, /\.developer-terminal-xterm \{\s*height: 430px;\s*\}/);
 });
 
@@ -207,11 +207,18 @@ test("Developer Terminal fit lifecycle is recreated for each opened session and 
 test("active Developer Terminal UI hides fresh-request controls and identifies the Host", () => {
   const panel = readFileSync("src/features/workspace/DeveloperModeScreen.tsx", "utf8");
 
-  assert.match(panel, /human-controlled current-session grant inside this Bridge/);
-  assert.match(panel, /separate from Agent Task, Worker, Execute, Plan authority/);
+  // Human-controlled, this session only, outside Agent and Plan authority,
+  // and only after the other device accepts.
+  assert.match(panel, /controlled by you for this session only/);
+  assert.match(panel, /separate from Agents, Plans and their permissions/);
+  assert.match(panel, /the other device must accept each request/);
+  // A fresh request is offered only when no terminal is active or waiting.
+  assert.match(panel, /const canRequest = !controller \|\| \["denied", "exited", "closed", "disconnected"\]\.includes\(controller\.state\)/);
+  assert.match(panel, /session && canRequest \? [\s\S]*?requestTerminal\(\)[\s\S]*?Request terminal/);
+  // The active terminal names its Host's environment and can be ended.
+  assert.match(panel, /active\.environmentLabel \?\? "Shell"/);
   assert.match(panel, /End session/);
-  assert.match(panel, /Request terminal admission/);
-  assert.match(panel, /<DeveloperTerminalViewport/);
+  assert.match(panel, /active\.state === "active" && session \? <DeveloperTerminalViewport/);
   assert.match(panel, /closeDeveloperTerminal/);
-  assert.match(panel, /Burn remains a separate destructive local Bridge action/);
+  assert.match(panel, /Burn is a separate action in Bridge details/);
 });
