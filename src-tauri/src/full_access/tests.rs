@@ -137,3 +137,17 @@ fn retired_unattended_grants_are_removed_never_converted() {
     assert_eq!(left, 0);
     assert!(active_grants(&h.paths).unwrap().is_empty());
 }
+
+#[test]
+fn the_rights_full_access_inherits_are_reported_before_granting() {
+    let h = FixtureV1::new();
+    h.pair();
+    let state = bridge_full_access(&h.paths, BRIDGE).unwrap();
+    // Tests run as an ordinary user, never root or an elevated token.
+    assert_eq!(state.process_rights, ProcessRightsV1::Standard);
+    assert_eq!(process_rights(), ProcessRightsV1::Standard);
+    assert_eq!(
+        serde_json::to_value(&state).unwrap()["processRights"],
+        "standard"
+    );
+}

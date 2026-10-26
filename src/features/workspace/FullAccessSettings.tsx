@@ -10,7 +10,7 @@ import {
   type BridgeFullAccess,
   type FullAccessGrant,
 } from "../../lib/tauri";
-import { FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits } from "../../lib/fullAccess";
+import { FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits, processRightsWarning, type ProcessRights } from "../../lib/fullAccess";
 import type { DeveloperTerminalSession, RoomInfo } from "../../lib/types";
 import { Badge, Dialog, Icon, ListRow, Notice, errorText } from "./ui";
 
@@ -65,7 +65,8 @@ export function BridgeFullAccessSection({ room, peerName }: { room: RoomInfo; pe
     <div className="row"><h3 className="spacer">Full Access</h3>{state ? <Badge tone={grant ? "warn" : "neutral"}>{grant ? "On" : "Off"}</Badge> : null}</div>
     {state === null ? <p className="small muted">Checking…</p>
       : grant ? <>
-        <p className="small">{grant.deviceLabel} can control this device without anyone here: run Codex, continue sessions and open a terminal as you. Since {sinceLabel(grant.grantedAt)}.</p>
+        <p className="small">{grant.deviceLabel} can control this device without anyone here: run Codex, continue sessions and open a terminal with Pastey's rights. Since {sinceLabel(grant.grantedAt)}.</p>
+        {state.processRights === "administrator" ? <Notice tone="bad">{processRightsWarning(state.processRights)}</Notice> : null}
         {grant.folders.length ? <div className="card"><div className="list">
           {grant.folders.map((folder) => <ListRow key={folder} leading={<Icon name="folder" small />} title={folder.split(/[\\/]/).filter(Boolean).pop() ?? folder} meta={<span className="mono">{folder}</span>} side={<button type="button" className="btn btn-sm" disabled={pending} onClick={() => void removeFolder(grant, folder)}>Remove</button>} />)}
         </div></div> : null}
@@ -79,7 +80,7 @@ export function BridgeFullAccessSection({ room, peerName }: { room: RoomInfo; pe
       : <p className="small muted">Pair this Bridge first. Full Access can only be given to the device a pairing code proved.</p>}
     {error ? <p className="error-text" role="alert">{error}</p> : null}
 
-    {consent && state ? <FullAccessConsentDialog peerName={peerName} fingerprint={state.displayFingerprint} pending={pending} onClose={() => setConsent(false)} onGrant={() => void act(() => grantFullAccess(room.id, true)).then((ok) => { if (ok) setConsent(false); })} /> : null}
+    {consent && state ? <FullAccessConsentDialog peerName={peerName} fingerprint={state.displayFingerprint} rights={state.processRights} pending={pending} onClose={() => setConsent(false)} onGrant={() => void act(() => grantFullAccess(room.id, true)).then((ok) => { if (ok) setConsent(false); })} /> : null}
     {confirmRevoke && grant ? <Dialog title={`Revoke ${grant.deviceLabel}'s Full Access?`} onClose={() => { if (!pending) setConfirmRevoke(false); }} footer={<><button type="button" className="btn" disabled={pending} onClick={() => setConfirmRevoke(false)}>Cancel</button><button type="button" className="btn btn-danger-solid" disabled={pending} onClick={() => void act(() => revokeFullAccess(room.id)).then(() => setConfirmRevoke(false))}>Revoke</button></>}>
       <p>From now on, everything {grant.deviceLabel} asks for here waits for your Accept again. A terminal it has open on this device closes now, and Codex tasks Full Access started here are asked to stop.</p>
       <p className="small muted">A stop is a request: Pastey no longer accepts those tasks' results, but cannot always confirm when Codex stops, and anything it already did stays. Giving Full Access again later is a new decision.</p>
@@ -89,8 +90,9 @@ export function BridgeFullAccessSection({ room, peerName }: { room: RoomInfo; pe
 
 /** The informed-consent step. Granting requires reading what it allows and
  * ticking that you understand; the fingerprint names exactly which device. */
-export function FullAccessConsentDialog({ peerName, fingerprint, pending, onClose, onGrant }: { peerName: string; fingerprint: string | null; pending: boolean; onClose: () => void; onGrant: () => void }) {
+export function FullAccessConsentDialog({ peerName, fingerprint, rights, pending, onClose, onGrant }: { peerName: string; fingerprint: string | null; rights: ProcessRights; pending: boolean; onClose: () => void; onGrant: () => void }) {
   const [understood, setUnderstood] = useState(false);
+  const warning = processRightsWarning(rights);
   return <Dialog
     title={`Let ${peerName} control this device?`}
     labelledBy="full-access-title"
@@ -99,13 +101,14 @@ export function FullAccessConsentDialog({ peerName, fingerprint, pending, onClos
     footer={<><button type="button" className="btn" disabled={pending} onClick={onClose}>Cancel</button><button type="button" className="btn btn-danger-solid" disabled={pending || !understood} onClick={onGrant}>{pending ? "Allowing…" : "Allow Full Access"}</button></>}
   >
     <p>With Full Access, {peerName} can do these here <strong>without anyone at this device clicking Accept</strong>, even when you are away:</p>
+    {warning ? <Notice tone={rights === "administrator" ? "bad" : "warn"}>{warning}</Notice> : null}
     <ul className="small consent-list">{fullAccessAllows(peerName).map((line) => <li key={line}>{line}</li>)}</ul>
     <p className="small"><strong>It does not:</strong></p>
     <ul className="small consent-list">{fullAccessLimits(peerName).map((line) => <li key={line}>{line}</li>)}</ul>
     <p className="small"><strong>It lasts</strong> through reconnects and restarts until one of these ends it:</p>
     <ul className="small consent-list">{FULL_ACCESS_ENDS.map((line) => <li key={line}>{line}</li>)}</ul>
     {fingerprint ? <><p className="small muted">The device this Bridge is paired with, as its pairing code proved. It should match {peerName}'s Settings → This device:</p><p className="mono fingerprint-callout">{fingerprint}</p></> : null}
-    <label className="check"><input type="checkbox" checked={understood} disabled={pending} onChange={(event) => setUnderstood(event.target.checked)} /><span>I understand that {peerName} can use this device as me, through Pastey, while Full Access is on.</span></label>
+    <label className="check"><input type="checkbox" checked={understood} disabled={pending} onChange={(event) => setUnderstood(event.target.checked)} /><span>I understand that {peerName} can use this device with Pastey's rights here{rights === "administrator" ? ", which are administrator rights" : ""}, while Full Access is on.</span></label>
   </Dialog>;
 }
 

@@ -42,7 +42,7 @@ export function DeviceTrustSettings() {
 
   return <>
     <section className="section" aria-label="Trusted devices">
-      <div className="section-head"><h2>Trusted devices</h2><p>Trusting a device lets you give it limited permissions under Permissions. It does not let it run or read anything by itself.</p></div>
+      <div className="section-head"><h2>Trusted devices</h2><p>Trusting a device lets you share folders with it. It does not let it run or read anything by itself; Full Access, given inside a Bridge, is the separate decision that does.</p></div>
       <div className="card"><div className="list">
         {activeTrusted.length === 0 ? <p className="list-empty">No trusted devices.</p> : activeTrusted.map((device) => <ListRow key={device.fingerprint} leading={<Icon name="shield" />} title={device.label} meta={<span className="mono">{device.displayFingerprint}</span>} side={<button type="button" className="btn btn-danger btn-sm" disabled={pending} onClick={() => void act(() => revokeTrustedDevice(device.fingerprint))}>Revoke device</button>} />)}
       </div></div>
@@ -64,7 +64,7 @@ function TrustDialog({ device, pending, onCancel, onConfirm }: { device: SeenPee
   return <Dialog title={`Trust ${device.peerName}?`} onClose={onCancel} footer={<><button type="button" className="btn" onClick={onCancel}>Cancel</button><button type="button" className="btn btn-primary" disabled={pending} onClick={onConfirm}>It matches. Trust</button></>}>
     <p>{confirmText}</p>
     <p className="mono fingerprint-callout">{device.displayFingerprint}</p>
-    <p className="small muted">Trusting it lets you give it limited permissions. It does not let it run anything by itself.</p>
+    <p className="small muted">Trusting it lets you share folders with it. It does not let it run anything by itself.</p>
   </Dialog>;
 }
 

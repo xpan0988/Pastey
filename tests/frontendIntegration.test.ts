@@ -36,7 +36,7 @@ import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent,
 import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { bridgeInternetLine, internetSettingLine, relayUrlProblem } from "../src/lib/internetStatus";
-import { controlLine, expiryLabel, FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits } from "../src/lib/fullAccess";
+import { controlLine, expiryLabel, FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits, processRightsWarning } from "../src/lib/fullAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
 import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
@@ -790,13 +790,21 @@ test("Full Access is one informed, directional decision made only on the control
   // The consent says what it allows, in plain words, including the terminal.
   const allows = fullAccessAllows("School Mac").join(" ");
   assert.match(allows, /Run Codex in any folder on this device, and continue Codex sessions here/);
-  assert.match(allows, /Open a terminal on this device \(PowerShell on Windows, your shell on macOS\) as your user account/);
-  assert.match(allows, /read, change or delete your files and run programs/);
+  assert.match(allows, /Open a terminal on this device \(PowerShell on Windows, your shell on macOS\) with exactly the rights Pastey has here/);
+  assert.match(allows, /read, change or delete your files, reach any folder, and run programs/);
+  // Folder rules are not presented as limiting the terminal or Codex.
+  assert.match(allows, /folder rules decide only which folders are offered for sessions; they do not limit the terminal or Codex/);
   // What it does not do: direction, the Agent's own approvals, the OS.
   const limits = fullAccessLimits("School Mac").join(" ");
   assert.match(limits, /does not let this device control School Mac/);
-  assert.match(limits, /Codex still asks before risky commands and file changes\. Those questions go to the person using School Mac/);
-  assert.match(limits, /administrator prompts, macOS privacy permissions and Windows UAC still apply/);
+  assert.match(limits, /Pastey never answers Codex's own questions\. Whether Codex asks before a command or file change follows Codex's own settings on this device/);
+  assert.match(limits, /It never raises its rights: a Windows UAC prompt, an administrator password, or a macOS privacy prompt/);
+  assert.match(limits, /What Pastey has already been allowed, it has too/);
+  assert.doesNotMatch(limits, /Codex still asks|cannot get past your operating system/);
+  // The rights it inherits are stated before granting.
+  assert.equal(processRightsWarning("standard"), null);
+  assert.match(processRightsWarning("administrator") ?? "", /running as administrator[\s\S]*administrator rights too, with no UAC prompt/);
+  assert.match(processRightsWarning("unknown") ?? "", /Whatever rights it has, the other device gets/);
   assert.match(limits, /Claude Code sessions here can still be continued only on this device/);
   assert.match(FULL_ACCESS_ENDS.join(" "), /Revoke Full Access[\s\S]*Forget or revoke the device[\s\S]*Burn this Bridge, or pair it with another device/);
   assert.match(controlLine("Home PC", true), /start there without anyone accepting them/);
@@ -820,6 +828,8 @@ test("Full Access is one informed, directional decision made only on the control
   assert.match(access, /disabled=\{pending \|\| !understood\} onClick=\{onGrant\}/);
   assert.match(access, /grantFullAccess\(room\.id, true\)/);
   assert.match(access, /<p className="mono fingerprint-callout">\{fingerprint\}<\/p>/);
+  assert.match(access, /rights=\{state\.processRights\}/);
+  assert.match(access, /\{warning \? <Notice tone=/);
   assert.match(access, /without anyone at this device clicking Accept<\/strong>, even when you are away/);
   // Revoking is one confirmed step, and says what keeps running.
   assert.match(access, /revokeFullAccess\(room\.id\)/);
@@ -920,7 +930,7 @@ test("Codex requests are shown as untrusted text and answered only once, by the 
   assert.match(panel, /respondRemoteNativeDecision\(roomId, status\.taskId, review\.reviewRef, review\.contentDigest, decision\)/);
   assert.match(bindings, /invoke\("respond_remote_native_decision", \{ roomId, taskId, reviewRef, contentDigest, decision \}\)/);
   // Full Access never approves; its consent says where requests go instead.
-  assert.match(fullAccessLimits("School Mac").join(" "), /Those questions go to the person using School Mac, and Pastey never answers them by itself/);
+  assert.match(fullAccessLimits("School Mac").join(" "), /Pastey never answers Codex's own questions[\s\S]*the question goes to the person using School Mac/);
 });
 
 function sessionView(overrides: Partial<SessionView>): SessionView {

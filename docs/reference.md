@@ -383,6 +383,8 @@ Design and contract: [Connectivity](layers/layer-4-connectivity.md). Source: `sr
 | Active when | `FULL_ACCESS_IS_ACTIVE` in `storage.rs`: unrevoked; `trusted_devices` row with the same fingerprint and key, unrevoked; `bridge_peer_pins` row for the Bridge with the same peer HostRef and key; Bridge row live and not tombstoned |
 | Created by | `grant_full_access({ roomId, understood: true })`, local only; uses the Bridge's pin, trusts that key, keeps one active grant per Bridge |
 | Ended by | `revoke_full_access`, `revoke_trusted_device`, `forget_known_device`, pairing the Bridge with another key (`establish_fresh_peer_trust`), Burn (cutoff, then `delete_bridge_full_access`) |
+| On revoke | `end_full_access_operations`: closes the Bridge's hosted terminals (`host_closed`); `stop_full_access_tasks` asks every task the grant admitted to stop, recorded as `native_agent_full_access_revoked` (or `native_agent_cancel_delivery_uncertain`) with state `cancelled` |
+| Process rights | `get_bridge_full_access` reports `processRights`: `standard`, `administrator` (elevated Windows token or root) or `unknown`; everything Full Access starts inherits them |
 | Other local commands | `get_bridge_full_access`, `list_full_access`, `remove_full_access_folder` |
 | Requester command | `open_remote_folder(roomId, targetHostRef, folder)` |
 | Folders | Same rule as a share (`validate_shareable_folder`); at most 32 per grant; forgotten on revoke |

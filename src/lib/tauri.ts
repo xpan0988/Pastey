@@ -754,6 +754,8 @@ export interface FullAccessGrant {
 /** Full Access for one Bridge, as this device's user sees it. */
 export interface BridgeFullAccess {
   paired: boolean;
+  /** The rights everything Full Access starts here runs with. */
+  processRights: "standard" | "administrator" | "unknown";
   /** The paired device's fingerprint, to compare before giving it. */
   displayFingerprint: string | null;
   grant: FullAccessGrant | null;

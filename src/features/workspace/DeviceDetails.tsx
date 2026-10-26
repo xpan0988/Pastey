@@ -223,7 +223,7 @@ function TrustSection({ room, name, seen, myFingerprint, onChanged, onOpenSettin
     {confirm && seen ? <Dialog title={`Trust ${seen.peerName}?`} labelledBy="trust-device-title" onClose={() => setConfirm(false)} footer={<><button type="button" className="btn" onClick={() => setConfirm(false)}>Cancel</button><button type="button" className="btn btn-primary" disabled={pending} onClick={() => { setConfirm(false); void act(() => trustPeerDevice(seen.fingerprint)); }}>It matches. Trust</button></>}>
       <p>{`Only continue if ${seen.peerName} shows exactly this identity under Settings → This device:`}</p>
       <p className="mono fingerprint-callout">{seen.displayFingerprint}</p>
-      <p className="small muted">Trusting it lets you give it limited permissions. It does not let it run anything by itself.</p>
+      <p className="small muted">Trusting it lets you share folders with it. It does not let it run anything by itself.</p>
     </Dialog> : null}
   </div>;
 }

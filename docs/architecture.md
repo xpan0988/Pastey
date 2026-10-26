@@ -142,7 +142,10 @@ and any malformed or mismatched terminal notification stay non-DONE.
   local command of the controlled Host's user after informed consent. It
   replaces each Accept and nothing else: it never answers a native
   capability's own approvals, runs a capability local to its Host, admits a
-  managed Plan, or passes an operating-system prompt or permission.
+  managed Plan, or raises the Pastey process's own rights, which everything
+  it starts inherits. Revoking it refuses new requests at once, closes the
+  terminals it opened and asks the tasks it admitted to stop, without
+  claiming a stop it cannot confirm.
 - An adapter prepares or starts an invocation only after Core has admitted it.
 - Requester movement approval and executor execution approval are distinct;
   neither substitutes for the other.
@@ -282,7 +285,7 @@ human controller enters Developer Mode
 
 The grant is bound to the controller and target Developer Host identities, exact terminal/session binding, Bridge, terminal session, expiry, and one PTY start. A route is necessary but insufficient. The requester cannot choose executable, argv, cwd, environment, or privilege escalation. Unix uses a Host-selected allowed shell in a real PTY; Windows uses PowerShell through ConPTY.
 
-When the target Host's user gave the controlling device **Full Access** ([Layer 5](layers/layer-5-agent.md#full-access)) and that device proved its identity in exactly the session the request arrived on, the target admits the pending request itself, without a Host-local interaction, and creates the same one-use `DeveloperTerminalGrant` (checked again just before the PTY starts; any failure leaves the request pending for Accept). Everything else is unchanged: the grant's binding, 30-minute lifetime, one PTY start, revocation events, and the Host-selected shell. The target's Bridge view shows such a terminal with **Close terminal**, and revoking Full Access closes it; the controller is told `host_closed`. Full Access never runs the shell elevated.
+When the target Host's user gave the controlling device **Full Access** ([Layer 5](layers/layer-5-agent.md#full-access)) and that device proved its identity in exactly the session the request arrived on, the target admits the pending request itself, without a Host-local interaction, and creates the same one-use `DeveloperTerminalGrant` (checked again just before the PTY starts; any failure leaves the request pending for Accept). Everything else is unchanged: the grant's binding, 30-minute lifetime, one PTY start, revocation events, and the Host-selected shell. The target's Bridge view shows such a terminal with **Close terminal**, and revoking Full Access closes it; the controller is told `host_closed`. The shell has exactly the Pastey process's rights: Full Access never raises them, but if Pastey itself runs as administrator, so does the shell, and the consent dialog says so first.
 
 Terminal messages use the authenticated encrypted Room Control transport but a distinct `developer_terminal` protocol branch. They do not enter ordinary Bridge item history. Wrong, stale, replayed, out-of-order, oversized, or late frames fail closed. Current bounds and protocol names live in [reference](reference.md).
 

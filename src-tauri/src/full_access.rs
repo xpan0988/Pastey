@@ -52,12 +52,83 @@ pub(crate) struct FullAccessViewV1 {
     pub(crate) folders: Vec<String>,
 }
 
+/// The rights everything Full Access starts here inherits: those of this
+/// Pastey process. Shown before granting, so the consent is truthful.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProcessRightsV1 {
+    /// An ordinary user account's rights (Windows: a filtered token).
+    Standard,
+    /// Administrator (an elevated Windows token) or root.
+    Administrator,
+    Unknown,
+}
+
+/// What this process runs as. Terminals and native agents started here
+/// inherit it: Full Access never raises it, and never lowers it either.
+pub(crate) fn process_rights() -> ProcessRightsV1 {
+    match process_is_elevated() {
+        Some(true) => ProcessRightsV1::Administrator,
+        Some(false) => ProcessRightsV1::Standard,
+        None => ProcessRightsV1::Unknown,
+    }
+}
+
+#[cfg(unix)]
+fn process_is_elevated() -> Option<bool> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    Some(unsafe { libc::geteuid() } == 0)
+}
+
+/// Whether this process's effective token is in the Administrators group,
+/// which under UAC is true only for an elevated token.
+#[cfg(windows)]
+fn process_is_elevated() -> Option<bool> {
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid, SECURITY_NT_AUTHORITY,
+    };
+    const SECURITY_BUILTIN_DOMAIN_RID: u32 = 0x0000_0020;
+    const DOMAIN_ALIAS_RID_ADMINS: u32 = 0x0000_0220;
+    // SAFETY: the SID is allocated, used and freed here only; a null token
+    // handle means this thread's effective token.
+    unsafe {
+        let mut administrators = std::ptr::null_mut();
+        if AllocateAndInitializeSid(
+            &SECURITY_NT_AUTHORITY,
+            2,
+            SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut administrators,
+        ) == 0
+        {
+            return None;
+        }
+        let mut member = 0;
+        let checked = CheckTokenMembership(std::ptr::null_mut(), administrators, &mut member);
+        FreeSid(administrators);
+        (checked != 0).then_some(member != 0)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_elevated() -> Option<bool> {
+    None
+}
+
 /// Full Access as this Host's user sees it for one Bridge.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BridgeFullAccessV1 {
     /// Whether the Bridge is paired with a device it could be given to.
     pub(crate) paired: bool,
+    /// The rights everything it starts here runs with.
+    pub(crate) process_rights: ProcessRightsV1,
     /// The paired device's fingerprint, to compare before granting.
     pub(crate) display_fingerprint: Option<String>,
     pub(crate) grant: Option<FullAccessViewV1>,
@@ -155,6 +226,7 @@ pub(crate) fn bridge_full_access(paths: &AppPaths, room_id: &str) -> AppResult<B
         .transpose()?;
     Ok(BridgeFullAccessV1 {
         paired: pin.is_some(),
+        process_rights: process_rights(),
         display_fingerprint: pin
             .map(|pin| display_fingerprint(&fingerprint(&pin.peer_device_public_key))),
         grant,
