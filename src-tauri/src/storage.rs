@@ -190,29 +190,10 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             revoked_at INTEGER
         );
 
-        -- Host-local, expiring, use-limited permission for one trusted device
-        -- to run one capability in one workspace over one Bridge without a
-        -- per-task Review on this Host.
-        CREATE TABLE IF NOT EXISTS unattended_grants (
-            grant_id TEXT PRIMARY KEY,
-            device_fingerprint TEXT NOT NULL,
-            bridge_id TEXT NOT NULL,
-            peer_host_ref TEXT NOT NULL,
-            local_host_ref TEXT NOT NULL,
-            capability_id TEXT NOT NULL,
-            workspace TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
-            max_uses INTEGER NOT NULL,
-            uses INTEGER NOT NULL DEFAULT 0,
-            revoked_at INTEGER
-        );
-
         -- Workspaces this Host's user shares with one trusted device over
         -- one Bridge, each with what it allows: reading native session
         -- summaries, and asking to run native agents there (each run still
-        -- waits for this Host's Review). Separate from unattended grants:
-        -- sharing never lets anything run without that Review.
+        -- waits for this Host's Review unless the device has Full Access).
         CREATE TABLE IF NOT EXISTS session_read_grants (
             grant_id TEXT PRIMARY KEY,
             device_fingerprint TEXT NOT NULL,
@@ -226,10 +207,31 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             revoked_at INTEGER
         );
 
-        CREATE TABLE IF NOT EXISTS unattended_grant_uses (
-            task_id TEXT PRIMARY KEY,
+        -- Full Access: this Host's user lets the device one Bridge is paired
+        -- with control this Host through Pastey without anyone here
+        -- accepting each request. Directional (it says nothing about this
+        -- Host controlling that device), created only by a local command,
+        -- and counted only while the Bridge is live, still pinned to exactly
+        -- this device key and HostRef, and the device is still trusted.
+        CREATE TABLE IF NOT EXISTS full_access_grants (
+            grant_id TEXT PRIMARY KEY,
+            bridge_id TEXT NOT NULL,
+            peer_host_ref TEXT NOT NULL,
+            local_host_ref TEXT NOT NULL,
+            device_fingerprint TEXT NOT NULL,
+            device_public_key TEXT NOT NULL,
+            granted_at INTEGER NOT NULL,
+            revoked_at INTEGER
+        );
+
+        -- Folders a device with Full Access named on this Host by path, so
+        -- it can read and continue their sessions like a shared folder's.
+        -- They count only while their grant is active.
+        CREATE TABLE IF NOT EXISTS full_access_folders (
             grant_id TEXT NOT NULL,
-            used_at INTEGER NOT NULL
+            workspace TEXT NOT NULL,
+            added_at INTEGER NOT NULL,
+            PRIMARY KEY (grant_id, workspace)
         );
 
         -- The address the user gave to reach one Bridge's peer on another
@@ -342,6 +344,7 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
     ensure_bridge_peer_schema(&conn)?;
     ensure_authorized_search_folder_schema(&conn)?;
     ensure_workspace_share_schema(&conn)?;
+    retire_unattended_grants(&conn)?;
     bridge_plan::init_schema(&conn)?;
     migrate_room_statuses(&conn)?;
     backfill_legacy_bridge_peers(&conn)?;
@@ -478,9 +481,6 @@ pub(crate) fn update_native_agent_observed_task_if_present(
     Ok(())
 }
 
-/// Most unattended grants a Host keeps active at once.
-pub(crate) const MAX_ACTIVE_UNATTENDED_GRANTS: i64 = 32;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredTrustedDevice {
     pub(crate) fingerprint: String,
@@ -539,13 +539,14 @@ pub(crate) fn revoke_trusted_device(paths: &AppPaths, fingerprint: &str) -> AppR
         "UPDATE trusted_devices SET revoked_at = ?2 WHERE fingerprint = ?1 AND revoked_at IS NULL",
         params![fingerprint, now],
     )?;
-    transaction.execute(
-        "UPDATE unattended_grants SET revoked_at = ?2 WHERE device_fingerprint = ?1 AND revoked_at IS NULL",
-        params![fingerprint, now],
-    )?;
-    // Trusting the device again later must not bring its shares back.
+    // Trusting the device again later must not bring its Full Access or its
+    // shares back.
     transaction.execute(
         "UPDATE session_read_grants SET revoked_at = ?2 WHERE device_fingerprint = ?1 AND revoked_at IS NULL",
+        params![fingerprint, now],
+    )?;
+    transaction.execute(
+        "UPDATE full_access_grants SET revoked_at = ?2 WHERE device_fingerprint = ?1 AND revoked_at IS NULL",
         params![fingerprint, now],
     )?;
     transaction.commit()?;
@@ -553,211 +554,300 @@ pub(crate) fn revoke_trusted_device(paths: &AppPaths, fingerprint: &str) -> AppR
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct StoredUnattendedGrant {
+pub(crate) struct StoredFullAccessGrant {
     pub(crate) grant_id: String,
-    pub(crate) device_fingerprint: String,
     pub(crate) bridge_id: String,
     pub(crate) peer_host_ref: String,
     pub(crate) local_host_ref: String,
-    pub(crate) capability_id: String,
-    pub(crate) workspace: String,
-    pub(crate) created_at: i64,
-    pub(crate) expires_at: i64,
-    pub(crate) max_uses: i64,
-    pub(crate) uses: i64,
+    pub(crate) device_fingerprint: String,
+    /// Standard base64, the encoding of both `trusted_devices` and
+    /// `bridge_peer_pins`.
+    pub(crate) device_public_key: String,
+    pub(crate) granted_at: i64,
     pub(crate) revoked_at: Option<i64>,
 }
 
-const GRANT_COLUMNS: &str =
-    "g.grant_id, g.device_fingerprint, g.bridge_id, g.peer_host_ref, g.local_host_ref,
-    g.capability_id, g.workspace, g.created_at, g.expires_at, g.max_uses, g.uses, g.revoked_at";
+const FULL_ACCESS_COLUMNS: &str = "f.grant_id, f.bridge_id, f.peer_host_ref, f.local_host_ref,
+    f.device_fingerprint, f.device_public_key, f.granted_at, f.revoked_at";
 
-fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUnattendedGrant> {
-    Ok(StoredUnattendedGrant {
+fn row_to_full_access(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFullAccessGrant> {
+    Ok(StoredFullAccessGrant {
         grant_id: row.get(0)?,
-        device_fingerprint: row.get(1)?,
-        bridge_id: row.get(2)?,
-        peer_host_ref: row.get(3)?,
-        local_host_ref: row.get(4)?,
-        capability_id: row.get(5)?,
-        workspace: row.get(6)?,
-        created_at: row.get(7)?,
-        expires_at: row.get(8)?,
-        max_uses: row.get(9)?,
-        uses: row.get(10)?,
-        revoked_at: row.get(11)?,
+        bridge_id: row.get(1)?,
+        peer_host_ref: row.get(2)?,
+        local_host_ref: row.get(3)?,
+        device_fingerprint: row.get(4)?,
+        device_public_key: row.get(5)?,
+        granted_at: row.get(6)?,
+        revoked_at: row.get(7)?,
     })
 }
 
-/// The condition every use of a grant is checked against, in SQL, so that
-/// listing candidates and consuming one apply exactly the same rule.
-const GRANT_IS_ACTIVE: &str = "g.revoked_at IS NULL AND g.expires_at > ?1 AND g.uses < g.max_uses
-    AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = g.device_fingerprint AND d.revoked_at IS NULL)
-    AND EXISTS (SELECT 1 FROM rooms r WHERE r.id = g.bridge_id AND r.status != 'burned')
-    AND NOT EXISTS (SELECT 1 FROM burned_bridges b WHERE b.room_id = g.bridge_id)";
+/// The one rule every use of Full Access is checked against, in SQL: not
+/// revoked; the device still trusted with exactly this key; the Bridge live
+/// and still pinned to exactly this device key and HostRef. Forgetting the
+/// device, pairing the Bridge with another device, revoking the device and
+/// Burn each end it here, whatever else is still recorded.
+const FULL_ACCESS_IS_ACTIVE: &str = "f.revoked_at IS NULL
+    AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = f.device_fingerprint
+        AND d.public_key = f.device_public_key AND d.revoked_at IS NULL)
+    AND EXISTS (SELECT 1 FROM bridge_peer_pins p WHERE p.room_id = f.bridge_id
+        AND p.peer_host_ref = f.peer_host_ref AND p.peer_device_public_key = f.device_public_key)
+    AND EXISTS (SELECT 1 FROM rooms r WHERE r.id = f.bridge_id AND r.status != 'burned')
+    AND NOT EXISTS (SELECT 1 FROM burned_bridges b WHERE b.room_id = f.bridge_id)";
 
-/// Creates one grant. The device must be trusted and the Bridge live; the
-/// caller has already checked everything else Host-locally.
-pub(crate) fn insert_unattended_grant(
+/// Most folders one Full Access grant keeps.
+pub(crate) const MAX_FULL_ACCESS_FOLDERS: i64 = 32;
+
+/// Records Full Access for the device `grant` names, trusting that device
+/// key in the same transaction. One active grant per Bridge: granting again
+/// keeps the existing one. Fails unless the Bridge is live and pinned to
+/// exactly that device key and HostRef now.
+pub(crate) fn insert_full_access_grant(
     paths: &AppPaths,
-    grant: &StoredUnattendedGrant,
-) -> AppResult<()> {
+    grant: &StoredFullAccessGrant,
+    device_label: &str,
+) -> AppResult<StoredFullAccessGrant> {
     let mut conn = connection(paths)?;
-    // Concurrent writers wait briefly instead of failing.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let now = now_ts();
-    let active: i64 = transaction.query_row(
-        &format!("SELECT COUNT(*) FROM unattended_grants g WHERE {GRANT_IS_ACTIVE}"),
-        [now],
-        |row| row.get(0),
-    )?;
-    if active >= MAX_ACTIVE_UNATTENDED_GRANTS {
-        return Err(AppError::InvalidInput(
-            "Revoke an unattended permission before adding another.".into(),
-        ));
-    }
-    let trusted: i64 = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM trusted_devices WHERE fingerprint = ?1 AND revoked_at IS NULL)",
-        [&grant.device_fingerprint],
-        |row| row.get(0),
-    )?;
-    let bridge_live: i64 = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status != 'burned')
+    let pinned: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bridge_peer_pins WHERE room_id = ?1 AND peer_host_ref = ?2
+                AND peer_device_public_key = ?3)
+            AND EXISTS(SELECT 1 FROM rooms WHERE id = ?1 AND status != 'burned')
             AND NOT EXISTS(SELECT 1 FROM burned_bridges WHERE room_id = ?1)",
-        [&grant.bridge_id],
+        params![
+            &grant.bridge_id,
+            &grant.peer_host_ref,
+            &grant.device_public_key
+        ],
         |row| row.get(0),
     )?;
-    if trusted == 0 || bridge_live == 0 {
+    if pinned == 0 {
         return Err(AppError::InvalidInput(
-            "That device or Bridge is no longer available for unattended permission.".into(),
+            "This Bridge is no longer paired with that device. Pair it again first.".into(),
         ));
     }
+    // Trusting here is part of the same informed decision: the key is the
+    // one the pairing code proved, and revoking the device ends Full Access.
+    let trusted_key: Option<(String, Option<i64>)> = transaction
+        .query_row(
+            "SELECT public_key, revoked_at FROM trusted_devices WHERE fingerprint = ?1",
+            [&grant.device_fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if !matches!(&trusted_key, Some((key, None)) if *key == grant.device_public_key) {
+        transaction.execute(
+            "INSERT INTO trusted_devices (fingerprint, public_key, label, enrolled_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(fingerprint) DO UPDATE SET public_key = excluded.public_key,
+                 label = excluded.label, enrolled_at = excluded.enrolled_at, revoked_at = NULL",
+            params![
+                &grant.device_fingerprint,
+                &grant.device_public_key,
+                device_label,
+                grant.granted_at
+            ],
+        )?;
+    }
+    let existing = transaction
+        .query_row(
+            &format!(
+                "SELECT {FULL_ACCESS_COLUMNS} FROM full_access_grants f
+                 WHERE {FULL_ACCESS_IS_ACTIVE} AND f.bridge_id = ?1"
+            ),
+            [&grant.bridge_id],
+            row_to_full_access,
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        transaction.commit()?;
+        return Ok(existing);
+    }
+    // Anything older for this Bridge (another device, or one that lost its
+    // pin) never comes back.
     transaction.execute(
-        "INSERT INTO unattended_grants (grant_id, device_fingerprint, bridge_id, peer_host_ref,
-            local_host_ref, capability_id, workspace, created_at, expires_at, max_uses, uses, revoked_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, NULL)",
+        "UPDATE full_access_grants SET revoked_at = ?2 WHERE bridge_id = ?1 AND revoked_at IS NULL",
+        params![&grant.bridge_id, grant.granted_at],
+    )?;
+    transaction.execute(
+        "INSERT INTO full_access_grants (grant_id, bridge_id, peer_host_ref, local_host_ref,
+            device_fingerprint, device_public_key, granted_at, revoked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)",
         params![
             &grant.grant_id,
-            &grant.device_fingerprint,
             &grant.bridge_id,
             &grant.peer_host_ref,
             &grant.local_host_ref,
-            &grant.capability_id,
-            &grant.workspace,
-            grant.created_at,
-            grant.expires_at,
-            grant.max_uses
+            &grant.device_fingerprint,
+            &grant.device_public_key,
+            grant.granted_at
         ],
     )?;
     transaction.commit()?;
-    Ok(())
+    Ok(grant.clone())
 }
 
-pub(crate) fn list_unattended_grants(paths: &AppPaths) -> AppResult<Vec<StoredUnattendedGrant>> {
+pub(crate) fn list_full_access_grants(paths: &AppPaths) -> AppResult<Vec<StoredFullAccessGrant>> {
     let conn = connection(paths)?;
     let mut statement = conn.prepare(&format!(
-        "SELECT {GRANT_COLUMNS} FROM unattended_grants g ORDER BY g.created_at DESC, g.grant_id"
+        "SELECT {FULL_ACCESS_COLUMNS} FROM full_access_grants f
+         ORDER BY f.granted_at DESC, f.grant_id"
     ))?;
     let grants = statement
-        .query_map([], row_to_grant)?
+        .query_map([], row_to_full_access)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(grants)
 }
 
-/// Whether a grant may be used at `now`.
-pub(crate) fn unattended_grant_is_active(
-    paths: &AppPaths,
-    grant_id: &str,
-    now: i64,
-) -> AppResult<bool> {
-    let active: i64 = connection(paths)?.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM unattended_grants g WHERE g.grant_id = ?2 AND {GRANT_IS_ACTIVE})"),
-        params![now, grant_id],
-        |row| row.get(0),
-    )?;
-    Ok(active != 0)
+/// Every active grant, for this Host's own user.
+pub(crate) fn active_full_access_grants(paths: &AppPaths) -> AppResult<Vec<StoredFullAccessGrant>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(&format!(
+        "SELECT {FULL_ACCESS_COLUMNS} FROM full_access_grants f
+         WHERE {FULL_ACCESS_IS_ACTIVE} ORDER BY f.granted_at DESC, f.grant_id"
+    ))?;
+    let grants = statement
+        .query_map([], row_to_full_access)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(grants)
 }
 
-/// Active grants of exactly this device key, Bridge, peer, Host and
-/// capability.
-pub(crate) fn candidate_unattended_grants(
+/// The active grant of exactly this device key, Bridge, peer and Host.
+pub(crate) fn matching_full_access_grant(
     paths: &AppPaths,
     device_fingerprint: &str,
     device_public_key: &str,
     bridge_id: &str,
     peer_host_ref: &str,
     local_host_ref: &str,
-    capability_id: &str,
-    now: i64,
-) -> AppResult<Vec<StoredUnattendedGrant>> {
-    let conn = connection(paths)?;
-    let mut statement = conn.prepare(&format!(
-        "SELECT {GRANT_COLUMNS} FROM unattended_grants g
-         WHERE {GRANT_IS_ACTIVE}
-           AND g.device_fingerprint = ?2 AND g.bridge_id = ?3 AND g.peer_host_ref = ?4
-           AND g.local_host_ref = ?5 AND g.capability_id = ?6
-           AND EXISTS (SELECT 1 FROM trusted_devices d WHERE d.fingerprint = ?2 AND d.public_key = ?7)
-         ORDER BY g.expires_at, g.grant_id"
-    ))?;
-    let grants = statement
-        .query_map(
+) -> AppResult<Option<StoredFullAccessGrant>> {
+    Ok(connection(paths)?
+        .query_row(
+            &format!(
+                "SELECT {FULL_ACCESS_COLUMNS} FROM full_access_grants f
+                 WHERE {FULL_ACCESS_IS_ACTIVE}
+                   AND f.device_fingerprint = ?1 AND f.device_public_key = ?2
+                   AND f.bridge_id = ?3 AND f.peer_host_ref = ?4 AND f.local_host_ref = ?5"
+            ),
             params![
-                now,
                 device_fingerprint,
+                device_public_key,
                 bridge_id,
                 peer_host_ref,
-                local_host_ref,
-                capability_id,
-                device_public_key
+                local_host_ref
             ],
-            row_to_grant,
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(grants)
+            row_to_full_access,
+        )
+        .optional()?)
 }
 
-/// Spends one use of a grant for exactly one task, atomically: the grant
-/// must still be active at this instant, and a task can consume at most one
-/// use ever. Returns false when it cannot (revoked, expired, exhausted, or
-/// the task already used one).
-pub(crate) fn consume_unattended_grant(
-    paths: &AppPaths,
-    grant_id: &str,
-    task_id: &str,
-    now: i64,
-) -> AppResult<bool> {
+/// Revokes every Full Access grant of one Bridge, with its folders.
+pub(crate) fn revoke_bridge_full_access(paths: &AppPaths, bridge_id: &str) -> AppResult<bool> {
     let mut conn = connection(paths)?;
-    // Concurrent writers wait briefly instead of failing.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let already: i64 = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM unattended_grant_uses WHERE task_id = ?1)",
-        [task_id],
-        |row| row.get(0),
+    let changed = transaction.execute(
+        "UPDATE full_access_grants SET revoked_at = ?2 WHERE bridge_id = ?1 AND revoked_at IS NULL",
+        params![bridge_id, now_ts()],
     )?;
-    if already != 0 {
-        return Ok(false);
-    }
-    let spent = transaction.execute(
-        &format!("UPDATE unattended_grants AS g SET uses = uses + 1 WHERE g.grant_id = ?2 AND {GRANT_IS_ACTIVE}"),
-        params![now, grant_id],
-    )?;
-    if spent != 1 {
-        return Ok(false);
-    }
     transaction.execute(
-        "INSERT INTO unattended_grant_uses (task_id, grant_id, used_at) VALUES (?1, ?2, ?3)",
-        params![task_id, grant_id, now],
+        "DELETE FROM full_access_folders WHERE grant_id IN
+            (SELECT grant_id FROM full_access_grants WHERE bridge_id = ?1)",
+        [bridge_id],
     )?;
     transaction.commit()?;
-    Ok(true)
+    Ok(changed > 0)
 }
 
-pub(crate) fn revoke_unattended_grant(paths: &AppPaths, grant_id: &str) -> AppResult<bool> {
+/// Burn, or pairing the Bridge with another device: its Full Access and
+/// folders end with it.
+pub(crate) fn delete_bridge_full_access(paths: &AppPaths, bridge_id: &str) -> AppResult<()> {
+    let conn = connection(paths)?;
+    conn.execute(
+        "DELETE FROM full_access_folders WHERE grant_id IN
+            (SELECT grant_id FROM full_access_grants WHERE bridge_id = ?1)",
+        [bridge_id],
+    )?;
+    conn.execute(
+        "DELETE FROM full_access_grants WHERE bridge_id = ?1",
+        [bridge_id],
+    )?;
+    Ok(())
+}
+
+/// Adds one folder to an active grant; adding it again is no change.
+pub(crate) fn add_full_access_folder(
+    paths: &AppPaths,
+    grant_id: &str,
+    workspace: &str,
+    now: i64,
+) -> AppResult<()> {
+    let mut conn = connection(paths)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let active: i64 = transaction.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM full_access_grants f
+                WHERE f.grant_id = ?1 AND {FULL_ACCESS_IS_ACTIVE})"
+        ),
+        [grant_id],
+        |row| row.get(0),
+    )?;
+    if active == 0 {
+        return Err(AppError::InvalidInput(
+            "This device no longer has Full Access here.".into(),
+        ));
+    }
+    let known: i64 = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM full_access_folders WHERE grant_id = ?1 AND workspace = ?2)",
+        params![grant_id, workspace],
+        |row| row.get(0),
+    )?;
+    if known != 0 {
+        return Ok(());
+    }
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM full_access_folders WHERE grant_id = ?1",
+        [grant_id],
+        |row| row.get(0),
+    )?;
+    if count >= MAX_FULL_ACCESS_FOLDERS {
+        return Err(AppError::InvalidInput(
+            "That device has opened as many folders here as it may. Remove one on this device first."
+                .into(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO full_access_folders (grant_id, workspace, added_at) VALUES (?1, ?2, ?3)",
+        params![grant_id, workspace, now],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// The folders of one grant, oldest first.
+pub(crate) fn full_access_folders(paths: &AppPaths, grant_id: &str) -> AppResult<Vec<String>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare(
+        "SELECT workspace FROM full_access_folders WHERE grant_id = ?1
+         ORDER BY added_at, workspace",
+    )?;
+    let folders = statement
+        .query_map([grant_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(folders)
+}
+
+pub(crate) fn remove_full_access_folder(
+    paths: &AppPaths,
+    grant_id: &str,
+    workspace: &str,
+) -> AppResult<bool> {
     Ok(connection(paths)?.execute(
-        "UPDATE unattended_grants SET revoked_at = ?2 WHERE grant_id = ?1 AND revoked_at IS NULL",
-        params![grant_id, now_ts()],
+        "DELETE FROM full_access_folders WHERE grant_id = ?1 AND workspace = ?2",
+        params![grant_id, workspace],
     )? > 0)
 }
 
@@ -773,7 +863,7 @@ pub(crate) struct StoredSessionReadGrant {
     pub(crate) read_sessions: bool,
     pub(crate) share_excerpts: bool,
     /// Whether the device may ask to run native agents here; each run still
-    /// waits for this Host's Review unless an unattended grant applies.
+    /// waits for this Host's Review unless the device has Full Access.
     pub(crate) agent_requests: bool,
     pub(crate) created_at: i64,
     pub(crate) expires_at: i64,
@@ -946,9 +1036,8 @@ pub(crate) fn update_session_read_grant(
     )? > 0)
 }
 
-/// Stops sharing one folder with one device over one Bridge: the share, and
-/// every unattended grant that device holds for that folder on that Bridge,
-/// end together, so nothing about the folder stays reachable over it.
+/// Stops sharing one folder with one device over one Bridge: every share of
+/// that folder with that device on that Bridge ends together.
 pub(crate) fn stop_sharing_workspace(paths: &AppPaths, grant_id: &str) -> AppResult<bool> {
     let mut conn = connection(paths)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -970,11 +1059,6 @@ pub(crate) fn stop_sharing_workspace(paths: &AppPaths, grant_id: &str) -> AppRes
          WHERE device_fingerprint = ?1 AND bridge_id = ?2 AND workspace = ?3 AND revoked_at IS NULL",
         params![&fingerprint, &bridge_id, &workspace, now],
     )?;
-    transaction.execute(
-        "UPDATE unattended_grants SET revoked_at = ?4
-         WHERE device_fingerprint = ?1 AND bridge_id = ?2 AND workspace = ?3 AND revoked_at IS NULL",
-        params![&fingerprint, &bridge_id, &workspace, now],
-    )?;
     transaction.commit()?;
     Ok(changed > 0)
 }
@@ -986,15 +1070,6 @@ pub(crate) fn delete_bridge_session_read_grants(
 ) -> AppResult<()> {
     connection(paths)?.execute(
         "DELETE FROM session_read_grants WHERE bridge_id = ?1",
-        [bridge_id],
-    )?;
-    Ok(())
-}
-
-/// Burn: a Bridge's grants end with it.
-pub(crate) fn delete_bridge_unattended_grants(paths: &AppPaths, bridge_id: &str) -> AppResult<()> {
-    connection(paths)?.execute(
-        "DELETE FROM unattended_grants WHERE bridge_id = ?1",
         [bridge_id],
     )?;
     Ok(())
@@ -1351,6 +1426,11 @@ pub(crate) fn forget_known_device(
     tx.execute(
         "DELETE FROM bridge_peer_pins WHERE peer_device_public_key = ?1",
         [&key],
+    )?;
+    // Pairing it again later must not bring Full Access back.
+    tx.execute(
+        "UPDATE full_access_grants SET revoked_at = ?1 WHERE device_public_key = ?2 AND revoked_at IS NULL",
+        params![now_ts(), key],
     )?;
     tx.commit()?;
     Ok(rooms)
@@ -2945,7 +3025,7 @@ pub fn finalize_burned_room(
     crate::native_agent::purge_durable_bridge_state(paths, room_id)?;
     delete_bridge_authorized_search_folders(paths, room_id)?;
     set_bridge_peer_address(paths, room_id, None)?;
-    delete_bridge_unattended_grants(paths, room_id)?;
+    delete_bridge_full_access(paths, room_id)?;
     delete_bridge_session_read_grants(paths, room_id)?;
     let conn = connection(paths)?;
     delete_room_files(paths, room_id, effective_inbox_dir)?;
@@ -3778,6 +3858,16 @@ fn ensure_workspace_share_schema(conn: &Connection) -> AppResult<()> {
             [],
         )?;
     }
+    Ok(())
+}
+
+/// Full Access replaced the per-folder, run-limited unattended grants. They
+/// are removed, never converted: a device that held one asks for Accept
+/// again until this Host's user gives it Full Access.
+fn retire_unattended_grants(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS unattended_grants; DROP TABLE IF EXISTS unattended_grant_uses;",
+    )?;
     Ok(())
 }
 

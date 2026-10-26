@@ -988,6 +988,7 @@ pub async fn discover_remote_native_sessions(
             active_within_secs,
             scope_ref,
             session_id: None,
+            folder: None,
         },
         &state,
     )
@@ -1018,6 +1019,7 @@ pub async fn inspect_remote_native_session(
             active_within_secs: None,
             scope_ref: None,
             session_id: Some(session_id),
+            folder: None,
         },
         &state,
     )
@@ -1071,6 +1073,40 @@ pub async fn list_remote_shared_workspaces(
             active_within_secs: None,
             scope_ref: None,
             session_id: None,
+            folder: None,
+        },
+        &state,
+    )
+    .await
+}
+
+/// Under the Full Access one exact current Bridge Host gave this device:
+/// adds one of that Host's folders, named by its full path, to the
+/// workspaces this device may work in there, so its sessions can be read
+/// and continued. That Host checks the folder against its own rules and
+/// lists it for its user; without Full Access it refuses.
+#[tauri::command]
+pub async fn open_remote_folder(
+    room_id: String,
+    target_host_ref: String,
+    folder: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::remote::RemoteSessionResponseV1, String> {
+    use crate::native_agent::sessions::remote::{RemoteSessionOperationV1, RemoteSessionQueryV1};
+    remote_native_session_query(
+        &room_id,
+        &target_host_ref,
+        RemoteSessionQueryV1 {
+            schema_version: String::new(),
+            request_id: String::new(),
+            target_host_ref: String::new(),
+            operation: RemoteSessionOperationV1::OpenFolder,
+            provider: None,
+            text: None,
+            active_within_secs: None,
+            scope_ref: None,
+            session_id: None,
+            folder: Some(folder.trim().to_owned()),
         },
         &state,
     )
@@ -1210,9 +1246,9 @@ fn local_device_identity(state: &AppState) -> AppResult<crate::device_identity::
 
 fn identity_view(
     identity: &crate::device_identity::DeviceIdentity,
-) -> crate::unattended_access::DeviceIdentityViewV1 {
+) -> crate::device_trust::DeviceIdentityViewV1 {
     let fingerprint = identity.fingerprint();
-    crate::unattended_access::DeviceIdentityViewV1 {
+    crate::device_trust::DeviceIdentityViewV1 {
         display_fingerprint: crate::device_identity::display_fingerprint(&fingerprint),
         fingerprint,
     }
@@ -1222,7 +1258,7 @@ fn identity_view(
 #[tauri::command]
 pub fn get_device_identity(
     state: State<'_, Arc<AppState>>,
-) -> Result<crate::unattended_access::DeviceIdentityViewV1, String> {
+) -> Result<crate::device_trust::DeviceIdentityViewV1, String> {
     local_device_identity(&state)
         .map(|identity| identity_view(&identity))
         .map_err(|error| error.message())
@@ -1233,7 +1269,7 @@ pub fn get_device_identity(
 #[tauri::command]
 pub fn rotate_device_identity(
     state: State<'_, Arc<AppState>>,
-) -> Result<crate::unattended_access::DeviceIdentityViewV1, String> {
+) -> Result<crate::device_trust::DeviceIdentityViewV1, String> {
     let master_key = {
         let config = state.config.read();
         config::master_key(&config).map_err(|error| error.message())?
@@ -1256,9 +1292,9 @@ fn peer_name_for(state: &AppState) -> impl Fn(&str) -> String + '_ {
 #[tauri::command]
 pub fn list_seen_peer_devices(
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<crate::unattended_access::SeenPeerDeviceV1>, String> {
+) -> Result<Vec<crate::device_trust::SeenPeerDeviceV1>, String> {
     let current = crate::host_runtime::current_verified_peer_devices(&state);
-    crate::unattended_access::seen_peer_devices(&state.paths, &current, peer_name_for(&state))
+    crate::device_trust::seen_peer_devices(&state.paths, &current, peer_name_for(&state))
         .map_err(|error| error.message())
 }
 
@@ -1266,75 +1302,131 @@ pub fn list_seen_peer_devices(
 pub fn trust_peer_device(
     fingerprint: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<crate::unattended_access::TrustedDeviceViewV1>, String> {
+) -> Result<Vec<crate::device_trust::TrustedDeviceViewV1>, String> {
     let current = crate::host_runtime::current_verified_peer_devices(&state);
     let label = current
         .iter()
         .find(|device| device.fingerprint == fingerprint)
         .map(|device| peer_name_for(&state)(&device.binding.bridge_id))
         .unwrap_or_default();
-    crate::unattended_access::trust_seen_device(&state.paths, &current, &fingerprint, &label)
-        .and_then(|()| crate::unattended_access::trusted_devices(&state.paths))
+    crate::device_trust::trust_seen_device(&state.paths, &current, &fingerprint, &label)
+        .and_then(|()| crate::device_trust::trusted_devices(&state.paths))
         .map_err(|error| error.message())
 }
 
 #[tauri::command]
 pub fn list_trusted_devices(
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<crate::unattended_access::TrustedDeviceViewV1>, String> {
-    crate::unattended_access::trusted_devices(&state.paths).map_err(|error| error.message())
+) -> Result<Vec<crate::device_trust::TrustedDeviceViewV1>, String> {
+    crate::device_trust::trusted_devices(&state.paths).map_err(|error| error.message())
 }
 
+/// Revoking a device also ends its Full Access, so a terminal it has open
+/// here closes too.
 #[tauri::command]
 pub fn revoke_trusted_device(
     fingerprint: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<crate::unattended_access::TrustedDeviceViewV1>, String> {
-    crate::unattended_access::revoke_device(&state.paths, &fingerprint)
-        .and_then(|()| crate::unattended_access::trusted_devices(&state.paths))
+) -> Result<Vec<crate::device_trust::TrustedDeviceViewV1>, String> {
+    let controlled = storage::active_full_access_grants(&state.paths)
+        .map_err(|error| error.message())?
+        .into_iter()
+        .filter(|grant| grant.device_fingerprint == fingerprint)
+        .map(|grant| grant.bridge_id)
+        .collect::<Vec<_>>();
+    crate::device_trust::revoke_device(&state.paths, &fingerprint)
+        .and_then(|()| crate::device_trust::trusted_devices(&state.paths))
+        .inspect(|_| {
+            for room_id in &controlled {
+                state.developer_terminal.end_hosted_sessions(room_id);
+            }
+        })
         .map_err(|error| error.message())
 }
 
-#[tauri::command]
-pub fn list_unattended_grants(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<crate::unattended_access::UnattendedGrantViewV1>, String> {
-    crate::unattended_access::grants(&state.paths, storage::now_ts())
-        .map_err(|error| error.message())
+/// The name this Host shows for the device `room_id` is paired with.
+fn paired_device_label(state: &AppState, room_id: &str) -> String {
+    let pinned = storage::bridge_peer_pin(&state.paths, room_id)
+        .ok()
+        .flatten();
+    pinned
+        .and_then(|pin| {
+            storage::list_known_devices(&state.paths)
+                .ok()?
+                .into_iter()
+                .find(|device| device.device_public_key == pin.peer_device_public_key)
+                .map(|device| device.label)
+        })
+        .unwrap_or_else(|| peer_name_for(state)(room_id))
 }
 
-/// Only this Host's user, with the device connected and shown, can create a
-/// permission. Nothing a peer sends reaches this command.
+/// Full Access over one Bridge, for this Host's own user.
 #[tauri::command]
-pub fn create_unattended_grant(
-    request: crate::unattended_access::CreateUnattendedGrantV1,
+pub fn get_bridge_full_access(
+    room_id: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<crate::unattended_access::UnattendedGrantViewV1, String> {
-    let current = crate::host_runtime::current_verified_peer_devices(&state);
-    crate::unattended_access::create_grant(
+) -> Result<crate::full_access::BridgeFullAccessV1, String> {
+    crate::full_access::bridge_full_access(&state.paths, &room_id).map_err(|error| error.message())
+}
+
+/// Every device this Host's user gave Full Access, across Bridges.
+#[tauri::command]
+pub fn list_full_access(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::full_access::FullAccessViewV1>, String> {
+    crate::full_access::active_grants(&state.paths).map_err(|error| error.message())
+}
+
+/// Only this Host's user, after confirming what it allows, can give the
+/// device a Bridge is paired with Full Access. Nothing a peer sends reaches
+/// this command.
+#[tauri::command]
+pub fn grant_full_access(
+    request: crate::full_access::GrantFullAccessV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::full_access::BridgeFullAccessV1, String> {
+    let label = paired_device_label(&state, &request.room_id);
+    crate::full_access::grant_full_access(
         &state.paths,
         &state.local_host_ref,
-        &current,
         &request,
+        &label,
         storage::now_ts(),
     )
+    .and_then(|_| crate::full_access::bridge_full_access(&state.paths, &request.room_id))
     .map_err(|error| error.message())
 }
 
+/// Ends Full Access over one Bridge. A Developer Terminal it opened here
+/// closes now; Agent tasks it started keep running until stopped.
 #[tauri::command]
-pub fn revoke_unattended_grant(
-    grant_id: String,
+pub fn revoke_full_access(
+    room_id: String,
     state: State<'_, Arc<AppState>>,
-) -> Result<Vec<crate::unattended_access::UnattendedGrantViewV1>, String> {
-    crate::unattended_access::revoke_grant(&state.paths, &grant_id)
-        .and_then(|()| crate::unattended_access::grants(&state.paths, storage::now_ts()))
+) -> Result<crate::full_access::BridgeFullAccessV1, String> {
+    crate::full_access::revoke_full_access(&state.paths, &room_id)
+        .inspect(|()| state.developer_terminal.end_hosted_sessions(&room_id))
+        .and_then(|()| crate::full_access::bridge_full_access(&state.paths, &room_id))
+        .map_err(|error| error.message())
+}
+
+/// Stops offering one folder a device with Full Access named here.
+#[tauri::command]
+pub fn remove_full_access_folder(
+    grant_id: String,
+    workspace: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::full_access::FullAccessViewV1>, String> {
+    crate::full_access::remove_folder(&state.paths, &grant_id, &workspace)
+        .and_then(|()| crate::full_access::active_grants(&state.paths))
         .map_err(|error| error.message())
 }
 
 /// Proves this device's durable identity to the peer of one exact current
 /// session. The peer records it only for that session; it admits and
-/// authorizes nothing, and a Host's user must still trust the device and
-/// grant it scoped permission before anything runs unattended.
+/// authorizes nothing by itself. What the peer's user allowed this device
+/// (shares, or Full Access) applies only to requests over a session where
+/// this proof was given.
 pub(crate) async fn present_device_identity_over(
     state: Arc<AppState>,
     binding: &crate::host_identity::HostSessionBinding,
@@ -2150,6 +2242,10 @@ pub async fn approve_remote_native_codex_workspace_movement(
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before workspace preparation.".into());
     }
+    // Lets that Host recognize this device in this session, so its Full
+    // Access, if it gave this device any, applies when the workspace lands.
+    // It grants nothing by itself.
+    let _ = present_device_identity_over(state.inner().clone(), session.binding()).await;
     let (prepare, metadata, package) = state
         .native_agents
         .lock()
@@ -3406,10 +3502,9 @@ fn check_pairing_target(
 /// (including a Bridge with no pin, such as one from before pairing existed)
 /// is fresh trust: nothing earned by an earlier, unverified or different
 /// device carries over. Bridge-scoped runtime authority, Native Agent tasks,
-/// conversations and retained results, and folders shared with the Bridge
-/// are removed; Bridge history (items, Plans) and the device-key-bound
-/// unattended permissions stay. Re-pairing the same pinned device changes
-/// nothing.
+/// conversations and retained results, folders shared with the Bridge, and
+/// Full Access over it are removed; Bridge history (items, Plans) stays.
+/// Re-pairing the same pinned device changes nothing.
 pub(crate) fn establish_fresh_peer_trust(
     state: &Arc<AppState>,
     room_id: &str,
@@ -3428,6 +3523,7 @@ pub(crate) fn establish_fresh_peer_trust(
     runtime?;
     crate::native_agent::purge_durable_bridge_state(&state.paths, room_id)?;
     storage::delete_bridge_authorized_search_folders(&state.paths, room_id)?;
+    storage::delete_bridge_full_access(&state.paths, room_id)?;
     Ok(())
 }
 
@@ -6183,14 +6279,37 @@ pub async fn request_developer_terminal(
     developer_ui_token: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::developer_terminal::DeveloperTerminalWorkspace, String> {
-    let state = state.inner().clone();
+    request_developer_terminal_for(
+        state.inner().clone(),
+        &room_id,
+        &peer_session_id,
+        &developer_ui_token,
+    )
+    .await
+    .map_err(|error| error.message())
+}
+
+pub(crate) async fn request_developer_terminal_for(
+    state: Arc<AppState>,
+    room_id: &str,
+    peer_session_id: &str,
+    developer_ui_token: &str,
+) -> AppResult<crate::developer_terminal::DeveloperTerminalWorkspace> {
     let binding =
-        crate::host_runtime::current_controller_binding(&state, &room_id, &peer_session_id)
-            .map_err(|error| error.message())?;
-    let message = state
-        .developer_terminal
-        .request_open(&developer_ui_token, binding.clone(), storage::now_ts())
-        .map_err(|error| error.message())?;
+        crate::host_runtime::current_controller_binding(&state, room_id, peer_session_id)?;
+    // The Host recognizes this device in this session, so a Full Access it
+    // gave this device opens the terminal without anyone there. Grants
+    // nothing by itself.
+    if let Ok(session) =
+        crate::host_runtime::current_host_session_binding(&state, room_id, peer_session_id)
+    {
+        let _ = present_device_identity_over(state.clone(), &session).await;
+    }
+    let message = state.developer_terminal.request_open(
+        developer_ui_token,
+        binding.clone(),
+        storage::now_ts(),
+    )?;
     if let Err(error) = send_developer_terminal_message(
         state.clone(),
         &binding,
@@ -6202,11 +6321,11 @@ pub async fn request_developer_terminal(
         state
             .developer_terminal
             .abort_controller_session(&message.terminal_session_id, "delivery_failed");
-        return Err(error.message());
+        return Err(error);
     }
     Ok(state
         .developer_terminal
-        .workspace(&room_id, storage::now_ts()))
+        .workspace(room_id, storage::now_ts()))
 }
 
 #[tauri::command]
@@ -6247,7 +6366,7 @@ pub async fn accept_developer_terminal(
         &pending_binding.peer_route_ref,
     )
     .map_err(|error| error.message())?;
-    let (message, mut events) = state
+    let (message, events) = state
         .developer_terminal
         .accept_open(
             &developer_ui_token,
@@ -6258,6 +6377,66 @@ pub async fn accept_developer_terminal(
             storage::now_ts(),
         )
         .map_err(|error| error.message())?;
+    run_hosted_terminal(state, binding, terminal_session_id, message, events)
+        .await
+        .map(|()| true)
+        .map_err(|error| error.message())
+}
+
+/// Opens a pending terminal request at once, without anyone at this Host,
+/// when the requesting device holds this Host's Full Access, proven in
+/// exactly the session the request arrived on; checked again here, just
+/// before the shell starts. Otherwise the request keeps waiting for Accept.
+pub(crate) async fn admit_developer_terminal_under_full_access(
+    state: Arc<AppState>,
+    room_id: String,
+    terminal_session_id: String,
+) -> AppResult<()> {
+    let pending_binding = state
+        .developer_terminal
+        .pending_binding(&terminal_session_id)
+        .filter(|binding| binding.room_id == room_id)
+        .ok_or_else(|| {
+            AppError::InvalidInput("Developer terminal request is unavailable.".into())
+        })?;
+    let session = crate::host_runtime::current_host_session_binding(
+        &state,
+        &room_id,
+        &pending_binding.peer_route_ref,
+    )?;
+    let device = crate::host_runtime::verified_peer_device_for(&state, &session);
+    let now = storage::now_ts();
+    if !crate::full_access::admits(&state.paths, device.as_ref(), &session, now) {
+        return Err(AppError::InvalidInput(
+            "That device does not have Full Access here.".into(),
+        ));
+    }
+    let binding = crate::host_runtime::current_target_binding(
+        &state,
+        &room_id,
+        &pending_binding.peer_route_ref,
+    )?;
+    let (message, events) = state.developer_terminal.admit_open_with_full_access(
+        &terminal_session_id,
+        &binding,
+        now,
+    )?;
+    crate::logging::write_transfer_line(&format!(
+        "[pastey developer-terminal] event=full_access_opened room={}",
+        &room_id[..room_id.len().min(8)]
+    ));
+    run_hosted_terminal(state, binding, terminal_session_id, message, events).await
+}
+
+/// Tells the controller its terminal is open, then carries the shell's
+/// output and exit to it until either ends.
+async fn run_hosted_terminal(
+    state: Arc<AppState>,
+    binding: crate::host_runtime::DeveloperTerminalBinding,
+    terminal_session_id: String,
+    message: crate::developer_terminal::TerminalMessage,
+    mut events: tokio::sync::mpsc::Receiver<crate::developer_terminal::PtyRuntimeEvent>,
+) -> AppResult<()> {
     if let Err(error) = send_developer_terminal_message(
         state.clone(),
         &binding,
@@ -6269,25 +6448,34 @@ pub async fn accept_developer_terminal(
         state
             .developer_terminal
             .abort_host_session(&terminal_session_id);
-        return Err(error.message());
+        return Err(error);
     }
     let pump_state = state.clone();
-    let pump_session_id = terminal_session_id.clone();
+    let pump_session_id = terminal_session_id;
     state.spawn(async move {
         while let Some(event) = events.recv().await {
             let prepared = match event {
-                crate::developer_terminal::PtyRuntimeEvent::Output(bytes) => pump_state
-                    .developer_terminal
-                    .prepare_output(&pump_session_id, &bytes, storage::now_ts())
-                    .map(|(binding, message)| (binding, message, "developer_terminal.output")),
-                crate::developer_terminal::PtyRuntimeEvent::Exit(status) => pump_state
+                crate::developer_terminal::PtyRuntimeEvent::Output(bytes) => {
+                    match pump_state.developer_terminal.prepare_output(
+                        &pump_session_id,
+                        &bytes,
+                        storage::now_ts(),
+                    ) {
+                        Ok((binding, message)) => (binding, message, "developer_terminal.output"),
+                        // Output after this Host closed the session is
+                        // dropped; its exit is still reported.
+                        Err(_) => continue,
+                    }
+                }
+                crate::developer_terminal::PtyRuntimeEvent::Exit(status) => match pump_state
                     .developer_terminal
                     .prepare_exit(&pump_session_id, status)
-                    .map(|(binding, message)| (binding, message, "developer_terminal.exit")),
+                {
+                    Ok((binding, message)) => (binding, message, "developer_terminal.exit"),
+                    Err(_) => break,
+                },
             };
-            let Ok((binding, message, kind)) = prepared else {
-                break;
-            };
+            let (binding, message, kind) = prepared;
             if send_developer_terminal_message(pump_state.clone(), &binding, kind, &message)
                 .await
                 .is_err()
@@ -6305,7 +6493,26 @@ pub async fn accept_developer_terminal(
             }
         }
     });
-    Ok(true)
+    Ok(())
+}
+
+/// This Host's user closes a terminal another device has open here.
+#[tauri::command]
+pub fn close_hosted_developer_terminal(
+    room_id: String,
+    terminal_session_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::developer_terminal::DeveloperTerminalWorkspace, String> {
+    if state
+        .developer_terminal
+        .end_hosted_sessions_matching(&room_id, Some(&terminal_session_id))
+        == 0
+    {
+        return Err("That terminal is no longer open.".into());
+    }
+    Ok(state
+        .developer_terminal
+        .workspace(&room_id, storage::now_ts()))
 }
 
 #[tauri::command]

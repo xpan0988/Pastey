@@ -15,6 +15,7 @@ fn query(operation: RemoteSessionOperationV1) -> RemoteSessionQueryV1 {
         active_within_secs: None,
         scope_ref: None,
         session_id: None,
+        folder: None,
     }
 }
 
@@ -97,6 +98,8 @@ fn the_requester_accepts_only_answers_to_its_own_queries_from_their_host() {
         scopes: vec![],
         discovery: None,
         snapshot: None,
+        full_access: false,
+        detail: None,
     };
     assert!(
         pending
@@ -227,6 +230,7 @@ mod with_claude_store {
             share_excerpts: excerpts,
             agent_requests: false,
             expires_at: storage_now() + 3_600,
+            full_access: false,
         }
     }
 
@@ -447,4 +451,44 @@ mod with_claude_store {
         assert!(discovery.truncated && discovery.sessions.len() <= 50);
         assert!(serde_json::to_vec(&answer).unwrap().len() < 56 * 1024);
     }
+}
+
+#[test]
+fn opening_a_folder_names_one_bounded_path_and_only_that_operation_carries_one() {
+    let mut open = query(RemoteSessionOperationV1::OpenFolder);
+    assert!(validate_query(&open).is_err(), "names no folder");
+    open.folder = Some("   ".into());
+    assert!(validate_query(&open).is_err());
+    open.folder = Some(format!("/{}", "x".repeat(1100)));
+    assert!(validate_query(&open).is_err());
+    open.folder = Some("C:\\Users\\me\\REPZ\n".into());
+    assert!(validate_query(&open).is_err());
+    open.folder = Some("C:\\Users\\me\\REPZ".into());
+    validate_query(&open).unwrap();
+    let mut discover = query(RemoteSessionOperationV1::Discover);
+    discover.folder = Some("/Users/me/REPZ".into());
+    assert!(validate_query(&discover).is_err());
+    // An older answer without the new fields still reads; a new one says
+    // Full Access only when it is given.
+    let wire = serde_json::json!({
+        "schemaVersion": NATIVE_SESSION_SCHEMA,
+        "requestId": "req-1",
+        "sourceHostRef": "host:windows",
+        "outcome": "ok",
+        "scopes": [],
+    });
+    let older: RemoteSessionResponseV1 = serde_json::from_value(wire).unwrap();
+    assert!(!older.full_access && older.detail.is_none());
+    let encoded = serde_json::to_value(&older).unwrap();
+    assert!(encoded.get("fullAccess").is_none() && encoded.get("detail").is_none());
+    // A refusal says why without the folder's path.
+    let refused = folder_refused(
+        &open,
+        "host:windows",
+        "C:\\Users\\me\\REPZ is too broad to share.",
+    );
+    assert_eq!(refused.outcome, RemoteSessionOutcomeV1::FolderRefused);
+    let detail = refused.detail.clone().unwrap();
+    assert!(!detail.contains("Users"), "{detail}");
+    validate_response(&refused).unwrap();
 }

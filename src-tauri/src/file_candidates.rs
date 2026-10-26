@@ -91,7 +91,7 @@ pub(crate) fn list_authorized_search_folders(
 /// filesystem root, the home folder or any folder containing it, an OS
 /// application-data or cache location, Pastey's own data, and hidden folders.
 /// A specific real folder this Host's user may hand to a peer's scoped use
-/// (Bridge Search or an unattended Agent workspace): its canonical path and
+/// (Bridge Search, a shared workspace or a Full Access folder): its canonical path and
 /// display name. Refuses a filesystem root, the home folder or any folder
 /// containing it, an OS application-data or cache location, Pastey's own
 /// data, hidden folders, and links.
@@ -111,7 +111,7 @@ pub(crate) fn validate_shareable_folder(
         .map_err(|_| AppError::InvalidInput("The chosen folder is unavailable.".into()))?;
     let too_broad = || {
         Err(AppError::InvalidInput(
-            "This folder is too broad to share for Bridge search. Choose a specific folder, such as a project's output folder.".into(),
+            "This folder is too broad to share. Choose a specific folder, such as a project's folder.".into(),
         ))
     };
     if canonical.parent().is_none() {

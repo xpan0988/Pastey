@@ -39,6 +39,10 @@ pub const EVENT_KINDS: &[&str] = &[
 const UI_SESSION_TTL_SECONDS: i64 = 30 * 60;
 const OPEN_REQUEST_TTL_SECONDS: i64 = 2 * 60;
 const ACTIVE_SESSION_TTL_SECONDS: i64 = 30 * 60;
+/// The size a terminal opened without anyone at this Host starts at; the
+/// controller resizes it to its own view.
+const UNATTENDED_COLS: u16 = 100;
+const UNATTENDED_ROWS: u16 = 30;
 pub const MAX_FRAME_BYTES: usize = 8 * 1024;
 const MAX_BUFFERED_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_DIMENSION: u16 = 500;
@@ -80,6 +84,10 @@ pub struct TerminalSessionProjection {
     pub output_sequence: u64,
     pub termination_reason: Option<String>,
     pub expires_at: i64,
+    /// A Host session the controlling device opened under this Host's Full
+    /// Access, without anyone here accepting it.
+    #[serde(default)]
+    pub full_access: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -212,6 +220,7 @@ struct HostSession {
     state: TerminalState,
     environment_label: String,
     termination_reason: Option<String>,
+    full_access: bool,
 }
 
 #[derive(Default)]
@@ -393,16 +402,46 @@ impl DeveloperTerminalService {
         let pending = {
             let mut state = self.state.lock();
             require_ui_session_in_state(&state, ui_token, &current_binding.room_id, now)?;
-            let pending = state.pending.remove(terminal_session_id).ok_or_else(|| {
-                AppError::InvalidInput("Developer terminal request is unavailable.".into())
-            })?;
-            if pending.expires_at <= now || pending.binding != *current_binding {
-                return Err(AppError::InvalidInput(
-                    "Developer terminal Host session binding is stale.".into(),
-                ));
-            }
-            pending
+            take_pending(&mut state, terminal_session_id, current_binding, now)?
         };
+        self.start_host_session(terminal_session_id, pending, cols, rows, now, false)
+    }
+
+    /// Admits one pending request without a Host-local interaction. Only for
+    /// a controller whose device, proven in exactly the session the request
+    /// arrived on, holds this Host's Full Access, as the caller established
+    /// immediately before (`crate::full_access`). Everything else about the
+    /// grant is the same: one PTY start, bound to the exact current binding,
+    /// with the same lifetime, and ended by the same events.
+    pub fn admit_open_with_full_access(
+        &self,
+        terminal_session_id: &str,
+        current_binding: &DeveloperTerminalBinding,
+        now: i64,
+    ) -> AppResult<(TerminalMessage, mpsc::Receiver<PtyRuntimeEvent>)> {
+        let pending = {
+            let mut state = self.state.lock();
+            take_pending(&mut state, terminal_session_id, current_binding, now)?
+        };
+        self.start_host_session(
+            terminal_session_id,
+            pending,
+            UNATTENDED_COLS,
+            UNATTENDED_ROWS,
+            now,
+            true,
+        )
+    }
+
+    fn start_host_session(
+        &self,
+        terminal_session_id: &str,
+        pending: PendingRequest,
+        cols: u16,
+        rows: u16,
+        now: i64,
+        full_access: bool,
+    ) -> AppResult<(TerminalMessage, mpsc::Receiver<PtyRuntimeEvent>)> {
         let (process, events, environment_label) = spawn_native_terminal(cols, rows)?;
         let mut grant = DeveloperTerminalGrant {
             grant_id: format!("developer-terminal-grant:{}", uuid::Uuid::new_v4()),
@@ -426,6 +465,7 @@ impl DeveloperTerminalService {
                 state: TerminalState::Active,
                 environment_label: environment_label.clone(),
                 termination_reason: None,
+                full_access,
             },
         );
         let mut accepted = TerminalMessage::base(&pending.binding, terminal_session_id);
@@ -670,11 +710,15 @@ impl DeveloperTerminalService {
             })?;
         session.state = TerminalState::Exited;
         session.grant.revoked = true;
-        session.termination_reason = Some("process_exit".into());
+        // A session this Host closed says so; otherwise the shell exited.
+        let reason = session
+            .termination_reason
+            .get_or_insert_with(|| "process_exit".into())
+            .clone();
         let binding = session.binding.clone();
         let mut message = TerminalMessage::base(&binding, terminal_session_id);
         message.exit_status = Some(exit_status);
-        message.reason_code = Some("process_exit".into());
+        message.reason_code = Some(reason);
         Ok((binding, message))
     }
 
@@ -794,6 +838,7 @@ impl DeveloperTerminalService {
                 output_sequence: session.last_output_sequence,
                 termination_reason: session.termination_reason.clone(),
                 expires_at: session.expires_at,
+                full_access: false,
             })
             .collect();
         sessions.extend(
@@ -811,6 +856,7 @@ impl DeveloperTerminalService {
                     output_sequence: 0,
                     termination_reason: session.termination_reason.clone(),
                     expires_at: session.grant.expires_at,
+                    full_access: session.full_access,
                 }),
         );
         DeveloperTerminalWorkspace {
@@ -838,6 +884,39 @@ impl DeveloperTerminalService {
                 true
             }
         });
+    }
+
+    /// This Host's user closes terminals other devices have open on this
+    /// Host over one Bridge (`terminal_session_id`: just that one). Each
+    /// shell is ended at once and input is refused from now on; its
+    /// controller is told the Host closed it. Terminals this Host controls
+    /// elsewhere are untouched.
+    pub fn end_hosted_sessions_matching(
+        &self,
+        room_id: &str,
+        terminal_session_id: Option<&str>,
+    ) -> usize {
+        let mut state = self.state.lock();
+        let mut ended = 0;
+        for (id, session) in state.host_sessions.iter_mut() {
+            if session.binding.room_id != room_id
+                || terminal_session_id.is_some_and(|wanted| wanted != id)
+                || session.state != TerminalState::Active
+            {
+                continue;
+            }
+            session.grant.revoked = true;
+            session.state = TerminalState::Closed;
+            session.termination_reason = Some("host_closed".into());
+            session.process.terminate();
+            ended += 1;
+        }
+        ended
+    }
+
+    /// Every terminal other devices have open on this Host over one Bridge.
+    pub fn end_hosted_sessions(&self, room_id: &str) {
+        self.end_hosted_sessions_matching(room_id, None);
     }
 
     pub fn shutdown_all(&self) {
@@ -902,6 +981,25 @@ impl DeveloperTerminalService {
             }
         });
     }
+}
+
+/// Removes one pending request, which is consumed whatever happens next. It
+/// must still be unexpired and bound to exactly the current binding.
+fn take_pending(
+    state: &mut TerminalStateStore,
+    terminal_session_id: &str,
+    current_binding: &DeveloperTerminalBinding,
+    now: i64,
+) -> AppResult<PendingRequest> {
+    let pending = state.pending.remove(terminal_session_id).ok_or_else(|| {
+        AppError::InvalidInput("Developer terminal request is unavailable.".into())
+    })?;
+    if pending.expires_at <= now || pending.binding != *current_binding {
+        return Err(AppError::InvalidInput(
+            "Developer terminal Host session binding is stale.".into(),
+        ));
+    }
+    Ok(pending)
 }
 
 fn require_ui_session_in_state(
@@ -1578,5 +1676,110 @@ mod tests {
         assert!(service
             .prepare_output(&open.terminal_session_id, b"x", 10)
             .is_err());
+    }
+
+    #[test]
+    fn full_access_admission_still_needs_the_exact_pending_request_and_binding() {
+        let service = DeveloperTerminalService::default();
+        // Nothing pending: nothing to admit.
+        assert!(service
+            .admit_open_with_full_access("developer-terminal:none", &binding(), 10)
+            .is_err());
+        let controller_ui = service.enter_mode("room", 10);
+        let open = service
+            .request_open(&controller_ui.token, binding(), 10)
+            .unwrap();
+        service.receive_open_request(binding(), &open, 10).unwrap();
+        // A binding from another session consumes the request and starts no
+        // shell.
+        let stale =
+            DeveloperTerminalBinding::new("room", "controller-session", "host-session", "other");
+        assert!(service
+            .admit_open_with_full_access(&open.terminal_session_id, &stale, 10)
+            .is_err());
+        assert!(service.workspace("room", 10).pending_requests.is_empty());
+        assert!(service
+            .admit_open_with_full_access(&open.terminal_session_id, &binding(), 10)
+            .is_err());
+        // An expired request is refused the same way.
+        let again = service.request_open(&controller_ui.token, binding(), 10);
+        assert!(
+            again.is_err(),
+            "the first request is still active for the controller"
+        );
+        let other_room =
+            DeveloperTerminalBinding::new("room-2", "controller-session", "host-session", "peer");
+        let other_ui = service.enter_mode("room-2", 10);
+        let late = service
+            .request_open(&other_ui.token, other_room.clone(), 10)
+            .unwrap();
+        service
+            .receive_open_request(other_room.clone(), &late, 10)
+            .unwrap();
+        assert!(service
+            .admit_open_with_full_access(
+                &late.terminal_session_id,
+                &other_room,
+                10 + OPEN_REQUEST_TTL_SECONDS
+            )
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_full_access_terminal_opens_without_host_ui_and_the_host_can_close_it() {
+        let service = DeveloperTerminalService::default();
+        let controller_ui = service.enter_mode("room", 10);
+        let open = service
+            .request_open(&controller_ui.token, binding(), 10)
+            .unwrap();
+        service.receive_open_request(binding(), &open, 10).unwrap();
+        let (accepted, _events) = service
+            .admit_open_with_full_access(&open.terminal_session_id, &binding(), 10)
+            .unwrap();
+        // One use: the request is gone, a second admission finds nothing.
+        assert!(service
+            .admit_open_with_full_access(&open.terminal_session_id, &binding(), 10)
+            .is_err());
+        service.receive_accepted(&binding(), &accepted, 10).unwrap();
+        let workspace = service.workspace("room", 10);
+        let hosted = workspace
+            .sessions
+            .iter()
+            .find(|session| session.role == TerminalRole::Host)
+            .unwrap();
+        assert!(hosted.full_access);
+        assert_eq!(hosted.state, TerminalState::Active);
+        let (_, input) = service
+            .prepare_input(
+                &controller_ui.token,
+                &open.terminal_session_id,
+                b"printf ok\r",
+                10,
+            )
+            .unwrap();
+        service.receive_input(&binding(), &input, 10).unwrap();
+        // The Host's user closes it: input is refused, and its exit says the
+        // Host closed it. A terminal in another Bridge is untouched.
+        assert_eq!(service.end_hosted_sessions_matching("other-room", None), 0);
+        assert_eq!(
+            service.end_hosted_sessions_matching("room", Some(&open.terminal_session_id)),
+            1
+        );
+        assert!(service.receive_input(&binding(), &input, 10).is_err());
+        let (_, exit) = service.prepare_exit(&open.terminal_session_id, 0).unwrap();
+        assert_eq!(exit.reason_code.as_deref(), Some("host_closed"));
+        service.receive_exit(&binding(), &exit).unwrap();
+        let controller = service
+            .workspace("room", 10)
+            .sessions
+            .into_iter()
+            .find(|session| session.role == TerminalRole::Controller)
+            .unwrap();
+        assert_eq!(controller.state, TerminalState::Exited);
+        assert_eq!(
+            controller.termination_reason.as_deref(),
+            Some("host_closed")
+        );
     }
 }

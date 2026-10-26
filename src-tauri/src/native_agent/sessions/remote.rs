@@ -7,8 +7,11 @@
 //! (`crate::session_read_access`), each with what it allows, so the
 //! requester can choose one without a path. Sessions are answered only for
 //! shared workspaces that allow reading them; trusting a device grants
-//! nothing, and sharing a folder does not share its sessions. The answer
-//! follows minimal disclosure:
+//! nothing, and sharing a folder does not share its sessions. A device with
+//! the Host's Full Access (`crate::full_access`) may read every folder
+//! shared with it and may name further folders by path (`OpenFolder`); the
+//! answer says whether it has Full Access. The answer follows minimal
+//! disclosure:
 //!
 //! - no folder paths: a workspace appears as its folder name and an opaque
 //!   scope reference, changed files only relative to it, and any path-like
@@ -57,7 +60,14 @@ pub(crate) enum RemoteSessionOperationV1 {
     Inspect,
     /// Only the shared workspaces, without looking for sessions.
     Workspaces,
+    /// Under Full Access only: adds the folder named in `folder` to the
+    /// requesting device's workspaces on that Host, then answers as
+    /// `Workspaces`.
+    OpenFolder,
 }
+
+/// Longest folder a requester may name.
+const MAX_FOLDER_CHARS: usize = 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -77,6 +87,9 @@ pub(crate) struct RemoteSessionQueryV1 {
     pub(crate) scope_ref: Option<String>,
     #[serde(default)]
     pub(crate) session_id: Option<String>,
+    /// `OpenFolder` only: the folder on that Host, by its full path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) folder: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,6 +103,8 @@ pub(crate) enum RemoteSessionOutcomeV1 {
     /// Another query from this Bridge is still being answered.
     Busy,
     Unavailable,
+    /// `OpenFolder`: the Host would not add that folder; `detail` says why.
+    FolderRefused,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -105,9 +120,17 @@ pub(crate) struct RemoteScopeV1 {
     /// waits for that Host's Review).
     #[serde(default)]
     pub(crate) agent_requests: bool,
-    /// When the share ends, in seconds since the epoch.
+    /// When the share ends, in seconds since the epoch. None for a folder
+    /// allowed by Full Access alone, which ends only with it.
     #[serde(default)]
     pub(crate) expires_at: Option<i64>,
+    /// Allowed through the requesting device's Full Access.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) full_access: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn yes() -> bool {
@@ -250,6 +273,14 @@ pub(crate) struct RemoteSessionResponseV1 {
     pub(crate) discovery: Option<RemoteDiscoveryV1>,
     #[serde(default)]
     pub(crate) snapshot: Option<RemoteSnapshotV1>,
+    /// Whether the requesting device, proven in this session, holds the
+    /// Host's Full Access now. Omitted when it does not, so older devices
+    /// read the answer as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) full_access: bool,
+    /// Why `FolderRefused`, in the Host's words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
 }
 
 fn invalid<T>(message: &str) -> AppResult<T> {
@@ -309,6 +340,17 @@ pub(crate) fn validate_query(query: &RemoteSessionQueryV1) -> AppResult<()> {
     {
         return invalid("Inspecting a session names its provider and id.");
     }
+    match (&query.operation, query.folder.as_deref()) {
+        (RemoteSessionOperationV1::OpenFolder, Some(folder))
+            if !folder.trim().is_empty()
+                && folder.chars().count() <= MAX_FOLDER_CHARS
+                && !folder.chars().any(char::is_control) => {}
+        (RemoteSessionOperationV1::OpenFolder, _) => {
+            return invalid("Opening a folder names it by its full path.")
+        }
+        (_, Some(_)) => return invalid("Invalid native session query."),
+        (_, None) => {}
+    }
     Ok(())
 }
 
@@ -362,6 +404,10 @@ pub(crate) fn validate_response(response: &RemoteSessionResponseV1) -> AppResult
             .scopes
             .iter()
             .any(|scope| !valid_scope_ref(&scope.scope_ref) || !bounded(&scope.label, 120))
+        || response
+            .detail
+            .as_deref()
+            .is_some_and(|detail| !bounded(detail, MAX_TEXT_CHARS))
     {
         return invalid("Invalid native session answer.");
     }
@@ -626,12 +672,31 @@ fn response(
                 share_excerpts: scope.share_excerpts,
                 read_sessions: scope.read_sessions,
                 agent_requests: scope.agent_requests,
-                expires_at: Some(scope.expires_at),
+                expires_at: (scope.expires_at != i64::MAX).then_some(scope.expires_at),
+                full_access: scope.full_access,
             })
             .collect(),
         discovery: None,
         snapshot: None,
+        full_access: false,
+        detail: None,
     }
+}
+
+/// The answer when the Host would not add the folder an `OpenFolder` named.
+pub(crate) fn folder_refused(
+    query: &RemoteSessionQueryV1,
+    local_host_ref: &str,
+    reason: &str,
+) -> RemoteSessionResponseV1 {
+    let mut answer = response(
+        query,
+        local_host_ref,
+        RemoteSessionOutcomeV1::FolderRefused,
+        &[],
+    );
+    answer.detail = Some(cut(&redact_paths(reason), MAX_TEXT_CHARS - 1));
+    answer
 }
 
 /// The executing Host's answer to one validated query, for the workspaces
@@ -653,7 +718,10 @@ pub(crate) fn answer(
             &[],
         );
     }
-    if query.operation == RemoteSessionOperationV1::Workspaces {
+    if matches!(
+        query.operation,
+        RemoteSessionOperationV1::Workspaces | RemoteSessionOperationV1::OpenFolder
+    ) {
         return response(query, local_host_ref, RemoteSessionOutcomeV1::Ok, scopes);
     }
     let selected: Vec<SessionReadScopeV1> = scopes
@@ -717,7 +785,7 @@ pub(crate) fn answer(
             }
             answer.discovery = Some(remote);
         }
-        RemoteSessionOperationV1::Workspaces => {}
+        RemoteSessionOperationV1::Workspaces | RemoteSessionOperationV1::OpenFolder => {}
         RemoteSessionOperationV1::Inspect => {
             let provider = query.provider.as_deref().unwrap_or_default();
             let session_id = query.session_id.as_deref().unwrap_or_default();

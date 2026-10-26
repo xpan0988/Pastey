@@ -84,7 +84,7 @@ impl FixtureV1 {
     }
 
     fn trust(&self, device: &VerifiedPeerDevice) {
-        crate::unattended_access::trust_seen_device(
+        crate::device_trust::trust_seen_device(
             &self.paths,
             &[device.clone()],
             &device.fingerprint,
@@ -232,7 +232,7 @@ fn revocation_device_revocation_burn_and_a_moved_folder_end_reading() {
     assert!(stop_sharing(&h.paths, &view.grant_id).is_err());
 
     h.grant(&device, true);
-    crate::unattended_access::revoke_device(&h.paths, &device.fingerprint).unwrap();
+    crate::device_trust::revoke_device(&h.paths, &device.fingerprint).unwrap();
     assert!(authorized_scopes(&h.paths, &device, &binding, now)
         .unwrap()
         .is_empty());
@@ -677,30 +677,11 @@ fn stopping_expiry_revoked_trust_and_burn_end_a_share() {
     let reference = shared_workspaces(&h.paths, &device, &binding, now).unwrap()[0]
         .scope_ref
         .clone();
-    // An unattended grant for the same folder ends with the share.
-    crate::unattended_access::create_grant(
-        &h.paths,
-        &h.windows,
-        &[device.clone()],
-        &crate::unattended_access::CreateUnattendedGrantV1 {
-            device_fingerprint: device.fingerprint.clone(),
-            room_id: BRIDGE.into(),
-            workspace_path: h.workspace.to_string_lossy().into_owned(),
-            duration_hours: 1,
-            max_runs: 1,
-        },
-        now,
-    )
-    .unwrap();
     stop_sharing(&h.paths, &view.grant_id).unwrap();
     assert!(shared_workspaces(&h.paths, &device, &binding, now)
         .unwrap()
         .is_empty());
     assert!(resolve(&h, Some(&device), &binding, codex, &codex_run(&reference)).is_err());
-    assert!(crate::unattended_access::grants(&h.paths, now)
-        .unwrap()
-        .iter()
-        .all(|grant| grant.state != crate::unattended_access::GrantStateV1::Active));
     assert!(stop_sharing(&h.paths, &view.grant_id).is_err());
     assert!(
         update_share(
@@ -734,7 +715,7 @@ fn stopping_expiry_revoked_trust_and_burn_end_a_share() {
     );
 
     // Revoking trust ends the share, and trusting again does not revive it.
-    crate::unattended_access::revoke_device(&h.paths, &device.fingerprint).unwrap();
+    crate::device_trust::revoke_device(&h.paths, &device.fingerprint).unwrap();
     assert!(shared_workspaces(&h.paths, &device, &binding, now)
         .unwrap()
         .is_empty());
@@ -790,4 +771,142 @@ fn an_older_reading_permission_keeps_reading_and_allows_no_runs() {
             .unwrap()
             .is_empty()
     );
+}
+
+impl FixtureV1 {
+    /// Pairs `BRIDGE` with the Mac's key and gives it Full Access here.
+    fn give_full_access(&self) {
+        storage::pin_bridge_peer(
+            &self.paths,
+            BRIDGE,
+            HostRef::from_device_id("mac").unwrap().as_str(),
+            &self.mac.public_key(),
+        )
+        .unwrap();
+        crate::full_access::grant_full_access(
+            &self.paths,
+            &self.windows,
+            &crate::full_access::GrantFullAccessV1 {
+                room_id: BRIDGE.into(),
+                understood: true,
+            },
+            "School Mac",
+            storage::now_ts(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn full_access_allows_everything_in_shared_folders_and_ends_with_it() {
+    let h = FixtureV1::new();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    let now = storage::now_ts();
+    let codex = crate::native_agent::CODEX_CAPABILITY_ID;
+    let thread = crate::native_agent::CODEX_THREAD_CAPABILITY;
+    h.trust(&device);
+    h.grant(&device, false);
+    let reference = shared_workspaces(&h.paths, &device, &binding, now).unwrap()[0]
+        .scope_ref
+        .clone();
+    let continue_there =
+        crate::native_agent::codex_thread_peer_input(&reference, "thread-1", "go on", None)
+            .unwrap();
+    // Sessions only: no agent requests, no continuation.
+    assert!(resolve(&h, Some(&device), &binding, codex, &codex_run(&reference)).is_err());
+    assert!(resolve(&h, Some(&device), &binding, thread, &continue_there).is_err());
+    h.give_full_access();
+    let scopes = shared_workspaces(&h.paths, &device, &binding, now).unwrap();
+    assert_eq!(scopes.len(), 1);
+    assert!(scopes[0].read_sessions && scopes[0].share_excerpts && scopes[0].agent_requests);
+    assert!(scopes[0].full_access);
+    assert!(
+        resolve(&h, Some(&device), &binding, codex, &codex_run(&reference))
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        resolve(&h, Some(&device), &binding, thread, &continue_there)
+            .unwrap()
+            .is_some()
+    );
+    // The share's own switches are unchanged, and revoking Full Access
+    // restores exactly them.
+    crate::full_access::revoke_full_access(&h.paths, BRIDGE).unwrap();
+    let scopes = shared_workspaces(&h.paths, &device, &binding, now).unwrap();
+    assert!(scopes[0].read_sessions && !scopes[0].agent_requests && !scopes[0].full_access);
+    assert!(resolve(&h, Some(&device), &binding, codex, &codex_run(&reference)).is_err());
+}
+
+#[test]
+fn full_access_folders_are_named_by_path_checked_here_and_end_with_it() {
+    let h = FixtureV1::new();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    let now = storage::now_ts();
+    let folder = h.workspace.to_string_lossy().into_owned();
+    // Without Full Access a folder cannot be named by path.
+    assert!(crate::full_access::open_folder(&h.paths, &device, &binding, &folder, now).is_err());
+    h.give_full_access();
+    // Folders too broad to share, relative paths and missing folders are
+    // refused like a share.
+    let home = dirs::home_dir().unwrap();
+    for refused in [
+        home.to_string_lossy().into_owned(),
+        "relative/folder".into(),
+        h.workspace.join("missing").to_string_lossy().into_owned(),
+    ] {
+        assert!(
+            crate::full_access::open_folder(&h.paths, &device, &binding, &refused, now).is_err(),
+            "{refused}"
+        );
+    }
+    let opened =
+        crate::full_access::open_folder(&h.paths, &device, &binding, &folder, now).unwrap();
+    assert_eq!(opened, h.workspace);
+    // Opening it again is no change.
+    crate::full_access::open_folder(&h.paths, &device, &binding, &folder, now).unwrap();
+    let scopes = shared_workspaces(&h.paths, &device, &binding, now).unwrap();
+    assert_eq!(scopes.len(), 1);
+    let scope = &scopes[0];
+    assert_eq!(scope.label, "Pastey");
+    assert!(scope.full_access && scope.read_sessions && scope.agent_requests);
+    assert_eq!(scope.scope_ref, scope_ref(BRIDGE, &folder));
+    // Its reference resolves for a run and a continuation, as a share's does.
+    let run = resolve(
+        &h,
+        Some(&device),
+        &binding,
+        crate::native_agent::CODEX_CAPABILITY_ID,
+        &codex_run(&scope.scope_ref),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(&run).unwrap()["workspace"],
+        folder.as_str()
+    );
+    // A proof from another session sees none of it.
+    let (later, _) = h.proven(BRIDGE, "s2");
+    assert!(shared_workspaces(&h.paths, &device, &later, now)
+        .unwrap()
+        .is_empty());
+    // This Host's user sees the folder and can remove it.
+    let grant = crate::full_access::active_grants(&h.paths)
+        .unwrap()
+        .remove(0);
+    assert_eq!(grant.folders, vec![folder.clone()]);
+    crate::full_access::remove_folder(&h.paths, &grant.grant_id, &folder).unwrap();
+    assert!(shared_workspaces(&h.paths, &device, &binding, now)
+        .unwrap()
+        .is_empty());
+    // Revoking Full Access forgets its folders: giving it again starts empty.
+    crate::full_access::open_folder(&h.paths, &device, &binding, &folder, now).unwrap();
+    crate::full_access::revoke_full_access(&h.paths, BRIDGE).unwrap();
+    assert!(shared_workspaces(&h.paths, &device, &binding, now)
+        .unwrap()
+        .is_empty());
+    h.give_full_access();
+    assert!(crate::full_access::active_grants(&h.paths).unwrap()[0]
+        .folders
+        .is_empty());
 }

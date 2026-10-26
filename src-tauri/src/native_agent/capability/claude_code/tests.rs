@@ -353,6 +353,72 @@ fn no_bridge_peer_can_invoke_it_or_learn_of_it() {
     let refused =
         service.receive_bridge_invocation(&binding, &request, crate::storage::now_ts(), None);
     assert!(refused.is_err_and(|error| error.message().contains("local to its Host")));
+    // Not even a device this Host gave Full Access, proven in this session.
+    let paths =
+        crate::storage::AppPaths::new(fixture.root.join("app-data"), fixture.root.join("logs"));
+    crate::storage::create_room(
+        &paths,
+        &[5u8; 32],
+        "12345678",
+        15,
+        crate::models::LocalRole::Creator,
+        Some("room-claude".into()),
+        None,
+    )
+    .unwrap();
+    let requester_paths =
+        crate::storage::AppPaths::new(fixture.root.join("requester"), fixture.root.join("logs"));
+    requester_paths.ensure_directories().unwrap();
+    crate::storage::init_database(&requester_paths).unwrap();
+    let requester = crate::device_identity::load_or_create(&requester_paths, &[6u8; 32]).unwrap();
+    crate::storage::pin_bridge_peer(
+        &paths,
+        "room-claude",
+        binding.peer_host_ref.as_str(),
+        &requester.public_key(),
+    )
+    .unwrap();
+    crate::full_access::grant_full_access(
+        &paths,
+        &binding.local_host_ref,
+        &crate::full_access::GrantFullAccessV1 {
+            room_id: "room-claude".into(),
+            understood: true,
+        },
+        "Requester",
+        crate::storage::now_ts(),
+    )
+    .unwrap();
+    let requester_side = crate::host_identity::HostSessionBinding::new(
+        "room-claude",
+        binding.peer_host_ref.clone(),
+        binding.local_host_ref.clone(),
+        "requester-session",
+        "executor-session",
+        "executor-route",
+        crate::storage::now_ts() + 600,
+    )
+    .unwrap();
+    let device = crate::device_identity::verify_attestation(
+        &requester
+            .attest(&requester_side, &uuid::Uuid::new_v4().to_string())
+            .unwrap(),
+        &binding,
+    )
+    .unwrap();
+    assert!(crate::full_access::admits(
+        &paths,
+        Some(&device),
+        &binding,
+        crate::storage::now_ts()
+    ));
+    let refused = service.receive_bridge_invocation(
+        &binding,
+        &request,
+        crate::storage::now_ts(),
+        Some(&device),
+    );
+    assert!(refused.is_err_and(|error| error.message().contains("local to its Host")));
     assert_eq!(fixture.launches(), 0);
 }
 

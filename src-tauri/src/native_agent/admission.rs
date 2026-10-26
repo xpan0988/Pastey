@@ -5,10 +5,10 @@
 //! peer may make this Host run it. Admission is that third decision. Core
 //! makes it, capability-agnostically, before any adapter sees the input.
 //!
-//! There is no configurable policy, ACL or per-peer memory here. A remote
-//! invocation waits for one process-local, one-shot Host Review, unless an
-//! unattended grant this Host's user created applies first (see
-//! `start_under_unattended_grant`); otherwise it falls back to this Review.
+//! There is no configurable policy or per-capability ACL here. A remote
+//! invocation waits for one process-local, one-shot Host Review, unless the
+//! requesting device holds this Host's Full Access (`crate::full_access`),
+//! proven in exactly the session the invocation arrived on.
 
 use serde::Serialize;
 
@@ -36,6 +36,19 @@ pub(super) enum NativeInvocationPrincipalV1<'a> {
     Local,
     /// A peer, authenticated as this exact current Bridge session.
     Remote(&'a HostSessionBinding),
+    /// A peer as above whose device, proven in exactly this session, holds
+    /// this Host's Full Access.
+    FullAccess(&'a HostSessionBinding),
+}
+
+impl<'a> NativeInvocationPrincipalV1<'a> {
+    /// The peer session, for a remote principal.
+    pub(super) fn binding(&self) -> Option<&'a HostSessionBinding> {
+        match self {
+            Self::Local => None,
+            Self::Remote(binding) | Self::FullAccess(binding) => Some(binding),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,7 +63,9 @@ pub(super) enum NativeAdmissionDecisionV1 {
 /// The fixed policy.
 pub(super) fn decide(principal: &NativeInvocationPrincipalV1<'_>) -> NativeAdmissionDecisionV1 {
     match principal {
-        NativeInvocationPrincipalV1::Local => NativeAdmissionDecisionV1::Allow,
+        NativeInvocationPrincipalV1::Local | NativeInvocationPrincipalV1::FullAccess(_) => {
+            NativeAdmissionDecisionV1::Allow
+        }
         NativeInvocationPrincipalV1::Remote(_) => NativeAdmissionDecisionV1::RequireReview,
     }
 }

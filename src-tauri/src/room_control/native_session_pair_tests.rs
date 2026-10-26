@@ -138,6 +138,7 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
             active_within_secs: None,
             scope_ref: None,
             session_id: None,
+            folder: None,
         };
         pending.register(&query.request_id, "room-pair", windows_host.as_str());
         native_event(
@@ -176,7 +177,7 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
         };
 
     // Trusted but not permitted: nothing.
-    crate::unattended_access::trust_seen_device(
+    crate::device_trust::trust_seen_device(
         &windows_paths,
         &[device.clone()],
         &device.fingerprint,

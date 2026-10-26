@@ -368,7 +368,7 @@ impl RuntimePairV1 {
             .iter()
             .find(|device| device.binding.bridge_id == ROOM)
             .unwrap();
-        crate::unattended_access::trust_seen_device(
+        crate::device_trust::trust_seen_device(
             &self.windows.runtime.paths,
             &current,
             &mac.fingerprint,
@@ -416,6 +416,7 @@ impl RuntimePairV1 {
                     active_within_secs: None,
                     scope_ref: None,
                     session_id: None,
+                    folder: None,
                 },
             )
             .await
@@ -1091,7 +1092,7 @@ async fn revocation_stop_sharing_and_burn_end_access_even_for_a_waiting_review()
         .into_iter()
         .find(|device| device.binding.bridge_id == ROOM)
         .unwrap();
-    crate::unattended_access::revoke_device(&pair.windows.runtime.paths, &mac.fingerprint).unwrap();
+    crate::device_trust::revoke_device(&pair.windows.runtime.paths, &mac.fingerprint).unwrap();
     pair.advance(2);
     let refused_request = pair.mac_continues(&scope).await.unwrap();
     assert_eq!(

@@ -8,8 +8,12 @@
 //! - read native session summaries (Claude Code, Codex), optionally with
 //!   short excerpts;
 //! - ask to run a native agent there, or to continue a Codex thread there.
-//!   Each such run still waits for this Host's Review, unless an unattended
-//!   grant (`crate::unattended_access`) for the same folder applies.
+//!   Each such run still waits for this Host's Review.
+//!
+//! A device with Full Access (`crate::full_access`) is not limited by these
+//! switches: every folder shared with it allows everything, the folders it
+//! named here by path under that Full Access count as shared, and its runs
+//! start without Review.
 //!
 //! Every operation that creates, changes, lists or ends a share is a local
 //! command of this Host's own user; no Room Control event reaches them. A
@@ -109,6 +113,9 @@ pub(crate) struct SessionReadScopeV1 {
     pub(crate) share_excerpts: bool,
     pub(crate) agent_requests: bool,
     pub(crate) expires_at: i64,
+    /// Allowed through the device's Full Access rather than a share's own
+    /// switches; a folder it named by path has no end of its own.
+    pub(crate) full_access: bool,
 }
 
 fn valid_duration(hours: i64) -> AppResult<()> {
@@ -290,8 +297,8 @@ pub(crate) fn update_share(
     Ok(updated)
 }
 
-/// Ends one share, with every unattended grant its device holds for that
-/// folder over that Bridge.
+/// Ends one share, with every other share of that folder with that device
+/// over that Bridge.
 pub(crate) fn stop_sharing(paths: &AppPaths, grant_id: &str) -> AppResult<()> {
     if !storage::stop_sharing_workspace(paths, grant_id)? {
         return Err(AppError::NotFound(
@@ -370,8 +377,10 @@ fn grant_state(
 
 /// Every workspace this Host shares with the device proven in exactly
 /// `binding` now, whatever each allows. Empty unless the device holds an
-/// active share for this Bridge, peer and Host; a folder that moved since
-/// is left out. Two shares of one folder allow what either allows.
+/// active share for this Bridge, peer and Host, or Full Access; a folder
+/// that moved since is left out. Two shares of one folder allow what either
+/// allows. Under Full Access every one allows everything, and the folders
+/// the device named by path are added.
 pub(crate) fn shared_workspaces(
     paths: &AppPaths,
     device: &VerifiedPeerDevice,
@@ -414,6 +423,33 @@ pub(crate) fn shared_workspaces(
             share_excerpts: grant.read_sessions && grant.share_excerpts,
             agent_requests: grant.agent_requests,
             expires_at: grant.expires_at,
+            full_access: false,
+        });
+    }
+    let opened = crate::full_access::opened_folders(paths, device, binding, now)?;
+    if opened.is_empty() && !crate::full_access::admits(paths, Some(device), binding, now) {
+        return Ok(scopes);
+    }
+    for scope in &mut scopes {
+        scope.read_sessions = true;
+        scope.share_excerpts = true;
+        scope.agent_requests = true;
+        scope.full_access = true;
+    }
+    for workspace in opened {
+        if scopes.iter().any(|scope| scope.workspace == workspace) {
+            continue;
+        }
+        let path = workspace.to_string_lossy().into_owned();
+        scopes.push(SessionReadScopeV1 {
+            scope_ref: scope_ref(&binding.bridge_id, &path),
+            label: folder_label(&workspace),
+            workspace,
+            read_sessions: true,
+            share_excerpts: true,
+            agent_requests: true,
+            expires_at: i64::MAX,
+            full_access: true,
         });
     }
     Ok(scopes)
@@ -527,7 +563,7 @@ pub(crate) fn share_requirement_holds(
 }
 
 /// What the executing Host does with a peer's native invocation before it
-/// is admitted (and, without an unattended grant, held for Review): a Codex
+/// is admitted (and, without Full Access, held for Review): a Codex
 /// run naming a folder by its share reference, or any thread continuation
 /// (which names its folder only that way), is turned into this Host's own
 /// folder among the shares of the device proven in exactly `binding` now.

@@ -1875,6 +1875,34 @@ pub async fn receive_room_control_event_handler(
             let (status, code, message) = terminal_control_rejection(&error);
             return control_error(status, code, message);
         }
+        if validated.kind == "developer_terminal.open_request" {
+            // A request from a device with this Host's Full Access, proven in
+            // exactly this session, opens without anyone here. The check is
+            // made again right before the shell starts; any failure leaves the
+            // request pending for Accept, as without Full Access.
+            let full_access = crate::host_runtime::current_host_session_binding(
+                &ctx.state,
+                &room_id,
+                &inbound_peer.peer_session_id,
+            )
+            .is_ok_and(|session| {
+                let device = crate::host_runtime::verified_peer_device_for(&ctx.state, &session);
+                crate::full_access::admits(&ctx.state.paths, device.as_ref(), &session, now)
+            });
+            if full_access {
+                let runtime = ctx.state.clone();
+                let terminal_room = room_id.clone();
+                let terminal_session_id = message.terminal_session_id.clone();
+                ctx.state.spawn(async move {
+                    let _ = crate::commands::admit_developer_terminal_under_full_access(
+                        runtime,
+                        terminal_room,
+                        terminal_session_id,
+                    )
+                    .await;
+                });
+            }
+        }
         if validated.kind == "developer_terminal.output" {
             if let Ok(output) =
                 crate::developer_terminal::DeveloperTerminalOutputUiEvent::from_message(
@@ -1968,17 +1996,19 @@ pub async fn receive_room_control_event_handler(
                     );
                 }
                 // Ownership, replay, availability, then admission: a new
-                // remote invocation is held for Host Review, unstarted.
-                // A device identity proven in exactly this session lets a
-                // Host-local unattended grant apply; nothing else does.
+                // remote invocation is held for Host Review, unstarted,
+                // unless the device identity proven in exactly this session
+                // holds this Host's Full Access; nothing else skips Review.
                 let verified_device =
                     crate::host_runtime::verified_peer_device_for(&ctx.state, &binding);
                 // A folder this Host shares with the requesting device is
                 // named by its reference, never by a path, and resolved here
                 // from this Host's own shares, before anything else. Running
                 // there needs the share to allow agent requests; continuing a
-                // thread also needs it to allow reading sessions. Each run
-                // still waits for this Host's Review below.
+                // thread also needs it to allow reading sessions (Full Access
+                // allows both, and adds the folders it named by path). Each
+                // run still waits for this Host's Review below unless the
+                // device has Full Access.
                 let mut request = request;
                 let mut share_requirement = None;
                 match crate::session_read_access::resolve_agent_request(
@@ -2512,28 +2542,58 @@ pub async fn receive_room_control_event_handler(
                         )
                     }
                 };
-                // Only workspaces this Host's own shares name for this device;
+                // Only workspaces this Host's own shares (and, under Full
+                // Access, the folders that device named) give this device;
                 // sessions only of those it may read.
-                let scopes = crate::host_runtime::verified_peer_device_for(&ctx.state, &binding)
+                let device = crate::host_runtime::verified_peer_device_for(&ctx.state, &binding);
+                let now = storage::now_ts();
+                let full_access =
+                    crate::full_access::admits(&ctx.state.paths, device.as_ref(), &binding, now);
+                let local_host_ref = ctx.state.local_host_ref.as_str().to_owned();
+                // A folder named by path is added only under Full Access, and
+                // only if it passes the same rule as a share.
+                let refused = match (&query.operation, query.folder.as_deref(), device.as_ref()) {
+                    (remote::RemoteSessionOperationV1::OpenFolder, Some(folder), Some(device))
+                        if full_access =>
+                    {
+                        crate::full_access::open_folder(
+                            &ctx.state.paths,
+                            device,
+                            &binding,
+                            folder,
+                            now,
+                        )
+                        .err()
+                        .map(|error| error.message())
+                    }
+                    (remote::RemoteSessionOperationV1::OpenFolder, _, _) => Some(
+                        "This device does not have Full Access there, so it cannot open folders by path."
+                            .to_owned(),
+                    ),
+                    _ => None,
+                };
+                let scopes = device
                     .map(|device| {
                         crate::session_read_access::shared_workspaces(
                             &ctx.state.paths,
                             &device,
                             &binding,
-                            storage::now_ts(),
+                            now,
                         )
                         .unwrap_or_default()
                     })
                     .unwrap_or_default();
-                let local_host_ref = ctx.state.local_host_ref.as_str().to_owned();
                 let answer_state = ctx.state.clone();
                 let answer_room = room_id.clone();
                 let answer_route =
                     selected_peer_control_route(&room_id, &inbound_peer.peer_session_id);
                 ctx.state.spawn(async move {
-                    let answer = match remote::begin_answer(&answer_room) {
-                        None => remote::busy(&query, &local_host_ref),
-                        Some(guard) => {
+                    let mut answer = match (refused, remote::begin_answer(&answer_room)) {
+                        (Some(reason), _) => {
+                            remote::folder_refused(&query, &local_host_ref, &reason)
+                        }
+                        (None, None) => remote::busy(&query, &local_host_ref),
+                        (None, Some(guard)) => {
                             let (claude, codex) =
                                 answer_state.native_agents.lock().session_sources();
                             let blocking_host = local_host_ref.clone();
@@ -2555,6 +2615,7 @@ pub async fn receive_room_control_event_handler(
                             }
                         }
                     };
+                    answer.full_access = full_access;
                     if let Ok(payload) = serde_json::to_value(answer) {
                         // The asker waits up to 30 s for this answer.
                         let _ = send_room_control_event_with_backpressure(
@@ -2699,18 +2760,25 @@ pub async fn receive_room_control_event_handler(
                     );
                 }
                 let movement_id = request.movement_id.clone();
-                if ctx
-                    .state
-                    .native_agents
-                    .lock()
-                    .accept_bridge_workspace_prepare(&binding, request)
-                    .is_err()
                 {
-                    return control_error(
-                        StatusCode::BAD_REQUEST,
-                        "native_agent_workspace_rejected",
-                        "Native Agent workspace preparation was rejected by this Host.",
-                    );
+                    let mut agents = ctx.state.native_agents.lock();
+                    if agents
+                        .accept_bridge_workspace_prepare(&binding, request)
+                        .is_err()
+                    {
+                        return control_error(
+                            StatusCode::BAD_REQUEST,
+                            "native_agent_workspace_rejected",
+                            "Native Agent workspace preparation was rejected by this Host.",
+                        );
+                    }
+                    // Whether that device's Full Access admits the landed
+                    // workspace is decided when it lands.
+                    if let Some(device) =
+                        crate::host_runtime::verified_peer_device_for(&ctx.state, &binding)
+                    {
+                        agents.remember_movement_device(&movement_id, device);
+                    }
                 }
                 let runtime = ctx.state.clone();
                 let watcher_room = room_id.clone();
@@ -5954,6 +6022,7 @@ mod tests {
                 read_sessions: true,
                 agent_requests: false,
                 expires_at: None,
+                full_access: false,
             }],
             discovery: None,
             snapshot: Some(RemoteSnapshotV1 {
@@ -5985,6 +6054,8 @@ mod tests {
                     source: "agent reply".into(),
                 }],
             }),
+            full_access: false,
+            detail: None,
         }
     }
 
@@ -6001,6 +6072,7 @@ mod tests {
             active_within_secs: None,
             scope_ref: None,
             session_id: Some("77777777-7777-4777-8777-777777777777".into()),
+            folder: None,
         };
         let validated = validate_native(native_event(
             "native_agent.session_query",
@@ -6045,6 +6117,8 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod full_access_pair_tests;
 #[cfg(all(test, unix))]
 mod native_session_pair_tests;
 #[cfg(test)]
