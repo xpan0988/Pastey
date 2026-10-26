@@ -1321,8 +1321,8 @@ pub fn list_trusted_devices(
     crate::device_trust::trusted_devices(&state.paths).map_err(|error| error.message())
 }
 
-/// Revoking a device also ends its Full Access, so a terminal it has open
-/// here closes too.
+/// Revoking a device also ends its Full Access, with what that Full Access
+/// opened or started here.
 #[tauri::command]
 pub fn revoke_trusted_device(
     fingerprint: String,
@@ -1338,7 +1338,7 @@ pub fn revoke_trusted_device(
         .and_then(|()| crate::device_trust::trusted_devices(&state.paths))
         .inspect(|_| {
             for room_id in &controlled {
-                state.developer_terminal.end_hosted_sessions(room_id);
+                end_full_access_operations(&state, room_id);
             }
         })
         .map_err(|error| error.message())
@@ -1397,17 +1397,31 @@ pub fn grant_full_access(
     .map_err(|error| error.message())
 }
 
-/// Ends Full Access over one Bridge. A Developer Terminal it opened here
-/// closes now; Agent tasks it started keep running until stopped.
+/// Ends Full Access over one Bridge.
 #[tauri::command]
 pub fn revoke_full_access(
     room_id: String,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::full_access::BridgeFullAccessV1, String> {
     crate::full_access::revoke_full_access(&state.paths, &room_id)
-        .inspect(|()| state.developer_terminal.end_hosted_sessions(&room_id))
+        .inspect(|()| end_full_access_operations(&state, &room_id))
         .and_then(|()| crate::full_access::bridge_full_access(&state.paths, &room_id))
         .map_err(|error| error.message())
+}
+
+/// After Full Access over `room_id` ended (it is already refused for every
+/// new request): every terminal the other device has open here closes, and
+/// every Native Agent task the grant admitted is asked to stop, as Stop
+/// does. A stop is a request; each task's status says whether its interrupt
+/// was delivered, and the requester is told through that task's status.
+pub(crate) fn end_full_access_operations(state: &AppState, room_id: &str) {
+    state.developer_terminal.end_hosted_sessions(room_id);
+    let stopped = state.native_agents.lock().stop_full_access_tasks(room_id);
+    crate::logging::write_transfer_line(&format!(
+        "[pastey full-access] event=revoked room={} tasks_asked_to_stop={}",
+        &room_id[..room_id.len().min(8)],
+        stopped.len()
+    ));
 }
 
 /// Stops offering one folder a device with Full Access named here.
@@ -6421,6 +6435,28 @@ pub(crate) async fn admit_developer_terminal_under_full_access(
         &binding,
         now,
     )?;
+    // A revocation between the check above and the shell's start found no
+    // session to close; the shell exists now, so look once more.
+    if !crate::full_access::admits(&state.paths, device.as_ref(), &session, storage::now_ts()) {
+        state
+            .developer_terminal
+            .abort_host_session(&terminal_session_id);
+        let denial = crate::developer_terminal::DeveloperTerminalService::denial(
+            &binding,
+            &terminal_session_id,
+            "full_access_revoked",
+        );
+        let _ = send_developer_terminal_message(
+            state.clone(),
+            &binding,
+            "developer_terminal.open_denied",
+            &denial,
+        )
+        .await;
+        return Err(AppError::InvalidInput(
+            "That device's Full Access ended before its terminal opened.".into(),
+        ));
+    }
     crate::logging::write_transfer_line(&format!(
         "[pastey developer-terminal] event=full_access_opened room={}",
         &room_id[..room_id.len().min(8)]

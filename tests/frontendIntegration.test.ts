@@ -823,7 +823,14 @@ test("Full Access is one informed, directional decision made only on the control
   assert.match(access, /without anyone at this device clicking Accept<\/strong>, even when you are away/);
   // Revoking is one confirmed step, and says what keeps running.
   assert.match(access, /revokeFullAccess\(room\.id\)/);
-  assert.match(access, /Codex tasks it already started keep running until they finish or you stop them/);
+  assert.match(access, /Codex tasks Full Access started here are asked to stop/);
+  assert.match(access, /cannot always confirm when Codex stops/);
+  // A stop the device cannot confirm is never shown as "Stopped".
+  const revoked = taskOutcome({ state: "cancelled", code: "native_agent_full_access_revoked", result: null }, { hostName: "Home PC", remote: true, continuing: false, agentName: "Codex" });
+  assert.equal(revoked.headline, "Stop requested: Full Access ended");
+  assert.match(revoked.detail ?? "", /cannot confirm when it stopped/);
+  assert.equal(taskOutcome({ state: "cancelled", code: "native_agent_cancel_delivery_uncertain", result: null }, { hostName: "Home PC", remote: true, continuing: false, agentName: "Codex" }).headline, "Stop requested · not confirmed");
+  assert.equal(taskStages({ state: "cancelled", code: "native_agent_full_access_revoked" }, { hostName: "Home PC", remote: true }).find((stage) => stage.id === "result")!.label, "Stop requested");
   // The controlled device sees a terminal the other device opened, and can close it.
   assert.match(access, /closeHostedDeveloperTerminal\(room\.id, session\.terminalSessionId\)/);
   // Bridge details carry it; the Bridge view tells the user it exists.

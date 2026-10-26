@@ -310,8 +310,12 @@ while IFS= read -r line; do
     *'"id":9,'*) echo '{{"id":9,"result":{{"data":[{{"id":"{THREAD}","cwd":"{cwd}"}}],"nextCursor":null}}}}' ;;
     *'"id":3,'*) echo turn >> '{starts}'
       echo '{{"id":3,"result":{{"turn":{{"id":"turn-new"}}}}}}'
+      if [ ! -f '{hold}' ]; then
       echo '{{"method":"item/completed","params":{{"threadId":"{THREAD}","turnId":"turn-new","item":{{"type":"agentMessage","id":"m1","text":"continued","phase":"final_answer"}}}}}}'
-      echo '{{"method":"turn/completed","params":{{"threadId":"{THREAD}","turn":{{"id":"turn-new","items":[],"status":"completed","error":null}}}}}}' ;;
+      echo '{{"method":"turn/completed","params":{{"threadId":"{THREAD}","turn":{{"id":"turn-new","items":[],"status":"completed","error":null}}}}}}'
+      fi ;;
+    *'turn/interrupt'*) echo interrupt >> '{interrupts}'
+      echo '{{"method":"turn/completed","params":{{"threadId":"{THREAD}","turn":{{"id":"turn-new","items":[],"status":"interrupted","error":null}}}}}}' ;;
   esac
 done
 rm -f '{lock}'
@@ -319,6 +323,8 @@ rm -f '{lock}'
         lock = lock.display(),
         cwd = workspace.display(),
         starts = turn_starts.display(),
+        hold = pair.root.join("hold-turns").display(),
+        interrupts = pair.root.join("interrupts").display(),
     );
     let program = pair.root.join("codex-fixture");
     std::fs::write(&program, script).unwrap();

@@ -81,8 +81,8 @@ export function BridgeFullAccessSection({ room, peerName }: { room: RoomInfo; pe
 
     {consent && state ? <FullAccessConsentDialog peerName={peerName} fingerprint={state.displayFingerprint} pending={pending} onClose={() => setConsent(false)} onGrant={() => void act(() => grantFullAccess(room.id, true)).then((ok) => { if (ok) setConsent(false); })} /> : null}
     {confirmRevoke && grant ? <Dialog title={`Revoke ${grant.deviceLabel}'s Full Access?`} onClose={() => { if (!pending) setConfirmRevoke(false); }} footer={<><button type="button" className="btn" disabled={pending} onClick={() => setConfirmRevoke(false)}>Cancel</button><button type="button" className="btn btn-danger-solid" disabled={pending} onClick={() => void act(() => revokeFullAccess(room.id)).then(() => setConfirmRevoke(false))}>Revoke</button></>}>
-      <p>From now on, everything {grant.deviceLabel} asks for here waits for your Accept again. A terminal it has open on this device closes now.</p>
-      <p className="small muted">Codex tasks it already started keep running until they finish or you stop them. Giving Full Access again later is a new decision.</p>
+      <p>From now on, everything {grant.deviceLabel} asks for here waits for your Accept again. A terminal it has open on this device closes now, and Codex tasks Full Access started here are asked to stop.</p>
+      <p className="small muted">A stop is a request: Pastey no longer accepts those tasks' results, but cannot always confirm when Codex stops, and anything it already did stays. Giving Full Access again later is a new decision.</p>
     </Dialog> : null}
   </section>;
 }

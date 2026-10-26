@@ -218,10 +218,50 @@ async fn with_full_access_a_terminal_opens_without_anyone_at_windows_until_revok
 
     // Revoking Full Access on Windows closes it, and the Mac is told so.
     crate::full_access::revoke_full_access(&pair.windows.runtime.paths, ROOM).unwrap();
-    pair.windows
-        .runtime
-        .developer_terminal
-        .end_hosted_sessions(ROOM);
+    crate::commands::end_full_access_operations(&pair.windows.runtime, ROOM);
     let ended = pair.mac_terminal_becomes(TerminalState::Exited).await;
     assert_eq!(ended.termination_reason.as_deref(), Some("host_closed"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revoking_full_access_asks_a_running_task_to_stop_and_the_mac_is_told() {
+    let pair = RuntimePairV1::new().await;
+    let codex = install_windows_codex(&pair);
+    pair.windows_pins_mac();
+    pair.windows_gives_full_access();
+    let opened = pair
+        .mac_opens_folder(&codex.workspace.to_string_lossy())
+        .await
+        .unwrap();
+    let scope = opened.scopes[0].scope_ref.clone();
+    // Windows's Codex holds this turn until it is interrupted.
+    std::fs::write(pair.root.join("hold-turns"), b"").unwrap();
+    let started = pair.mac_continues(&scope).await.unwrap();
+    for _ in 0..200 {
+        if codex.turn_starts() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(codex.turn_starts(), 1, "the turn is running on Windows");
+
+    crate::full_access::revoke_full_access(&pair.windows.runtime.paths, ROOM).unwrap();
+    crate::commands::end_full_access_operations(&pair.windows.runtime, ROOM);
+    let ended = pair.mac_task_ends(&started.task_id).await;
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Cancelled, "{ended:?}");
+    assert_eq!(
+        ended.code.as_deref(),
+        Some(crate::native_agent::FULL_ACCESS_REVOKED_CODE)
+    );
+    for _ in 0..200 {
+        if std::fs::read_to_string(pair.root.join("interrupts")).is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        std::fs::read_to_string(pair.root.join("interrupts")).is_ok(),
+        "Windows asked Codex to interrupt the turn"
+    );
+    assert_eq!(codex.turn_starts(), 1, "nothing ran again");
 }

@@ -41,6 +41,10 @@ use capability::{
 const MAX_LINE_BYTES: usize = 64 * 1024;
 const MAX_TASK_BYTES: usize = 16 * 1024;
 
+/// A task Full Access admitted, asked to stop because its Host's user
+/// revoked that Full Access. Like Stop, a request: not proof the turn ended.
+pub(crate) const FULL_ACCESS_REVOKED_CODE: &str = "native_agent_full_access_revoked";
+
 /// Continuing an existing Codex thread (`capability::codex::thread_continuation`).
 pub(crate) const CODEX_THREAD_CAPABILITY: &str =
     capability::codex::thread_continuation::CODEX_THREAD_CAPABILITY_ID;
@@ -1129,6 +1133,10 @@ pub(crate) struct NativeAgentServiceV1 {
     /// Access, if it holds it when the workspace lands, stands in for the
     /// executor Review.
     movement_devices: HashMap<String, crate::device_identity::VerifiedPeerDevice>,
+    /// Tasks this Host admitted under Full Access instead of an Accept, so
+    /// revoking it can ask exactly them to stop. Process-local: a restart
+    /// never resumes a native turn, so none of them can still be running.
+    full_access_tasks: HashSet<String>,
     /// The conversation key each Bridge-owned task ran in, so Burn can end
     /// that conversation's live native state.
     task_conversations: HashMap<String, String>,
@@ -1188,6 +1196,7 @@ impl NativeAgentServiceV1 {
             task_input_digests: HashMap::new(),
             movement_bindings: HashMap::new(),
             movement_devices: HashMap::new(),
+            full_access_tasks: HashSet::new(),
             task_conversations: HashMap::new(),
             task_requesters: HashMap::new(),
             workspace_movements: HashMap::new(),
@@ -4199,13 +4208,23 @@ impl NativeAgentServiceV1 {
                 // A start the capability refuses ends as it would after an
                 // Accept: a definite non-start the peer is told about, and a
                 // landed workspace removed by the same terminal cleanup.
-                match continuation {
-                    NativeInvocationContinuationV1::Direct => self
-                        .start_admitted_peer_invocation(binding, capability_id, task_id, input)
-                        .or_else(|_| self.task_status(task_id)),
-                    NativeInvocationContinuationV1::ReceivedWorkspace { movement_id } => self
-                        .start_admitted_received_workspace(&movement_id, task_id, input)
-                        .or_else(|_| self.end_review(task_id, admission::START_REJECTED_CODE)),
+                let started = match continuation {
+                    NativeInvocationContinuationV1::Direct => {
+                        self.start_admitted_peer_invocation(binding, capability_id, task_id, input)
+                    }
+                    NativeInvocationContinuationV1::ReceivedWorkspace { movement_id } => {
+                        self.start_admitted_received_workspace(&movement_id, task_id, input)
+                    }
+                };
+                match started {
+                    Ok(status) => {
+                        self.full_access_tasks.insert(task_id.to_owned());
+                        Ok(status)
+                    }
+                    Err(_) if self.unstarted_review_tasks.contains(task_id) => {
+                        self.task_status(task_id)
+                    }
+                    Err(_) => self.end_review(task_id, admission::START_REJECTED_CODE),
                 }
             }
             (
@@ -5832,6 +5851,9 @@ impl NativeAgentServiceV1 {
 
     pub(crate) fn purge_bridge_authority(&mut self, bridge_id: &str) -> AppResult<()> {
         self.revoked_bridges.insert(bridge_id.to_owned());
+        let task_bridges = &self.task_bridges;
+        self.full_access_tasks
+            .retain(|task_id| task_bridges.get(task_id).map(String::as_str) != Some(bridge_id));
         self.pending_reviews
             .retain(|_, pending| pending.binding.bridge_id != bridge_id);
         self.movement_bindings
@@ -5959,6 +5981,48 @@ impl NativeAgentServiceV1 {
     }
 
     pub(crate) fn cancel_task(&mut self, task_id: &str) -> AppResult<NativeAgentTaskStatusV1> {
+        self.cancel_task_with_code(task_id, "native_agent_cancel_requested")
+    }
+
+    /// Revoking Full Access over `bridge_id` asks every task it admitted
+    /// there, and that has not ended, to stop: the same cancellation as Stop
+    /// (Pastey's authority over the turn and its result ends now; the native
+    /// interrupt is requested, not proven), recorded as
+    /// `native_agent_full_access_revoked`, or `..._cancel_delivery_uncertain`
+    /// when the interrupt could not be delivered. A task whose outcome is
+    /// already unknown keeps Stop's own rules. Returns what each task now says.
+    pub(crate) fn stop_full_access_tasks(
+        &mut self,
+        bridge_id: &str,
+    ) -> Vec<NativeAgentTaskStatusV1> {
+        let task_ids = self
+            .full_access_tasks
+            .iter()
+            .filter(|task_id| {
+                self.task_bridges.get(*task_id).map(String::as_str) == Some(bridge_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut stopped = Vec::new();
+        for task_id in task_ids {
+            self.full_access_tasks.remove(&task_id);
+            if let Ok(status) = self.cancel_task_with_code(&task_id, FULL_ACCESS_REVOKED_CODE) {
+                log_native_lifecycle(
+                    "full_access_revoked_stop",
+                    &task_id,
+                    status.code.as_deref().unwrap_or(""),
+                );
+                stopped.push(status);
+            }
+        }
+        stopped
+    }
+
+    fn cancel_task_with_code(
+        &mut self,
+        task_id: &str,
+        requested_code: &str,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         // Cancelling a task held for Review ends the Review; it never started.
         self.pending_reviews.remove(task_id);
         let (status, native_execution_needs_cancellation) = {
@@ -5987,7 +6051,7 @@ impl NativeAgentServiceV1 {
             // fallible native interrupt. This is not proof the process ended.
             let native_execution_needs_cancellation = task.state != NativeAgentTaskStateV1::Queued;
             task.state = NativeAgentTaskStateV1::Cancelled;
-            task.code = Some("native_agent_cancel_requested".into());
+            task.code = Some(requested_code.into());
             // No outstanding review may be answered once stopping began.
             task.native_decisions.clear();
             (task.clone(), native_execution_needs_cancellation)
@@ -9986,6 +10050,81 @@ done
         wait_for_workspace_release(&h.service, &workspace);
         assert!(!workspace.join("approval-answered").exists());
         let _ = fs::remove_dir_all(approval_root);
+    }
+
+    #[test]
+    fn revoking_full_access_asks_exactly_its_tasks_to_stop() {
+        let (script_root, _, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*)
+      {{ACK}}
+      printf '%s\n' '{{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{{"threadId":"native-thread","turnId":"native-turn","itemId":"cmd-1","command":"make"}}}}'
+      ;;
+    *'turn/interrupt'*)
+      touch "$PWD/interrupt-requested"
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"native-thread","turn":{{"id":"native-turn","items":[],"status":"interrupted","error":null}}}}}}'
+      ;;
+"#
+        ));
+        let mut h = full_access_fixture();
+        h.service.codex.use_executable(&agent);
+        let (binding, device) = h.proven(GRANT_BRIDGE, "mac", "s1");
+        // One run Windows's user accepted, before Full Access existed.
+        let accepted_folder = h.workspace.parent().unwrap().join("Accepted");
+        fs::create_dir_all(&accepted_folder).unwrap();
+        let accepted_folder = accepted_folder.canonicalize().unwrap();
+        assert_waits_for_review(
+            &h.invoke(&binding, Some(&device), "task-acc", &accepted_folder, "x")
+                .unwrap(),
+        );
+        h.service
+            .accept_invocation_review("task-acc", Some(&binding), crate::storage::now_ts())
+            .unwrap();
+        // One run Full Access admitted.
+        h.give_full_access();
+        let workspace = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-fa", &workspace, "x")
+            .unwrap();
+        for task in ["task-acc", "task-fa"] {
+            wait_for_code(&h.service, task, Some(AWAITING_NATIVE_DECISION_CODE));
+        }
+        // Revoked: a new request waits for Review at once, and exactly the
+        // task Full Access admitted is asked to stop, like Stop.
+        crate::full_access::revoke_full_access(&h.paths, GRANT_BRIDGE).unwrap();
+        let third = workspace.parent().unwrap().join("Third");
+        fs::create_dir_all(&third).unwrap();
+        assert_waits_for_review(
+            &h.invoke(&binding, Some(&device), "task-new", &third, "x")
+                .unwrap(),
+        );
+        let stopped = h.service.stop_full_access_tasks(GRANT_BRIDGE);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].task_id, "task-fa");
+        assert_eq!(stopped[0].state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(stopped[0].code.as_deref(), Some(FULL_ACCESS_REVOKED_CODE));
+        assert!(
+            stopped[0].native_decisions.is_empty(),
+            "nothing can be answered now"
+        );
+        // The native interrupt was requested, and the folder is released only
+        // once the turn actually ended.
+        wait_for_workspace_release(&h.service, &workspace);
+        assert!(workspace.join("interrupt-requested").exists());
+        // Its interrupted turn does not overturn the recorded stop.
+        let after = h.service.task_status("task-fa").unwrap();
+        assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(after.code.as_deref(), Some(FULL_ACCESS_REVOKED_CODE));
+        // The accepted run is untouched, and there is nothing left to stop.
+        assert_eq!(
+            h.service.task_status("task-acc").unwrap().state,
+            NativeAgentTaskStateV1::Running
+        );
+        assert!(!accepted_folder.join("interrupt-requested").exists());
+        assert!(h.service.stop_full_access_tasks(GRANT_BRIDGE).is_empty());
+        h.service
+            .cancel_bridge_task(GRANT_BRIDGE, "task-acc")
+            .unwrap();
+        wait_for_workspace_release(&h.service, &accepted_folder);
+        let _ = fs::remove_dir_all(script_root);
     }
 
     /// Codex raising a command approval and a file-change approval (whose

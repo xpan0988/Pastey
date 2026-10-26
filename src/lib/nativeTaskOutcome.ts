@@ -44,6 +44,12 @@ const NOTHING_RAN = new Set([
   "native_agent_conversation_unavailable",
 ]);
 
+/** A cancellation Pastey asked the Agent for but cannot confirm. */
+const STOP_REQUESTED_ONLY = new Set([
+  "native_agent_full_access_revoked",
+  "native_agent_cancel_delivery_uncertain",
+]);
+
 export function taskNothingRan(status: Pick<NativeAgentTaskStatus, "state" | "code">): boolean {
   return status.state === "failed" && NOTHING_RAN.has(status.code ?? "");
 }
@@ -105,7 +111,7 @@ export function taskStages(status: Pick<NativeAgentTaskStatus, "state" | "code">
     sent: {},
     accepted: { current: "Waiting for Accept", stopped: "Not accepted", todo: "Accept there" },
     running: { stopped: status.state === "failed" && taskNothingRan(status) ? "Did not start" : "Running" },
-    result: { stopped: status.state === "interrupted" ? "Outcome unknown" : status.state === "cancelled" ? "Stopped" : "Failed" },
+    result: { stopped: status.state === "interrupted" ? "Outcome unknown" : status.state === "cancelled" ? STOP_REQUESTED_ONLY.has(status.code ?? "") ? "Stop requested" : "Stopped" : "Failed" },
   };
   for (const stage of stages) stage.label = words[stage.id][stage.state] ?? stage.label;
   return stages;
@@ -129,6 +135,12 @@ export function taskOutcome(status: Pick<NativeAgentTaskStatus, "state" | "code"
     case "completed":
       return { tone: "complete", headline: "Completed", detail: continuing ? `The session${there} now ends with this turn. Its reply is below; it is ${agentName}'s own account, not verified.` : `Its reply is below; it is ${agentName}'s own account, not verified.`, next: null, nothingRan: false };
     case "cancelled":
+      if (status.code === "native_agent_full_access_revoked") {
+        return { tone: "danger", headline: "Stop requested: Full Access ended", detail: `${hostName}'s user revoked this device's Full Access while ${agentName} worked, so ${hostName} asked it to stop and no longer accepts its result. Whatever it did before it stopped stays there; Pastey cannot confirm when it stopped.`, next: `Check the folder on ${hostName}. To run there again, someone on ${hostName} must accept, or give Full Access again.`, nothingRan: false };
+      }
+      if (status.code === "native_agent_cancel_delivery_uncertain") {
+        return { tone: "danger", headline: "Stop requested · not confirmed", detail: `Pastey${there} no longer accepts this run's result, but could not confirm that ${agentName} received the request to stop. It may still be working.`, next: `Check the folder${there} before relying on it. Nothing runs again on its own.`, nothingRan: false };
+      }
       return { tone: "neutral", headline: "Stopped", detail: `Stopped at your request. Anything ${agentName} did before it stopped stays${remote ? ` on ${hostName}` : ""}; nothing runs again on its own.`, next: reread, nothingRan: false };
     case "interrupted":
       if (["native_agent_outcome_unknown", "native_agent_reconciliation_required"].includes(status.code ?? "")) {

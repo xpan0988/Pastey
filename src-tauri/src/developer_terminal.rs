@@ -473,6 +473,18 @@ impl DeveloperTerminalService {
         Ok((accepted, events))
     }
 
+    /// The denial a controller receives when its request could not be
+    /// admitted after all (`reason`: why, a bounded code).
+    pub fn denial(
+        binding: &DeveloperTerminalBinding,
+        terminal_session_id: &str,
+        reason: &str,
+    ) -> TerminalMessage {
+        let mut message = TerminalMessage::base(binding, terminal_session_id);
+        message.reason_code = Some(reason.into());
+        message
+    }
+
     pub fn receive_accepted(
         &self,
         binding: &DeveloperTerminalBinding,
