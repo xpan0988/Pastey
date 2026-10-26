@@ -152,6 +152,18 @@ cargo test --manifest-path src-tauri/Cargo.toml --bin pastey full_access
 
 It does not exercise a packaged app, Windows, or an unattended session there; part U of the [Mac ↔ Windows acceptance](platform/mac-windows-acceptance.md) does.
 
+### Known timing-sensitive tests
+
+Classified on 2026-10-26 on an Apple Silicon Mac, comparing `232e231` (before Full Access) with the Full Access branch. Each side ran the full suite twice (`cargo test --bin pastey`, outside the sandbox so PTYs work) and each test below five times alone (`--exact`):
+
+| Test | Baseline | Full Access | Class |
+| --- | --- | --- | --- |
+| `room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers` | full: 1 of 2 runs failed; alone: 5/5 pass (failed alone once in an earlier check) | full: 1 of 2 failed; alone: 4/5 | Flaky before Full Access. Under the burst, Room Control can drop the Mac's current Windows session ("Current remote Host session is unavailable") |
+| `native_agent::tests::a_reviewed_task_with_a_proven_requester_takes_its_decisions` | pass | pass, after the fix | Was a regression in the test's assumption (a folder-scoped grant not covering another folder); fixed by revoking Full Access in the test |
+| `a_new_conversation_replaces_the_live_one_without_touching_other_owners`, `an_unknown_turn_at_restart_blocks_follow_ups_and_is_never_rerun`, `an_unavailable_conversation_is_never_replaced_by_a_new_one`, `another_owner_or_workspace_never_inherits_a_conversation`, `concurrent_follow_ups_are_exclusive_and_each_runs_once`, `thread_continuation::tests::pastey_s_own_idle_session_is_closed_only_after_the_folder_check`, `a_workspace_sent_by_a_device_with_full_access_starts_when_it_lands` | pass in both full runs and 5/5 alone (the last is new) | pass in both full runs and 5/5 alone | Failed only once, in one full run made while other builds competed for the CPU; their waits on the fixture Codex are bounded to a few seconds |
+
+To repeat a classification, run the full suite on an otherwise idle machine, then the test alone, for example `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- --exact room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers`.
+
 Claude Code session continuation has a live check. It uses the installed, signed-in Claude Code and a little of its quota. In `src-tauri/target/claude-s2-live` it creates a fresh session, continues it through Pastey's Native Agent lifecycle, and then shows that a session a foreground run holds is refused without anything being sent:
 
 ```bash
