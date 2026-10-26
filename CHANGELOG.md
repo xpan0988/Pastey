@@ -8,6 +8,15 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Changed
 
+- **Full Access replaces unattended Codex permissions.** On the device to be controlled (say a Windows PC at home), Bridge details → **Full Access** → Allow Full Access… lets the device that Bridge is paired with (say a MacBook elsewhere) control it through Pastey without anyone there clicking Accept: run Codex in any folder, continue Codex sessions, read the sessions in its shared folders, add folders by path, send a folder to run on, and open a Developer Terminal.
+  - Informed and explicit: the dialog says what it allows (including that the terminal can do anything your user account can), what it never does, and what ends it, shows the paired device's fingerprint, and needs "I understand" ticked. After pairing, the Bridge shows a one-time notice that Full Access exists and is off.
+  - Directional: it lets that device control this one, never the other way round. Each device gives it only for itself, on itself.
+  - It lasts through reconnects and restarts. Revoke (Bridge details or Settings → Permissions), revoking or forgetting the device, pairing the Bridge with another device, and Burn each end it; trusting or pairing the same device again does not bring it back.
+  - It applies only to requests over a session where the paired device proved its identity key. It never answers Codex's own approval prompts (they still go to the requesting device), never continues a Claude Code session from another device, never passes UAC, administrator or macOS privacy prompts, and leaves Plan approval unchanged.
+  - The controlled device shows a terminal the other device has open on it, with **Close terminal**; revoking closes it. Codex tasks already started keep running until stopped.
+  - On the controlling device, Agents shows "Full Access" for that device and **Workspaces on <device>** with an Add a folder… button. The Access dialog says whether that device gave this one Full Access.
+  - Existing unattended permissions are removed on update, not converted: those requests wait for Accept until Full Access is given. Trusting a device still allows nothing by itself.
+
 - Agents is organised as the work is: **Agents on [device]**, the **workspaces** it shares with this Bridge (each with what it allows, Sessions and Agents), and, in a workspace, **New conversation** and its **sessions**. One conversation is open beside the navigator, or alone with a back button at the default window size.
   - A session opens as a conversation: its prompts and replies (this device's sessions: the newest 40 messages; another device's: the short excerpts its Host shares, if any), then your turns in it, then a composer that continues that session. State, who has it open, ids and evidence are under Details.
   - Each turn shows where it is (waiting for Accept, running, an approval it asks for) and then the reply, inside the conversation; failures say whether anything ran and what to do, with Reconcile, Stop and the other repair actions in the turn. Pastey does not show a reply before it has one: Codex's partial output is never read.

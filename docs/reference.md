@@ -110,12 +110,12 @@ The renderer-visible task states are `queued`, `running`, `completed`, `failed`,
 
 Every task has one immutable owner: Local, or the Bridge it was created on. The owner is durable as the envelope's Bridge correlation (or its movement's), and its absence means Local. No invocation, replay, workspace preparation, approval, or failed request from another principal can adopt, re-home, or erase it. Executor-side `native_agent.cancel` is accepted only from the owning Bridge; another Bridge's task, a Local task, and an unknown task receive the same refusal. `native_agent.workspace_prepare` is accepted only from the exact authenticated peer `HostSessionBinding` whose `HostRef` is the claimed source.
 
-Native executor admission (`src-tauri/src/native_agent/admission.rs`) is the executor's separate decision that a principal may make this Host run a capability; it is unrelated to the managed Plan path's attempt-bound Host admission. The fixed policy admits `Local` immediately and requires Review for `Remote(HostSessionBinding)`; there is no configurable policy, stored grant, ACL, or per-peer memory. A remote `native_agent.invoke`, and an approved movement's landed workspace, become `queued` with `native_agent_review_required`; no adapter `prepare` or `start` runs. For `native_agent.invoke` the executing Host checks, in order: the exact authenticated peer `HostSessionBinding`; target Host equal to itself; capability present and available; immutable ownership and replay; availability again; admission. A replay of an existing task is compared with the digest of the input Core admitted for it and never reaches an adapter; a replay whose admitted input is no longer known, for example after restart, is refused. A landed workspace reaches admission only after its tree is materialized and durably owned by its movement, which stays `transferring_to_agent` and keeps the landed tree and the requester's source owned while the executor Review is pending. Accept is one-shot and revalidates the exact binding, Bridge/Burn authority, Review expiry, ownership, availability, and, for a movement, that the landed workspace and held input still belong to that movement and task. Terminal admission codes, all with task state `failed`:
+Native executor admission (`src-tauri/src/native_agent/admission.rs`) is the executor's separate decision that a principal may make this Host run a capability; it is unrelated to the managed Plan path's attempt-bound Host admission. The fixed policy admits `Local` immediately, admits `FullAccess(HostSessionBinding)` immediately, and requires Review for `Remote(HostSessionBinding)`. A peer is `FullAccess` only when the device identity verified in exactly that binding matches an active row of `full_access_grants` for this Bridge, peer HostRef and Host (`full_access::admits`); there is no other stored grant, per-capability ACL or per-peer memory. A capability that advertises no peer protocol is refused for both remote principals. A remote `native_agent.invoke`, and an approved movement's landed workspace, become `queued` with `native_agent_review_required`; no adapter `prepare` or `start` runs. For `native_agent.invoke` the executing Host checks, in order: the exact authenticated peer `HostSessionBinding`; target Host equal to itself; capability present and available; immutable ownership and replay; availability again; admission. A replay of an existing task is compared with the digest of the input Core admitted for it and never reaches an adapter; a replay whose admitted input is no longer known, for example after restart, is refused. A landed workspace reaches admission only after its tree is materialized and durably owned by its movement, which stays `transferring_to_agent` and keeps the landed tree and the requester's source owned while the executor Review is pending. Accept is one-shot and revalidates the exact binding, Bridge/Burn authority, Review expiry, ownership, availability, and, for a movement, that the landed workspace and held input still belong to that movement and task. Terminal admission codes, all with task state `failed`:
 
 - `native_agent_admission_denied` — the Host user denied the Review.
 - `native_agent_review_expired` — the Review expired.
 - `native_agent_admission_revoked` — the exact session, Bridge, ownership, or capability ended before Accept could start it, or the Host restarted while it was pending.
-- `native_agent_start_rejected` — accepted, but the capability refused the input or could not start it.
+- `native_agent_start_rejected` — accepted (or admitted under Full Access), but the capability refused the input or could not start it.
 
 A pending Review is process-local and is never persisted: session loss ends it, Burn and peer departure remove it, and restart forgets it. A persisted movement task still marked `native_agent_review_required` becomes `failed` with `native_agent_admission_revoked` on restart, and its landed tree is cleaned through the existing terminal path. The renderer projection `NativeInvocationReviewV1` is exactly `taskId`, `bridgeId`, `peerHostRef`, `requestingPeerSessionId`, `capabilityDisplayName`, and `expiresAt` (Unix seconds)—never the invocation input—and is the same for direct invocations and received workspaces. Requester or local cancellation ends a pending executor Review as `cancelled`. Once started, an invocation keeps the existing lifecycle and is not re-admitted on route or session change.
 
@@ -178,9 +178,10 @@ Bounds:
 A requester asks one exact current Bridge Host about its native sessions with `native_agent.session_query`. The Host answers with `native_agent.session_response` on the same session. Both payloads use schema `pastey-native-session-v1` and reject unknown fields. The replay keys are `native-session-query:<requestId>` and `native-session-response:<requestId>`.
 
 **Query.** It has these fields:
-- `requestId`, `targetHostRef`, and `operation` (`discover`, `inspect`, or `workspaces`, which only lists the shared workspaces and looks at no session);
+- `requestId`, `targetHostRef`, and `operation` (`discover`, `inspect`, `workspaces`, which only lists the shared workspaces and looks at no session, or `open_folder`);
 - optional `provider`, `text` (at most 200 characters, one line), `activeWithinSecs` and `scopeRef` (`scope:` followed by 16 hex characters);
-- `sessionId`, which an inspection must name together with `provider`.
+- `sessionId`, which an inspection must name together with `provider`;
+- `folder`, only and always with `open_folder`: the folder on that Host by its full path, one line, at most 1,024 characters.
 
 **Authority.** The Host resolves the asker from the exact current peer session and the device identity proven in it (`verified_peer_device_for`). It answers only from that device's active **workspace shares**. The requester shows its identity before each query (`present_device_identity_over`), so a reconnect or a Host restart needs no other step.
 - A share lives in the Host-local `session_read_grants` table (`src-tauri/src/session_read_access.rs`). Each row is one folder shared with one trusted device over one Bridge, with what it allows: `read_sessions` (and `share_excerpts`, only with it) and `agent_requests`. Rows made before workspace sharing keep `read_sessions = 1` and get `agent_requests = 0`.
@@ -189,14 +190,15 @@ A requester asks one exact current Bridge Host about its native sessions with `n
 - At most 32 are active. Sharing a folder already shared with that device over that Bridge changes that share instead of adding one.
 - Only the Host's local commands create, change, list or end shares (`share_bridge_workspace`, `update_workspace_share`, `stop_sharing_workspace`, `list_bridge_workspace_shares`, `list_session_read_grants`). `share_bridge_workspace` takes the Bridge and uses the device proven on it now (a fingerprint is required when more than one is); the device must already be trusted, and sharing never trusts it. Stopping a share also revokes that device's unattended grants for that folder on that Bridge. Trusting a device creates none. A share never satisfies an unattended grant.
 - Burn deletes a Bridge's shares.
+- **Full Access** (`src-tauri/src/full_access.rs`, tables `full_access_grants` and `full_access_folders`) lifts the switches: while the device proven in that session holds it, every share allows `read_sessions`, `share_excerpts` and `agent_requests` (the stored switches are unchanged), and the folders it added with `open_folder` count as shares with no expiry (`fullAccess: true`). `open_folder` validates the folder with the share rule (`validate_shareable_folder`) and adds it, at most 32 per grant; without Full Access, or for a refused folder, the answer is `folder_refused` with `detail`.
 - The Host answers one query per Bridge at a time; another gets `busy`.
 
 **Shared folder references.** A peer names a shared folder only as `scope:` followed by 16 hex characters: a BLAKE3 digest of the Bridge id and the canonical path, so two Bridges never see the same reference for one folder. The executing Host resolves every reference against that device's active shares in exactly that session (`resolve_agent_request`, called by Room Control before admission):
 - a Codex run (`agent.coding.codex`, v1 invocation) whose `workspace` is a reference needs a share with `agent_requests`; a `workspace` that is a path keeps meaning that path, as before;
 - a thread continuation (`agent.coding.codex_thread`) needs a share with both `agent_requests` and `read_sessions`, and refuses a path;
-- anything else is refused with `native_agent_not_authorized` before admission; nothing is queued. An admitted request still waits for the Host's Review, unless an unattended grant for that folder applies (runs only; continuation always waits).
+- anything else is refused with `native_agent_not_authorized` before admission; nothing is queued. An admitted request still waits for the Host's Review, unless the device has Full Access there, for runs and continuations alike.
 
-**Answer.** It carries `requestId`, `sourceHostRef`, `outcome` (`ok`, `not_authorized`, `not_found`, `busy` or `unavailable`), and every folder shared with the device as `scopes` (`scopeRef`, folder `label`, `readSessions`, `shareExcerpts`, `agentRequests`, `expiresAt`; a scope from an older Host reads as readable without agent requests). Sessions come only from scopes with `readSessions`; `not_authorized` means none is readable (or the named one is not). It also carries either `discovery` or `snapshot`.
+**Answer.** It carries `requestId`, `sourceHostRef`, `outcome` (`ok`, `not_authorized`, `not_found`, `busy`, `unavailable` or `folder_refused`), and every folder shared with the device as `scopes` (`scopeRef`, folder `label`, `readSessions`, `shareExcerpts`, `agentRequests`, `expiresAt`, and `fullAccess` when only Full Access allows it; a scope from an older Host reads as readable without agent requests). `fullAccess: true` says the device holds the Host's Full Access now; `detail` says why a folder was refused, with any path replaced. Both are omitted when not set, so an older requester reads every other answer unchanged. Sessions come only from scopes with `readSessions`; `not_authorized` means none is readable (or the named one is not). It also carries either `discovery` or `snapshot`.
 - **Minimal disclosure:**
   - no folder path: a workspace appears only as its folder name and `scopeRef`;
   - path-like text in statements and titles becomes `<path>`;
@@ -207,7 +209,7 @@ A requester asks one exact current Bridge Host about its native sessions with `n
 - **Statuses** are the same as local discovery's: live state from a live source, history only for a stopped session.
 - **Requester checks.** The requester accepts an answer only for a query it has outstanding (`register`, 60 s), on the same Bridge, from the Host it asked, once.
 
-The requester's commands are `discover_remote_native_sessions(roomId, targetHostRef, provider?, text?, activeWithinSecs?, scopeRef?)` and `inspect_remote_native_session(roomId, targetHostRef, provider, sessionId)`. Each waits up to 30 s.
+The requester's commands are `discover_remote_native_sessions(roomId, targetHostRef, provider?, text?, activeWithinSecs?, scopeRef?)`, `inspect_remote_native_session(roomId, targetHostRef, provider, sessionId)` and `open_remote_folder(roomId, targetHostRef, folder)`. Each waits up to 30 s.
 
 ### Native Agent source map
 
@@ -372,6 +374,20 @@ Design and contract: [Connectivity](layers/layer-4-connectivity.md). Source: `sr
 | Timeouts | Carrier connect 12 s; reconnect answer 12 s; tunnel liveness probe 5 s, 4 failures (LAN 1.8 s, 3) |
 | Endpoint | The peer endpoint of a tunnelled session is `127.0.0.1:<forwarder port>`, one forwarder per (Bridge, peer carrier key), stable across path changes and carrier reconnects |
 
+## Full Access facts
+
+| Fact | Value |
+| --- | --- |
+| Source | `src-tauri/src/full_access.rs`; admission in `native_agent/admission.rs` (`FullAccess` principal) |
+| Tables | `full_access_grants` (grant id, Bridge, peer HostRef, local HostRef, device fingerprint and base64 public key, granted/revoked time); `full_access_folders` (grant id, canonical folder, added time) |
+| Active when | `FULL_ACCESS_IS_ACTIVE` in `storage.rs`: unrevoked; `trusted_devices` row with the same fingerprint and key, unrevoked; `bridge_peer_pins` row for the Bridge with the same peer HostRef and key; Bridge row live and not tombstoned |
+| Created by | `grant_full_access({ roomId, understood: true })`, local only; uses the Bridge's pin, trusts that key, keeps one active grant per Bridge |
+| Ended by | `revoke_full_access`, `revoke_trusted_device`, `forget_known_device`, pairing the Bridge with another key (`establish_fresh_peer_trust`), Burn (cutoff, then `delete_bridge_full_access`) |
+| Other local commands | `get_bridge_full_access`, `list_full_access`, `remove_full_access_folder` |
+| Requester command | `open_remote_folder(roomId, targetHostRef, folder)` |
+| Folders | Same rule as a share (`validate_shareable_folder`); at most 32 per grant; forgotten on revoke |
+| Retired | `unattended_grants` and `unattended_grant_uses` are dropped at startup (`retire_unattended_grants`); nothing is converted |
+
 ## Developer Terminal protocol and bounds
 
 Protocol family/version: `developer_terminal` / `pastey-developer-terminal-v0`.
@@ -397,6 +413,8 @@ Current limits:
 - 5,000-line xterm scrollback;
 - 30-minute UI and active-session lifetime;
 - 2-minute admission-request lifetime.
+
+A pending `open_request` from a controller whose device, proven in exactly that session, holds the target Host's Full Access is admitted by the target itself (`admit_open_with_full_access`, starting at 100×30 until the controller resizes it). Its Host session is marked `fullAccess` in the target's workspace projection. The target's user can end it (`close_hosted_developer_terminal`), and revoking Full Access or the device ends every such session on that Bridge; the controller receives `developer_terminal.exit` with `reasonCode: host_closed`.
 
 The frontend uses `@xterm/xterm` and `@xterm/addon-fit`. Host shell selection is Host-owned: an allowed `$SHELL` or safe fallback on Unix, and PowerShell through ConPTY on Windows. Terminal content and absolute paths are excluded from ordinary Pastey logs/history.
 

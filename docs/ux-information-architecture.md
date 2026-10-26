@@ -11,10 +11,11 @@ How the desktop UI is organized, and why. Product rules (authority, movement, re
 | Kind | Where | Authority | Review |
 |---|---|---|---|
 | Movement: text and files, either way | **Share** tab. Send by typing, + → Send files…, or drop on the window. Get a file with + → Get a file from <device>… | Send: this device's user. Get: the other device's shared search folders only | Get a file: review the Search, then choose the one file |
-| Workspace sharing: this device's folders, for one Bridge | **Bridge details → Workspaces** → Share a workspace… (this device's own folder picker), then per folder: Sessions, excerpts, Agent requests, Allow without asking…, Stop sharing | This device's user only; the Bridge's own device, trusted once (inline Trust… there) | None to share; sharing allows nothing until a switch is on |
-| Execution: Run Codex | **Agents** tab → a workspace → New conversation; or Other places → a folder by path on <device>, or a folder from this device (movement) | The executing device's Accept, or its own unattended permission | The other device's Accept; workspace movement reviewed here first |
+| Full Access: the other device controls this one, unattended | **Bridge details → Full Access** → Allow Full Access… (consent dialog with what it allows, what it never does and what ends it); Revoke there or in Settings → Permissions. A notice above the Bridge offers it once after pairing, and shows a terminal the other device has open here, with Close terminal | This device's user only, for the device the Bridge's pairing code proved | The consent itself; afterwards no per-request Accept |
+| Workspace sharing: this device's folders, for one Bridge | **Bridge details → Workspaces** → Share a workspace… (this device's own folder picker), then per folder: Sessions, excerpts, Agent requests, Stop sharing | This device's user only; the Bridge's own device, trusted once (inline Trust… there) | None to share; sharing allows nothing until a switch is on |
+| Execution: Run Codex | **Agents** tab → a workspace → New conversation; or Other places → a folder by path on <device>, or a folder from this device (movement) | The executing device's Accept, or the Full Access it gave this device | The other device's Accept unless Full Access; workspace movement reviewed here first |
 | Observation: Agent sessions | **Agents** tab → a workspace's sessions, and each session's conversation | A share of that folder with Sessions on | None: read only, never starts, continues or stops a session |
-| Continuation: an existing session, in itself | **Agents** tab → a workspace → a session → its composer | This device's user; on another device, a share with Sessions and Agent requests on, and its Accept | The other device's Accept for each remote continuation; the session must still end where you saw it |
+| Continuation: an existing session, in itself | **Agents** tab → a workspace → a session → its composer | This device's user; on another device, a share with Sessions and Agent requests on and its Accept, or its Full Access (with a folder it shares or one added by path) | The other device's Accept for each remote continuation unless Full Access; the session must still end where you saw it |
 
 ### Inside the Bridge, not in Settings
 
@@ -22,7 +23,8 @@ A Bridge is the collaboration context the user already set up, so everything tha
 - **Windows:** this Bridge → Bridge details → Workspaces → Share a workspace…, choose the folder with Windows's own picker, turn on Sessions (and Agent requests to let the Mac run or continue there). If the Mac is not trusted yet, the same place offers Trust… with the fingerprint, once.
 - **Mac:** this Bridge → Agents on Windows. The navigator lists what Windows shares, by name and with what each allows; a workspace opens to New conversation and its sessions, listed by themselves; a session opens as a conversation whose composer continues it, and the run is followed in that conversation. Every missing permission is explained in place with the exact step on Windows, never as an unexplained grey button.
 - Each device shows its identity to the Bridge's other devices once per connection while the Bridge is open (it grants nothing), so the other device can trust it without a step here.
-- Settings → Permissions keeps the cross-Bridge view: every shared workspace (Stop sharing), unattended Codex access, and shared search folders.
+- **Unattended (Full Access):** on Windows, this Bridge → Bridge details → Full Access → Allow Full Access…. From then on the Mac's runs, continuations and terminals start there without anyone at Windows. On the Mac, Agents on Windows shows "Full Access" and **Workspaces on Windows** with an Add a folder… button that names a Windows folder by its path.
+- Settings → Permissions keeps the cross-Bridge view: every device with Full Access (Revoke), every shared workspace (Stop sharing), and shared search folders.
 
 ### Agents: a device, its workspaces, their conversations
 
@@ -50,7 +52,8 @@ In a conversation:
 | Run Codex on this or another device; continue Pastey's own conversation in a folder | Implemented |
 | Workspace movement to another device and result return | Implemented |
 | Share a folder with one Bridge, from inside it, with Sessions and Agent requests chosen per folder | Implemented (Mac ↔ Windows acceptance N) |
-| Run Codex in a folder another device shares, chosen by name | Implemented: that device resolves its own path; same Review and unattended grants |
+| Run Codex in a folder another device shares, chosen by name | Implemented: that device resolves its own path; same Review, or Full Access |
+| Use another device unattended (Full Access) | Implemented: runs, continuations, received workspaces and terminals start without Accept; folders added by path; revoked by Revoke, Forget, re-pairing or Burn. Physical Mac ↔ Windows acceptance pending (acceptance F) |
 | Read-only discovery and inspection of Claude Code and Codex sessions, here or on another device that shares the folder with Sessions on | Implemented |
 | Continue an idle Codex thread on this device, in the thread itself | Implemented: Codex's writer lock excludes other writers; checked against the turn you saw (real, macOS). A thread only Pastey's own idle conversation holds is continued after Pastey closes that session |
 | Continue a Codex thread on another device | Implemented: needs a share with Sessions and Agent requests there, and that device's Accept per run (real Mac → Windows: refused while the Codex app had it open, continued once every Codex client was closed) |
@@ -94,7 +97,7 @@ Device-wide, in Settings:
 | General | Appearance (System, Light, Dark; renderer-only), global shortcut, receiving folder (Open, Change…, Use default), Save received files, Save received images; Across the internet (Connect across the internet, off by default; relay: n0's or your own) |
 | This device | Identity and Replace key; device profile (Refresh); runtimes (Quick or Full check); local speed test (Pastey pipeline or raw memory, 1, 5 or 15 s) |
 | Devices & trust | Trusted devices and the devices connected now (Trust… with a fingerprint check); paired devices (Forget) |
-| Permissions | What other devices may do here, across Bridges: Unattended Codex access (add form one click away), Shared workspaces (every share with Stop sharing; created and changed in its Bridge), Shared search folders |
+| Permissions | What other devices may do here, across Bridges: Full Access (every device with it, Revoke; given in its Bridge), Shared workspaces (every share with Stop sharing; created and changed in its Bridge), Shared search folders |
 | Agents | Codex availability on this device (Check again); how approvals work; the Plan runtime and provider |
 | Advanced | Developer tools, transfer grouping, transfer window (takes effect with Developer tools), logs and last error |
 | About | Version, application data, updates |

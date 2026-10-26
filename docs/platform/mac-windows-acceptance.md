@@ -1,6 +1,6 @@
 # Mac ↔ Windows physical acceptance
 
-One procedure for the physical evidence that automated tests cannot give: secure pairing, LAN Bridge operation, reconnection, representative Agent and file workflows, and Bridges across the internet. Each step says what to do, what must happen, and what to record.
+One procedure for the physical evidence that automated tests cannot give: secure pairing, LAN Bridge operation, reconnection, representative Agent and file workflows, unattended control with Full Access, and Bridges across the internet. Each step says what to do, what must happen, and what to record.
 
 Until a step is run on real devices and recorded, it is **untested**, whatever the automated suites say. Deterministic evidence is described in [development](../development.md).
 
@@ -98,8 +98,29 @@ After each step, send one text and the small file both ways.
 | E3 | Workspace movement: Agents tab, Device Windows, “On this device”, choose a small folder → Review movement, Approve and send on the Mac, Accept on Windows. | The workspace lands, Codex runs, the result returns and applies, and the Mac's original folder is unchanged until it is applied. |
 | E4 | Cancel a running task from the Mac. | Windows stops it, and both cards show cancelled. |
 | E5 | Turn Mac Wi-Fi off during a task for 20 s, then reconnect. | Reconcile shows the true outcome. Nothing runs twice. |
-| E6 | Unattended access. On Windows, Settings → Devices & trust: compare the Mac's fingerprint (A2, now under Settings → This device) and trust it; then Settings → Permissions → Unattended Codex access: grant one folder. Start a task from the Mac. | It runs without Accept. Revoke the grant: the next task waits for Accept again. |
-| E7 | Re-pair this Bridge with a **different** device's code (or after D6), then repeat E1 from that device. | Earlier tasks, conversations and folder shares from before the re-pair are gone. Unattended runs need a grant for the new device. |
+| E6 | Full Access, briefly (part U covers it fully). On Windows, Bridge details → Full Access → Allow Full Access…, tick that you understand, Allow. Start a task from the Mac. | It runs without Accept. Revoke there: the next task waits for Accept again. |
+| E7 | Re-pair this Bridge with a **different** device's code (or after D6), then repeat E1 from that device. | Earlier tasks, conversations, folder shares and Full Access from before the re-pair are gone. Running without Accept needs Full Access given to the new device. |
+
+## U. Unattended control with Full Access (Mac controls Windows, nobody at Windows)
+
+Run before part W when the internet tests are to be driven from the Mac alone. Windows: set Power & battery → Screen and sleep → "When plugged in, put my device to sleep after" to Never, keep it plugged in, signed in, and with Pastey running. Pastey cannot pass the lock screen, sleep, a closed app or a signed-out account. A locked but signed-in session is untested here: record it in U7.
+
+| # | Do | Expect |
+|---|---|---|
+| U1 | Pair a new Bridge (B1). On Windows, look above the Bridge's tabs. | "Use this device from <Mac> when nobody is here?" with Review Full Access… and Not now. Not now hides it for this Bridge only. Bridge details → Full Access says Off, and every request waits for Accept. |
+| U2 | Windows: Bridge details → Full Access → Allow Full Access…. Read the dialog. | It lists what the Mac may do (Codex in any folder, sessions, a terminal as your user), what it never does (control in the other direction, answer Codex's own prompts, pass UAC or privacy prompts, continue Claude Code), and what ends it. The fingerprint matches the Mac's Settings → This device. Allow stays disabled until "I understand" is ticked. |
+| U3 | Tick it and Allow. Open Settings → Permissions and Settings → Devices & trust on Windows. | Full Access: On. Permissions lists the Mac under Full Access with Revoke; Devices & trust lists it as trusted. |
+| U4 | Direction. On the Mac, open Bridge details → Full Access. From Windows, start a Codex run on the Mac. | The Mac says Off: Windows got nothing. Windows's run waits for Accept on the Mac. |
+| U5 | Leave Windows untouched from here on. On the Mac: Agents → Windows. Open Access. | The status line says "Connected · Codex ready · Full Access". Access shows Full Access as Ready, and Run Codex as starting at once. |
+| U6 | Mac: Other places → A folder by path on Windows, type a test folder path and a small task, Run with Codex. | No Accept appears on Windows; the task runs and its reply reaches the Mac. If Codex asks to run a command or change a file, the request appears on the Mac with Approve once / Deny, never on Windows, and is never answered by itself. |
+| U7 | Mac: Workspaces on Windows → + (Add a folder on Windows), type the full path of the folder used in part M (with a Codex thread in it). Then type `C:\Users\<you>`. | The folder appears marked Full Access with its sessions listed; on Windows, Bridge details → Full Access lists it. The home folder is refused as too broad to share, and no path is shown on the Mac. With every Codex client on Windows closed, continue one of its threads from the Mac: it completes without Accept and the thread on Windows has one more turn. Record whether a locked Windows session behaves the same. |
+| U8 | Mac: Developer Mode → request a terminal on Windows. Run `whoami`, then `net session`. | It opens at once as PowerShell. `whoami` is your Windows user; `net session` is refused with access denied, since Full Access never elevates. Windows shows "<Mac> has a terminal open on this device" with Close terminal. |
+| U9 | Windows (one step at a desk, or via U8's terminal ending): Close terminal. | The Mac's terminal ends with "the other device closed it". |
+| U10 | Restart Pastey on Windows; then restart Windows, sign in and start Pastey. Each time, without touching Windows further, repeat U6 from the Mac. | Both times the run starts without Accept once the Bridge reconnects. |
+| U11 | Across networks: repeat U6 and U8 with the Mac on the phone hotspot (part W setup). | Same as on the LAN; nothing waits for Windows. |
+| U12 | Windows: Bridge details → Full Access → Revoke, with a Mac terminal open. | The Mac's terminal closes (the other device closed it); the next run from the Mac waits for Accept; the folder added in U7 is no longer offered on the Mac. Revoking did not stop a Codex task already running: Stop does. |
+| U13 | Allow Full Access again. Then on Windows: Settings → Devices & trust → revoke the Mac (or Forget it under Paired devices); trust or pair it again. | After revoking or forgetting, the next run waits for Accept, and trusting or pairing again does not bring Full Access back. Burn (part H) also ends it. |
+| U14 | Only on a Windows install that had an unattended permission from an earlier build: after updating, start a run from the Mac in that folder. | It waits for Accept; the old permission was removed, not turned into Full Access. |
 
 ## F. Raw iroh paths across networks (isolated probe, optional)
 
@@ -217,7 +238,7 @@ Use this for any crash of Pastey on the executing device, including one that alr
 | K2 | `Get-ChildItem "$env:LOCALAPPDATA\Microsoft\Windows\WER\ReportArchive" \| Where-Object Name -like '*pastey*'` and open `Report.wer` in the newest folder. | Record the exception code and module. Do not share the dump itself. |
 | K3 | `Get-Content "$env:LOCALAPPDATA\pastey\logs\pastey.log" -Tail 300` (also `pastey.log.1`). From this build on, the log has `[pastey crash] event=panic thread=… location=… message=…` for a panic, `[pastey lifecycle] event=previous_run_ended_uncleanly` on the next start after any unclean exit, and `[pastey native-agent] event=…` for each task step (received, review accepted, turn starting, turn ended, interrupted by restart). | Record the lines around the crash. They name tasks by id only; no folder paths or prompts. |
 | K4 | Right after a crash, before restarting Pastey: `Get-Process codex, node -ErrorAction SilentlyContinue \| Format-Table Id, ProcessName, StartTime`. | Whether Codex outlived Pastey. Expected: none (closing Pastey's pipe ends the app-server). If one remains, record it and whether the test folder still changed afterwards. |
-| K5 | Reproduce E1 with this build, once with Accept on Windows and once under an unattended permission. | Both complete. If it crashes, K1–K4 now have the cause. On the Mac the task shows the indeterminate notice; Reconcile, then Stop. Nothing is run again automatically. |
+| K5 | Reproduce E1 with this build, once with Accept on Windows and once under Full Access. | Both complete. If it crashes, K1–K4 now have the cause. On the Mac the task shows the indeterminate notice; Reconcile, then Stop. Nothing is run again automatically. |
 | K6 | Start a task from the Mac, switch to another Bridge and back (or reload with ⌘R). | The running task card is still there, names Windows, and Stop still works. |
 
 ## L. Device details and diagnostics
@@ -329,6 +350,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Sessions outlive clients; holds (P1–P6) | |
 | Agents as conversations (Q1–Q7) | |
 | Bridge workspaces (N1–N12) | |
+| Full Access, unattended (U1–U14; lock-screen result from U7) | |
 | Control channel (O1–O7) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |

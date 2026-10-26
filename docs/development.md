@@ -144,6 +144,14 @@ cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_sessions_
 
 Remote session reading has a deterministic two-Host check without sockets. In it, the Mac's query passes the Windows Host's Room Control validator, Windows resolves the Mac's permission from its own storage and answers from a real Claude Code store, and the answer passes the Mac's validator into its outstanding query. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey native_session_pair_tests`. It does not exercise the HTTP transport, a running app, or Windows.
 
+Full Access has unit tests (`full_access`, `session_read_access`, the `full_access_*` and landing tests in `native_agent`, the Developer Terminal tests) and a two-Host check over the real room router and Room Control: the Mac opens a Windows folder by path and continues a Codex thread with no Review on Windows, a terminal opens without Accept, and revoking ends both. The terminal tests need a PTY, which a sandboxed shell may refuse:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey full_access
+```
+
+It does not exercise a packaged app, Windows, or an unattended session there; part U of the [Mac ↔ Windows acceptance](platform/mac-windows-acceptance.md) does.
+
 Claude Code session continuation has a live check. It uses the installed, signed-in Claude Code and a little of its quota. In `src-tauri/target/claude-s2-live` it creates a fresh session, continues it through Pastey's Native Agent lifecycle, and then shows that a session a foreground run holds is refused without anything being sent:
 
 ```bash

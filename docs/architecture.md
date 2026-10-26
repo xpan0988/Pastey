@@ -68,7 +68,8 @@ that is native executor admission, which Core decides before any adapter sees
 the input. It is separate from the managed Plan path's attempt-bound Host
 admission. A local invocation is admitted at once; every remote invocation,
 including a workspace that arrived through an approved movement, waits for a
-one-shot, process-local Accept/Deny executor Review on the executing Host. Every task
+one-shot, process-local Accept/Deny executor Review on the executing Host,
+unless that Host's user gave the requesting device Full Access (below). Every task
 also has one immutable owner—Local or the Bridge it was created on—so no other
 principal can adopt, cancel, or detach it, and Burn selects exactly its
 Bridge's tasks.
@@ -135,7 +136,13 @@ and any malformed or mismatched terminal notification stay non-DONE.
   compatibility, is never invocation permission.
 - Remote native capability execution requires native executor admission: a
   local invocation is admitted at once; a remote one waits for the executing
-  Host's executor Review.
+  Host's executor Review, or is admitted at once under the Full Access that
+  Host's own user gave exactly the requesting device, proven in that session.
+- Full Access is directional, durable until revoked, and created only by a
+  local command of the controlled Host's user after informed consent. It
+  replaces each Accept and nothing else: it never answers a native
+  capability's own approvals, runs a capability local to its Host, admits a
+  managed Plan, or passes an operating-system prompt or permission.
 - An adapter prepares or starts an invocation only after Core has admitted it.
 - Requester movement approval and executor execution approval are distinct;
   neither substitutes for the other.
@@ -267,7 +274,7 @@ The product embeds Developer Mode as an alternate central workspace inside the s
 ```text
 human controller enters Developer Mode
   → chooses one current Bridge Host
-  → remote human explicitly accepts
+  → remote human explicitly accepts (or the Host's Full Access for that device admits it)
   → Host creates and consumes one process-local DeveloperTerminalGrant
   → typed encrypted terminal frames use the exact current session
   → Host-owned PTY/ConPTY shell
@@ -275,9 +282,11 @@ human controller enters Developer Mode
 
 The grant is bound to the controller and target Developer Host identities, exact terminal/session binding, Bridge, terminal session, expiry, and one PTY start. A route is necessary but insufficient. The requester cannot choose executable, argv, cwd, environment, or privilege escalation. Unix uses a Host-selected allowed shell in a real PTY; Windows uses PowerShell through ConPTY.
 
+When the target Host's user gave the controlling device **Full Access** ([Layer 5](layers/layer-5-agent.md#full-access)) and that device proved its identity in exactly the session the request arrived on, the target admits the pending request itself, without a Host-local interaction, and creates the same one-use `DeveloperTerminalGrant` (checked again just before the PTY starts; any failure leaves the request pending for Accept). Everything else is unchanged: the grant's binding, 30-minute lifetime, one PTY start, revocation events, and the Host-selected shell. The target's Bridge view shows such a terminal with **Close terminal**, and revoking Full Access closes it; the controller is told `host_closed`. Full Access never runs the shell elevated.
+
 Terminal messages use the authenticated encrypted Room Control transport but a distinct `developer_terminal` protocol branch. They do not enter ordinary Bridge item history. Wrong, stale, replayed, out-of-order, oversized, or late frames fail closed. Current bounds and protocol names live in [reference](reference.md).
 
-Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown, and restart revoke the process-local UI session, grant, binding, and PTY. Reconnect requires new human admission. Developer Terminal commands and resulting filesystem mutations create no Plan step, ObjectRef, logical revision, effect evidence, or managed lineage; later managed use must reacquire and revalidate the artifact. No PM, provider, Worker, capability fact, route, Plan approval, EffectEnvelope, or NetworkGrant can be converted into `DeveloperTerminalGrant`, or vice versa.
+Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown, and restart revoke the process-local UI session, grant, binding, and PTY. Reconnect requires new admission: a human Accept, or the Host's Full Access for that device. Developer Terminal commands and resulting filesystem mutations create no Plan step, ObjectRef, logical revision, effect evidence, or managed lineage; later managed use must reacquire and revalidate the artifact. No PM, provider, Worker, capability fact, route, Plan approval, EffectEnvelope, or NetworkGrant can be converted into `DeveloperTerminalGrant`, or vice versa.
 
 ## Platform availability
 
@@ -295,7 +304,7 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 The primary product path is Native mature Agents. Pastey implements a capability-neutral native lifecycle with Codex as its production adapter: capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit reviewed workspace movement when it does not. Both remote paths start only after the executing Host's own Accept. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
 
-The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, requester movement review and approval, the executing Host's Agent-request Accept/Deny banner, bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete. Phase 2 source-level reliability and deterministic two-Host state validation are complete; physical Mac ↔ Windows validation remains pending.
+The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, requester movement review and approval, the executing Host's Agent-request Accept/Deny banner, Full Access (given and revoked only on the controlled Host, after a consent dialog), bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete. Phase 2 source-level reliability and deterministic two-Host state validation are complete; physical Mac ↔ Windows validation remains pending.
 
 The Generic Managed Worker / Transform / Execute path remains implemented and distinct. It includes the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, the bounded Worker Harness and model-visible Worker Context Contract, provider configuration, exact managed runtime binding, managed Host coordination, native-v2 orchestration, Natural-v2 lowering, and capability observation/confirmation. V1 remains isolated and unchanged: it executes Search/Transfer and rejects Transform/Execute. The Generic Managed path retains its own evidence limits: Bridge Device Check is a bounded Managed E2E self-check, and Windows Managed Execute acceptance does not establish an external-provider or physical multi-Host PASS.
 

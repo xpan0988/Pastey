@@ -10,7 +10,7 @@ The 8-digit Bridge code is used only to *find* a room; it is never proven. The r
 
 What *is* sound: after a session exists, Room Control, managed/native transfers and device-identity proofs are bound to the stored transport keys. The problem is that nothing binds those keys to the code or to the peer device. An attacker who wins the join or reconnect therefore *becomes* the authenticated peer.
 
-No finding lets an attacker skip executor Review or use an unattended grant: Review is still required on the executing Host, and unattended grants need a device-key signature that only the trusted device can make. The risks are confidentiality of Bridge traffic, integrity of what the user believes about the requester (the Review prompt names a HostRef the attacker chose), injection of ordinary items, and availability.
+No finding lets an attacker skip executor Review or use an unattended grant: Review is still required on the executing Host, and unattended grants need a device-key signature that only the trusted device can make. (Full Access later replaced unattended grants; it is bound to the Bridge's pinned device key and applies only under the same per-session device-key proof.) The risks are confidentiality of Bridge traffic, integrity of what the user believes about the requester (the Review prompt names a HostRef the attacker chose), injection of ordinary items, and availability.
 
 ## 2. Message sequences
 
