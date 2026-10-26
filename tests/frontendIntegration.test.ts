@@ -36,7 +36,7 @@ import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent,
 import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { bridgeInternetLine, internetSettingLine, relayUrlProblem } from "../src/lib/internetStatus";
-import { expiryLabel, grantableDevices, grantFormProblem, grantStateLabel } from "../src/lib/unattendedAccess";
+import { controlLine, expiryLabel, FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits } from "../src/lib/fullAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
 import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
@@ -786,54 +786,64 @@ test("Join and reconnect failures say what the user can do", () => {
   assert.match(bindings, /invoke\("join_room_at", \{ code, address \}\)/);
 });
 
-test("Unattended Codex permissions are narrow, explained and only created on the executing device", () => {
-  const seen = [
-    { fingerprint: "device:v1:a", displayFingerprint: "AAAA", bridgeId: "b", peerName: "School Mac", trusted: true },
-    { fingerprint: "device:v1:z", displayFingerprint: "ZZZZ", bridgeId: "b", peerName: "Unknown", trusted: false },
-  ];
-  assert.deepEqual(grantableDevices(seen).map((device) => device.peerName), ["School Mac"]);
-  const complete = { deviceFingerprint: "device:v1:a", roomId: "b", workspacePath: "C:\\Users\\me\\REPZ", durationHours: 24, maxRuns: 10 };
-  assert.equal(grantFormProblem(complete), null);
-  assert.notEqual(grantFormProblem({ ...complete, workspacePath: "" }), null);
-  assert.notEqual(grantFormProblem({ ...complete, durationHours: 24 * 365 }), null);
-  assert.notEqual(grantFormProblem({ ...complete, maxRuns: 1000 }), null);
-  assert.notEqual(grantFormProblem({ ...complete, deviceFingerprint: "" }), null);
-  const grant = { grantId: "g", deviceLabel: "School Mac", displayFingerprint: "AAAA", bridgeId: "b", capabilityId: "agent.coding.codex", workspace: "C:\\REPZ", createdAt: 0, expiresAt: 100, maxRuns: 10, runs: 3, state: "active" as const };
-  assert.equal(grantStateLabel(grant), "Active · 3 of 10 runs used");
-  assert.equal(grantStateLabel({ ...grant, state: "used_up" }), "All 10 runs used");
-  assert.match(grantStateLabel({ ...grant, state: "unavailable" }), /folder moved/);
+test("Full Access is one informed, directional decision made only on the controlled device", () => {
+  // The consent says what it allows, in plain words, including the terminal.
+  const allows = fullAccessAllows("School Mac").join(" ");
+  assert.match(allows, /Run Codex in any folder on this device, and continue Codex sessions here/);
+  assert.match(allows, /Open a terminal on this device \(PowerShell on Windows, your shell on macOS\) as your user account/);
+  assert.match(allows, /read, change or delete your files and run programs/);
+  // What it does not do: direction, the Agent's own approvals, the OS.
+  const limits = fullAccessLimits("School Mac").join(" ");
+  assert.match(limits, /does not let this device control School Mac/);
+  assert.match(limits, /Codex still asks before risky commands and file changes\. Those questions go to the person using School Mac/);
+  assert.match(limits, /administrator prompts, macOS privacy permissions and Windows UAC still apply/);
+  assert.match(limits, /Claude Code sessions here can still be continued only on this device/);
+  assert.match(FULL_ACCESS_ENDS.join(" "), /Revoke Full Access[\s\S]*Forget or revoke the device[\s\S]*Burn this Bridge, or pair it with another device/);
+  assert.match(controlLine("Home PC", true), /start there without anyone accepting them/);
+  assert.match(controlLine("Home PC", false), /waits for someone at Home PC to click Accept[\s\S]*turns on Full Access for this device in that Bridge's details on Home PC/);
+  assert.match(controlLine("Home PC", null), /Not known yet/);
   assert.equal(expiryLabel(100, 200), "expired");
   assert.equal(expiryLabel(200 + 2 * 3600, 200), "expires in 2 h");
 
-  const settings = readFileSync("src/features/workspace/UnattendedAccessSettings.tsx", "utf8");
+  const access = readFileSync("src/features/workspace/FullAccessSettings.tsx", "utf8");
   const trust = readFileSync("src/features/workspace/DeviceTrustSettings.tsx", "utf8");
   const panel = readFileSync("src/features/workspace/BridgeNetworkPanel.tsx", "utf8");
   const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  // No blanket permission exists anywhere.
-  for (const file of [settings, trust, panel, details, lifecycle, readFileSync("src/lib/tauri.ts", "utf8")]) {
-    assert.doesNotMatch(file, /always allow|allowAll|trust_all/i);
+  const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  // No other blanket permission exists anywhere, and nothing unattended is left.
+  for (const file of [access, trust, panel, details, lifecycle, bindings]) {
+    assert.doesNotMatch(file, /always allow|allowAll|trust_all|[Uu]nattended/);
   }
-  // Trust requires comparing the fingerprint; permissions say what they do not cover.
+  // Granting needs the explicit "I understand" tick and names the paired device by fingerprint.
+  assert.match(access, /disabled=\{pending \|\| !understood\} onClick=\{onGrant\}/);
+  assert.match(access, /grantFullAccess\(room\.id, true\)/);
+  assert.match(access, /<p className="mono fingerprint-callout">\{fingerprint\}<\/p>/);
+  assert.match(access, /without anyone at this device clicking Accept<\/strong>, even when you are away/);
+  // Revoking is one confirmed step, and says what keeps running.
+  assert.match(access, /revokeFullAccess\(room\.id\)/);
+  assert.match(access, /Codex tasks it already started keep running until they finish or you stop them/);
+  // The controlled device sees a terminal the other device opened, and can close it.
+  assert.match(access, /closeHostedDeveloperTerminal\(room\.id, session\.terminalSessionId\)/);
+  // Bridge details carry it; the Bridge view tells the user it exists.
+  assert.match(details, /<BridgeFullAccessSection room=\{room\} /);
+  assert.match(readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8"), /<FullAccessBanner room=\{room\} /);
+  // The controlling device can only ask: it never grants, trusts or shares.
+  for (const file of [panel, workspace, readFileSync("src/lib/accessGuidance.ts", "utf8")]) {
+    assert.doesNotMatch(file, /grantFullAccess|trustPeerDevice|shareBridgeWorkspace/);
+  }
+  assert.match(workspace, /openRemoteFolder\(roomId, hostRef, folder\.trim\(\)\)/);
+  assert.match(bindings, /invoke\("grant_full_access", \{ request: \{ roomId, understood \} \}\)/);
+  // Trust still requires comparing the fingerprint.
   assert.match(trust, /Only continue if \$\{device\.peerName\} shows exactly this identity/);
-  assert.match(settings, /Codex's own approval requests are never answered by it/);
-  assert.match(settings, /must stay on, awake, signed in and running Pastey/);
-  // The requesting device can only show itself; it cannot create permissions.
   assert.match(panel, /presentDeviceIdentity\(room\.id, peerHostRef\)/);
-  assert.doesNotMatch(panel, /createUnattendedGrant|trustPeerDevice/);
-  // A Bridge's details revoke what it is allowed here; sharing a folder,
-  // and the runs allowed in it, are created only by this device's user in
-  // the Bridge's Workspaces, for the Bridge's own device, from a folder
-  // chosen with this device's own picker. Nothing comes from the peer.
-  assert.doesNotMatch(details, /createUnattendedGrant|createSessionReadGrant|authorizeSearchFolder|trustPeerDevice/);
-  assert.match(details, /revokeUnattendedGrant\(grant\.grantId\)/);
   const workspaces = readFileSync("src/features/workspace/BridgeWorkspaces.tsx", "utf8");
   assert.match(workspaces, /stopSharingWorkspace\(share\.grantId\)/);
   assert.match(workspaces, /await open\(\{ directory: true, multiple: false/);
   assert.match(workspaces, /shareBridgeWorkspace\(\{ roomId: room\.id, deviceFingerprint: device\.fingerprint, workspacePath: draft\.path/);
-  assert.match(workspaces, /createUnattendedGrant\(\{ deviceFingerprint: allowing\.deviceFingerprint, roomId: room\.id, workspacePath: allowing\.workspace/);
   assert.match(workspaces, /Only continue if \$\{device\.peerName\} shows exactly this identity/);
-  assert.match(lifecycle, /waiting for the other device to accept \(no unattended permission applied\)/);
+  assert.match(lifecycle, /waiting for the other device to accept \(it has not given this device Full Access\)/);
 });
 
 test("Codex requests are shown as untrusted text and answered only once, by the requesting device", () => {
@@ -902,9 +912,8 @@ test("Codex requests are shown as untrusted text and answered only once, by the 
   assert.match(panel, />Approve once</);
   assert.match(panel, /respondRemoteNativeDecision\(roomId, status\.taskId, review\.reviewRef, review\.contentDigest, decision\)/);
   assert.match(bindings, /invoke\("respond_remote_native_decision", \{ roomId, taskId, reviewRef, contentDigest, decision \}\)/);
-  // A permission never approves; the settings say where requests go instead.
-  const settings = readFileSync("src/features/workspace/UnattendedAccessSettings.tsx", "utf8");
-  assert.match(settings, /shown on the device that started the task, where its user may approve it once or deny it/);
+  // Full Access never approves; its consent says where requests go instead.
+  assert.match(fullAccessLimits("School Mac").join(" "), /Those questions go to the person using School Mac, and Pastey never answers them by itself/);
 });
 
 function sessionView(overrides: Partial<SessionView>): SessionView {
@@ -1097,7 +1106,7 @@ test("Settings are device-wide sections and every permission can be found and re
     assert.match(settings, new RegExp(`label: "${label}"`));
   }
   const permissions = settings.slice(settings.indexOf("function PermissionsSettings"), settings.indexOf("function SharedSearchFolders"));
-  assert.match(permissions, /<UnattendedAccessSettings \/>/);
+  assert.match(permissions, /<FullAccessSettings \/>/);
   assert.match(permissions, /<SessionReadingSettings \/>/);
   assert.match(readFileSync("src/features/workspace/SessionReadingSettings.tsx", "utf8"), /Stop sharing<\/button>/);
   assert.match(permissions, /<SharedSearchFolders \/>/);
@@ -1110,16 +1119,12 @@ test("Settings are device-wide sections and every permission can be found and re
   assert.doesNotMatch(settings, /value="Unavailable"|Not projected|Not renderer-exposed|UnavailableRows/);
   // Each Bridge shows and revokes what it is allowed, and links here.
   const details = readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8");
-  assert.match(details, /grant\.bridgeId === room\.id/);
   assert.match(details, /folder\.bridgeId === room\.id/);
   assert.match(readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8"), /onOpenSettings=\{\(next\) => navigate\(next \?\? "settings-permissions"\)\}/);
   assert.match(readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8"), /onOpenSettings=\{\(\) => onOpenSettings\("settings-permissions"\)\}/);
-  // Grants list first; the add form is one explicit step away.
-  for (const file of ["UnattendedAccessSettings.tsx"]) {
-    const source = readFileSync(`src/features/workspace/${file}`, "utf8");
-    assert.ok(source.indexOf("ordered.map") < source.indexOf("add-form"), file);
-    assert.match(source, /Revoke<\/button>/);
-  }
+  // Every device with Full Access is listed with Revoke.
+  const access = readFileSync("src/features/workspace/FullAccessSettings.tsx", "utf8");
+  assert.match(access, /revokeFullAccess\(grant\.bridgeId\)\)\}>Revoke<\/button>/);
 });
 
 test("Burn, Forget and identity replacement each need an explicit confirmation", () => {
@@ -1158,7 +1163,7 @@ test("Execution, observation and continuation stay separate in the Bridge", () =
   // One observation of what the chosen device shares, asked over its own
   // connection, serves running, reading and continuing.
   assert.match(workspace, /const shares = usePeerSharedWorkspaces\(room\.id, targetHostRef, connected\);/);
-  assert.doesNotMatch(workspace, /createUnattendedGrant|createSessionReadGrant|shareBridgeWorkspace|updateWorkspaceShare|trustPeerDevice/);
+  assert.doesNotMatch(workspace, /grantFullAccess|createSessionReadGrant|shareBridgeWorkspace|updateWorkspaceShare|trustPeerDevice/);
   const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8") + readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
   // Continuing never starts a new run in place of the session.
   assert.doesNotMatch(sessions, /startRemoteNativeCodexTask|startNativeCodexTask/);
@@ -1183,7 +1188,7 @@ function sharedFolder(overrides: Partial<SharedWorkspace> = {}): SharedWorkspace
 
 test("Bridge access guidance keeps each authority separate and says where it is granted", () => {
   const lines = remoteAccessGuidance(accessFacts());
-  assert.deepEqual(lines.map((line) => line.id), ["pairing", "run", "decisions", "reading", "continue"]);
+  assert.deepEqual(lines.map((line) => line.id), ["pairing", "control", "run", "decisions", "reading", "continue"]);
   // Continuing is its own authority: it needs reading and agent requests there, and an Accept.
   assert.equal(lines.find((line) => line.id === "continue")!.state, "decided_there");
   const readOnly = { state: "known" as const, workspaces: [sharedFolder({ readSessions: true })] };
@@ -1218,11 +1223,22 @@ test("Bridge access guidance keeps each authority separate and says where it is 
   assert.equal(both.state, "decided_there");
   assert.match(both.detail, /Codex threads in PasteySessionTest: each continuation waits for someone on DESKTOP-DMI2L9P to click Accept/);
   // A run that waited in Review is reported, not guessed beforehand.
-  assert.match(remoteAccessGuidance(accessFacts({ lastRunWaitedForAccept: true })).find((line) => line.id === "run")!.detail, /no unattended permission for this device/);
+  assert.match(remoteAccessGuidance(accessFacts({ lastRunWaitedForAccept: true })).find((line) => line.id === "run")!.detail, /has not given this device Full Access/);
+  // Full Access is reported as that device said, and then nothing waits.
+  assert.equal(lines.find((line) => line.id === "control")!.state, "unknown");
+  const off = remoteAccessGuidance(accessFacts({ sharing: { state: "known", workspaces: [] } })).find((line) => line.id === "control")!;
+  assert.equal(off.state, "decided_there");
+  assert.match(off.steps.join(" "), /On DESKTOP-DMI2L9P: open this Bridge, then Bridge details → Full Access → Allow Full Access…/);
+  const controlled = remoteAccessGuidance(accessFacts({ sharing: { state: "known", workspaces: [sharedFolder({ readSessions: true, agentRequests: true, fullAccess: true })], fullAccess: true } }));
+  assert.equal(controlled.find((line) => line.id === "control")!.state, "ok");
+  assert.equal(controlled.find((line) => line.id === "run")!.state, "ok");
+  assert.deepEqual(controlled.find((line) => line.id === "run")!.steps, []);
+  assert.match(controlled.find((line) => line.id === "continue")!.detail, /each continuation starts at once/);
+  assert.match(peerShareGuidance("DESKTOP-DMI2L9P", { state: "known", workspaces: [], fullAccess: true }, "read") ?? "", /gave this device Full Access\. Add one of its folders by its path/);
   assert.equal(remoteAccessGuidance(accessFacts({ paired: false }))[0].state, "needs_action");
   // Nothing here can grant anything.
   const source = readFileSync("src/lib/accessGuidance.ts", "utf8") + readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
-  assert.doesNotMatch(source, /createUnattendedGrant|createSessionReadGrant|shareBridgeWorkspace|updateWorkspaceShare|trustPeerDevice|authorizeSearchFolder/);
+  assert.doesNotMatch(source, /grantFullAccess|createSessionReadGrant|shareBridgeWorkspace|updateWorkspaceShare|trustPeerDevice|authorizeSearchFolder/);
 });
 
 test("a folder another device shares is used only for what it allows, with the exact step otherwise", () => {
@@ -1268,7 +1284,7 @@ test("a Bridge's own device is shown this device's identity once per connection,
   assert.match(bridge, /usePresentIdentityToPeers\(room\.id, peers\);/);
   assert.match(bridge, /shown\.current\.has\(peer\.peerSessionId\)/);
   assert.match(bridge, /presentDeviceIdentity\(roomId, peer\.hostRef\)/);
-  assert.doesNotMatch(bridge, /trustPeerDevice|shareBridgeWorkspace|createUnattendedGrant/);
+  assert.doesNotMatch(bridge, /trustPeerDevice|shareBridgeWorkspace|grantFullAccess/);
   // Bridge details carry the Workspaces section for this Bridge.
   assert.match(readFileSync("src/features/workspace/BridgeDetails.tsx", "utf8"), /<BridgeWorkspaces room=\{room\} members=\{roomMembers\(room\)\} peers=\{roomPeers\(room\)\} \/>/);
 });
@@ -1341,7 +1357,7 @@ test("Sessions follow the Agents device and mark the ones Pastey started", () =>
   assert.doesNotMatch(sessions, /aria-label="Device"/);
   assert.match(sessions, /session\.origin === "pastey" \? " · by Pastey" : ""/);
   // Every answer reports what the device shares now; nothing is guessed.
-  assert.match(sessions, /if \(response\.outcome === "ok" \|\| response\.outcome === "not_authorized"\) shares\?\.adopt\(response\.scopes\);/);
+  assert.match(sessions, /if \(response\.outcome === "ok" \|\| response\.outcome === "not_authorized"\) shares\?\.adopt\(response\.scopes, response\.fullAccess === true\);/);
 });
 
 test("A session is offered for continuation only where the Host would accept it", () => {

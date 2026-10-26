@@ -1,8 +1,8 @@
 /** What Run with Codex still needs before it can start, in the order the
  * user should fix it. Presentation only: Rust re-checks the Host session,
  * the capability, the invocation and every permission when it is sent, and
- * the executing device still decides (its Accept or its own unattended
- * permission). Which folders it shares, and for what, comes only from
+ * the executing device still decides (its Accept, or the Full Access it
+ * gave). Which folders it shares, and for what, comes only from
  * that device's own answer; reading its sessions is a separate authority. */
 import type { NativeAgentTargetAvailability } from "../features/workspace/AgentTaskLifecycle";
 import type { SharedWorkspace } from "./tauri";
@@ -139,7 +139,7 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
     blocker,
     ready: blocker === null && !input.busy,
     next: action === "run_remote"
-      ? `${where} asks its user to accept unless you hold an unattended permission there. No files move.`
+      ? `${where} asks its user to accept unless it gave this device Full Access. No files move.`
       : action === "review_movement"
         ? `Next you review exactly what is sent to ${where}. Nothing moves until you approve.`
         : "Codex runs on this device in its own native session.",

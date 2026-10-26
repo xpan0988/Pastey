@@ -49,7 +49,7 @@ export function taskNothingRan(status: Pick<NativeAgentTaskStatus, "state" | "co
 }
 
 /** The stages a task passes, with where it is now. A task on another
- * device passes that device's Accept (or its unattended permission). */
+ * device passes that device's Accept (or the Full Access it gave). */
 export function taskStages(status: Pick<NativeAgentTaskStatus, "state" | "code">, context: Pick<TaskContext, "hostName" | "remote">): TaskStage[] {
   const stages: TaskStage[] = context.remote
     ? [

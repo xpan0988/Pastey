@@ -688,3 +688,7 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
 .task-stages li.current .mark { border-color: var(--accent); box-shadow: inset 0 0 0 3px var(--surface); background: var(--accent); }
 .task-stages li.stopped { background: var(--danger-soft); color: var(--text); }
 .task-stages li.stopped .mark { border-color: var(--danger); background: var(--danger); color: var(--bg); }
+
+/* Full Access: the consent list and the banner above a controlled Bridge. */
+.consent-list { margin: 4px 0 10px; padding-left: 18px; display: grid; gap: 4px; }
+.full-access-banner { max-width: var(--content-w); width: 100%; margin: 0 auto 8px; padding: 0 16px; }

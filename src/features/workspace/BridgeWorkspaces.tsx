@@ -2,23 +2,20 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
 import {
-  createUnattendedGrant,
+  getBridgeFullAccess,
   listBridgeWorkspaceShares,
   listRemoteSharedWorkspaces,
   listSeenPeerDevices,
-  listUnattendedGrants,
-  revokeUnattendedGrant,
   shareBridgeWorkspace,
   stopSharingWorkspace,
   trustPeerDevice,
   updateWorkspaceShare,
   type SeenPeerDevice,
   type SharedWorkspace,
-  type UnattendedGrant,
   type WorkspaceShare,
 } from "../../lib/tauri";
 import type { RoomInfo } from "../../lib/types";
-import { expiryLabel, GRANT_DURATIONS, GRANT_RUN_LIMITS } from "../../lib/unattendedAccess";
+import { expiryLabel } from "../../lib/fullAccess";
 import { peerShareGuidance, SHARE_DURATIONS, shareLocation, shareStateNote, shareSummary, visibleShares, type PeerShareKnowledge } from "../../lib/workspaceShares";
 import { Badge, Dialog, Icon, ListRow, Notice, Switch, errorText } from "./ui";
 
@@ -43,7 +40,7 @@ export function usePeerSharedWorkspaces(roomId: string, hostRef: string | null, 
       const response = await listRemoteSharedWorkspaces(roomId, hostRef);
       if (ask !== asked.current) return;
       if (response.outcome === "ok" || response.outcome === "not_authorized") {
-        setKnowledge({ state: "known", workspaces: response.scopes });
+        setKnowledge({ state: "known", workspaces: response.scopes, fullAccess: response.fullAccess === true });
         setMessage(null);
       } else {
         setMessage(response.outcome === "busy" ? "It is still answering an earlier request. Check again in a moment." : "It could not answer now.");
@@ -66,7 +63,11 @@ export function usePeerSharedWorkspaces(roomId: string, hostRef: string | null, 
   }, [refresh]);
 
   /** A fresh answer from a session query carries the same list. */
-  const adopt = useCallback((workspaces: SharedWorkspace[]) => setKnowledge({ state: "known", workspaces }), []);
+  const adopt = useCallback((workspaces: SharedWorkspace[], fullAccess?: boolean) => setKnowledge((current) => ({
+    state: "known",
+    workspaces,
+    fullAccess: fullAccess ?? (current.state === "known" ? current.fullAccess : false),
+  })), []);
   return { knowledge, loading, message, refresh, adopt };
 }
 
@@ -93,22 +94,21 @@ type Draft = { path: string; readSessions: boolean; shareExcerpts: boolean; agen
 function LocalShares({ room, peerName }: { room: RoomInfo; peerName: string }) {
   const [shares, setShares] = useState<WorkspaceShare[]>([]);
   const [seen, setSeen] = useState<SeenPeerDevice[]>([]);
-  const [unattended, setUnattended] = useState<UnattendedGrant[]>([]);
+  const [fullAccess, setFullAccess] = useState(false);
   const [draft, setDraft] = useState<Draft | null>(null);
-  const [allowing, setAllowing] = useState<WorkspaceShare | null>(null);
   const [confirmTrust, setConfirmTrust] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    const [nextShares, nextSeen, nextUnattended] = await Promise.all([
+    const [nextShares, nextSeen, nextFullAccess] = await Promise.all([
       listBridgeWorkspaceShares(room.id).catch(() => []),
       listSeenPeerDevices().catch(() => []),
-      listUnattendedGrants().catch(() => []),
+      getBridgeFullAccess(room.id).catch(() => null),
     ]);
     setShares(nextShares);
     setSeen(nextSeen.filter((device) => device.bridgeId === room.id));
-    setUnattended(nextUnattended.filter((grant) => grant.bridgeId === room.id && grant.state === "active"));
+    setFullAccess(!!nextFullAccess?.grant);
   }, [room.id]);
 
   useEffect(() => {
@@ -154,14 +154,13 @@ function LocalShares({ room, peerName }: { room: RoomInfo; peerName: string }) {
         key={share.grantId}
         share={share}
         peerName={name}
-        unattended={unattended.filter((grant) => grant.workspace === share.workspace && grant.capabilityId === "agent.coding.codex")}
+        fullAccess={fullAccess}
         pending={pending}
         onUpdate={(next) => void act(() => updateWorkspaceShare({ grantId: share.grantId, readSessions: next.readSessions, shareExcerpts: next.shareExcerpts, agentRequests: next.agentRequests, durationHours: next.durationHours ?? null }))}
         onStop={() => void act(() => stopSharingWorkspace(share.grantId))}
-        onAllowWithoutAsking={() => setAllowing(share)}
-        onRevokeUnattended={(grantId) => void act(() => revokeUnattendedGrant(grantId))}
       />)}
     </div></div> : <p className="small muted">This device shares no folder with {name}. Sharing a folder lets {name} pick it by name, without its path, and only for what you turn on.</p>}
+    {fullAccess ? <p className="xsmall subtle">{name} has Full Access here, so it may do everything in these folders whatever their switches say, and its runs start without your Accept. The switches apply again if you revoke Full Access.</p> : null}
     {device && !device.trusted ? <Notice tone="info" title={`${name} is not trusted on this device yet`} action={<button type="button" className="btn btn-sm" disabled={pending} onClick={() => setConfirmTrust(true)}>Trust {name}…</button>}>Needed once, before you share anything with it. Trust alone allows nothing.</Notice> : null}
     <div className="row"><button type="button" className="btn btn-sm" disabled={pending || !!shareBlocker} onClick={() => void chooseFolder()}><Icon name="folder" small />Share a workspace…</button>{shareBlocker ? <span className="xsmall subtle spacer">{shareBlocker}</span> : null}</div>
     {!device ? <div><button type="button" className="btn btn-link small" onClick={() => void refresh()}>Check again</button></div> : null}
@@ -170,12 +169,11 @@ function LocalShares({ room, peerName }: { room: RoomInfo; peerName: string }) {
     {confirmTrust && device ? <Dialog title={`Trust ${device.peerName}?`} labelledBy="share-trust-title" onClose={() => setConfirmTrust(false)} footer={<><button type="button" className="btn" onClick={() => setConfirmTrust(false)}>Cancel</button><button type="button" className="btn btn-primary" disabled={pending} onClick={() => { setConfirmTrust(false); void act(() => trustPeerDevice(device.fingerprint)); }}>It matches. Trust</button></>}>
       <p>{`Only continue if ${device.peerName} shows exactly this identity under Settings → This device:`}</p>
       <p className="mono fingerprint-callout">{device.displayFingerprint}</p>
-      <p className="small muted">Trusting it lets you share folders with it and give it limited permissions here. It does not let it read or run anything by itself.</p>
+      <p className="small muted">Trusting it lets you share folders with it. It does not let it read or run anything by itself.</p>
     </Dialog> : null}
 
     {draft && device ? <ShareDialog draft={draft} peerName={device.peerName} pending={pending} onChange={setDraft} onClose={() => setDraft(null)} onShare={() => void act(() => shareBridgeWorkspace({ roomId: room.id, deviceFingerprint: device.fingerprint, workspacePath: draft.path, durationHours: draft.durationHours, readSessions: draft.readSessions, shareExcerpts: draft.readSessions && draft.shareExcerpts, agentRequests: draft.agentRequests })).then((ok) => { if (ok) setDraft(null); })} /> : null}
 
-    {allowing ? <AllowWithoutAskingDialog share={allowing} peerName={name} pending={pending} onClose={() => setAllowing(null)} onAllow={(durationHours, maxRuns) => void act(() => createUnattendedGrant({ deviceFingerprint: allowing.deviceFingerprint, roomId: room.id, workspacePath: allowing.workspace, durationHours, maxRuns })).then((ok) => { if (ok) setAllowing(null); })} /> : null}
   </div>;
 }
 
@@ -188,7 +186,7 @@ function CapabilityChecks({ value, peerName, disabled, onChange }: {
   return <div className="stack">
     <label className="check"><input type="checkbox" checked={value.readSessions} disabled={disabled} onChange={(event) => onChange({ ...value, readSessions: event.target.checked, shareExcerpts: event.target.checked && value.shareExcerpts })} /><span>Sessions<small>{peerName} can see the Claude Code and Codex sessions in this folder: statuses, titles, activity, changed file names and Git facts. Never whole conversations.</small></span></label>
     {value.readSessions ? <label className="check nested"><input type="checkbox" checked={value.shareExcerpts} disabled={disabled} onChange={(event) => onChange({ ...value, shareExcerpts: event.target.checked })} /><span>Short excerpts too<small>Up to four recent prompts and replies, shortened.</small></span></label> : null}
-    <label className="check"><input type="checkbox" checked={value.agentRequests} disabled={disabled} onChange={(event) => onChange({ ...value, agentRequests: event.target.checked })} /><span>Agent requests<small>{peerName} can ask to run Codex here, or to continue a Codex thread here when it can also see sessions. Each request waits for your Accept on this device.</small></span></label>
+    <label className="check"><input type="checkbox" checked={value.agentRequests} disabled={disabled} onChange={(event) => onChange({ ...value, agentRequests: event.target.checked })} /><span>Agent requests<small>{peerName} can ask to run Codex here, or to continue a Codex thread here when it can also see sessions. Each request waits for your Accept on this device, unless you gave {peerName} Full Access.</small></span></label>
   </div>;
 }
 
@@ -204,15 +202,13 @@ function ShareDialog({ draft, peerName, pending, onChange, onClose, onShare }: {
   </Dialog>;
 }
 
-function ShareRow({ share, peerName, unattended, pending, onUpdate, onStop, onAllowWithoutAsking, onRevokeUnattended }: {
+function ShareRow({ share, peerName, fullAccess, pending, onUpdate, onStop }: {
   share: WorkspaceShare;
   peerName: string;
-  unattended: UnattendedGrant[];
+  fullAccess: boolean;
   pending: boolean;
   onUpdate: (next: { readSessions: boolean; shareExcerpts: boolean; agentRequests: boolean; durationHours?: number }) => void;
   onStop: () => void;
-  onAllowWithoutAsking: () => void;
-  onRevokeUnattended: (grantId: string) => void;
 }) {
   const active = share.state === "active";
   const note = shareStateNote(share);
@@ -228,10 +224,7 @@ function ShareRow({ share, peerName, unattended, pending, onUpdate, onStop, onAl
       {active ? <span className="stack share-switches">
         <span className="row"><span className="spacer small">Sessions{share.readSessions ? share.shareExcerpts ? " · with excerpts" : " · statuses only" : ""}</span><Switch label={`${share.label}: sessions`} checked={share.readSessions} disabled={pending} onChange={(value) => set({ readSessions: value })} /></span>
         {share.readSessions ? <span className="row"><span className="spacer xsmall subtle">Short excerpts of recent prompts and replies</span><Switch label={`${share.label}: excerpts`} checked={share.shareExcerpts} disabled={pending} onChange={(value) => set({ shareExcerpts: value })} /></span> : null}
-        <span className="row"><span className="spacer small">Agent requests<span className="xsmall subtle"> · each waits for your Accept</span></span><Switch label={`${share.label}: agent requests`} checked={share.agentRequests} disabled={pending} onChange={(value) => set({ agentRequests: value })} /></span>
-        {share.agentRequests ? unattended.length
-          ? unattended.map((grant) => <span className="row" key={grant.grantId}><span className="spacer xsmall">Codex runs without asking: {grant.maxRuns - grant.runs} of {grant.maxRuns} left, {expiryLabel(grant.expiresAt)}</span><button type="button" className="btn btn-sm" disabled={pending} onClick={() => onRevokeUnattended(grant.grantId)}>Revoke</button></span>)
-          : <span className="row"><span className="spacer xsmall subtle">Every Codex run waits for your Accept here.</span><button type="button" className="btn btn-link small" disabled={pending} onClick={onAllowWithoutAsking}>Allow without asking…</button></span> : null}
+        <span className="row"><span className="spacer small">Agent requests<span className="xsmall subtle">{fullAccess ? ` · ${peerName} has Full Access: they start at once` : " · each waits for your Accept"}</span></span><Switch label={`${share.label}: agent requests`} checked={share.agentRequests} disabled={pending} onChange={(value) => set({ agentRequests: value })} /></span>
       </span> : null}
     </span>
     <span className="list-row-side stack">
@@ -239,18 +232,6 @@ function ShareRow({ share, peerName, unattended, pending, onUpdate, onStop, onAl
       <button type="button" className="btn btn-danger btn-sm" disabled={pending} onClick={onStop} title={`${peerName} can no longer pick this folder, read its sessions or ask to run anything in it`}>Stop sharing</button>
     </span>
   </div>;
-}
-
-function AllowWithoutAskingDialog({ share, peerName, pending, onClose, onAllow }: { share: WorkspaceShare; peerName: string; pending: boolean; onClose: () => void; onAllow: (durationHours: number, maxRuns: number) => void }) {
-  const [durationHours, setDurationHours] = useState(8);
-  const [maxRuns, setMaxRuns] = useState(5);
-  return <Dialog title={`Let ${peerName} run Codex in ${share.label} without asking?`} labelledBy="allow-unattended-title" onClose={() => { if (!pending) onClose(); }} footer={<><button type="button" className="btn" disabled={pending} onClick={onClose}>Cancel</button><button type="button" className="btn btn-primary" disabled={pending} onClick={() => onAllow(durationHours, maxRuns)}>Allow these runs</button></>}>
-    <p className="small">Runs from {peerName} in this folder then start without your Accept, until the time or the runs run out, or you revoke it. Codex's own approval prompts still go to {peerName}'s user, and continuing an existing thread still waits for your Accept.</p>
-    <div className="row-wrap">
-      <select className="select" value={durationHours} disabled={pending} onChange={(event) => setDurationHours(Number(event.target.value))} aria-label="How long">{GRANT_DURATIONS.map((duration) => <option key={duration.hours} value={duration.hours}>For {duration.label}</option>)}</select>
-      <select className="select" value={maxRuns} disabled={pending} onChange={(event) => setMaxRuns(Number(event.target.value))} aria-label="How many runs">{GRANT_RUN_LIMITS.map((runs) => <option key={runs} value={runs}>{runs === 1 ? "1 run" : `${runs} runs`}</option>)}</select>
-    </div>
-  </Dialog>;
 }
 
 /** What one other device shares with this one, as it last said. Changing
@@ -270,7 +251,7 @@ export function PeerSharesList({ name, shares, routeable, need }: { name: string
   const guidance = peerShareGuidance(name, shares.knowledge, need ?? "read");
   return <>
     {workspaces.length ? <div className="card"><div className="list">
-      {workspaces.map((share) => <ListRow key={share.scopeRef} leading={<Icon name="folder" small />} title={share.label} meta={`${shareSummary(share)}${share.agentRequests ? ` · each run waits for ${name}'s Accept` : ""}${share.expiresAt ? ` · ${expiryLabel(share.expiresAt)}` : ""}`} />)}
+      {workspaces.map((share) => <ListRow key={share.scopeRef} leading={<Icon name="folder" small />} title={share.label} meta={`${shareSummary(share)}${share.fullAccess ? " · Full Access: runs start at once" : share.agentRequests ? ` · each run waits for ${name}'s Accept` : ""}${share.expiresAt ? ` · ${expiryLabel(share.expiresAt)}` : ""}`} />)}
     </div></div> : null}
     {guidance && (need || !workspaces.length) ? <p className="small muted">{guidance}</p> : null}
     <div className="row"><span className="xsmall subtle spacer">{workspaces.length ? `Only ${name}'s user can change these. ${shareLocation(name)}.` : ""}</span><button type="button" className="btn btn-link small" disabled={shares.loading} onClick={() => void shares.refresh()}>{shares.loading ? "Asking…" : "Check again"}</button></div>

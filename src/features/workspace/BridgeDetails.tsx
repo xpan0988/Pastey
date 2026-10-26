@@ -2,23 +2,20 @@ import { useEffect, useMemo, useState } from "react";
 import {
   getBridgeNodeListProjection,
   listAuthorizedSearchFolders,
-  listBridgeWorkspaceShares,
-  listUnattendedGrants,
   revokeAuthorizedSearchFolder,
-  revokeUnattendedGrant,
   type AuthorizedSearchFolder,
-  type UnattendedGrant,
 } from "../../lib/tauri";
 import type { BridgeNodeListProjectionV1, RoomInfo } from "../../lib/types";
-import { expiryLabel } from "../../lib/unattendedAccess";
 import { BridgeConnectionSection, ShowDeviceIdentity } from "./BridgeNetworkPanel";
 import { BridgeWorkspaces } from "./BridgeWorkspaces";
+import { BridgeFullAccessSection } from "./FullAccessSettings";
 import { Dialog, Dot, Icon, ListRow } from "./ui";
 import { bridgeCode, roomMembers, roomPeers } from "./workspaceViewModel";
 
 /** Everything about the current Bridge that is not the work itself:
- * connection, members, the folders shared over it and what each allows,
- * anything else this device allows over it, and Burn. */
+ * connection, members, whether the other device may control this one
+ * (Full Access), the folders shared over it and what each allows, anything
+ * else this device allows over it, and Burn. */
 export function BridgeDetails({ room, onClose, onRefresh, onBurn, onOpenSettings, onOpenDevice }: {
   room: RoomInfo;
   onClose: () => void;
@@ -37,6 +34,7 @@ export function BridgeDetails({ room, onClose, onRefresh, onBurn, onOpenSettings
     <div className="inspector-body">
       <BridgeConnectionSection room={room} onPairingChanged={onRefresh} />
       <BridgeDevices room={room} onOpenDevice={onOpenDevice} />
+      <BridgeFullAccessSection room={room} peerName={roomMembers(room).find((member) => member.hostRef)?.displayName ?? "the other device"} />
       <BridgeWorkspaces room={room} members={roomMembers(room)} peers={roomPeers(room)} />
       <BridgePermissions room={room} onOpenSettings={onOpenSettings} />
       <ShowDeviceIdentity room={room} />
@@ -97,23 +95,15 @@ export function BridgeDevices({ room, onOpenDevice }: { room: RoomInfo; onOpenDe
 }
 
 /** What else this device lets the other devices of this Bridge do here,
- * outside its shared workspaces, with Revoke beside each: finding files,
- * and unattended runs in a folder given by its path. */
+ * outside its shared workspaces and Full Access, with Revoke beside each:
+ * finding files. */
 function BridgePermissions({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: () => void }) {
-  const [unattended, setUnattended] = useState<UnattendedGrant[]>([]);
   const [folders, setFolders] = useState<AuthorizedSearchFolder[]>([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   async function refresh() {
-    const [nextUnattended, nextShares, nextFolders] = await Promise.all([
-      listUnattendedGrants().catch(() => []),
-      listBridgeWorkspaceShares(room.id).catch(() => []),
-      listAuthorizedSearchFolders().catch(() => []),
-    ]);
-    // Runs in a shared folder are shown, and revoked, with that folder.
-    const shared = new Set(nextShares.filter((share) => share.state === "active" && share.agentRequests).map((share) => share.workspace));
-    setUnattended(nextUnattended.filter((grant) => grant.bridgeId === room.id && grant.state === "active" && !shared.has(grant.workspace)));
+    const nextFolders = await listAuthorizedSearchFolders().catch(() => []);
     setFolders(nextFolders.filter((folder) => folder.bridgeId === room.id));
   }
   useEffect(() => {
@@ -130,13 +120,11 @@ function BridgePermissions({ room, onOpenSettings }: { room: RoomInfo; onOpenSet
     finally { setPending(false); }
   }
 
-  const none = unattended.length === 0 && folders.length === 0;
   return <section className="inspector-section" aria-label="Also allowed on this device">
     <h3>Also allowed on this device</h3>
-    {none
-      ? <p className="small muted">Nothing else. Outside the workspaces above, other devices of this Bridge cannot search folders here, and every Codex run they ask for waits for your Accept.</p>
+    {folders.length === 0
+      ? <p className="small muted">Nothing else. Outside Full Access and the workspaces above, other devices of this Bridge cannot search folders here.</p>
       : <div className="card"><div className="list">
-        {unattended.map((grant) => <ListRow key={grant.grantId} title="Start Codex without asking" meta={`${grant.deviceLabel} · ${grant.workspace} · ${grant.runs} of ${grant.maxRuns} runs used · ${expiryLabel(grant.expiresAt)}`} side={<button type="button" className="btn btn-danger btn-sm" disabled={pending} onClick={() => void revoke(() => revokeUnattendedGrant(grant.grantId))}>Revoke</button>} />)}
         {folders.map((folder) => <ListRow key={folder.folderId} title={`Find files in ${folder.displayName}`} meta={folder.unavailable ? "Moved or replaced; not searched" : "Any device on this Bridge, by file name"} side={<button type="button" className="btn btn-danger btn-sm" disabled={pending} onClick={() => void revoke(() => revokeAuthorizedSearchFolder(folder.folderId))}>Stop sharing</button>} />)}
       </div></div>}
     <div><button type="button" className="btn btn-link small" onClick={onOpenSettings}>All Bridges: Settings → Permissions</button></div>

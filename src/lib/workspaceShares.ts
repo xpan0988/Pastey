@@ -8,7 +8,8 @@ import type { SharedWorkspace, WorkspaceShare } from "./tauri";
 /** What this device knows about the folders another device shares with it. */
 export type PeerShareKnowledge =
   | { state: "unknown" }
-  | { state: "known"; workspaces: SharedWorkspace[] };
+  /** `fullAccess`: that device gave this one Full Access there. */
+  | { state: "known"; workspaces: SharedWorkspace[]; fullAccess?: boolean };
 
 export type ShareNeed = "read" | "run" | "continue";
 
@@ -63,6 +64,9 @@ export function peerShareGuidance(owner: string, knowledge: PeerShareKnowledge, 
     return `${owner} shares ${chosen.label} with this Bridge, but has not turned on ${NEED_SWITCHES[need]} for it. ${shareLocation(owner)} → ${chosen.label}, and turn ${need === "continue" ? "them" : "it"} on.`;
   }
   if (knowledge.workspaces.some((share) => allows(share, need))) return null;
+  if (knowledge.fullAccess) {
+    return `${owner} gave this device Full Access. Add one of its folders by its path to see its sessions and work in it.`;
+  }
   if (!knowledge.workspaces.length) {
     return `${owner} hasn't shared any ${need === "read" ? "session-readable workspace" : "workspace"} with this Bridge. ${shareLocation(owner)} and choose Share a workspace.`;
   }

@@ -167,6 +167,7 @@ export function remoteOutcomeMessage(response: Pick<RemoteNativeSessionResponse,
     case "not_found": return `${hostName} has no such session in the folders it shares with this device.`;
     case "busy": return `${hostName} is still answering an earlier request from this Bridge. Try again in a moment.`;
     case "unavailable": return `${hostName} could not read its sessions now.`;
+    case "folder_refused": return `${hostName} would not open that folder.`;
   }
 }
 

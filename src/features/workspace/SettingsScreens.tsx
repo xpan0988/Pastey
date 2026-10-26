@@ -30,7 +30,7 @@ import { KnownDevicesSettings } from "./KnownDevicesSettings";
 import { availabilityCopy } from "./NativeAgentPanel";
 import { SessionReadingSettings } from "./SessionReadingSettings";
 import { ThisDeviceSettings } from "./ThisDeviceSettings";
-import { UnattendedAccessSettings } from "./UnattendedAccessSettings";
+import { FullAccessSettings } from "./FullAccessSettings";
 import { Badge, Dot, Icon, ListRow, Notice, Segmented, Switch, type IconName } from "./ui";
 import { bridgeCode } from "./workspaceViewModel";
 import type { NavigateWorkspace, WorkspaceRoute } from "./workspaceTypes";
@@ -127,8 +127,8 @@ function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConf
 
 function PermissionsSettings() {
   return <>
-    <p className="muted" style={{ marginBottom: "var(--space-6)" }}>What other devices may do on this device, across all Bridges. Each permission names one device, one Bridge and one folder, and only you can create or revoke it. Folders are shared from inside their Bridge (Bridge details → Workspaces); here you can see and end every one. A trusted device without a permission can do none of this.</p>
-    <UnattendedAccessSettings />
+    <p className="muted" style={{ marginBottom: "var(--space-6)" }}>What other devices may do on this device, across all Bridges, and only you can give or revoke any of it. Full Access lets one paired device control this one without anyone here; shared workspaces let a device see sessions and ask to run agents in one folder, each run waiting for your Accept. Both are given from inside their Bridge (Bridge details); here you can see and end every one. A trusted device without either can do none of this.</p>
+    <FullAccessSettings />
     <SessionReadingSettings />
     <SharedSearchFolders />
   </>;
@@ -212,9 +212,9 @@ function AgentSettings() {
     <section className="section" aria-label="Approvals">
       <div className="section-head"><h2>Approvals</h2></div>
       <div className="card">
-        <div className="setting-row"><span><strong>Codex requests from other devices</strong><small>Each request waits for your Accept on this device, unless an unattended permission under Permissions covers it.</small></span><span className="value">Always reviewed</span></div>
+        <div className="setting-row"><span><strong>Codex requests from other devices</strong><small>Each request waits for your Accept on this device, unless you gave the requesting device Full Access (Settings → Permissions).</small></span><span className="value">Reviewed unless Full Access</span></div>
         <div className="setting-row"><span><strong>Plans</strong><small>A Plan runs only after you approve its exact revision, and each device admits it.</small></span><span className="value">Always reviewed</span></div>
-        <div className="setting-row"><span><strong>Developer Mode terminals</strong><small>Each terminal request needs a separate Accept on the device it opens on.</small></span><span className="value">Always reviewed</span></div>
+        <div className="setting-row"><span><strong>Developer Mode terminals</strong><small>Each terminal request needs a separate Accept on the device it opens on, unless that device gave the requester Full Access.</small></span><span className="value">Reviewed unless Full Access</span></div>
       </div>
     </section>
     <ProviderSettings />

@@ -1,8 +1,10 @@
 /** What this device can do on another device of a Bridge, authority by
  * authority, and where each is decided. Presentation only: each authority
- * stays separate and is granted only on the device that owns it, inside
- * this same Bridge there. Nothing here can be satisfied from this side, and
+ * is granted only on the device that owns it, inside this same Bridge
+ * there: Full Access for everything at once, or folder by folder with each
+ * run accepted there. Nothing here can be satisfied from this side, and
  * trust alone allows nothing. */
+import { controlLine } from "./fullAccess";
 import { allows, peerShareGuidance, shareLocation, type PeerShareKnowledge } from "./workspaceShares";
 
 export interface RemoteAccessFacts {
@@ -22,7 +24,7 @@ export interface RemoteAccessFacts {
 export type AccessState = "ok" | "decided_there" | "needs_action" | "unknown";
 
 export interface AccessLine {
-  id: "pairing" | "run" | "decisions" | "reading" | "continue";
+  id: "pairing" | "control" | "run" | "decisions" | "reading" | "continue";
   label: string;
   state: AccessState;
   detail: string;
@@ -53,18 +55,29 @@ export function remoteAccessGuidance(facts: RemoteAccessFacts): AccessLine[] {
     ? { id: "pairing", label: "Paired", state: "ok", detail: `This Bridge is paired with ${where}.`, steps: [] }
     : { id: "pairing", label: "Not paired", state: "needs_action", detail: "This Bridge has no verified device, so nothing can run or be read.", steps: ["Here: Bridge details → Pair this Bridge, and enter the code on the other device."] });
 
+  // Full Access is the one switch for using that device unattended.
+  const fullAccess = sharing.state === "known" ? sharing.fullAccess === true : null;
+  const fullAccessSteps = [`On ${where}: open this Bridge, then Bridge details → Full Access → Allow Full Access…, read what it allows and confirm. Only ${where}'s user can do this, and it lets this device control ${where}, never the other way round.`];
+  lines.push({
+    id: "control",
+    label: "Full Access",
+    state: fullAccess === null ? "unknown" : fullAccess ? "ok" : "decided_there",
+    detail: controlLine(where, fullAccess),
+    steps: fullAccess ? [] : fullAccessSteps,
+  });
+
   const runnable = shared.filter((share) => allows(share, "run")).map((share) => share.label);
   lines.push({
     id: "run",
     label: "Run Codex",
-    state: "decided_there",
-    detail: (facts.lastRunWaitedForAccept === true
-      ? `Your last run waited for someone on ${where} to click Accept: ${where} has no unattended permission for this device in that folder.`
-      : `Each run waits for someone on ${where} to click Accept, unless ${where}'s user lets this device run in that folder without asking.`)
+    state: fullAccess ? "ok" : "decided_there",
+    detail: (fullAccess
+      ? `Runs start on ${where} at once, in its shared folders or any folder you name by path.`
+      : facts.lastRunWaitedForAccept === true
+        ? `Your last run waited for someone on ${where} to click Accept: ${where} has not given this device Full Access.`
+        : `Each run waits for someone on ${where} to click Accept, unless ${where}'s user gives this device Full Access.`)
       + (runnable.length ? ` You can pick ${runnable.join(", ")} by name.` : ""),
-    steps: runnable.length
-      ? [`${shareLocation(where)} → ${runnable[0]} → Allow without asking…, to skip the Accept for a few runs.`]
-      : shareSteps(facts, "“Agent requests”"),
+    steps: fullAccess ? [] : runnable.length ? fullAccessSteps : [...fullAccessSteps, ...shareSteps(facts, "“Agent requests”")],
   });
 
   lines.push({
@@ -85,15 +98,16 @@ export function remoteAccessGuidance(facts: RemoteAccessFacts): AccessLine[] {
   }
 
   // Continuing names a session only in a folder this device may read there
-  // and ask to run in, and each continuation still waits for that Accept.
+  // and ask to run in; without Full Access each continuation still waits
+  // for that Accept.
   const continuable = shared.filter((share) => allows(share, "continue")).map((share) => share.label);
   lines.push(sharing.state === "known" && !continuable.length
-    ? { id: "continue", label: "Continue its sessions", state: "needs_action", detail: peerShareGuidance(where, sharing, "continue") ?? `Needs a folder ${where} shares with both “Sessions” and “Agent requests”.`, steps: shareSteps(facts, "“Sessions” and “Agent requests”") }
+    ? { id: "continue", label: "Continue its sessions", state: "needs_action", detail: peerShareGuidance(where, sharing, "continue") ?? `Needs a folder ${where} shares with both “Sessions” and “Agent requests”.`, steps: fullAccess ? [] : shareSteps(facts, "“Sessions” and “Agent requests”") }
     : {
       id: "continue",
       label: "Continue its sessions",
-      state: "decided_there",
-      detail: `Codex threads in ${continuable.length ? continuable.join(", ") : `folders ${where} shares for sessions and agent requests`}: each continuation waits for someone on ${where} to click Accept. Claude Code sessions are continued only on ${where} itself.`,
+      state: fullAccess ? "ok" : "decided_there",
+      detail: `Codex threads in ${continuable.length ? continuable.join(", ") : `folders ${where} shares for sessions and agent requests`}: ${fullAccess ? "each continuation starts at once" : `each continuation waits for someone on ${where} to click Accept`}. Claude Code sessions are continued only on ${where} itself.`,
       steps: [],
     });
   return lines;

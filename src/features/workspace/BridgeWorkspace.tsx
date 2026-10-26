@@ -17,6 +17,7 @@ import { AgentWorkspace } from "./AgentWorkspace";
 import { DeviceDetails } from "./DeviceDetails";
 import { RemoteFileFinder } from "./RemoteFileFinder";
 import { Dialog, Dot, EmptyState, Icon, MenuButton, Notice, Tabs } from "./ui";
+import { FullAccessBanner } from "./FullAccessSettings";
 import { bridgeCode, fileName, formatBytes, formatClock, roomMembers, roomPeers } from "./workspaceViewModel";
 
 export type BridgeTab = "share" | "agents";
@@ -75,10 +76,11 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
           <button type="button" className={`btn btn-ghost btn-icon${detailsOpen ? " active" : ""}`} aria-label="Bridge details" title="Bridge details" aria-pressed={detailsOpen} onClick={() => setDetailsOpen(!detailsOpen)}><Icon name="panel" /></button>
           <MenuButton label="More Bridge actions">{(close) => <>
             <button type="button" role="menuitem" disabled={!peers.length || developerMode} onClick={() => { close(); onDeveloper(); }}><Icon name="terminal" /><span>Developer Mode<small>Request a terminal on the other device</small></span></button>
-            <button type="button" role="menuitem" onClick={() => { close(); setDetailsOpen(true); }}><Icon name="panel" /><span>Bridge details<small>Connection, devices, permissions, Burn</small></span></button>
+            <button type="button" role="menuitem" onClick={() => { close(); setDetailsOpen(true); }}><Icon name="panel" /><span>Bridge details<small>Connection, devices, Full Access, permissions, Burn</small></span></button>
           </>}</MenuButton>
         </div>
       </header>
+      {!developerMode ? <FullAccessBanner room={room} peerName={members.find((member) => member.hostRef)?.displayName ?? "the other device"} onOpenDetails={() => setDetailsOpen(true)} /> : null}
       {developerMode ? <div className="panel-scroll"><div className="panel-inner"><DeveloperModeScreen room={room} session={developerSession} workspace={developerWorkspace} onSession={onDeveloperSession} onRefresh={onRefreshDeveloper} /></div></div> : <>
         <div className="page-tabs">
           <Tabs label="Bridge" value={tab} onChange={setTab} tabs={[

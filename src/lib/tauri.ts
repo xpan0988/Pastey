@@ -738,31 +738,25 @@ export interface TrustedDevice {
   revoked: boolean;
 }
 
-export type UnattendedGrantState = "active" | "expired" | "used_up" | "revoked" | "unavailable";
-
-/** A Host-local permission for one trusted device to start Codex in one
- * folder over one Bridge without a Review here, until it expires, runs out
- * or is revoked. There is no unrestricted permission. */
-export interface UnattendedGrant {
+/** Full Access that this device gave the device one Bridge is paired with:
+ * it may control this device through Pastey without anyone here accepting
+ * each request. Only this device's user gives or revokes it. */
+export interface FullAccessGrant {
   grantId: string;
+  bridgeId: string;
   deviceLabel: string;
   displayFingerprint: string;
-  bridgeId: string;
-  capabilityId: string;
-  workspace: string;
-  createdAt: number;
-  expiresAt: number;
-  maxRuns: number;
-  runs: number;
-  state: UnattendedGrantState;
+  grantedAt: number;
+  /** Folders that device named here by path, shown only on this device. */
+  folders: string[];
 }
 
-export interface CreateUnattendedGrant {
-  deviceFingerprint: string;
-  roomId: string;
-  workspacePath: string;
-  durationHours: number;
-  maxRuns: number;
+/** Full Access for one Bridge, as this device's user sees it. */
+export interface BridgeFullAccess {
+  paired: boolean;
+  /** The paired device's fingerprint, to compare before giving it. */
+  displayFingerprint: string | null;
+  grant: FullAccessGrant | null;
 }
 
 export function listSeenPeerDevices(): Promise<SeenPeerDevice[]> {
@@ -781,16 +775,27 @@ export function revokeTrustedDevice(fingerprint: string): Promise<TrustedDevice[
   return invoke("revoke_trusted_device", { fingerprint });
 }
 
-export function listUnattendedGrants(): Promise<UnattendedGrant[]> {
-  return invoke("list_unattended_grants");
+export function getBridgeFullAccess(roomId: string): Promise<BridgeFullAccess> {
+  return invoke("get_bridge_full_access", { roomId });
 }
 
-export function createUnattendedGrant(request: CreateUnattendedGrant): Promise<UnattendedGrant> {
-  return invoke("create_unattended_grant", { request });
+export function listFullAccess(): Promise<FullAccessGrant[]> {
+  return invoke("list_full_access");
 }
 
-export function revokeUnattendedGrant(grantId: string): Promise<UnattendedGrant[]> {
-  return invoke("revoke_unattended_grant", { grantId });
+/** Gives the device this Bridge is paired with Full Access to this device.
+ * `understood`: the user confirmed what it allows. */
+export function grantFullAccess(roomId: string, understood: boolean): Promise<BridgeFullAccess> {
+  return invoke("grant_full_access", { request: { roomId, understood } });
+}
+
+/** Ends it; a terminal it has open here closes. */
+export function revokeFullAccess(roomId: string): Promise<BridgeFullAccess> {
+  return invoke("revoke_full_access", { roomId });
+}
+
+export function removeFullAccessFolder(grantId: string, workspace: string): Promise<FullAccessGrant[]> {
+  return invoke("remove_full_access_folder", { grantId, workspace });
 }
 
 /** Native session discovery (read only). Rust owns every rule: live state
@@ -834,7 +839,7 @@ export interface RemoteNativeSessionSnapshot {
   evidence: Array<{ basis: EvidenceBasis; statement: string; source: string }>;
 }
 
-export type RemoteNativeSessionOutcome = "ok" | "not_authorized" | "not_found" | "busy" | "unavailable";
+export type RemoteNativeSessionOutcome = "ok" | "not_authorized" | "not_found" | "busy" | "unavailable" | "folder_refused";
 
 export interface RemoteNativeSessionResponse {
   schemaVersion: string;
@@ -851,6 +856,11 @@ export interface RemoteNativeSessionResponse {
     sessionId: string | null;
   } | null;
   snapshot?: RemoteNativeSessionSnapshot | null;
+  /** That Host gave this device Full Access (absent: it did not, or it is
+   * older than Full Access). */
+  fullAccess?: boolean;
+  /** Why it would not open a folder (`folder_refused`). */
+  detail?: string | null;
 }
 
 /** A folder another Bridge Host shares with this device, as that Host
@@ -861,13 +871,23 @@ export interface SharedWorkspace {
   label: string;
   readSessions: boolean;
   shareExcerpts: boolean;
-  /** Runs there still wait for that Host's Accept. */
+  /** Runs there wait for that Host's Accept unless it gave this device
+   * Full Access. */
   agentRequests: boolean;
+  /** None for a folder this device opened under Full Access. */
   expiresAt: number | null;
+  /** Allowed by this device's Full Access there. */
+  fullAccess?: boolean;
 }
 
 export function listRemoteSharedWorkspaces(roomId: string, targetHostRef: string): Promise<RemoteNativeSessionResponse> {
   return invoke("list_remote_shared_workspaces", { roomId, targetHostRef });
+}
+
+/** Under the Full Access another Bridge Host gave this device: adds one of
+ * its folders, by full path, to the workspaces this device may use there. */
+export function openRemoteFolder(roomId: string, targetHostRef: string, folder: string): Promise<RemoteNativeSessionResponse> {
+  return invoke("open_remote_folder", { roomId, targetHostRef, folder });
 }
 
 export interface NativeSessionFilters {
@@ -974,7 +994,7 @@ export function updateWorkspaceShare(request: { grantId: string; readSessions: b
   return invoke("update_workspace_share", { request: { ...request, durationHours: request.durationHours ?? null } });
 }
 
-/** Ends the share and any unattended permission for that folder over it. */
+/** Ends the share of that folder with that device over its Bridge. */
 export function stopSharingWorkspace(grantId: string): Promise<void> {
   return invoke("stop_sharing_workspace", { grantId });
 }
@@ -1119,6 +1139,11 @@ export function closeDeveloperTerminal(
   developerUiToken: string,
 ): Promise<boolean> {
   return invoke("close_developer_terminal", { terminalSessionId, developerUiToken });
+}
+
+/** This device's user closes a terminal another device has open here. */
+export function closeHostedDeveloperTerminal(roomId: string, terminalSessionId: string): Promise<DeveloperTerminalWorkspace> {
+  return invoke("close_hosted_developer_terminal", { roomId, terminalSessionId });
 }
 
 export async function sendFileToRoom(roomId: string, path: string, options?: SendFileOptions): Promise<RoomItem> {

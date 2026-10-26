@@ -178,7 +178,7 @@ function AgentsSection({ room, hostRef, name, connected, capabilities }: { room:
     {capabilities.length ? <section className="stack"><span className="subhead">Reported capabilities</span><div className="card"><div className="list">
       {capabilities.map((capability) => <div className="list-row" key={capability.capabilityId}><span className="list-row-main"><span className="list-row-title mono">{capability.capabilityId}</span>{capability.unavailableReason ? <span className="list-row-meta">{capability.unavailableReason}</span> : null}</span><span className="list-row-side"><Badge tone={capability.available ? "ok" : "neutral"}>{capability.available ? "Available" : "Unavailable"}</Badge></span></div>)}
     </div></div></section> : null}
-    <p className="xsmall subtle">What {name} reports about itself in this session. Running anything there still needs {name}'s Accept or its own unattended permission.</p>
+    <p className="xsmall subtle">What {name} reports about itself in this session. Running anything there still needs {name}'s Accept, unless {name} gave this device Full Access.</p>
   </div>;
 }
 

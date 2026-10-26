@@ -67,7 +67,9 @@ export function useSessionList({ roomId, peers, members, target, shares, choice,
   const scopeKey = choice?.kind === "local" ? `local|${choice.path}`
     : choice?.kind === "shared" && remote && share?.readSessions ? `${target}|${choice.scopeRef}` : null;
   const unavailable = choice?.kind === "path" || choice?.kind === "send"
-    ? `Sessions are listed only for folders ${hostName} shares with “Sessions” on.`
+    ? knowledge.state === "known" && knowledge.fullAccess
+      ? `To see sessions here, add this folder to ${hostName}'s folders by its path (Full Access).`
+      : `Sessions are listed only for folders ${hostName} shares with “Sessions” on.`
     : choice?.kind === "shared" && share && !share.readSessions ? peerShareGuidance(hostName, knowledge, "read", share)
       : choice?.kind === "shared" && !remote ? `${hostName} is not connected right now.` : null;
 
@@ -78,9 +80,9 @@ export function useSessionList({ roomId, peers, members, target, shares, choice,
       if (choice.kind === "shared" && remote) {
         const response = await discoverRemoteNativeSessions(roomId, remote.hostRef!, sessionFilters({ provider: "", text: "", activeWithinSecs: null, scopeRef: choice.scopeRef }));
         // Every answer lists what that device shares now.
-        if (response.outcome === "ok" || response.outcome === "not_authorized") shares?.adopt(response.scopes);
+        if (response.outcome === "ok" || response.outcome === "not_authorized") shares?.adopt(response.scopes, response.fullAccess === true);
         const problem = response.outcome === "not_authorized"
-          ? peerShareGuidance(hostName, { state: "known", workspaces: response.scopes }, "read") ?? remoteOutcomeMessage(response, hostName)
+          ? peerShareGuidance(hostName, { state: "known", workspaces: response.scopes, fullAccess: response.fullAccess === true }, "read") ?? remoteOutcomeMessage(response, hostName)
           : remoteOutcomeMessage(response, hostName);
         if (problem) { setSessions(null); setMessage(problem); return; }
         setSessions(response.discovery?.sessions ?? []);

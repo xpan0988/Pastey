@@ -177,7 +177,7 @@ export function NewConversation({ roomId, agent, peers, members, target, choice,
       above={above}
       bar={<><Icon name="agent" small />Codex · {label}{targetHostRef ? ` · ${targetName}` : ""}</>}
       hint={blocker && (agent.taskText.trim() || taskActive || readiness.requirements.some((requirement) => !requirement.met && requirement.id !== "task")) ? blocker
-        : followUp ? `Continues this conversation in ${label}. ${targetHostRef ? `${targetName} asks its user to accept unless you hold an unattended permission there.` : ""}`
+        : followUp ? `Continues this conversation in ${label}. ${targetHostRef ? `${targetName} asks its user to accept unless it gave this device Full Access.` : ""}`
           : showTurns && current ? `Starts a new conversation in ${label}.` : readiness.next}
       hintTone={blocker && (agent.taskText.trim() || taskActive) ? "warn" : undefined}
     />

@@ -231,6 +231,9 @@ export interface DeveloperTerminalSession {
   outputSequence: number;
   terminationReason?: string | null;
   expiresAt: number;
+  /** A terminal another device opened on this one under the Full Access
+   * this device gave it, without anyone here accepting it. */
+  fullAccess?: boolean;
 }
 
 export interface DeveloperTerminalWorkspace {

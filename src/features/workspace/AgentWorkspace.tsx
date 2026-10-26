@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react
 import { remoteAccessGuidance, type AccessLine } from "../../lib/accessGuidance";
 import { peerShareGuidance, shareSummary, type PeerShareKnowledge } from "../../lib/workspaceShares";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
-import { getDeviceIdentity, getDeviceProfile, presentDeviceIdentity, type NativeAgentCapability, type SharedWorkspace } from "../../lib/tauri";
+import { getDeviceIdentity, getDeviceProfile, openRemoteFolder, presentDeviceIdentity, type NativeAgentCapability, type SharedWorkspace } from "../../lib/tauri";
 import type { RoomInfo } from "../../lib/types";
 import {
   continuedSessionKey,
@@ -86,6 +86,8 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
     ? nativeAgentTargetAvailability("agent.coding.codex", remoteCapabilities.observation)
     : localAvailability(agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex"));
   const sharedList = shares.knowledge.state === "known" ? shares.knowledge.workspaces : [];
+  const fullAccess = shares.knowledge.state === "known" && shares.knowledge.fullAccess === true;
+  const [addingFolder, setAddingFolder] = useState(false);
 
   // The workspace shown: the one last chosen while it is still offered,
   // else the first shared one (sessions and agents first).
@@ -123,7 +125,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   }
 
   // A run that waits in Review tells this device that the other one has no
-  // unattended permission for it there. Nothing else is inferred.
+  // Full Access for it there. Nothing else is inferred.
   useEffect(() => {
     if (agent.taskHostRef && agent.status?.state === "queued" && agent.status.code === "native_agent_review_required") {
       setWaitedForAccept((current) => current[agent.taskHostRef!] ? current : { ...current, [agent.taskHostRef!]: true });
@@ -188,7 +190,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
         </select>
         <div className="nav-host-status" role="status">
           <Dot tone={!connected ? "neutral" : availability.state === "available" ? "ok" : availability.state === "checking" ? "neutral" : "warn"} pulse={availability.state === "checking"} />
-          <span>{!connected ? "Not connected" : availability.state === "available" ? targetHostRef ? "Connected · Codex ready" : "Codex ready" : availabilityCopy(availability, targetHostRef ? targetName : null, false)}</span>
+          <span>{!connected ? "Not connected" : availability.state === "available" ? targetHostRef ? `Connected · Codex ready${fullAccess ? " · Full Access" : ""}` : "Codex ready" : availabilityCopy(availability, targetHostRef ? targetName : null, false)}</span>
         </div>
         {targetHostRef ? <div className="row nav-host-actions">
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => setAccessOpen(true)}><Icon name="shield" small />Access</button>
@@ -197,8 +199,11 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
       </div>
 
       <div className="nav-section-head">
-        <span>{targetHostRef ? "Shared workspaces" : "Folders on this device"}</span>
-        {targetHostRef ? <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Ask again" title="Ask again which folders it shares" disabled={shares.loading || !connected} onClick={() => void shares.refresh()}><Icon name="refresh" small /></button>
+        <span>{targetHostRef ? fullAccess ? `Workspaces on ${targetName}` : "Shared workspaces" : "Folders on this device"}</span>
+        {targetHostRef ? <span className="row">
+          {fullAccess ? <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label={`Add a folder on ${targetName}`} title={`Add a folder on ${targetName} by its path (Full Access)`} disabled={!connected} onClick={() => setAddingFolder(true)}><Icon name="plus" small /></button> : null}
+          <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Ask again" title="Ask again which folders it shares" disabled={shares.loading || !connected} onClick={() => void shares.refresh()}><Icon name="refresh" small /></button>
+        </span>
           : <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Add a folder" title="Add a folder on this device" onClick={() => void addLocalFolder()}><Icon name="plus" small /></button>}
       </div>
       <ul className="nav-places">
@@ -216,7 +221,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
       {targetHostRef ? <>
         <div className="nav-section-head"><span>Other places</span></div>
         <ul className="nav-places">
-          <PlaceItem label={`A folder by path on ${targetName}`} grants={<span>Type its path · no sessions</span>} selected={choice?.kind === "path"} onSelect={() => choose({ kind: "path" })}>
+          <PlaceItem label={`A folder by path on ${targetName}`} grants={<span>{fullAccess ? "Type its path · add it above for sessions" : "Type its path · no sessions"}</span>} selected={choice?.kind === "path"} onSelect={() => choose({ kind: "path" })}>
             {placeBody(true, null)}
           </PlaceItem>
           <PlaceItem label="A folder from this device" grants={<span>Sent after your review · no sessions</span>} selected={choice?.kind === "send"} onSelect={() => choose({ kind: "send" })}>
@@ -228,6 +233,12 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
 
     <main className="agents-main">{main}</main>
 
+    {addingFolder && targetHostRef ? <AddRemoteFolderDialog roomId={room.id} hostRef={targetHostRef} name={targetName} onClose={() => setAddingFolder(false)} onAdded={(scopes, added) => {
+      shares.adopt(scopes, true);
+      setAddingFolder(false);
+      const chosen = added ?? scopes.find((scope) => !sharedList.some((known) => known.scopeRef === scope.scopeRef));
+      if (chosen) choose({ kind: "shared", scopeRef: chosen.scopeRef });
+    }} /> : null}
     {accessOpen && targetHostRef ? <Dialog title={`Access on ${targetName}`} description={`What this device may do on ${targetName}, authority by authority, and where each is decided. Nothing here can be granted from this device.`} onClose={() => setAccessOpen(false)}>
       <RemoteAccessSummary room={room} hostRef={targetHostRef} name={targetName} connected={connected} paired={(room.pairing_state ?? "pairing_required") === "paired"} sharing={shares.knowledge} waitedForAccept={waitedForAccept[targetHostRef] ?? null} onOpenDetails={onOpenDetails ? () => { setAccessOpen(false); onOpenDetails(); } : undefined} />
     </Dialog> : null}
@@ -246,9 +257,48 @@ function PlaceItem({ label, grants, title, selected, onSelect, children }: { lab
   </li>;
 }
 
+/** Under the Full Access another device gave this one: names one of its
+ * folders by full path. That device checks the folder against its own
+ * rules, lists it for its user, and answers with its workspaces. */
+function AddRemoteFolderDialog({ roomId, hostRef, name, onClose, onAdded }: {
+  roomId: string;
+  hostRef: string;
+  name: string;
+  onClose: () => void;
+  onAdded: (scopes: SharedWorkspace[], added: SharedWorkspace | null) => void;
+}) {
+  const [folder, setFolder] = useState("");
+  const [pending, setPending] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  async function add() {
+    setPending(true); setProblem(null);
+    try {
+      const response = await openRemoteFolder(roomId, hostRef, folder.trim());
+      if (response.outcome === "ok") {
+        const leaf = folder.trim().split(/[\\/]/).filter(Boolean).pop() ?? "";
+        onAdded(response.scopes, response.scopes.find((scope) => scope.fullAccess && scope.label === leaf) ?? null);
+        return;
+      }
+      setProblem(response.outcome === "folder_refused"
+        ? response.detail ?? `${name} would not open that folder.`
+        : response.outcome === "busy" ? `${name} is still answering an earlier request. Try again in a moment.` : `${name} could not open it now.`);
+    } catch (error) {
+      setProblem(error instanceof Error ? error.message : String(error));
+    } finally { setPending(false); }
+  }
+  return <Dialog title={`Add a folder on ${name}`} labelledBy="add-remote-folder-title" onClose={() => { if (!pending) onClose(); }} footer={<><button type="button" className="btn" disabled={pending} onClick={onClose}>Cancel</button><button type="button" className="btn btn-primary" disabled={pending || !folder.trim()} onClick={() => void add()}>{pending ? "Adding…" : "Add"}</button></>}>
+    <p className="small">Type the folder's full path on {name}, for example <span className="mono">{"C:\\Users\\you\\Projects\\app"}</span> or <span className="mono">/Users/you/Projects/app</span>. You can then see its sessions, continue them and run Codex there.</p>
+    <input className="input input-mono" autoFocus value={folder} disabled={pending} onChange={(event) => setFolder(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && folder.trim()) void add(); }} aria-label={`Folder path on ${name}`} placeholder="Full path on that device" />
+    <p className="xsmall subtle">{name} lists the folder for its user, who can remove it. Folders too broad to share (a drive root, your home folder, app data) are refused there.</p>
+    {problem ? <p className="error-text" role="alert">{problem}</p> : null}
+  </Dialog>;
+}
+
 /** What a workspace allows this device, in words. Each is the Host's own
- * switch for this Bridge; continuing a session needs both. */
+ * switch for this Bridge; continuing a session needs both. Under Full
+ * Access everything is allowed. */
 function Grants({ share }: { share: SharedWorkspace }) {
+  if (share.fullAccess) return <span className="grant on">Full Access</span>;
   return <>
     <span className={share.readSessions ? "grant on" : "grant"}>{share.readSessions ? "Sessions" : "No sessions"}</span>
     <span className={share.agentRequests ? "grant on" : "grant"}>{share.agentRequests ? "Agents" : "No agents"}</span>

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { listRooms, listSessionReadGrants, stopSharingWorkspace, type SessionReadGrant } from "../../lib/tauri";
 import type { RoomInfo } from "../../lib/types";
-import { expiryLabel } from "../../lib/unattendedAccess";
+import { expiryLabel } from "../../lib/fullAccess";
 import { shareStateNote, shareSummary } from "../../lib/workspaceShares";
 import { Badge, Icon, ListRow } from "./ui";
 import { bridgeCode } from "./workspaceViewModel";
