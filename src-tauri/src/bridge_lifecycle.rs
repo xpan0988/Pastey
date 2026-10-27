@@ -259,6 +259,11 @@ impl CurrentRemoteHostSession {
             &self.binding.bridge_id,
             &endpoint.transport_public_key,
         )?;
+        let (host, port) = (endpoint.host.clone(), endpoint.port);
+        let path = || {
+            crate::connectivity::tunnel_path_counters(&state, &self.binding.bridge_id, &host, port)
+        };
+        let before = path();
         let result = crate::link_benchmark::run_peer_link_benchmark_for_endpoint(
             signer,
             endpoint,
@@ -269,6 +274,7 @@ impl CurrentRemoteHostSession {
             crate::link_benchmark::cpu_hint(),
         )
         .await?;
+        log_benchmark_path(&self.binding.bridge_id, before, path());
         self.revalidate(&state).await?;
         store_current_link_benchmark(
             &mut state.latest_bridge_link_benchmarks.lock(),
@@ -277,6 +283,30 @@ impl CurrentRemoteHostSession {
         );
         Ok(result)
     }
+}
+
+/// Which path a Bridge benchmark ran on, and that path's counters before
+/// and after it: whether it was the LAN, a direct path or a relay, and
+/// whether the path lost packets, backed off or found an MTU black hole.
+fn log_benchmark_path(
+    bridge_id: &str,
+    before: Option<crate::connectivity::TunnelPath>,
+    after: Option<crate::connectivity::TunnelPath>,
+) {
+    let side = |observed: Option<crate::connectivity::TunnelPath>| match observed {
+        None => "path=not_tunnel".to_owned(),
+        Some((kind, counters)) => format!(
+            "path={kind:?} {}",
+            counters
+                .map(|counters| counters.log_fields())
+                .unwrap_or_else(|| "counters=unknown".into())
+        ),
+    };
+    logging::write_transfer_line(&format!(
+        "[pastey diagnostics] event=link_benchmark_path bridge_id={bridge_id} before=({}) after=({})",
+        side(before),
+        side(after)
+    ));
 }
 
 /// Records one revalidated link benchmark under its exact current route. A

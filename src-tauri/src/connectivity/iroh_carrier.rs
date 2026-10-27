@@ -281,6 +281,19 @@ impl CarrierLink for IrohLink {
         }
     }
 
+    fn path_counters(&self) -> Option<super::PathCounters> {
+        let paths = self.connection.paths();
+        let stats = paths.iter().find(|path| path.is_selected())?.stats();
+        Some(super::PathCounters {
+            rtt_ms: stats.rtt.as_secs_f64() * 1000.0,
+            congestion_window: stats.cwnd,
+            mtu: stats.current_mtu,
+            lost_packets: stats.lost_packets,
+            congestion_events: stats.congestion_events,
+            black_holes: stats.black_holes_detected,
+        })
+    }
+
     fn is_closed(&self) -> bool {
         self.connection.close_reason().is_some()
     }

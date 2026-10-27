@@ -142,7 +142,7 @@ function PerformanceSection({ room, hostRef, name, connected, linkBenchmark }: {
   return <div className="stack-lg">
     <div className="row-wrap">
       <button type="button" className="btn btn-primary" disabled={running || !connected} onClick={() => void testConnection()}><Icon name="refresh" small />{running ? "Testing…" : "Test connection"}</button>
-      <span className="xsmall subtle spacer">About one second. Sends test data to {name} in memory; no files are read or written.</span>
+      <span className="xsmall subtle spacer">Sends test data to {name} for about a second, then waits for it to arrive, which takes longer on a slow connection. In memory; no files are read or written.</span>
     </div>
     {!connected ? <Notice tone="warn">{name} is not connected, so nothing can be measured now.</Notice> : null}
     {error ? <Notice tone="bad">{error}</Notice> : null}

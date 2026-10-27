@@ -155,11 +155,41 @@ pub(crate) struct CarrierStream {
     pub(crate) writer: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
+/// Counters of the path a carrier connection sends on now. Diagnostics
+/// only: no address, key or content.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct PathCounters {
+    pub(crate) rtt_ms: f64,
+    pub(crate) congestion_window: u64,
+    pub(crate) mtu: u16,
+    pub(crate) lost_packets: u64,
+    pub(crate) congestion_events: u64,
+    pub(crate) black_holes: u64,
+}
+
+impl PathCounters {
+    pub(crate) fn log_fields(&self) -> String {
+        format!(
+            "rtt_ms={:.1} cwnd={} mtu={} lost_packets={} congestion_events={} black_holes={}",
+            self.rtt_ms,
+            self.congestion_window,
+            self.mtu,
+            self.lost_packets,
+            self.congestion_events,
+            self.black_holes
+        )
+    }
+}
+
 /// An authenticated connection to one peer carrier key.
 pub(crate) trait CarrierLink: Send + Sync {
     fn remote_id(&self) -> &str;
     fn open_stream(&self) -> BoxFuture<'_, AppResult<CarrierStream>>;
     fn path(&self) -> PathKind;
+    /// The selected path's counters, when the carrier keeps them.
+    fn path_counters(&self) -> Option<PathCounters> {
+        None
+    }
     fn is_closed(&self) -> bool;
 }
 
@@ -454,6 +484,30 @@ pub(crate) fn bridge_path(state: &AppState, bridge_id: &str) -> Option<PathKind>
         .get(&pin.card.endpoint_id)
         .cloned()?;
     (!link.is_closed()).then(|| link.path())
+}
+
+/// The path a tunnel uses now, and its counters when the carrier keeps them.
+pub(crate) type TunnelPath = (PathKind, Option<PathCounters>);
+
+/// The path and its counters, when a request to `host`:`port` runs through
+/// this device's tunnel toward a Bridge's peer.
+pub(crate) fn tunnel_path_counters(
+    state: &AppState,
+    bridge_id: &str,
+    host: &str,
+    port: u16,
+) -> Option<TunnelPath> {
+    if !is_tunnel_endpoint(state, host, port) {
+        return None;
+    }
+    let pin = storage::bridge_carrier_pin(&state.paths, bridge_id).ok()??;
+    let link = state
+        .connectivity
+        .links
+        .lock()
+        .get(&pin.card.endpoint_id)
+        .cloned()?;
+    (!link.is_closed()).then(|| (link.path(), link.path_counters()))
 }
 
 /// What the settings and a Bridge show about internet connectivity.
