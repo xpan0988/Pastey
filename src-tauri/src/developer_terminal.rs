@@ -60,6 +60,11 @@ pub struct DeveloperModeUiSession {
 pub struct DeveloperTerminalWorkspace {
     pub pending_requests: Vec<PendingTerminalProjection>,
     pub sessions: Vec<TerminalSessionProjection>,
+    /// When the Developer Mode UI session the renderer asked about ends, if
+    /// it is still valid for this Bridge; `None` once it expired or this
+    /// Bridge's session ended, or when the renderer asked about none.
+    #[serde(default)]
+    pub ui_session_expires_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -874,7 +879,20 @@ impl DeveloperTerminalService {
         DeveloperTerminalWorkspace {
             pending_requests,
             sessions,
+            ui_session_expires_at: None,
         }
+    }
+
+    /// When one Developer Mode UI session ends, while it is still valid for
+    /// exactly this Bridge. Read only: it renews nothing, and a running
+    /// terminal keeps its own authority and lifetime whatever this says.
+    pub fn ui_session_expires_at(&self, token: &str, room_id: &str, now: i64) -> Option<i64> {
+        self.state
+            .lock()
+            .ui_sessions
+            .get(token)
+            .filter(|session| session.room_id == room_id && session.expires_at > now)
+            .map(|session| session.expires_at)
     }
 
     pub fn purge_room(&self, room_id: &str) {
@@ -1357,6 +1375,126 @@ mod tests {
         let result = service.request_open("missing-ui-token", binding(), 10);
         assert!(result.is_err());
         assert!(service.workspace("room", 10).sessions.is_empty());
+    }
+
+    /// A renderer learns that its Developer Mode UI session ended, by expiry
+    /// or with the Bridge's session, and enters again without a restart. The
+    /// new session is this Host's own, for exactly this Bridge; it opens,
+    /// extends and re-binds nothing.
+    #[test]
+    fn an_ended_ui_session_is_reported_and_entering_again_recovers() {
+        let service = DeveloperTerminalService::default();
+        let first = service.enter_mode("room", 10);
+        let expires_at = 10 + UI_SESSION_TTL_SECONDS;
+        assert_eq!(
+            service.ui_session_expires_at(&first.token, "room", expires_at - 1),
+            Some(expires_at)
+        );
+        assert_eq!(
+            service.ui_session_expires_at(&first.token, "other-room", 10),
+            None
+        );
+        assert_eq!(service.ui_session_expires_at("unknown", "room", 10), None);
+
+        // Expired: reported, and still refused, with nothing created.
+        assert_eq!(
+            service.ui_session_expires_at(&first.token, "room", expires_at),
+            None
+        );
+        let refused = service
+            .request_open(&first.token, binding(), expires_at)
+            .err()
+            .unwrap();
+        assert_eq!(
+            refused.message(),
+            "Developer Mode UI authority is unavailable."
+        );
+        let workspace = service.workspace("room", expires_at);
+        assert!(workspace.sessions.is_empty() && workspace.pending_requests.is_empty());
+
+        // Entering again recovers, for this Bridge only, and only that.
+        let second = service.enter_mode("room", expires_at);
+        assert_ne!(second.token, first.token);
+        assert_eq!(
+            service.ui_session_expires_at(&second.token, "room", expires_at),
+            Some(expires_at + UI_SESSION_TTL_SECONDS)
+        );
+        assert_eq!(
+            service.ui_session_expires_at(&second.token, "other-room", expires_at),
+            None
+        );
+        let workspace = service.workspace("room", expires_at);
+        assert!(workspace.sessions.is_empty() && workspace.pending_requests.is_empty());
+        assert!(service.state.lock().host_sessions.is_empty());
+        service
+            .request_open(&second.token, binding(), expires_at)
+            .unwrap();
+        assert!(service
+            .request_open(&second.token, binding(), expires_at)
+            .is_err());
+
+        // The Bridge's session ending (a reconnect, Burn) ends it too.
+        service.purge_room("room");
+        assert_eq!(
+            service.ui_session_expires_at(&second.token, "room", expires_at),
+            None
+        );
+        assert!(service
+            .request_open(&second.token, binding(), expires_at)
+            .is_err());
+        let third = service.enter_mode("room", expires_at);
+        assert!(service
+            .request_open(&third.token, binding(), expires_at)
+            .is_ok());
+    }
+
+    /// A running terminal depends on its own authority, not on the UI
+    /// session it was requested in: it keeps working after that session
+    /// expires, for exactly its own lifetime. Entering again neither extends
+    /// it nor lets the new session drive or close it, and opens no second one.
+    #[test]
+    fn a_running_terminal_outlives_its_ui_session_but_not_its_own_lifetime() {
+        let service = DeveloperTerminalService::default();
+        let ui = service.enter_mode("room", 10);
+        let opened_at = 10 + UI_SESSION_TTL_SECONDS - 60;
+        let request = service
+            .request_open(&ui.token, binding(), opened_at)
+            .unwrap();
+        let id = request.terminal_session_id.clone();
+        let mut accepted = TerminalMessage::base(&binding(), &id);
+        accepted.environment_label = Some("zsh".into());
+        service
+            .receive_accepted(&binding(), &accepted, opened_at)
+            .unwrap();
+        let ends_at = opened_at + ACTIVE_SESSION_TTL_SECONDS;
+
+        let after_ui = 10 + UI_SESSION_TTL_SECONDS;
+        assert_eq!(
+            service.ui_session_expires_at(&ui.token, "room", after_ui),
+            None
+        );
+        service
+            .prepare_input(&ui.token, &id, b"ls\r", after_ui)
+            .unwrap();
+
+        let renewed = service.enter_mode("room", after_ui);
+        assert!(service
+            .prepare_input(&renewed.token, &id, b"ls\r", after_ui)
+            .is_err());
+        assert!(service
+            .close_from_controller(&renewed.token, &id, after_ui)
+            .is_err());
+        assert!(service
+            .request_open(&renewed.token, binding(), after_ui)
+            .is_err());
+        let workspace = service.workspace("room", after_ui);
+        assert_eq!(workspace.sessions.len(), 1);
+        assert_eq!(workspace.sessions[0].state, TerminalState::Active);
+        assert_eq!(workspace.sessions[0].expires_at, ends_at);
+
+        assert!(service
+            .prepare_input(&ui.token, &id, b"ls\r", ends_at)
+            .is_err());
     }
 
     #[test]

@@ -1079,8 +1079,11 @@ export function enterDeveloperMode(roomId: string): Promise<DeveloperModeUiSessi
   return invoke("enter_developer_mode", { roomId });
 }
 
-export function getDeveloperTerminalWorkspace(roomId: string): Promise<DeveloperTerminalWorkspace> {
-  return invoke("get_developer_terminal_workspace", { roomId });
+/** `developerUiToken`: this renderer's Developer Mode UI session for the
+ * Bridge, if any; the answer's `uiSessionExpiresAt` says whether it is
+ * still valid. */
+export function getDeveloperTerminalWorkspace(roomId: string, developerUiToken?: string): Promise<DeveloperTerminalWorkspace> {
+  return invoke("get_developer_terminal_workspace", { roomId, developerUiToken: developerUiToken ?? null });
 }
 
 export function requestDeveloperTerminal(

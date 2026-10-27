@@ -2,6 +2,7 @@ import { bridgeConnectionErrorMessage } from "../../lib/bridgeAddress";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useAgentTaskLifecycle } from "./AgentTaskLifecycle";
 import { BridgeWorkspace } from "./BridgeWorkspace";
+import { developerUiSessionUsable, withEndedDeveloperUiSessions, type DeveloperUiSessionObservation } from "../../lib/developerTerminalFrontend";
 import { acceptDeveloperTerminal, acceptNativeInvocationReview, denyDeveloperTerminal, denyNativeInvocationReview, enterDeveloperMode, getDeveloperTerminalWorkspace, listNativeInvocationReviews, type NativeInvocationReview } from "../../lib/tauri";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace } from "../../lib/types";
 import { SettingsScreen, type SettingsRoute } from "./SettingsScreens";
@@ -59,10 +60,26 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   const refreshDeveloperWorkspaces = useCallback(async () => {
     if (!props.nearbyDiscoveryAvailable) return;
     const roomIds = roomIdsKey ? roomIdsKey.split(":") : [];
-    const settled = await Promise.allSettled(roomIds.map(async (roomId) => ({ roomId, workspace: await getDeveloperTerminalWorkspace(roomId) })));
+    const settled = await Promise.allSettled(roomIds.map(async (roomId) => {
+      const token = developerSessionsRef.current[roomId]?.token;
+      return { roomId, token, workspace: await getDeveloperTerminalWorkspace(roomId, token) };
+    }));
     const next: Record<string, DeveloperTerminalWorkspace> = {};
-    for (const result of settled) if (result.status === "fulfilled") next[result.value.roomId] = result.value.workspace;
+    const observed: DeveloperUiSessionObservation[] = [];
+    for (const result of settled) {
+      if (result.status !== "fulfilled") continue;
+      next[result.value.roomId] = result.value.workspace;
+      observed.push({ roomId: result.value.roomId, token: result.value.token, uiSessionExpiresAt: result.value.workspace.uiSessionExpiresAt });
+    }
     setDeveloperWorkspaces(next);
+    // A session that expired, or ended when its Bridge reconnected, stops
+    // offering requests here, so Developer Mode can be entered again. Only
+    // the exact token asked about is ended: one entered meanwhile stays.
+    const sessions = withEndedDeveloperUiSessions(developerSessionsRef.current, observed);
+    if (sessions !== developerSessionsRef.current) {
+      developerSessionsRef.current = sessions;
+      setDeveloperSessions((current) => withEndedDeveloperUiSessions(current, observed));
+    }
   }, [props.nearbyDiscoveryAvailable, roomIdsKey]);
 
   useEffect(() => {
@@ -156,7 +173,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
 
   async function ensureDeveloperSession(roomId: string): Promise<DeveloperModeUiSession> {
     const existing = developerSessionsRef.current[roomId];
-    if (existing && existing.expiresAt > Math.floor(Date.now() / 1_000) + 2) return existing;
+    if (developerUiSessionUsable(existing, Math.floor(Date.now() / 1_000) + 2)) return existing;
     const session = await enterDeveloperMode(roomId);
     developerSessionsRef.current = { ...developerSessionsRef.current, [roomId]: session };
     setDeveloperSessions(developerSessionsRef.current);

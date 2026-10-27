@@ -239,6 +239,9 @@ export interface DeveloperTerminalSession {
 export interface DeveloperTerminalWorkspace {
   pendingRequests: DeveloperTerminalPendingRequest[];
   sessions: DeveloperTerminalSession[];
+  /** When the UI session the renderer asked about ends; null once it
+   * expired or ended with the Bridge's session, or when none was asked. */
+  uiSessionExpiresAt?: number | null;
 }
 
 export interface NearbyDevice {

@@ -1,3 +1,5 @@
+import type { DeveloperModeUiSession } from "./types";
+
 export const MAX_TERMINAL_INPUT_FRAME_BYTES = 8 * 1024;
 export const MAX_QUEUED_TERMINAL_INPUT_BYTES = 64 * 1024;
 
@@ -136,4 +138,39 @@ export function decodeTerminalOutputFrame(dataBase64: string): Uint8Array | null
   } catch {
     return null;
   }
+}
+
+/** Whether a Developer Mode UI session can still make new requests (open,
+ * accept or deny a terminal). Rust decides; this only stops the renderer
+ * offering what Rust would refuse. */
+export function developerUiSessionUsable(
+  session: DeveloperModeUiSession | null | undefined,
+  nowSeconds: number,
+): session is DeveloperModeUiSession {
+  return !!session && session.expiresAt > nowSeconds;
+}
+
+export interface DeveloperUiSessionObservation {
+  roomId: string;
+  /** The token the renderer asked about, if it held one. */
+  token: string | undefined;
+  uiSessionExpiresAt?: number | null;
+}
+
+/** The renderer's sessions, with each one Rust no longer recognizes (it
+ * expired, or ended with its Bridge's session) marked ended. Its token
+ * stays: a terminal it opened keeps its own authority and lifetime, so only
+ * a new request needs a new session, entered again by the user. A session
+ * entered since the question was asked is left alone. */
+export function withEndedDeveloperUiSessions(
+  sessions: Record<string, DeveloperModeUiSession>,
+  observations: readonly DeveloperUiSessionObservation[],
+): Record<string, DeveloperModeUiSession> {
+  let next = sessions;
+  for (const { roomId, token, uiSessionExpiresAt } of observations) {
+    const current = next[roomId];
+    if (!token || !current || current.token !== token || uiSessionExpiresAt != null || current.expiresAt === 0) continue;
+    next = { ...next, [roomId]: { ...current, expiresAt: 0 } };
+  }
+  return next;
 }

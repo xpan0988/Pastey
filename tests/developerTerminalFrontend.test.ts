@@ -4,12 +4,14 @@ import test from "node:test";
 
 import {
   decodeTerminalOutputFrame,
+  developerUiSessionUsable,
   MAX_QUEUED_TERMINAL_INPUT_BYTES,
   MAX_TERMINAL_INPUT_FRAME_BYTES,
   OrderedTerminalInputWriter,
   TerminalInputBackpressureError,
   terminalDimensionsEqual,
   terminalInputBytes,
+  withEndedDeveloperUiSessions,
 } from "../src/lib/developerTerminalFrontend";
 
 function deferred() {
@@ -214,11 +216,63 @@ test("active Developer Terminal UI hides fresh-request controls and identifies t
   assert.match(panel, /the other device must accept each request/);
   // A fresh request is offered only when no terminal is active or waiting.
   assert.match(panel, /const canRequest = !controller \|\| \["denied", "exited", "closed", "disconnected"\]\.includes\(controller\.state\)/);
-  assert.match(panel, /session && canRequest \? [\s\S]*?requestTerminal\(\)[\s\S]*?Request terminal/);
+  assert.match(panel, /requestable && canRequest \? [\s\S]*?requestTerminal\(\)[\s\S]*?Request terminal/);
   // The active terminal names its Host's environment and can be ended.
   assert.match(panel, /active\.environmentLabel \?\? "Shell"/);
   assert.match(panel, /End session/);
   assert.match(panel, /active\.state === "active" && session \? <DeveloperTerminalViewport/);
   assert.match(panel, /closeDeveloperTerminal/);
   assert.match(panel, /Burn is a separate action in Bridge details/);
+});
+
+test("an expired or ended Developer Mode UI session is marked ended, and only that one", () => {
+  const first = { token: "developer-ui:first", roomId: "room", expiresAt: 1_800 };
+  const other = { token: "developer-ui:other", roomId: "room-b", expiresAt: 1_800 };
+  assert.equal(developerUiSessionUsable(first, 1_799), true);
+  assert.equal(developerUiSessionUsable(first, 1_800), false);
+  assert.equal(developerUiSessionUsable(null, 0), false);
+
+  const sessions = { room: first, "room-b": other };
+  // Rust still recognizes both: nothing changes, not even the object.
+  assert.equal(withEndedDeveloperUiSessions(sessions, [
+    { roomId: "room", token: first.token, uiSessionExpiresAt: 1_800 },
+    { roomId: "room-b", token: other.token, uiSessionExpiresAt: 1_800 },
+  ]), sessions);
+  // Ended with its Bridge's session (or expired): marked ended, its token
+  // kept for a terminal it opened; the other Bridge's session untouched.
+  const ended = withEndedDeveloperUiSessions(sessions, [
+    { roomId: "room", token: first.token, uiSessionExpiresAt: null },
+    { roomId: "room-b", token: other.token, uiSessionExpiresAt: 1_800 },
+  ]);
+  assert.deepEqual(ended.room, { ...first, expiresAt: 0 });
+  assert.equal(ended["room-b"], other);
+  assert.equal(developerUiSessionUsable(ended.room, 0), false);
+  // An answer about a token the renderer no longer holds (it entered again
+  // meanwhile), or about none, ends nothing.
+  const entered = { room: { token: "developer-ui:second", roomId: "room", expiresAt: 3_600 } };
+  assert.equal(withEndedDeveloperUiSessions(entered, [{ roomId: "room", token: first.token, uiSessionExpiresAt: null }]), entered);
+  assert.equal(withEndedDeveloperUiSessions(entered, [{ roomId: "room", token: undefined, uiSessionExpiresAt: null }]), entered);
+  assert.equal(withEndedDeveloperUiSessions(ended, [{ roomId: "room", token: first.token, uiSessionExpiresAt: null }]), ended);
+});
+
+test("Developer Mode is entered again after its UI session ends, without a restart", () => {
+  const workspace = readFileSync("src/features/workspace/WorkspaceV2.tsx", "utf8");
+  const panel = readFileSync("src/features/workspace/DeveloperModeScreen.tsx", "utf8");
+  const tauri = readFileSync("src/lib/tauri.ts", "utf8");
+  // The 2 s poll asks Rust about the session the renderer holds, and marks
+  // it ended when Rust no longer recognizes it.
+  assert.match(tauri, /invoke\("get_developer_terminal_workspace", \{ roomId, developerUiToken: developerUiToken \?\? null \}\)/);
+  assert.match(workspace, /const token = developerSessionsRef\.current\[roomId\]\?\.token;\s*return \{ roomId, token, workspace: await getDeveloperTerminalWorkspace\(roomId, token\) \};/);
+  assert.match(workspace, /withEndedDeveloperUiSessions\(developerSessionsRef\.current, observed\)/);
+  assert.match(workspace, /setDeveloperSessions\(\(current\) => withEndedDeveloperUiSessions\(current, observed\)\)/);
+  // Accept and Deny here enter again when the session ended.
+  assert.match(workspace, /if \(developerUiSessionUsable\(existing, Math\.floor\(Date\.now\(\) \/ 1_000\) \+ 2\)\) return existing;/);
+  // The controlling side offers Enter again instead of a request Rust
+  // refuses, but never while a terminal it opened is still live.
+  assert.match(panel, /const requestable = developerUiSessionUsable\(session, Math\.floor\(Date\.now\(\) \/ 1_000\)\);/);
+  assert.match(panel, /\{!session \|\| \(!requestable && canRequest\) \? <section className="card">/);
+  assert.match(panel, /Developer Mode ended on this device: it lasts 30 minutes, and ends when this Bridge reconnects\./);
+  assert.match(panel, /if \(!requestable \|\| !selectedPeerId \|\| busy\) return;/);
+  // A live terminal keeps driving with the token it was opened with.
+  assert.match(panel, /sendDeveloperTerminalInput\(active\.terminalSessionId, session\.token, frame\)/);
 });

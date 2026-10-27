@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { DeveloperTerminalViewport } from "../../components/DeveloperTerminalViewport";
-import { OrderedTerminalInputWriter, TerminalInputBackpressureError } from "../../lib/developerTerminalFrontend";
+import { developerUiSessionUsable, OrderedTerminalInputWriter, TerminalInputBackpressureError } from "../../lib/developerTerminalFrontend";
 import { closeDeveloperTerminal, enterDeveloperMode, requestDeveloperTerminal, resizeDeveloperTerminal, sendDeveloperTerminalInput } from "../../lib/tauri";
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace, RoomInfo } from "../../lib/types";
 import { Dot, Notice } from "./ui";
@@ -27,6 +27,9 @@ export function DeveloperModeScreen({ room, session, workspace, onSession, onRef
     ?? null;
   const active = controller && (controller.state === "active" || controller.state === "awaiting_admission") ? controller : null;
   const canRequest = !controller || ["denied", "exited", "closed", "disconnected"].includes(controller.state);
+  // A session that expired or ended with the Bridge's session makes no new
+  // request; a terminal it opened keeps working with it until that ends.
+  const requestable = developerUiSessionUsable(session, Math.floor(Date.now() / 1_000));
 
   useEffect(() => {
     if (!peers.some((peer) => peer.peerSessionId === selectedPeerId)) setSelectedPeerId(peers[0]?.peerSessionId ?? "");
@@ -51,7 +54,7 @@ export function DeveloperModeScreen({ room, session, workspace, onSession, onRef
   }
 
   async function requestTerminal() {
-    if (!session || !selectedPeerId || busy) return;
+    if (!requestable || !selectedPeerId || busy) return;
     setBusy(true); setError(null);
     try {
       await requestDeveloperTerminal(room.id, selectedPeerId, session.token);
@@ -79,8 +82,8 @@ export function DeveloperModeScreen({ room, session, workspace, onSession, onRef
         <h2>Developer Mode</h2>
         <p>A terminal on the other device, controlled by you for this session only. It is separate from Agents, Plans and their permissions, and the other device must accept each request, unless it gave this device Full Access.</p>
       </div>
-      {!session ? <section className="card"><div className="card-body"><p className="small muted">Enter Developer Mode, then request a terminal on one device. Nothing opens until that device accepts, or it opens at once if that device gave this one Full Access.</p><div><button type="button" className="btn btn-primary" disabled={busy || peers.length === 0} onClick={() => void enter()}>{busy ? "Entering…" : "Enter Developer Mode"}</button></div></div></section> : null}
-      {session && canRequest ? <section className="card"><div className="card-body"><div className="row"><select className="select" value={selectedPeerId} onChange={(event) => setSelectedPeerId(event.target.value)} disabled={busy || peers.length === 0} aria-label="Device">{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select><button type="button" className="btn btn-primary" disabled={busy || !selectedPeerId} onClick={() => void requestTerminal()}>{busy ? "Requesting…" : "Request terminal"}</button></div></div></section> : null}
+      {!session || (!requestable && canRequest) ? <section className="card"><div className="card-body">{session ? <p className="small">Developer Mode ended on this device: it lasts 30 minutes, and ends when this Bridge reconnects. Enter it again to request a terminal.</p> : null}<p className="small muted">Enter Developer Mode, then request a terminal on one device. Nothing opens until that device accepts, or it opens at once if that device gave this one Full Access.</p><div><button type="button" className="btn btn-primary" disabled={busy || peers.length === 0} onClick={() => void enter()}>{busy ? "Entering…" : "Enter Developer Mode"}</button></div></div></section> : null}
+      {requestable && canRequest ? <section className="card"><div className="card-body"><div className="row"><select className="select" value={selectedPeerId} onChange={(event) => setSelectedPeerId(event.target.value)} disabled={busy || peers.length === 0} aria-label="Device">{peers.map((peer) => <option key={peer.peerSessionId} value={peer.peerSessionId}>{peer.displayName}</option>)}</select><button type="button" className="btn btn-primary" disabled={busy || !selectedPeerId} onClick={() => void requestTerminal()}>{busy ? "Requesting…" : "Request terminal"}</button></div></div></section> : null}
       {active ? <section className="terminal"><header className="terminal-header"><strong><Dot tone={active.state === "active" ? "ok" : "warn"} pulse={active.state !== "active"} /> {active.environmentLabel ?? "Shell"}</strong><span className="row"><span className="xsmall">{active.state === "active" ? "Live" : "Waiting for the other device to accept"}</span><button type="button" className="btn btn-danger btn-sm" disabled={busy} onClick={() => void close()}>End session</button></span></header>{active.state === "active" && session ? <DeveloperTerminalViewport roomId={room.id} terminalSessionId={active.terminalSessionId} environmentLabel={active.environmentLabel} output={active.output} outputSequence={active.outputSequence} onInput={enqueueTerminalInput} onResize={(cols, rows) => void resizeDeveloperTerminal(active.terminalSessionId, session.token, cols, rows)} /> : <p className="terminal-empty">Waiting for the other device to accept this request.</p>}</section> : controller ? <Notice tone={controller.state === "denied" ? "warn" : "neutral"} title={controller.state === "denied" ? "Request denied" : "Terminal ended"}>{controller.state === "denied" ? controller.terminationReason === "full_access_revoked" ? "Full Access to the other device ended before this terminal opened. No terminal process remains there." : "The other device denied this request. No terminal process was created." : `This terminal session ended${controller.terminationReason === "host_closed" ? ": the other device closed it." : controller.terminationReason ? `: ${controller.terminationReason}` : "."}`}</Notice> : null}
       <p className="xsmall subtle">End session closes only this terminal. Burn is a separate action in Bridge details.</p>
       {error ? <p className="error-text" role="status">{error}</p> : null}

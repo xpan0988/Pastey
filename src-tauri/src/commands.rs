@@ -6237,14 +6237,24 @@ pub fn enter_developer_mode(
         .enter_mode(&room_id, storage::now_ts()))
 }
 
+/// `developer_ui_token`: the renderer's Developer Mode UI session for this
+/// Bridge, if it holds one; the answer says whether it is still valid, so a
+/// renderer never keeps offering requests on one that expired or ended with
+/// the Bridge's session.
 #[tauri::command]
 pub fn get_developer_terminal_workspace(
     room_id: String,
+    developer_ui_token: Option<String>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::developer_terminal::DeveloperTerminalWorkspace, String> {
-    Ok(state
-        .developer_terminal
-        .workspace(&room_id, storage::now_ts()))
+    let now = storage::now_ts();
+    let mut workspace = state.developer_terminal.workspace(&room_id, now);
+    workspace.ui_session_expires_at = developer_ui_token.and_then(|token| {
+        state
+            .developer_terminal
+            .ui_session_expires_at(&token, &room_id, now)
+    });
+    Ok(workspace)
 }
 
 async fn send_developer_terminal_message(

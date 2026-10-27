@@ -312,7 +312,11 @@ test("Developer Mode stays inside the selected Bridge and receiver observation i
   assert.doesNotMatch(workspace, /route === "developer"/);
   assert.match(workspace, /bridgeMode === "developer"/);
   assert.match(bridge, /developerMode \? <div[^>]*><div[^>]*><DeveloperModeScreen/);
-  assert.match(workspace, /getDeveloperTerminalWorkspace\(roomId\)/);
+  // Observing requests needs no token; the renderer's own token, when it
+  // holds one, only learns whether that token is still valid.
+  assert.match(workspace, /getDeveloperTerminalWorkspace\(roomId, token\)/);
+  assert.match(readFileSync("src/lib/tauri.ts", "utf8"), /getDeveloperTerminalWorkspace\(roomId: string, developerUiToken\?: string\)/);
+  assert.match(readFileSync("src-tauri/src/commands.rs", "utf8"), /let mut workspace = state\.developer_terminal\.workspace\(&room_id, now\);/);
   assert.match(workspace, /Developer Mode request/);
   assert.match(workspace, />Deny</);
   assert.match(workspace, /Accept/);
