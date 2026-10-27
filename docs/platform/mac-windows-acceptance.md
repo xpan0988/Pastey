@@ -258,7 +258,7 @@ Use this for any crash of Pastey on the executing device, including one that alr
 | # | Do | Expect |
 |---|---|---|
 | L1 | Click the device name in a Bridge header, or a device in Bridge details. | Device Details opens with Overview, Connection, Performance, Agents, Trust & permissions and Advanced. |
-| L2 | Performance → Test connection. | About a second, then a measured average and peak MB/s, latency, quality and "Measured just now", labelled as Pastey's pipeline over this Bridge in memory. Record the numbers. |
+| L2 | Performance → Test connection. | About a second on a fast connection (longer on a slow one: it waits for what it sent), then a measured average and peak MB/s, latency, quality and "Measured just now", labelled as Pastey's pipeline over this Bridge in memory. The peak is never below the average. Record the numbers. |
 | L3 | Advanced → Run managed self-check. | Managed readiness and the E2E result (PASS, BLOCKED or FAIL), as before under Bridge Devices → Check. |
 | L4 | Settings → This device: Refresh, Full check, Run local test (each mode once). | Device facts, runtimes with versions, and a local-only measurement labelled "no network". |
 | L5 | Settings → General → Receiving folder → Change…, receive a file, then Use default. Turn Save received files off and receive a file. | The file lands in the chosen folder; with saving off it is not put in the receiving folder. |
@@ -341,6 +341,19 @@ What failed on real devices before this build: after about 64 Codex availability
 | O6 | Quit and reopen Pastey on Windows, then repeat O1 for 5 minutes and O2 once. | Same as O1 and O2; no "inbox is full" ever. |
 | O7 | On Windows, `Get-Content "$env:LOCALAPPDATA\pastey\logs\pastey.log" -Tail 200 \| Select-String "room-control"`. | Only `backpressure` / `backpressure_ended` lines from O3, with a class and counts; no prompts, paths or ids beyond 8 characters of the Bridge id. |
 
+## X. WAN retest of the 27 October 2026 findings
+
+What was seen on beta.2 with the Mac on an iPhone hotspot and Windows at home, over a direct path: Test connection reported 0.2 MB/s average but a 14.1 MB/s peak; Agents said "Current remote Host session is unavailable" while the Bridge showed Connected; the conversation said Windows must accept although Windows had given the Mac Full Access; and after a while Developer Mode refused with "Developer Mode UI authority is unavailable" until Pastey restarted. Run on packaged builds of the fixing commit, in the same setup (part W's W1).
+
+| # | Do | Expect / record |
+|---|---|---|
+| X1 | Device Details → Performance → Test connection, three times, about a minute apart. Then on the Mac: `grep -E "link_benchmark_(summary\|path)" ~/Library/"Application Support"/pastey/logs/pastey.log \| tail -6`. | Peak ≥ average, and close to it when every chunk took the whole run. Record average, peak, latency, duration, and from the log `chunks`, `first_ack_ms`, `longest_chunk_ms`, `path=` before and after, `rtt_ms`, `lost_packets`, `congestion_events`, `black_holes`. A congested uplink usually shows `rtt_ms` well above the idle latency and new congestion events; without them, look at `path=` (a path change) and `black_holes` (an MTU problem). The log names the Bridge by id only. |
+| X2 | Same, with the relay forced (W10 or W14). | The log shows `path=Relayed`; expect about 1 MiB/s (part F). |
+| X3 | Raw path: net-probe cell C2 from the Mac on the hotspot, `--bulk-mib 16 --http` (part F). | Bulk MiB/s of the raw iroh path on the same networks. If it is also about 0.2 MB/s, the hotspot's uplink is the limit and Poor is right. |
+| X4 | Keep Agents open on Windows for 10 minutes with the Mac on the hotspot; turn the hotspot off for 20 s once, then on. | After the Bridge is Connected again, "Codex is available on Windows" returns within about 20 s without Check again. "Could not check … session is unavailable" may show during the outage only. |
+| X5 | With Full Access given on Windows, open a new conversation in a Windows folder and continue it. | The conversation says it starts on Windows at once (Full Access), not that Windows must accept. Its progress shows "Checking there" then Running, never "Waiting for Accept". Revoke Full Access on Windows, wait 15 s and click into the Mac window: the next run says it waits for Accept, and it does. |
+| X6 | Enter Developer Mode on the Mac, open a terminal on Windows, wait more than 30 minutes (or turn the hotspot off until the Bridge reconnects), end the terminal. | Developer Mode says it ended and offers Enter Developer Mode; entering again and requesting a terminal works without restarting Pastey. A terminal still open when the 30 minutes pass keeps working until its own 30 minutes end, and is not reopened. Without Full Access, Windows still has to Accept the new request. |
+
 ## Record
 
 Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
@@ -367,4 +380,5 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
 | Internet carrier (W1–W14): networks, path shown, times |
+| WAN retest (X1–X6): benchmark numbers and log fields, recovery times |
 | Net-probe summary (part F) | |
