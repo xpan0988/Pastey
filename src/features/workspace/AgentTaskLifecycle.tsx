@@ -195,6 +195,9 @@ export type RemoteNativeCapabilityObservation =
  * its card is open, so a change there (Codex installed, signed in, or gone)
  * reaches this device without a manual check. */
 export const REMOTE_CAPABILITY_REFRESH_MS = 15_000;
+/** How soon a check that failed is tried again, so one lost answer is not
+ * shown for a whole refresh period while the Bridge stays connected. */
+export const REMOTE_CAPABILITY_RETRY_MS = 5_000;
 
 /** The observation shown while a new query is in flight. A background
  * refresh of the same Host keeps the last observed answer instead of
@@ -213,13 +216,16 @@ export function observationWhileRefreshing(
 }
 
 /** The selected remote Host's own advertised native capabilities, observed
- * over the existing capability query when the selection changes, when the
- * user checks again, periodically, and when the window regains focus.
- * Never this device's local capability state. */
-export function useRemoteNativeCapabilities(roomId: string, hostRef: string | null) {
+ * over the existing capability query when the selection or its current
+ * session (`sessionKey`) changes, when the user checks again, periodically,
+ * soon after a failed check, and when the window regains focus. Never this
+ * device's local capability state. */
+export function useRemoteNativeCapabilities(roomId: string, hostRef: string | null, sessionKey: string | null = null) {
   const [observation, setObservation] = useState<RemoteNativeCapabilityObservation | null>(null);
   const generation = useRef(0);
+  const retry = useRef<number | undefined>(undefined);
   const query = useCallback(async (background: boolean) => {
+    window.clearTimeout(retry.current);
     if (!roomId || !hostRef) {
       setObservation(null);
       return;
@@ -232,9 +238,10 @@ export function useRemoteNativeCapabilities(roomId: string, hostRef: string | nu
     } catch (error) {
       if (current === generation.current) {
         setObservation({ roomId, hostRef, state: "error", message: error instanceof Error ? error.message : String(error) });
+        retry.current = window.setTimeout(() => void query(true), REMOTE_CAPABILITY_RETRY_MS);
       }
     }
-  }, [hostRef, roomId]);
+  }, [hostRef, roomId, sessionKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const refresh = useCallback(() => query(false), [query]);
   useEffect(() => {
     if (!hasTauriRuntime()) return;
@@ -245,6 +252,7 @@ export function useRemoteNativeCapabilities(roomId: string, hostRef: string | nu
     return () => {
       generation.current += 1;
       window.clearInterval(timer);
+      window.clearTimeout(retry.current);
       window.removeEventListener("focus", onFocus);
     };
   }, [query]);

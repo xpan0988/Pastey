@@ -56,6 +56,15 @@ export function controlLine(host: string, fullAccess: boolean | null): string {
     : `Each run and terminal waits for someone at ${host} to click Accept. To use ${host} when nobody is there, its user turns on Full Access for this device in that Bridge's details on ${host}.`;
 }
 
+/** Whether a request from this device starts on `host` at once or waits
+ * there for its user, as far as `host` last said (`fullAccess`, or null
+ * before it answered). `host` decides when the request arrives. */
+export function remoteStartLine(host: string, fullAccess: boolean | null): string {
+  if (fullAccess === true) return `It starts on ${host} at once: ${host} gave this device Full Access.`;
+  if (fullAccess === false) return `It waits for someone on ${host} to accept: ${host} has not given this device Full Access.`;
+  return `${host} asks its user to accept unless it gave this device Full Access.`;
+}
+
 export function expiryLabel(expiresAt: number, now = Date.now() / 1000): string {
   const remaining = expiresAt - now;
   if (remaining <= 0) return "expired";

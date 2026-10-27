@@ -24,6 +24,7 @@ import {
   nativeAgentConversationUnavailable,
   observationWhileRefreshing,
   REMOTE_CAPABILITY_REFRESH_MS,
+  REMOTE_CAPABILITY_RETRY_MS,
 } from "../src/features/workspace/AgentTaskLifecycle";
 import { codexRunReadiness, looksLikeFullPath, type CodexRunInput } from "../src/lib/nativeAgentReadiness";
 import { remoteAccessGuidance, type RemoteAccessFacts } from "../src/lib/accessGuidance";
@@ -36,7 +37,7 @@ import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent,
 import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
 import { bridgeInternetLine, internetSettingLine, relayUrlProblem } from "../src/lib/internetStatus";
-import { controlLine, expiryLabel, FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits, processRightsWarning } from "../src/lib/fullAccess";
+import { controlLine, expiryLabel, FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits, processRightsWarning, remoteStartLine } from "../src/lib/fullAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
 import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
@@ -1108,13 +1109,55 @@ test("A remote Host's capability is observed again in the background without fla
   const failed = { roomId: "room", hostRef: "host:windows", state: "error" as const, message: "no answer" };
   assert.equal(observationWhileRefreshing(failed, "room", "host:windows", true), failed);
   assert.ok(REMOTE_CAPABILITY_REFRESH_MS >= 5_000 && REMOTE_CAPABILITY_REFRESH_MS <= 60_000);
+  // A failed check is tried again sooner than the refresh, but not in a
+  // burst: the Host's capability budget is 60 a minute.
+  assert.ok(REMOTE_CAPABILITY_RETRY_MS >= 3_000 && REMOTE_CAPABILITY_RETRY_MS < REMOTE_CAPABILITY_REFRESH_MS);
 
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
   assert.match(lifecycle, /window\.setInterval\(\(\) => void query\(true\), REMOTE_CAPABILITY_REFRESH_MS\)/);
   assert.match(lifecycle, /window\.addEventListener\("focus", onFocus\)/);
   assert.match(lifecycle, /window\.clearInterval\(timer\)/);
-  // A reconnecting Host is queried again as soon as it is routeable.
-  assert.match(readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8"), /useRemoteNativeCapabilities\(room\.id, remote \? targetHostRef : null\)/);
+  assert.match(lifecycle, /retry\.current = window\.setTimeout\(\(\) => void query\(true\), REMOTE_CAPABILITY_RETRY_MS\)/);
+  assert.match(lifecycle, /window\.clearTimeout\(retry\.current\)/);
+  assert.match(lifecycle, /\}, \[hostRef, roomId, sessionKey\]\);/);
+  // A reconnecting Host is queried again as soon as it is routeable, and
+  // again when its current session changes without leaving the list (a
+  // reconnect from the other side). So is what it shares, and its Full Access.
+  const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  assert.match(workspace, /useRemoteNativeCapabilities\(room\.id, remote \? targetHostRef : null, remote\?\.peerSessionId \?\? null\)/);
+  assert.match(workspace, /usePeerSharedWorkspaces\(room\.id, targetHostRef, connected, remote\?\.peerSessionId \?\? null\)/);
+  const shares = readFileSync("src/features/workspace/BridgeWorkspaces.tsx", "utf8");
+  assert.match(shares, /\}, \[hostRef, roomId, routeable, sessionKey\]\);/);
+  // A failed question is asked once more, and that retry asks no further.
+  assert.match(shares, /if \(failed && retryOnFailure && question === asked\.current\) \{\s*retry\.current = window\.setTimeout\(\(\) => void ask\(false\), RETRY_AFTER_FAILURE_MS\);/);
+});
+
+test("guidance about a run's start follows the Full Access the other device reported", () => {
+  // The reported case: Windows gave this Mac Full Access and its workspace
+  // said so, while the conversation still said Windows must accept.
+  const known = (fullAccess: boolean) => ({ state: "known" as const, workspaces: [], fullAccess });
+  assert.match(remoteStartLine("Windows", true), /starts on Windows at once: Windows gave this device Full Access/);
+  assert.doesNotMatch(remoteStartLine("Windows", true), /accept/);
+  assert.match(remoteStartLine("Windows", false), /waits for someone on Windows to accept: Windows has not given this device Full Access/);
+  assert.match(remoteStartLine("Windows", null), /asks its user to accept unless it gave this device Full Access/);
+  assert.match(codexRunReadiness(codexInput({ shares: known(true) })).next, /starts on DESKTOP-DMI2L9P at once[\s\S]*No files move/);
+  assert.match(codexRunReadiness(codexInput({ shares: known(false) })).next, /waits for someone on DESKTOP-DMI2L9P to accept/);
+  assert.match(codexRunReadiness(codexInput()).next, /asks its user to accept unless/);
+
+  const panel = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  assert.match(panel, /const fullAccess = knownFullAccess\(knowledge\);/);
+  assert.match(panel, /remoteStartLine\(targetName, fullAccess\)\} No files move\./);
+  assert.match(panel, /followUp \? `Continues this conversation in \$\{label\}\. \$\{targetHostRef \? remoteStartLine\(targetName, fullAccess\) : ""\}`/);
+  assert.doesNotMatch(panel, /accepts each request, unless they allowed this device/);
+
+  // A remote task waits for an Accept only once its Host says so; before
+  // that it is being checked there.
+  const remote = { hostName: "Windows", remote: true };
+  const sent = { state: "queued" as const, code: "remote_agent_queued" };
+  assert.equal(taskStages(sent, remote).find((stage) => stage.id === "accepted")!.label, "Checking there");
+  assert.equal(taskStages(sent, { ...remote, fullAccess: true }).find((stage) => stage.id === "accepted")!.label, "Checking there");
+  assert.equal(taskStages({ state: "queued", code: "native_agent_review_required" }, remote).find((stage) => stage.id === "accepted")!.label, "Waiting for Accept");
+  assert.equal(taskStages({ state: "running", code: null }, { ...remote, fullAccess: true }).find((stage) => stage.id === "accepted")!.label, "Accepted there");
 });
 
 test("Settings are device-wide sections and every permission can be found and revoked", () => {
@@ -1179,7 +1222,7 @@ test("Execution, observation and continuation stay separate in the Bridge", () =
   assert.match(workspace, /\{taskNeedsAttention && !taskShown \? <TaskBanner /);
   // One observation of what the chosen device shares, asked over its own
   // connection, serves running, reading and continuing.
-  assert.match(workspace, /const shares = usePeerSharedWorkspaces\(room\.id, targetHostRef, connected\);/);
+  assert.match(workspace, /const shares = usePeerSharedWorkspaces\(room\.id, targetHostRef, connected, remote\?\.peerSessionId \?\? null\);/);
   assert.doesNotMatch(workspace, /grantFullAccess|createSessionReadGrant|shareBridgeWorkspace|updateWorkspaceShare|trustPeerDevice/);
   const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8") + readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
   // Continuing never starts a new run in place of the session.

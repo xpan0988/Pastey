@@ -20,37 +20,49 @@ import { peerShareGuidance, SHARE_DURATIONS, shareLocation, shareStateNote, shar
 import { Badge, Dialog, Icon, ListRow, Notice, Switch, errorText } from "./ui";
 
 const FOCUS_REFRESH_MS = 15_000;
+/** A question that failed is asked once more after this long. */
+const RETRY_AFTER_FAILURE_MS = 5_000;
 
-/** What another device of this Bridge shares with this one, as it last said.
- * Asked again when its connection changes and when the window regains
- * focus; never inferred. */
-export function usePeerSharedWorkspaces(roomId: string, hostRef: string | null, routeable: boolean) {
+/** What another device of this Bridge shares with this one, as it last said,
+ * including whether it gave this device Full Access. Asked again when its
+ * connection or current session (`sessionKey`) changes, once soon after a
+ * failed question, and when the window regains focus; never inferred. */
+export function usePeerSharedWorkspaces(roomId: string, hostRef: string | null, routeable: boolean, sessionKey: string | null = null) {
   const [knowledge, setKnowledge] = useState<PeerShareKnowledge>({ state: "unknown" });
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const asked = useRef(0);
   const askedAt = useRef(0);
+  const retry = useRef<number | undefined>(undefined);
 
-  const refresh = useCallback(async () => {
+  const ask = useCallback(async (retryOnFailure: boolean) => {
+    window.clearTimeout(retry.current);
     if (!hostRef || !routeable) return;
-    const ask = ++asked.current;
+    const question = ++asked.current;
     askedAt.current = Date.now();
     setLoading(true);
+    let failed = false;
     try {
       const response = await listRemoteSharedWorkspaces(roomId, hostRef);
-      if (ask !== asked.current) return;
+      if (question !== asked.current) return;
       if (response.outcome === "ok" || response.outcome === "not_authorized") {
         setKnowledge({ state: "known", workspaces: response.scopes, fullAccess: response.fullAccess === true });
         setMessage(null);
       } else {
+        failed = true;
         setMessage(response.outcome === "busy" ? "It is still answering an earlier request. Check again in a moment." : "It could not answer now.");
       }
     } catch (error) {
-      if (ask === asked.current) setMessage(errorText(error, "Pastey could not ask the other device."));
+      failed = true;
+      if (question === asked.current) setMessage(errorText(error, "Pastey could not ask the other device."));
     } finally {
-      if (ask === asked.current) setLoading(false);
+      if (question === asked.current) setLoading(false);
     }
-  }, [hostRef, roomId, routeable]);
+    if (failed && retryOnFailure && question === asked.current) {
+      retry.current = window.setTimeout(() => void ask(false), RETRY_AFTER_FAILURE_MS);
+    }
+  }, [hostRef, roomId, routeable, sessionKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  const refresh = useCallback(() => ask(true), [ask]);
 
   useEffect(() => { setKnowledge({ state: "unknown" }); setMessage(null); }, [hostRef, roomId]);
   useEffect(() => {
@@ -59,7 +71,7 @@ export function usePeerSharedWorkspaces(roomId: string, hostRef: string | null, 
     // asks again only when the last answer is not recent.
     const onFocus = () => { if (Date.now() - askedAt.current > FOCUS_REFRESH_MS) void refresh(); };
     window.addEventListener("focus", onFocus);
-    return () => window.removeEventListener("focus", onFocus);
+    return () => { window.removeEventListener("focus", onFocus); window.clearTimeout(retry.current); };
   }, [refresh]);
 
   /** A fresh answer from a session query carries the same list. */

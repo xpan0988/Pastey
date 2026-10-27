@@ -1,7 +1,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect } from "react";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
-import { codexRunReadiness, looksLikeFullPath, type CodexWorkspaceSource } from "../../lib/nativeAgentReadiness";
+import { remoteStartLine } from "../../lib/fullAccess";
+import { codexRunReadiness, knownFullAccess, looksLikeFullPath, type CodexWorkspaceSource } from "../../lib/nativeAgentReadiness";
 import {
   nativeAgentMovementBlocksNewRun,
   type ConversationPlace,
@@ -73,6 +74,7 @@ export function NewConversation({ roomId, agent, peers, members, target, choice,
   const targetName = targetHostRef ? members.find((peer) => peer.hostRef === targetHostRef)?.displayName ?? remote?.displayName ?? "the other device" : "this device";
   const conversationPlace = current && agent.origin?.kind === "new" ? agent.origin.place : null;
   const knowledge = shares?.knowledge ?? { state: "unknown" as const };
+  const fullAccess = knownFullAccess(knowledge);
   const sharedList = knowledge.state === "known" ? knowledge.workspaces : [];
   const sharedScope = conversationPlace?.kind === "shared" ? conversationPlace.scopeRef : choice?.kind === "shared" ? choice.scopeRef : null;
   const sharedWorkspace = sharedScope ? sharedList.find((share) => share.scopeRef === sharedScope) ?? null : null;
@@ -150,13 +152,13 @@ export function NewConversation({ roomId, agent, peers, members, target, choice,
     <ConversationThread follow={`${agent.pastTurns.length}:${agent.status?.state}:${agent.status?.code}:${agent.movement?.state}`}>
       {showTurns ? <>
         {agent.pastTurns.map((turn) => <PastTurnView key={turn.taskId} turn={turn} hostName={agent.taskHostRef ? targetName : "this device"} />)}
-        <TaskTurn roomId={roomId} agent={agent} peers={peers} members={members} />
+        <TaskTurn roomId={roomId} agent={agent} peers={peers} members={members} fullAccess={targetHostRef && agent.taskHostRef === targetHostRef ? fullAccess : null} />
       </> : <div className="conversation-intro">
         <h3>Start a new conversation</h3>
         <p>{kind === "send"
           ? `Pastey shows you exactly what it sends to ${targetName}, and sends nothing until you approve. Codex works on the copy there, and the result comes back to be applied here.`
           : `Codex starts fresh in ${label}${targetHostRef ? ` on ${targetName}` : ""}. It does not see your other conversations there; to pick one of those up, open it from the list.`}
-          {targetHostRef && kind !== "send" ? ` ${targetName}'s user accepts each request, unless they allowed this device to run there without asking. No files move.` : ""}</p>
+          {targetHostRef && kind !== "send" ? ` ${remoteStartLine(targetName, fullAccess)} No files move.` : ""}</p>
         <div className="availability" role="status">
           <Dot tone={availabilityTone(availability, targetHostRef !== null && !remote)} pulse={availability.state === "checking"} />
           <span className="spacer">{targetHostRef && !remote ? `${targetName} is not connected right now.` : availabilityCopy(availability, targetHostRef ? targetName : null, kind === "send")}</span>
@@ -177,7 +179,7 @@ export function NewConversation({ roomId, agent, peers, members, target, choice,
       above={above}
       bar={<><Icon name="agent" small />Codex · {label}{targetHostRef ? ` · ${targetName}` : ""}</>}
       hint={blocker && (agent.taskText.trim() || taskActive || readiness.requirements.some((requirement) => !requirement.met && requirement.id !== "task")) ? blocker
-        : followUp ? `Continues this conversation in ${label}. ${targetHostRef ? `${targetName} asks its user to accept unless it gave this device Full Access.` : ""}`
+        : followUp ? `Continues this conversation in ${label}. ${targetHostRef ? remoteStartLine(targetName, fullAccess) : ""}`
           : showTurns && current ? `Starts a new conversation in ${label}.` : readiness.next}
       hintTone={blocker && (agent.taskText.trim() || taskActive) ? "warn" : undefined}
     />

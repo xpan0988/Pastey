@@ -28,11 +28,13 @@ function hostNameOf(hostRef: string | null, members: Members): string {
  * the turn, not a separate panel. Nothing is shown as replied before the
  * reply arrives: Pastey receives a turn's reply only when it ends, so the
  * turn shows where the task is, never text that has not come. */
-export function TaskTurn({ roomId, agent, peers, members }: {
+export function TaskTurn({ roomId, agent, peers, members, fullAccess = null }: {
   roomId: string;
   agent: NativeAgentController;
   peers: readonly BridgePeerSession[];
   members: Members;
+  /** Whether the device it runs on said it gave this one Full Access. */
+  fullAccess?: boolean | null;
 }) {
   const status = agent.status;
   const taskHostName = agent.taskHostRef ? hostNameOf(agent.taskHostRef, members) : null;
@@ -67,7 +69,7 @@ export function TaskTurn({ roomId, agent, peers, members }: {
     {agent.prompt ? <Bubble from="me" label="Your message">{agent.prompt}</Bubble> : null}
     {status || agent.movement ? <Bubble from="agent" rich tone={outcome?.tone ?? (agent.movement?.state === "awaiting_approval" ? "pending" : "neutral")} label={`${agentName} turn`} meta={<>{agentName}{taskHostName ? ` on ${taskHostName}` : " on this device"}{response?.kind === "text" ? " · its own account, not verified" : ""}</>}>
       {status && response?.kind !== "text" ? <div className="turn-status"><Dot tone={outcome?.tone === "danger" ? "bad" : outcome?.tone === "complete" ? "ok" : outcome?.tone === "live" ? "live" : outcome?.tone === "pending" ? "warn" : "neutral"} pulse={active} /><strong>{outcome?.headline ?? status.state}</strong></div> : null}
-      {status && status.state !== "completed" ? <TaskStages status={status} remote={!!agent.taskHostRef} hostName={hostName} /> : null}
+      {status && status.state !== "completed" ? <TaskStages status={status} remote={!!agent.taskHostRef} hostName={hostName} fullAccess={fullAccess} /> : null}
       {response?.kind === "text"
         ? <><div className="turn-reply">{response.text}</div>{response.truncated ? <small className="subtle">Pastey shortened this reply to fit its size limit.</small> : null}</>
         : response?.kind === "undisplayable" ? <small className="muted">The task completed with output Pastey cannot display as text.</small>
@@ -128,8 +130,8 @@ export function PastTurnView({ turn, hostName }: { turn: PastTurn; hostName: str
 }
 
 /** Where the task is: sent, accepted there, running, result. */
-function TaskStages({ status, remote, hostName }: { status: NativeAgentTaskStatus; remote: boolean; hostName: string }) {
-  const stages = taskStages(status, { remote, hostName });
+function TaskStages({ status, remote, hostName, fullAccess }: { status: NativeAgentTaskStatus; remote: boolean; hostName: string; fullAccess: boolean | null }) {
+  const stages = taskStages(status, { remote, hostName, fullAccess });
   return <ol className="task-stages" aria-label="Progress">
     {stages.map((stage) => <li key={stage.id} className={stage.state} aria-current={stage.state === "current" ? "step" : undefined}>
       <span className="mark" aria-hidden="true">{stage.state === "done" ? <Icon name="check" /> : stage.state === "stopped" ? <Icon name="close" /> : null}</span>

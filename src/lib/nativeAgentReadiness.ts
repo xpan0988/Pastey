@@ -5,6 +5,7 @@
  * gave). Which folders it shares, and for what, comes only from
  * that device's own answer; reading its sessions is a separate authority. */
 import type { NativeAgentTargetAvailability } from "../features/workspace/AgentTaskLifecycle";
+import { remoteStartLine } from "./fullAccess";
 import type { SharedWorkspace } from "./tauri";
 import { peerShareGuidance, type PeerShareKnowledge } from "./workspaceShares";
 
@@ -34,7 +35,8 @@ export interface CodexRunInput {
   taskText: string;
   busy: boolean;
   movementBlocksNewRun: boolean;
-  /** For "shared": what the executing device shares, and the one chosen. */
+  /** What the executing device shares, and the one chosen ("shared"),
+   * and whether it gave this device Full Access. */
   shares?: PeerShareKnowledge;
   sharedWorkspace?: SharedWorkspace | null;
 }
@@ -139,11 +141,17 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
     blocker,
     ready: blocker === null && !input.busy,
     next: action === "run_remote"
-      ? `${where} asks its user to accept unless it gave this device Full Access. No files move.`
+      ? `${remoteStartLine(where, knownFullAccess(input.shares))} No files move.`
       : action === "review_movement"
         ? `Next you review exactly what is sent to ${where}. Nothing moves until you approve.`
         : "Codex runs on this device in its own native session.",
   };
+}
+
+/** Whether the executing device said it gave this device Full Access, or
+ * null before it answered. */
+export function knownFullAccess(shares: PeerShareKnowledge | undefined): boolean | null {
+  return shares?.state === "known" ? shares.fullAccess === true : null;
 }
 
 function availabilityBlocker(availability: NativeAgentTargetAvailability, where: string): string {

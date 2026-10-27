@@ -31,6 +31,13 @@ const LIVENESS_FAILURES_BEFORE_INVALIDATION: u8 = 3;
 /// minute (4 rounds of a probe and the 2 s cadence).
 const TUNNEL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_LIVENESS_FAILURES_BEFORE_INVALIDATION: u8 = 4;
+/// Proofs a current-session resolution tries before calling a Connected
+/// session unavailable. Liveness keeps a session through a few lost probes
+/// (above), so one lost probe here would refuse a query on a session the
+/// Bridge still shows as connected. A session that is really gone fails
+/// every attempt; a success is still one fresh proof.
+const CURRENT_SESSION_PROOF_ATTEMPTS: u8 = 2;
+const CURRENT_SESSION_PROOF_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DISCONNECTED_AFTER_ATTEMPTS: u8 = 2;
 
 #[derive(Deserialize)]
@@ -505,6 +512,26 @@ async fn probe_exact_peer(
         })
 }
 
+/// One fresh transport-key proof of a Connected candidate, retried once
+/// after a lost probe. Whatever the proof, the caller then checks the
+/// stored route again.
+async fn prove_current_peer(
+    state: &AppState,
+    room: &StoredRoom,
+    peer: &StoredBridgePeerEndpoint,
+) -> bool {
+    let tunnel = through_tunnel(state, peer);
+    for attempt in 0..CURRENT_SESSION_PROOF_ATTEMPTS {
+        if attempt > 0 {
+            sleep(CURRENT_SESSION_PROOF_RETRY_DELAY).await;
+        }
+        if probe_exact_peer(state, room, peer, tunnel).await {
+            return true;
+        }
+    }
+    false
+}
+
 impl AppState {
     /// Resolves one durable remote HostRef to its exact live current Bridge
     /// session. Persisted liveness alone is insufficient: every Connected
@@ -537,7 +564,7 @@ impl AppState {
             .collect::<Vec<_>>();
         let mut live = Vec::new();
         for peer in candidates {
-            if probe_exact_peer(self, &room, &peer, through_tunnel(self, &peer)).await {
+            if prove_current_peer(self, &room, &peer).await {
                 live.push(peer);
             }
         }
@@ -1042,6 +1069,86 @@ mod tests {
 
         assert_eq!(session.binding().peer_host_ref, fixture.remote_host);
         assert_eq!(session.binding().peer_route_ref, "route-current");
+    }
+
+    /// A ping answered with a wrong proof `failures` times, then
+    /// correctly; counts every ping it receives.
+    async fn serve_ping_failing(
+        fixture: &ResolverFixture,
+        secret: [u8; 32],
+        failures: usize,
+    ) -> (
+        u16,
+        oneshot::Sender<()>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let pings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = pings.clone();
+        let key = fixture.remote_key.clone();
+        let (port, shutdown) = serve_ping(move |room_id, headers| {
+            let seen = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let proof = if seen < failures {
+                Some("00".repeat(32))
+            } else {
+                crate::bridge_auth::ping_proof_for_test(&room_id, &secret, &headers)
+            };
+            serde_json::json!({ "transportPublicKey": key, "proof": proof })
+        })
+        .await;
+        (port, shutdown, pings)
+    }
+
+    /// Bridge liveness keeps a session through lost probes, so one lost
+    /// probe must not make the same Connected session unavailable to a
+    /// query ("Current remote Host session is unavailable" while the Bridge
+    /// shows Connected). The retry is one more fresh proof.
+    #[tokio::test]
+    async fn a_lost_probe_does_not_make_a_connected_session_unavailable() {
+        let mut fixture = ResolverFixture::new("lost-probe").await;
+        let secret = crate::crypto::random_key();
+        fixture.remote_key =
+            crate::crypto::encode_key(&crate::crypto::transport_public_key(&secret));
+        let (port, shutdown, pings) = serve_ping_failing(&fixture, secret, 1).await;
+        fixture.remote_port = port;
+        fixture.store(&fixture.peer("route-current", BridgePeerLiveness::Connected));
+
+        let session = fixture
+            .runtime
+            .resolve_current_remote_host_session(ROOM_ID, &fixture.remote_host)
+            .await
+            .unwrap();
+        assert_eq!(session.binding().peer_route_ref, "route-current");
+        assert_eq!(pings.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = shutdown.send(());
+    }
+
+    /// A session that never proves itself stays unavailable, after a
+    /// bounded number of proofs: the retry is not a loophole.
+    #[tokio::test]
+    async fn a_session_that_never_proves_itself_stays_unavailable() {
+        let mut fixture = ResolverFixture::new("never-proves").await;
+        let secret = crate::crypto::random_key();
+        fixture.remote_key =
+            crate::crypto::encode_key(&crate::crypto::transport_public_key(&secret));
+        let (port, shutdown, pings) = serve_ping_failing(&fixture, secret, usize::MAX).await;
+        fixture.remote_port = port;
+        fixture.store(&fixture.peer("route-current", BridgePeerLiveness::Connected));
+
+        let error = fixture
+            .runtime
+            .resolve_current_remote_host_session(ROOM_ID, &fixture.remote_host)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.message(),
+            "Current remote Host session is unavailable."
+        );
+        assert_eq!(
+            pings.load(std::sync::atomic::Ordering::SeqCst),
+            usize::from(CURRENT_SESSION_PROOF_ATTEMPTS)
+        );
+        let _ = shutdown.send(());
     }
 
     #[tokio::test]

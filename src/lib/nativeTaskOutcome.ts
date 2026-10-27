@@ -55,8 +55,11 @@ export function taskNothingRan(status: Pick<NativeAgentTaskStatus, "state" | "co
 }
 
 /** The stages a task passes, with where it is now. A task on another
- * device passes that device's Accept (or the Full Access it gave). */
-export function taskStages(status: Pick<NativeAgentTaskStatus, "state" | "code">, context: Pick<TaskContext, "hostName" | "remote">): TaskStage[] {
+ * device passes that device's Accept (or the Full Access it gave). It waits
+ * for an Accept only once that device says so (`native_agent_review_required`);
+ * before its first answer it is being checked there, and `fullAccess` (what
+ * that device last said, when known) names the step ahead. */
+export function taskStages(status: Pick<NativeAgentTaskStatus, "state" | "code">, context: Pick<TaskContext, "hostName" | "remote"> & { fullAccess?: boolean | null }): TaskStage[] {
   const stages: TaskStage[] = context.remote
     ? [
       { id: "sent", label: `Sent to ${context.hostName}`, state: "done" },
@@ -109,7 +112,11 @@ export function taskStages(status: Pick<NativeAgentTaskStatus, "state" | "code">
   // Each stage says what happened there, not only its name.
   const words: Record<TaskStage["id"], Partial<Record<StageState, string>>> = {
     sent: {},
-    accepted: { current: "Waiting for Accept", stopped: "Not accepted", todo: "Accept there" },
+    accepted: {
+      current: status.code === REVIEW_REQUIRED ? "Waiting for Accept" : "Checking there",
+      stopped: "Not accepted",
+      todo: context.fullAccess ? "Starts there (Full Access)" : "Accept there",
+    },
     running: { stopped: status.state === "failed" && taskNothingRan(status) ? "Did not start" : "Running" },
     result: { stopped: status.state === "interrupted" ? "Outcome unknown" : status.state === "cancelled" ? STOP_REQUESTED_ONLY.has(status.code ?? "") ? "Stop requested" : "Stopped" : "Failed" },
   };

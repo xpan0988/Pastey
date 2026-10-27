@@ -80,8 +80,8 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   const targetName = targetHostRef ? options.find((peer) => peer.hostRef === targetHostRef)?.displayName ?? "the other device" : "this device";
   const remote = targetHostRef ? peers.find((peer) => peer.hostRef === targetHostRef) ?? null : null;
   const connected = targetHostRef ? !!remote : true;
-  const shares = usePeerSharedWorkspaces(room.id, targetHostRef, connected);
-  const remoteCapabilities = useRemoteNativeCapabilities(room.id, remote ? targetHostRef : null);
+  const shares = usePeerSharedWorkspaces(room.id, targetHostRef, connected, remote?.peerSessionId ?? null);
+  const remoteCapabilities = useRemoteNativeCapabilities(room.id, remote ? targetHostRef : null, remote?.peerSessionId ?? null);
   const availability: NativeAgentTargetAvailability = targetHostRef
     ? nativeAgentTargetAvailability("agent.coding.codex", remoteCapabilities.observation)
     : localAvailability(agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex"));
