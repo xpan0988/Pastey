@@ -162,6 +162,14 @@ Classified on 2026-10-26 on an Apple Silicon Mac, comparing `232e231` (before Fu
 | `native_agent::tests::a_reviewed_task_with_a_proven_requester_takes_its_decisions` | pass | pass, after the fix | Was a regression in the test's assumption (a folder-scoped grant not covering another folder); fixed by revoking Full Access in the test |
 | `a_new_conversation_replaces_the_live_one_without_touching_other_owners`, `an_unknown_turn_at_restart_blocks_follow_ups_and_is_never_rerun`, `an_unavailable_conversation_is_never_replaced_by_a_new_one`, `another_owner_or_workspace_never_inherits_a_conversation`, `concurrent_follow_ups_are_exclusive_and_each_runs_once`, `thread_continuation::tests::pastey_s_own_idle_session_is_closed_only_after_the_folder_check`, `a_workspace_sent_by_a_device_with_full_access_starts_when_it_lands` | pass in both full runs and 5/5 alone (the last is new) | pass in both full runs and 5/5 alone | Failed only once, in one full run made while other builds competed for the CPU; their waits on the fixture Codex are bounded to a few seconds |
 
+Rechecked on 2026-10-28 after the WAN fixes, comparing `5e3e38d` with `6163348`:
+
+- Alone, the burst test passes 5/5 on both commits.
+- On `5e3e38d` it also passes 10/10 with every core kept busy.
+- In one full run on `6163348` it failed at the answer count (`runtime_pair_tests.rs:816`: Mac 32 accepted `capability_answer`, Windows 33 accepted `capability_query`) instead of with "Current remote Host session is unavailable". The resolver now survives the lost liveness probe that ended such a run earlier, so a run under contention gets as far as this count.
+
+The count is read the moment the last check returns. That can come before Windows's last answer has reached the Mac, for three reasons: Windows counts a query when it admits it, it sends the answer in the background, and all the checks wait on one shared projection slot. This is a race in the test's own observation, in code unchanged since `5e3e38d`. It is not a lost or repeated delivery.
+
 To repeat a classification, run the full suite on an otherwise idle machine, then the test alone, for example `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- --exact room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers`.
 
 Claude Code session continuation has a live check. It uses the installed, signed-in Claude Code and a little of its quota. In `src-tauri/target/claude-s2-live` it creates a fresh session, continues it through Pastey's Native Agent lifecycle, and then shows that a session a foreground run holds is refused without anything being sent:
