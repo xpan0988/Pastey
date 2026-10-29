@@ -6,6 +6,8 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+## 2.0.0 — Pastey 2.0 — 2026-10-29
+
 The first stable Pastey 2.0 release. It follows 1.9.2 and the 2.0.0-beta.1 and 2.0.0-beta.2 prereleases, whose sections below are part of 2.0.
 
 Physical Mac ↔ Windows runs on packaged builds confirmed Bridges across separate networks, remote Codex execution, Host identity and the secure session, Full Access, connection and Agent recovery, and Developer Mode recovery ([recorded results](docs/platform/mac-windows-acceptance.md#recorded-results-for-200)). Native workspace movement and Return have not completed physical end-to-end acceptance. Where an entry below says a feature is not yet validated on physical devices, the recorded results say what has been validated since.
