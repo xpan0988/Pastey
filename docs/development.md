@@ -112,7 +112,7 @@ They do not exercise NAT traversal, relays, real networks or Windows; part W of 
 - Rust and TypeScript tests cover deterministic composition, alias resolution, immutable correlation, whole-Plan readiness, replay, Worker/provider streaming, effect enforcement, Core results, exact Transfer receipt, cancellation/revocation races, restart, and Burn.
 - A local dual-instance run covers desktop wiring, current-session Room Control, ordinary Transfer, and protocol interaction on one machine. It does not prove independent physical Hosts, LAN failure behavior, native Windows, or a verified managed process world on another platform.
 - Source-level Native Agent reliability and deterministic two-Host state validation are complete. The test-only pair harness uses two independent durable Host states; it does not exercise physical machines.
-- Physical Native Agent proof still requires packaged builds on a Mac and a Windows Host and recorded acceptance evidence. The deterministic pair harness does not replace this pending procedure.
+- Physical Native Agent proof requires packaged builds on a Mac and a Windows Host and recorded acceptance evidence. The deterministic pair harness does not replace it. For 2.0.0, remote invocation, identity, Full Access and recovery were run physically; movement and Return were not ([recorded results](platform/mac-windows-acceptance.md#recorded-results-for-200)).
 
 ## Native Agent focused validation
 
@@ -216,9 +216,11 @@ The command updates `src-tauri/Cargo.toml`, `package.json`, `package-lock.json`,
 
 Focused release-tool checks run with `node --test tests/releaseTooling.test.mjs`; they use temporary fixtures for prerelease version synchronization and do not change the checkout or create tags.
 
-Pushing the tag triggers GitHub Actions installer builds for macOS Apple Silicon, Windows, and Linux x86_64. A SemVer prerelease tag produces a GitHub Pre-release and is not marked latest; a stable tag produces a normal release. Windows prereleases require the sidecar-aware NSIS installer and do not require MSI; stable Windows releases require both NSIS and MSI. Artifact normalization requires the tag, packaged version, source artifact, and output filename to agree on the full version, including any prerelease suffix. The existing beta.1 release remains an incomplete pipeline probe: its macOS DMG uploaded, while Windows and Linux artifacts did not.
+Pushing the tag triggers GitHub Actions installer builds for macOS Apple Silicon, Windows, and Linux x86_64. A SemVer prerelease tag produces a GitHub Pre-release and is not marked latest; a stable tag produces a normal release, published as soon as the first job uploads. When `.github/release-notes/<tag>.md` exists in the tagged commit, it becomes the release body; otherwise the body is empty. Windows prereleases require the sidecar-aware NSIS installer and do not require MSI; stable Windows releases require both NSIS and MSI. Artifact normalization requires the tag, packaged version, source artifact, and output filename to agree on the full version, including any prerelease suffix. The builds are not code-signed or notarized.
 
-The tagged 2.0 beta releases provide a validation path while physical Mac ↔ Windows Native Agent acceptance remains pending. A beta release does not establish physical acceptance or RC/stable readiness. A release pass must also run the full validation stack and packaged physical smoke appropriate to its actual claim.
+Release history of the pipeline: beta.1 uploaded only its macOS DMG; beta.2 uploaded the DMG and the Windows NSIS installer. The Linux job has failed in its Rust check or test step on every release run since 1.9.1, so no Linux package has been published since then. 2.0.0 is the first release to build the Windows MSI with the Codex sandbox sidecars. Before pushing that tag, push the release commit alone (`git push origin main`), run `npm run build:checked:windows` from it on Windows to see both installers build, and only then push the tag (`git push origin v2.0.0`).
+
+A release claims only what was verified for it. For 2.0.0 the physical Mac ↔ Windows results are summarized in [Recorded results for 2.0.0](platform/mac-windows-acceptance.md#recorded-results-for-200); native workspace movement and Return were not accepted physically end to end. A release pass must also run the full validation stack and packaged physical smoke appropriate to its actual claim.
 
 ## Repository hygiene
 

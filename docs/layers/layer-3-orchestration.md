@@ -6,9 +6,11 @@ Layer 3 owns lower-level transfer planner/scheduler policy, queue lifecycle, cap
 
 The frontend planner (`src/lib/transferPlanner.ts`) and scheduler (`src/lib/transferScheduler.ts`) plan ordinary queued file-like work. File picker, drag/drop, and pasted-image transfers enter this queue; text uses the immediate text path. Every runnable file-like item eventually calls the existing `sendFileToRoom` wrapper and Rust `send_file_to_room` command for a single selected peer. Rust then admits the bounded resource request through `transfer_orchestration` using only opaque transfer/room identifiers, size, origin, and requested window; private paths, ObjectRefs, and Plan authority are not planner inputs.
 
-The tested global binary-v1 window budget is 8. The shared Rust boundary limits concurrent admitted transfers and reserves effective windows from the same budget for ordinary and managed work. Each selected runnable or active transfer has at least one window, and active/reserved work constrains later launches. Ordinary frontend allocation remains size-weighted within the global budget. Debugging overrides—`PASTEY_TRANSFER_WINDOW_SIZE` and the Developer Tools setting—retain their existing precedence over planner requests.
+The tested global binary-v1 window budget is 8. The shared Rust boundary (`src-tauri/src/transfer_orchestration.rs`) admits at most 4 transfers at once and reserves effective windows from the same budget for ordinary and managed work. Each selected runnable or active transfer has at least one window, and active/reserved work constrains later launches. Ordinary frontend allocation remains size-weighted within the global budget. Debugging overrides—`PASTEY_TRANSFER_WINDOW_SIZE` and the Developer Tools setting—retain their existing precedence over planner requests. Existing supported senders hot-adjust through the Layer 1 runtime-window primitive without a cancel/restart.
 
-Outgoing local Bridge control demand reserves capacity by lowering the data target from 8 to 7. After 750 ms of quiet it returns to 8. Existing supported senders hot-adjust through the Layer 1 runtime-window primitive without a cancel/restart. Inbound-only review does not reserve this outgoing capacity.
+Admission does not queue. A transfer that arrives while 4 are admitted, or while the whole window budget is reserved, is refused ("Transfer capacity is temporarily unavailable"). The frontend queue launches only within its own view of capacity, so ordinary sends normally wait in that queue instead. Native workspace movement and its Return do not pass through the frontend queue: each asks the Rust boundary for the default window, 8, and gets the whole budget when nothing else is active. A second movement or Return that starts while one is still sending is therefore refused rather than delayed. This is a known 2.0 limitation.
+
+There is no control-traffic reservation. Room Control events are separate HTTP requests outside the transfer window budget and are bounded by their own per-class rate budgets ([Layer 4](layer-4-bridge.md)). An earlier version lowered the data target from 8 to 7 while local control demand was active; that logic was removed in July 2026.
 
 ## Queue lifecycle and multi-target work
 
@@ -24,10 +26,12 @@ Layer 3 does not retain Layer 5 Transform authority or result metadata. ObjectRe
 
 The persisted default is `dynamic`; `fixed` remains available as a Developer Tools fallback. Both preserve per-child transfer accounting. Dynamic grouping occurs under contention, permits one active dynamic group, uses bounded service cost and group limits, and does not regroup running children. Fixed mode requires at least two compatible queued file-like children within the configured item, byte, and count limits.
 
+`MicroFlowGroup` applies only to the frontend queue of ordinary sends. Native Agent invocation, status and results travel over Room Control, and native workspace movement packages the whole workspace into one file before Layer 1 sends it ([Layer 1](layer-1-transfer.md#compatibility-and-limits)), so neither uses `MicroFlowGroup`.
+
 ## Boundaries
 
 Layer 2 provides facts, not planner commands. Layer 3 owns resource policy over queue state, bounded transfer size/origin, control workload, runtime capacity, and terminal state. Layer 4 owns current-session peer identity, routing, and control delivery. Layer 5 owns Plan topology, semantic eligibility, approval, ObjectRef/private-path authority, Host binding, and exact step authority.
 
 The canonical dependency is `Layer 5 eligibility → Layer 3 capacity → Layer 1 byte transfer`, with Layer 4 supplying current authenticated/session transport context where required. Layer 3 cannot create or reorder Plan steps, insert movement, or turn capacity admission into semantic authority.
 
-For the underlying byte transfer, see [Layer 1](layer-1-transfer.md). For runnable commands and contention/smoke evidence, see [development.md](../development.md).
+For the underlying byte transfer, see [Layer 1](layer-1-transfer.md). For runnable commands, including the transfer planner tests, see [development.md](../development.md).

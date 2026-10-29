@@ -8,9 +8,9 @@ How a Bridge's two devices reach each other. [Layer 4](layer-4-bridge.md) owns t
 | --- | --- | --- |
 | LAN (UDP discovery, TCP room servers) | Shipped, unchanged by the carrier | Automated suites; physical LAN acceptance in [Mac ↔ Windows acceptance](../platform/mac-windows-acceptance.md) parts B–D |
 | Overlay address (Tailscale/WireGuard) | Shipped, unchanged | Automated; physical part G |
-| Internet carrier (iroh: direct P2P, relay fallback) | **MVP, off by default** | Automated only: deterministic two-Host tests over an in-memory carrier, and real iroh QUIC on loopback. **Not yet run across separate physical networks**; part W of the acceptance procedure is the gate |
+| Internet carrier (iroh: direct P2P, relay fallback) | **Shipped in 2.0, off by default** | Automated: deterministic two-Host tests over an in-memory carrier, and real iroh QUIC on loopback. Physical: a Mac and a Windows PC on separate networks (home Wi-Fi and a phone hotspot) kept and recovered a Bridge and ran remote Codex across them ([acceptance](../platform/mac-windows-acceptance.md#recorded-results-for-200)) |
 
-Nothing on this page claims real-world WAN reliability. NAT traversal success, relay throughput and network-change recovery depend on the networks and are measured only by part W (and, for raw path behaviour, the isolated `tools/net-probe`, part F).
+This is evidence from one pair of devices and networks, not a claim of WAN reliability in general. NAT traversal success, relay throughput and network-change recovery depend on the networks and are measured only by part W (and, for raw path behaviour, the isolated `tools/net-probe`, part F). Throughput over the internet carrier is low in the tests so far: Test connection measured about 0.2–0.4 MB/s over a phone hotspot, and the cause (the hotspot uplink, the path, or Pastey) is not yet established.
 
 ## Transport–Session contract
 

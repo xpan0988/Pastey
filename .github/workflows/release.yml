@@ -92,9 +92,19 @@ jobs:
           set -euo pipefail
           node scripts/normalize-release-artifacts.mjs
 
+      - name: Select release notes for the tag
+        id: release_notes
+        shell: bash
+        run: |
+          notes=".github/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$notes" ]; then
+            echo "body_path=$notes" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload installers to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ steps.release_notes.outputs.body_path }}
           files: release-artifacts/*
           fail_on_unmatched_files: true
           prerelease: ${{ steps.release_meta.outputs.prerelease }}

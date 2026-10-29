@@ -6,6 +6,19 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+The first stable Pastey 2.0 release. It follows 1.9.2 and the 2.0.0-beta.1 and 2.0.0-beta.2 prereleases, whose sections below are part of 2.0.
+
+Physical Mac ↔ Windows runs on packaged builds confirmed Bridges across separate networks, remote Codex execution, Host identity and the secure session, Full Access, connection and Agent recovery, and Developer Mode recovery ([recorded results](docs/platform/mac-windows-acceptance.md#recorded-results-for-200)). Native workspace movement and Return have not completed physical end-to-end acceptance. Where an entry below says a feature is not yet validated on physical devices, the recorded results say what has been validated since.
+
+### Known limitations
+
+- Native workspace movement and Return have not completed physical end-to-end acceptance.
+- A second workspace movement or Return that starts while one is still sending is refused by transfer capacity admission, not queued.
+- Test connection over a phone hotspot measured about 0.4 MB/s; the bottleneck is not established.
+- Codex is the only shipped native Agent adapter.
+- Workspace movement carries at most 1,024 regular files and refuses symlinks, special files, empty folders, executable modes, case collisions and non-portable names.
+- Builds are not code-signed or notarized. Linux is not tested or supported in 2.0.0.
+
 ### Changed
 
 - **Full Access replaces unattended Codex permissions.** On the device to be controlled (say a Windows PC at home), Bridge details → **Full Access** → Allow Full Access… lets the device that Bridge is paired with (say a MacBook elsewhere) control it through Pastey without anyone there clicking Accept: run Codex in any folder, continue Codex sessions, read the sessions in its shared folders, add folders by path, send a folder to run on, and open a Developer Terminal.
@@ -43,7 +56,7 @@ The current development changes belong in `Unreleased`. Each release archives th
   - The Bridge itself is unchanged: the same pairing, signed reconnect, encrypted Room Control, Reviews and permissions. The internet path only carries a Bridge's encrypted traffic to a device key learned over that Bridge's authenticated session, and it is revoked with the Bridge (Burn, departure, forgetting the device, pairing another).
   - Bridge details and Device details → Connection say whether the internet path is in use, and whether directly or through a relay. A relay is slow for large files (about 1 MiB/s measured on n0's free relays).
   - A network change or a dropped path never reruns or resends Agent work; an uncertain outcome is reconciled as before, and nothing waits to be sent later.
-  - Not yet validated across separate physical networks; part W of the Mac ↔ Windows acceptance is the procedure.
+  - Validated for 2.0.0 between a Mac on a phone hotspot and a Windows PC on home Wi-Fi (acceptance parts W and X). Relay-only operation and other networks are not yet recorded.
 
 - Room Control rate budgets per kind of message: capability checks, their answers, Agent requests and statuses, Bridge Plans and membership each have their own, so a polling UI cannot use up what a running task needs. A refusal for the budget is retried automatically, with a fresh message, for a few seconds where it is safe (it proves nothing was done).
 - A request the other device refused before acting on it (its rate budget, its limit of 8 requests waiting for Accept, or this device's authority) now ends as "not delivered · nothing ran" with that device's reason, instead of an unknown outcome to reconcile.
@@ -182,6 +195,8 @@ The current development changes belong in `Unreleased`. Each release archives th
 - An unchanged Bridge no longer rewrites its legacy peer row on every Room Control event.
 
 ### Documentation
+
+- Release documentation for 2.0.0. The README says what was verified on physical devices, what is implemented without physical acceptance, the known limitations, and how to install and upgrade. Layer 3 no longer describes the control-traffic window reservation removed in July 2026 and says that capacity admission refuses instead of queuing. Layer 1 describes per-chunk binding, the in-flight window and the whole-file digest, and how folders cross Hosts as one regular-file-set package instead of saying there is no bundling. The acceptance procedure summarizes the 2.0.0 results.
 
 - [Mac–Windows acceptance](docs/platform/mac-windows-acceptance.md) part X retests the WAN findings of 27 October 2026 on real devices: the benchmark with its log fields, direct and relayed; the raw hotspot path; Codex availability through an outage; Full Access guidance; and Developer Mode after 30 minutes or a reconnect.
 

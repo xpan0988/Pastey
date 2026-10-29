@@ -10,7 +10,7 @@ The implementation includes UDP LAN discovery, nearby join and code-join plumbin
 
 ## Binary-v1 lifecycle
 
-For a file-like transfer, the sender creates an encrypted payload, divides it into chunks, sends chunks to the resolved peer endpoint, and advances only through acknowledgements. The receiver authenticates encrypted chunks, checks expected chunk count and total bytes at finalization, then exposes a terminal outcome. Corrupted or malformed chunks fail rather than being accepted as payload bytes.
+For a file-like transfer, the sender divides the file into 4 MiB chunks, encrypts each one with ChaCha20-Poly1305 bound to its transfer id, index, total, size and final flag, and sends each chunk as one HTTP request to the resolved peer endpoint. Up to the transfer's window of chunks (8 by default) are in flight at once; the sender advances as acknowledgements arrive. The receiver authenticates each chunk, writes it at its position, and at finalization checks the expected chunk count, total bytes and the sender's signed BLAKE3 digest of the whole file before exposing a terminal outcome. A malformed or forged chunk request is refused on its own and does not cancel the transfer; a chunk that fails authentication is never accepted as payload bytes.
 
 The sender may update a supported active binary-v1 window at runtime. Window policy is Layer 3 policy; Layer 1 provides the update primitive and does not create its own scheduler.
 
@@ -30,6 +30,8 @@ Startup recovery clears stale active-transfer state and partial files. It does n
 
 ## Compatibility and limits
 
-Transfer runs over whatever path the Bridge session uses: the LAN, an overlay address, or the optional internet carrier, which tunnels the same HTTP routes and may fall back to a relay ([Connectivity](layer-4-connectivity.md)). Over a relay it is slow, and an interrupted transfer fails rather than resuming. There is no WebRTC/TURN path, mobile release support, binary-v2 stream multiplexing, archive/folder bundling, whole-file hash exchange beyond authenticated chunks and finalize metadata, or second independent transfer stack.
+Transfer runs over whatever path the Bridge session uses: the LAN, an overlay address, or the optional internet carrier, which tunnels the same HTTP routes and may fall back to a relay ([Connectivity](layer-4-connectivity.md)). Over a relay it is slow, and an interrupted transfer fails rather than resuming. There is no WebRTC/TURN path, mobile release support, binary-v2 stream multiplexing, or second independent transfer stack.
+
+Layer 1 sends one file per transfer and has no general archive or folder bundling for ordinary sends. Folders cross Hosts only through Layer 5: native workspace movement and its Return, and authored managed regular-file-set Transfer, each frame a bounded set of regular files (at most 1,024 entries) into one Host-private `pastey-rfs-transfer-v1` package (`src-tauri/src/regular_file_set_transfer.rs`). Layer 1 carries that package as one ordinary file, and the receiving Host validates and materializes it. Symlinks, special files, empty directories and executable modes are not represented ([Layer 5](layer-5-agent.md)).
 
 For protocol and lifecycle names, see [reference.md](../reference.md). For automated and manual validation, see [development.md](../development.md).

@@ -50,10 +50,10 @@ In a conversation:
 | Capability | Status |
 |---|---|
 | Run Codex on this or another device; continue Pastey's own conversation in a folder | Implemented |
-| Workspace movement to another device and result return | Implemented |
+| Workspace movement to another device and result return | Implemented; not yet accepted end to end on physical devices. A second movement or Return while one is sending is refused |
 | Share a folder with one Bridge, from inside it, with Sessions and Agent requests chosen per folder | Implemented (Mac ↔ Windows acceptance N) |
 | Run Codex in a folder another device shares, chosen by name | Implemented: that device resolves its own path; same Review, or Full Access |
-| Use another device unattended (Full Access) | Implemented: runs, continuations, received workspaces and terminals start without Accept; folders added by path; revoked by Revoke, Forget, re-pairing or Burn. Physical Mac ↔ Windows acceptance pending (acceptance F) |
+| Use another device unattended (Full Access) | Implemented: runs, continuations, received workspaces and terminals start without Accept; folders added by path; revoked by Revoke, Forget, re-pairing or Burn. Physically verified Mac → Windows for 2.0.0 (acceptance part U); the locked-screen result is not recorded |
 | Read-only discovery and inspection of Claude Code and Codex sessions, here or on another device that shares the folder with Sessions on | Implemented |
 | Continue an idle Codex thread on this device, in the thread itself | Implemented: Codex's writer lock excludes other writers; checked against the turn you saw (real, macOS). A thread only Pastey's own idle conversation holds is continued after Pastey closes that session |
 | Continue a Codex thread on another device | Implemented: needs a share with Sessions and Agent requests there, and that device's Accept per run (real Mac → Windows: refused while the Codex app had it open, continued once every Codex client was closed) |

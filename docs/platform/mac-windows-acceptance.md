@@ -173,7 +173,7 @@ These bars describe the networks, not Pastey; part W is the test of the Bridge:
 
 ## W. Bridge across the internet (internet carrier)
 
-Run on packaged builds of the same commit. Until W1–W14 are recorded, Pastey makes no claim that Bridges work across real networks. Keep each device's Settings → General → Across the internet line in view, and the Bridge's details → Reach it on another network line ("Across the internet: …"), which shows **In use: directly** or **In use: through a relay**.
+Run on packaged builds of the same commit. Pastey claims only what these steps record across real networks; the 2.0.0 results are summarized in [Recorded results for 2.0.0](#recorded-results-for-200). Keep each device's Settings → General → Across the internet line in view, and the Bridge's details → Reach it on another network line ("Across the internet: …"), which shows **In use: directly** or **In use: through a relay**.
 
 Setup:
 1. Both devices on the same Wi-Fi. Pair a new Bridge by code (part B). Send one text both ways.
@@ -354,6 +354,24 @@ What was seen on beta.2 with the Mac on an iPhone hotspot and Windows at home, o
 | X5 | With Full Access given on Windows, open a new conversation in a Windows folder and continue it. | The conversation says it starts on Windows at once (Full Access), not that Windows must accept. Its progress shows "Checking there" then Running, never "Waiting for Accept". Revoke Full Access on Windows, wait 15 s and click into the Mac window: the next run says it waits for Accept, and it does. |
 | X6 | Enter Developer Mode on the Mac, open a terminal on Windows, wait more than 30 minutes (or turn the hotspot off until the Bridge reconnects), end the terminal. | Developer Mode says it ended and offers Enter Developer Mode; entering again and requesting a terminal works without restarting Pastey. A terminal still open when the 30 minutes pass keeps working until its own 30 minutes end, and is not reopened. Without Full Access, Windows still has to Accept the new request. |
 
+## Recorded results for 2.0.0
+
+Summary of the physical Mac ↔ Windows runs on packaged builds of the WAN-fix commits (October 2026), as reported by the release owner for the 2.0.0 release. The per-step Record tables for these runs are not in the repository. The last column points to the related parts of the procedure; it does not mean every step of those parts was recorded.
+
+| Area | Status | Related parts |
+|---|---|---|
+| Bridge across separate networks (Mac on a phone hotspot, Windows on home Wi-Fi) | Passed | W, X |
+| Remote Codex execution on Windows, requested from the Mac | Passed | E1, X5 |
+| Host identity and the secure current session | Passed | B, D, X4 |
+| Full Access, Mac controlling Windows unattended | Passed | U, X5 |
+| Connection and Agent recovery after an outage or reconnect | Passed | D, W, X4 |
+| Developer Mode after its UI session ends or the Bridge reconnects | Passed | X6 |
+| Test connection over the hotspot | Measured about 0.4 MB/s average; cause not established | X1 |
+| Native workspace movement and Return (send a folder, run, return, apply, conflict) | **Not accepted**: no complete physical end-to-end run | E3 |
+| Concurrent workspace movements or Returns | **Not accepted**: a second one while the first is sending is refused ([Layer 3](../layers/layer-3-orchestration.md#planner-and-capacity)) | — |
+
+Everything not listed, including remote session reading (I), relay-only operation (W10, W14), sleep/wake (W8) and the locked-screen Full Access result (U10), stays untested for 2.0.0 until recorded.
+
 ## Record
 
 Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
@@ -375,7 +393,7 @@ Copy this table per run and attach `tools/net-probe/results/*.jsonl` for part F.
 | Sessions outlive clients; holds (P1–P6) | |
 | Agents as conversations (Q1–Q7) | |
 | Bridge workspaces (N1–N12) | |
-| Full Access, unattended (U1–U14; lock-screen result from U7) | |
+| Full Access, unattended (U1–U14; lock-screen result from U10) | |
 | Control channel (O1–O7) | |
 | Throughput: C2 1 GiB each way, G1 | |
 | Reconnect times: D1–D4 | |
