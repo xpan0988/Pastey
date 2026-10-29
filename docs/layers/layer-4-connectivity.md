@@ -72,7 +72,7 @@ Each records what was chosen, against which alternative, and why. The [NAT trave
 
 ## Limitations
 
-- Not validated across physical networks (see Status).
+- Physical evidence comes from one device pair on one pair of networks; relay-only operation is not yet recorded (see Status).
 - First pairing needs the LAN or an overlay.
 - A session that started over the carrier stays on it when both devices come back to one network (iroh then usually finds a direct local path); the LAN path is used again at the next reconnect.
 - Large transfers over a relay are slow and are not resumable; an interrupted transfer fails as on a LAN.
