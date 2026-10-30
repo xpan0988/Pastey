@@ -2,6 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { readAppearance, saveAppearance, type Appearance } from "../../lib/appearance";
+import { isApplePlatform, readEnterKeyMode, saveEnterKeyMode, type EnterKeyMode } from "../../lib/composerKeys";
 import {
   authorizeSearchFolder,
   checkForUpdates,
@@ -83,6 +84,8 @@ type SavedConfigKey = "save_received_files_to_inbox" | "save_received_images_to_
 
 function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConfigChange: (config: AppConfig) => void }) {
   const [appearance, setAppearance] = useState<Appearance>(readAppearance);
+  const [enterMode, setEnterMode] = useState<EnterKeyMode>(readEnterKeyMode);
+  const enter = isApplePlatform() ? "Return" : "Enter";
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -106,6 +109,8 @@ function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConf
       <div className="card">
         <div className="setting-row"><span><strong>Appearance</strong><small>Light, dark, or follow the system.</small></span>
           <Segmented label="Appearance" value={appearance} onChange={(value) => { setAppearance(value); saveAppearance(value); }} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} /></div>
+        <div className="setting-row"><span><strong>{enter} key in messages</strong><small>{enterMode === "send" ? `${enter} sends; Shift+${enter} adds a line.` : `${enter} adds a line; ${isApplePlatform() ? "⌘" : "Ctrl+"}${enter} sends.`} An input method's {enter} only confirms its text.</small></span>
+          <Segmented label={`${enter} key in messages`} value={enterMode} onChange={(value) => { setEnterMode(value); saveEnterKeyMode(value); }} options={[{ value: "send", label: "Sends" }, { value: "newline", label: "Adds a line" }]} /></div>
         <div className="setting-row"><span><strong>Global shortcut</strong><small>Opens Pastey from anywhere.</small></span><span className="value mono">{config.shortcut}</span></div>
       </div>
     </section>

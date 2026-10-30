@@ -2,6 +2,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { BridgeRoute } from "../../lib/bridgeRouting";
+import { composerShortcutHint } from "../../lib/composerKeys";
 import { sendTextToRoomWithBridgeRoute } from "../../lib/bridgeRoutingRuntime";
 import { legacyRoomToBridgePeerCollection } from "../../lib/bridgeRoomAdapter";
 import { nativeDecisionsAwaitUser } from "../../lib/nativeDecisions";
@@ -11,6 +12,7 @@ import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferSc
 import type { DeveloperModeUiSession, DeveloperTerminalWorkspace, FileTransferProgressEvent, RoomInfo, RoomItem } from "../../lib/types";
 import { nativeAgentRecoveryRequiresAction, StatusBadge, useNativeAgentTask, type AgentTaskController } from "./AgentTaskLifecycle";
 import { BridgeDetails } from "./BridgeDetails";
+import { ComposerInput, SendButton, useEnterKeyMode, useSendGuard } from "./Conversation";
 import { bridgeStatus } from "./BridgeNetworkPanel";
 import { DeveloperModeScreen } from "./DeveloperModeScreen";
 import { AgentWorkspace } from "./AgentWorkspace";
@@ -208,6 +210,10 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
     } finally { setBusy(false); }
   }
 
+  const submit = useSendGuard(sendText);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const enterMode = useEnterKeyMode();
+
   async function chooseFiles() {
     if (!selectedRoute || !selectedPeer) return;
     try {
@@ -236,14 +242,15 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
     <div className="composer-wrap">
       {!selectedRoute ? <div style={{ maxWidth: "var(--content-w)", margin: "0 auto 8px" }}><Notice tone="neutral">{peers.length === 0 ? "No device is connected to this Bridge right now. Pastey keeps trying; open Bridge details to pair or set an address." : "Choose a device to send to."}</Notice></div> : null}
       <section className={`composer${dragging ? " dragging" : ""}`} aria-label="Send to the other device">
-        <textarea
+        <ComposerInput
+          inputRef={inputRef}
           value={text}
-          onChange={(event) => setText(event.target.value)}
-          onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void sendText(); } }}
+          onChange={setText}
+          onSubmit={submit}
           placeholder={dragging ? "Drop to send…" : peerName ? `Message ${peerName}, or drop files…` : "Waiting for a device…"}
-          aria-label="Send message"
+          ariaLabel="Send message"
           disabled={!selectedRoute}
-          rows={2}
+          pending={busy}
         />
         <div className="composer-bar">
           <MenuButton label="Add" icon="plus" align="left" up disabled={!selectedRoute} buttonClassName="btn btn-ghost btn-icon btn-sm">{(close) => <>
@@ -256,10 +263,10 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
               : peerName ? <>To {peerName}</> : null}
           </span>
           <span className="spacer" />
-          <button type="button" className="btn btn-primary btn-icon send-button" aria-label="Send" disabled={!selectedRoute || busy || !text.trim()} onClick={() => void sendText()}><Icon name="arrowUp" /></button>
+          <SendButton disabled={!selectedRoute || busy || !text.trim()} sending={busy} onClick={() => { submit(); inputRef.current?.focus({ preventScroll: true }); }} />
         </div>
       </section>
-      {message || task.message ? <p className="composer-hint error-text" role="status">{message ?? task.message}</p> : <p className="composer-hint">Enter sends · Shift+Enter adds a line</p>}
+      {message || task.message ? <p className="composer-hint error-text" role="status">{message ?? task.message}</p> : <p className="composer-hint">{composerShortcutHint(enterMode)}</p>}
     </div>
     {finding ? <Dialog title={`Get a file from ${peerName ?? "the other device"}`} description="Find one file by name in the folders that device shares with this Bridge. Only the file you choose is sent to your Inbox." onClose={() => setFinding(false)}>
       <RemoteFileFinder roomId={room.id} peerName={peerName} route={selectedRoute} />

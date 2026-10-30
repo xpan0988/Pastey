@@ -42,6 +42,12 @@ import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeL
 import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
 import type { NativeDecisionReview, SharedWorkspace, WorkspaceShare } from "../src/lib/tauri";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server.browser";
+import { AgentMarkdown, safeUrl } from "../src/features/workspace/AgentMarkdown";
+import { PastTurnView } from "../src/features/workspace/AgentTaskTracker";
+import { createSendGuard } from "../src/features/workspace/Conversation";
+import { COMPOSITION_GRACE_MS, composerKeyAction, composerShortcutHint, enterBelongsToComposition, type ComposerKeyEvent, type CompositionState } from "../src/lib/composerKeys";
 
 function room(peerConnected: boolean): RoomInfo {
   return {
@@ -554,8 +560,10 @@ test("Native Agent responses are shown apart from lifecycle and only as escaped 
   const card = readFileSync("src/features/workspace/AgentTaskTracker.tsx", "utf8");
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   assert.doesNotMatch(card, /dangerouslySetInnerHTML|innerHTML/);
-  // A reply is a message in the conversation, as plain text and nothing else.
-  assert.equal(card.match(/<div className="turn-reply">\{response\.text\}<\/div>/g)?.length, 2);
+  // A reply is a message in the conversation, read as sanitized Markdown,
+  // and copied as the exact text that arrived.
+  assert.equal(card.match(/<AgentMarkdown text=\{response\.text\} \/>/g)?.length, 2);
+  assert.equal(card.match(/<CopyButton text=\{response\.text\} label="Copy reply" \/>/g)?.length, 2);
   assert.doesNotMatch(card, /<a\b|href=|dangerously/);
   assert.match(bindings, /output\?: unknown;/);
 });
@@ -1653,4 +1661,220 @@ test("internet connectivity is described without implying any authority", () => 
   for (const line of [bridgeInternetLine({ ...status, path: "relayed" }), internetSettingLine({ enabled: true, relayUrl: null, running: true, problem: null }).text]) {
     assert.doesNotMatch(line, /trust|allow|permission|approve/i);
   }
+});
+
+const markdown = (text: string) => renderToStaticMarkup(createElement(AgentMarkdown, { text }));
+
+test("an Agent reply is read as Markdown: GFM, readable code and tables, headings inside the message", () => {
+  const html = markdown([
+    "# Plan", "", "Some **bold**, *emphasis*, ~~gone~~ and `inline`.", "",
+    "1. first", "2. second", "", "- [x] done", "- [ ] open", "",
+    "> quoted", "", "| a | b |", "|---|---|", "| 1 | 2 |", "",
+    "```ts", "const a: number = 1;", "```", "", "```", "plain <b>text</b>", "```", "",
+    "```brainfuck", "+++", "```",
+  ].join("\n"));
+  // A reply's headings are sections of one message, below the conversation's h2.
+  assert.match(html, /<p class="md-h md-h1" role="heading" aria-level="3">Plan<\/p>/);
+  assert.doesNotMatch(html, /<h[1-6]/);
+  assert.match(html, /<strong>bold<\/strong>/);
+  assert.match(html, /<em>emphasis<\/em>/);
+  assert.match(html, /<del>gone<\/del>/);
+  assert.match(html, /<code>inline<\/code>/);
+  assert.match(html, /<ol>/);
+  assert.match(html, /<input type="checkbox" disabled="" checked=""\/> done/);
+  assert.match(html, /<blockquote>/);
+  assert.match(html, /<div class="md-table"><table><thead><tr><th>a<\/th>/);
+  // Code: a labelled block with its own Copy, highlighted only for a
+  // language its fence names and Pastey knows; never by guessing.
+  assert.match(html, /<div class="md-code-head"><span>ts<\/span>.*Copy code/);
+  assert.match(html, /<code class="hljs language-ts"><span class="hljs-keyword">const<\/span>/);
+  assert.match(html, /<span>Code<\/span>.*<pre><code>plain &lt;b&gt;text&lt;\/b&gt;<\/code><\/pre>/);
+  assert.match(html, /<span>brainfuck<\/span>.*<pre><code>\+\+\+<\/code><\/pre>/);
+  // Aliases resolve to their grammar.
+  for (const alias of ["tsx", "sh", "zsh", "py", "rs", "yml", "toml", "html", "ps1", "diff", "json"]) {
+    assert.match(markdown(`\`\`\`${alias}\nx = 1\n\`\`\``), new RegExp(`class="hljs language-${alias}"`), alias);
+  }
+  // Very long code is shown, unhighlighted, so reading stays instant.
+  const long = markdown(`\`\`\`ts\n${"const a = 1;\n".repeat(2000)}\`\`\``);
+  assert.doesNotMatch(long, /hljs-keyword/);
+  assert.match(long, /const a = 1;/);
+});
+
+test("an Agent reply never becomes HTML, never loads anything and never navigates this window", () => {
+  const hostile = [
+    "<img src=x onerror=alert(1)> <script>alert(1)</script> <iframe src=https://evil.invalid></iframe>",
+    "",
+    "[safe](https://example.com/docs) [js](javascript:alert(1)) [data](data:text/html,<b>x</b>) [file](file:///etc/passwd) [rel](./x) [frag](#top) [mail](mailto:a@example.com)",
+    "",
+    "![tracker](https://tracker.invalid/pixel.png) https://auto.example.org/x",
+    "",
+    "<div onclick=\"steal()\">html block</div>",
+  ].join("\n");
+  const html = markdown(hostile);
+  // Raw HTML is shown as the text it is.
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(html, /&lt;div onclick=&quot;steal\(\)&quot;&gt;html block&lt;\/div&gt;/);
+  for (const tag of ["img", "script", "iframe", "a", "div onclick", "object", "embed", "style", "link"]) {
+    assert.doesNotMatch(html, new RegExp(`<${tag}[\\s>]`), tag);
+  }
+  // No element carries an address it could follow or load.
+  const tags = html.match(/<[a-z][^>]*>/g) ?? [];
+  for (const tag of tags) {
+    assert.doesNotMatch(tag, /\s(href|src|srcset|action|formaction|style)=/, tag);
+    assert.doesNotMatch(tag, /\son[a-z]+=/, tag);
+  }
+  // Only http(s) and mailto are links; each shows where it goes and copies it.
+  assert.match(html, /<button type="button" class="md-link" title="Copy link: https:\/\/example.com\/docs">safe<span class="md-link-host">\(example.com\)<\/span><\/button>/);
+  assert.match(html, /title="Copy link: mailto:a@example.com">mail<\/button>/);
+  assert.match(html, /title="Copy link: https:\/\/auto.example.org\/x">https:\/\/auto.example.org\/x<\/button>/);
+  for (const text of ["js", "data", "file", "rel", "frag"]) {
+    assert.match(html, new RegExp(`<span class="md-link-text">${text}</span>`), text);
+  }
+  assert.doesNotMatch(html, /javascript:|data:text|file:\/\//);
+  // An image is a placeholder: its address is never requested.
+  assert.match(html, /<span class="md-image" title="Pastey does not load images from Agent replies: https:\/\/tracker.invalid\/pixel.png">\[Image: tracker\]<\/span>/);
+
+  assert.equal(safeUrl("https://example.com/a b"), "https://example.com/a%20b");
+  assert.equal(safeUrl(" HTTPS://EXAMPLE.com "), "https://example.com/");
+  for (const unsafe of ["javascript:alert(1)", "JaVaScRiPt:alert(1)", "vbscript:x", "data:image/png;base64,AA", "file:///etc/passwd", "tauri://localhost", "asset://x", "./relative", "/absolute", "#fragment", ""]) {
+    assert.equal(safeUrl(unsafe), "", unsafe);
+  }
+
+  const source = readFileSync("src/features/workspace/AgentMarkdown.tsx", "utf8");
+  assert.doesNotMatch(source, /dangerouslySetInnerHTML|from "rehype-raw"|rehypePlugins|allowDangerousHtml|skipHtml=\{false\}|window\.open|location\.(href|assign|replace)|<a\b/);
+  assert.doesNotMatch(source, /highlightAuto|detect:/);
+});
+
+test("only an Agent's reply is Markdown: prompts, Share text, terminals and diagnostics stay verbatim", () => {
+  const prompt = "**not bold** <b>x</b>\n- not a list";
+  const reply = "**bold** reply";
+  const html = renderToStaticMarkup(createElement(PastTurnView, {
+    hostName: "Windows PC",
+    turn: { taskId: "t1", prompt, status: { schemaVersion: "pastey-native-agent-task-v1", taskId: "t1", agentId: "agent.coding.codex", workspaceName: "p", state: "completed", code: null, output: { schemaVersion: "pastey-native-text-output-v1", text: reply, truncated: false } } },
+  }));
+  // The user's prompt is shown exactly as written, line breaks kept by CSS.
+  assert.match(html, /<div class="msg out"><div class="msg-bubble">\*\*not bold\*\* &lt;b&gt;x&lt;\/b&gt;\n- not a list<\/div><\/div>/);
+  // The Agent's side is Markdown, labelled as its own account, with Copy.
+  assert.match(html, /<div class="md"><p><strong>bold<\/strong> reply<\/p><\/div>/);
+  assert.match(html, /its own account, not verified.*Copy reply/);
+  // A failed turn has no reply to render.
+  const failed = renderToStaticMarkup(createElement(PastTurnView, { hostName: "this device", turn: { taskId: "t2", prompt: "x", status: { schemaVersion: "pastey-native-agent-task-v1", taskId: "t2", agentId: "agent.coding.codex", workspaceName: "p", state: "failed", code: "native_agent_failed" } } as never }));
+  assert.doesNotMatch(failed, /class="md"|Copy reply/);
+
+  const users = ["src/features/workspace/AgentTaskTracker.tsx", "src/features/workspace/SessionDetail.tsx"];
+  for (const file of ["src/features/workspace/BridgeWorkspace.tsx", "src/components/DeveloperTerminalViewport.tsx", "src/features/workspace/DeviceDetails.tsx", "src/features/workspace/NativeDecisionPanel.tsx", "src/features/workspace/BridgeDetails.tsx", "src/App.tsx"]) {
+    assert.doesNotMatch(readFileSync(file, "utf8"), /AgentMarkdown/, file);
+  }
+  for (const file of users) assert.match(readFileSync(file, "utf8"), /<AgentMarkdown text=/, file);
+  // A session's history: prompts verbatim, the provider's side Markdown.
+  const detail = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
+  assert.match(detail, /<Bubble key=\{index\} from="me" meta=\{<>Prompt.*>\{entry\.text\}<\/Bubble>/);
+  assert.match(detail, /<AgentMarkdown text=\{entry\.text\} \/>/);
+});
+
+function keyEvent(overrides: Partial<ComposerKeyEvent> = {}): ComposerKeyEvent {
+  return { key: "Enter", shiftKey: false, altKey: false, ctrlKey: false, metaKey: false, isComposing: false, keyCode: 13, repeat: false, timeStamp: 1000, ...overrides };
+}
+const idle: CompositionState = { composing: false, endedAt: null };
+
+test("Enter sends, Shift+Enter adds a line, Cmd/Ctrl+Enter sends, and an input method's Enter never sends", () => {
+  assert.equal(composerKeyAction(keyEvent(), idle, "send"), "send");
+  assert.equal(composerKeyAction(keyEvent({ shiftKey: true }), idle, "send"), "default");
+  assert.equal(composerKeyAction(keyEvent({ altKey: true }), idle, "send"), "default");
+  assert.equal(composerKeyAction(keyEvent({ metaKey: true }), idle, "send"), "send");
+  assert.equal(composerKeyAction(keyEvent({ ctrlKey: true }), idle, "send"), "send");
+  assert.equal(composerKeyAction(keyEvent({ key: "a" }), idle, "send"), "default");
+  // Holding Enter sends once.
+  assert.equal(composerKeyAction(keyEvent({ repeat: true }), idle, "send"), "ignore");
+  assert.equal(composerKeyAction(keyEvent({ repeat: true, metaKey: true }), idle, "send"), "ignore");
+  // "Adds a line": Enter is the textarea's; only Cmd/Ctrl+Enter sends.
+  assert.equal(composerKeyAction(keyEvent(), idle, "newline"), "default");
+  assert.equal(composerKeyAction(keyEvent({ shiftKey: true }), idle, "newline"), "default");
+  assert.equal(composerKeyAction(keyEvent({ metaKey: true }), idle, "newline"), "send");
+  assert.equal(composerKeyAction(keyEvent({ ctrlKey: true }), idle, "newline"), "send");
+
+  // Chromium / Firefox / WebView2: keydown during composition.
+  assert.equal(composerKeyAction(keyEvent({ isComposing: true, keyCode: 229 }), { composing: true, endedAt: null }, "send"), "default");
+  assert.equal(composerKeyAction(keyEvent({ isComposing: true }), idle, "send"), "default");
+  // WebKit (macOS webview): compositionend first, then the confirming Enter
+  // with isComposing false but keyCode 229.
+  assert.equal(composerKeyAction(keyEvent({ keyCode: 229, timeStamp: 1200 }), { composing: false, endedAt: 1000 }, "send"), "default");
+  // The same without the 229 signal: an Enter within the grace window of
+  // compositionend, in either order, belongs to the composition.
+  assert.equal(composerKeyAction(keyEvent({ timeStamp: 1000 + COMPOSITION_GRACE_MS - 1 }), { composing: false, endedAt: 1000 }, "send"), "default");
+  assert.equal(composerKeyAction(keyEvent({ timeStamp: 1000 - 5 }), { composing: false, endedAt: 1000 }, "send"), "default");
+  // Our own composition flag alone also holds it, even with Cmd held.
+  assert.equal(composerKeyAction(keyEvent({ metaKey: true }), { composing: true, endedAt: null }, "send"), "default");
+  // A deliberate Enter after the composition ended sends.
+  assert.equal(composerKeyAction(keyEvent({ timeStamp: 1000 + COMPOSITION_GRACE_MS + 200 }), { composing: false, endedAt: 1000 }, "send"), "send");
+  assert.equal(enterBelongsToComposition(keyEvent(), idle), false);
+
+  assert.equal(composerShortcutHint("send", true), "Return sends · Shift+Return adds a line");
+  assert.equal(composerShortcutHint("newline", true), "⌘Return sends · Return adds a line");
+  assert.equal(composerShortcutHint("send", false), "Enter sends · Shift+Enter adds a line");
+  assert.equal(composerShortcutHint("newline", false), "Ctrl+Enter sends · Enter adds a line");
+});
+
+test("a message is sent once: repeated Enter, double clicks and slow sends do not send it again", async () => {
+  let resolve!: () => void;
+  let calls = 0;
+  const submit = createSendGuard(() => { calls += 1; return new Promise<void>((done) => { resolve = done; }); }, () => undefined);
+  submit(); submit(); submit();
+  assert.equal(calls, 1, "held while the first send is in flight");
+  resolve(); await new Promise((done) => setTimeout(done, 0));
+  submit();
+  assert.equal(calls, 2, "free again once it settled");
+
+  // A failed send frees the composer too.
+  let failCalls = 0;
+  const failing = createSendGuard(() => { failCalls += 1; return Promise.reject(new Error("refused")); }, () => undefined);
+  failing(); await new Promise((done) => setTimeout(done, 0)); failing();
+  assert.equal(failCalls, 2);
+
+  // A sender that starts work without returning it is held until released.
+  let release: (() => void) | null = null;
+  let syncCalls = 0;
+  const sync = createSendGuard(() => { syncCalls += 1; }, (done) => { release = done; });
+  sync(); sync();
+  assert.equal(syncCalls, 1);
+  release!(); sync();
+  assert.equal(syncCalls, 2);
+
+  // A sender that throws does not lock the composer.
+  let throwCalls = 0;
+  const throwing = createSendGuard(() => { throwCalls += 1; throw new Error("boom"); }, () => undefined);
+  assert.throws(() => throwing()); assert.throws(() => throwing());
+  assert.equal(throwCalls, 2);
+});
+
+test("every composer shares one input: IME-safe keys, kept focus while sending, drafting while a turn runs", () => {
+  const conversation = readFileSync("src/features/workspace/Conversation.tsx", "utf8");
+  const share = readFileSync("src/features/workspace/BridgeWorkspace.tsx", "utf8");
+  const session = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
+  const run = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  // No composer decides Enter for itself any more.
+  for (const [name, source] of [["share", share], ["session", session], ["run", run]] as const) {
+    assert.doesNotMatch(source, /event\.key === "Enter" && !event\.shiftKey/, name);
+    assert.doesNotMatch(source, /<textarea/, name);
+  }
+  assert.match(share, /<ComposerInput[\s\S]*onSubmit=\{submit\}[\s\S]*pending=\{busy\}/);
+  assert.match(share, /const submit = useSendGuard\(sendText\);/);
+  assert.match(conversation, /onCompositionStart=/);
+  assert.match(conversation, /onCompositionEnd=\{\(event\) => \{ composition\.current = \{ composing: false, endedAt: event\.timeStamp \}; \}\}/);
+  assert.match(conversation, /isComposing: native\.isComposing, keyCode: native\.keyCode, repeat: event\.repeat, timeStamp: event\.timeStamp/);
+  // In flight: the text stays and keeps focus, but takes no edits.
+  assert.match(conversation, /readOnly=\{pending\}/);
+  assert.match(conversation, /onChange=\{\(event\) => \{ if \(!pending\) onChange\(event\.target\.value\); \}\}/);
+  assert.match(conversation, /submit\(\); inputRef\.current\?\.focus\(\{ preventScroll: true \}\);/);
+  // A running turn blocks sending, never writing the next message.
+  assert.match(session, /disabled=\{!!availability && !availability\.allowed\}/);
+  assert.doesNotMatch(run, /disabled=\{locked\}\s*\n\s*sending=/);
+  assert.match(run, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
+  // Each sender hands its promise to the guard.
+  assert.match(session, /onSend=\{send\}/);
+  assert.match(run, /if \(!remote \|\| !targetHostRef\) return agent\.start\(place, followUp\);/);
+  // A session's unsent draft survives moving to another session, in memory only.
+  assert.match(session, /const drafts = new Map<string, string>\(\);/);
+  assert.doesNotMatch(session, /localStorage/);
 });

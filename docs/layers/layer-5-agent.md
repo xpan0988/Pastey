@@ -52,7 +52,8 @@ check skips exactly that subtree of `native_agent.invoke` (invoke-v2),
 is still checked. The renderer treats terminal output only as untrusted data.
 An adapter that reports user-facing text uses the shared
 `pastey-native-text-output-v1` shape (`text`, `truncated`), cut at a character
-boundary to fit the bound; the task card renders it as escaped plain text,
+boundary to fit the bound; the conversation renders it as sanitized Markdown
+(never HTML; nothing it names is loaded or opened) and copies it unchanged,
 separately from the lifecycle state, for any capability and any Host.
 
 Codex is the only adapter registered in the shipped product. A test-only

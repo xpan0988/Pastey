@@ -10,6 +10,7 @@ import {
   nativeAgentResponse,
   type PastTurn,
 } from "./AgentTaskLifecycle";
+import { AgentMarkdown, CopyButton } from "./AgentMarkdown";
 import { Bubble, SystemLine } from "./Conversation";
 import type { NativeAgentController } from "./NativeAgentPanel";
 import { NativeDecisionPanel } from "./NativeDecisionPanel";
@@ -67,11 +68,11 @@ export function TaskTurn({ roomId, agent, peers, members, fullAccess = null }: {
 
   return <>
     {agent.prompt ? <Bubble from="me" label="Your message">{agent.prompt}</Bubble> : null}
-    {status || agent.movement ? <Bubble from="agent" rich tone={outcome?.tone ?? (agent.movement?.state === "awaiting_approval" ? "pending" : "neutral")} label={`${agentName} turn`} meta={<>{agentName}{taskHostName ? ` on ${taskHostName}` : " on this device"}{response?.kind === "text" ? " · its own account, not verified" : ""}</>}>
+    {status || agent.movement ? <Bubble from="agent" rich tone={outcome?.tone ?? (agent.movement?.state === "awaiting_approval" ? "pending" : "neutral")} label={`${agentName} turn`} meta={<>{agentName}{taskHostName ? ` on ${taskHostName}` : " on this device"}{response?.kind === "text" ? <> · its own account, not verified<CopyButton text={response.text} label="Copy reply" /></> : ""}</>}>
       {status && response?.kind !== "text" ? <div className="turn-status"><Dot tone={outcome?.tone === "danger" ? "bad" : outcome?.tone === "complete" ? "ok" : outcome?.tone === "live" ? "live" : outcome?.tone === "pending" ? "warn" : "neutral"} pulse={active} /><strong>{outcome?.headline ?? status.state}</strong></div> : null}
       {status && status.state !== "completed" ? <TaskStages status={status} remote={!!agent.taskHostRef} hostName={hostName} fullAccess={fullAccess} /> : null}
       {response?.kind === "text"
-        ? <><div className="turn-reply">{response.text}</div>{response.truncated ? <small className="subtle">Pastey shortened this reply to fit its size limit.</small> : null}</>
+        ? <><AgentMarkdown text={response.text} />{response.truncated ? <small className="subtle">Pastey shortened this reply to fit its size limit.</small> : null}</>
         : response?.kind === "undisplayable" ? <small className="muted">The task completed with output Pastey cannot display as text.</small>
           : response?.kind === "none" ? <small className="muted">The task completed, but no reply text came back.</small> : null}
       {outcome && status?.state !== "completed" && (outcome.detail || outcome.next) ? <div className="turn-outcome">
@@ -123,8 +124,8 @@ export function PastTurnView({ turn, hostName }: { turn: PastTurn; hostName: str
   const outcome = taskOutcome(turn.status, { hostName, remote: hostName !== "this device", continuing: false, agentName });
   return <>
     <Bubble from="me">{turn.prompt}</Bubble>
-    <Bubble from="agent" rich tone={response?.kind === "text" ? "neutral" : outcome.tone} meta={<>{agentName} on {hostName}{response?.kind === "text" ? " · its own account, not verified" : ""}</>}>
-      {response?.kind === "text" ? <div className="turn-reply">{response.text}</div> : <div className="turn-status"><strong>{outcome.headline}</strong></div>}
+    <Bubble from="agent" rich tone={response?.kind === "text" ? "neutral" : outcome.tone} meta={<>{agentName} on {hostName}{response?.kind === "text" ? <> · its own account, not verified<CopyButton text={response.text} label="Copy reply" /></> : ""}</>}>
+      {response?.kind === "text" ? <AgentMarkdown text={response.text} /> : <div className="turn-status"><strong>{outcome.headline}</strong></div>}
     </Bubble>
   </>;
 }

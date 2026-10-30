@@ -22,6 +22,7 @@ import {
   snapshotActivityLine,
 } from "../../lib/nativeSessions";
 import { continuedSessionKey, type ContinuedSession } from "./AgentTaskLifecycle";
+import { AgentMarkdown, CopyButton } from "./AgentMarkdown";
 import { PastTurnView, TaskTurn } from "./AgentTaskTracker";
 import { Bubble, Composer, ConversationHeader, ConversationThread, SystemLine } from "./Conversation";
 import type { NativeAgentController } from "./NativeAgentPanel";
@@ -29,6 +30,11 @@ import type { SessionRef, SessionSnapshot } from "./NativeSessionsCard";
 import { Badge, Dot, Icon, type Tone } from "./ui";
 
 const STATUS_TONE: Record<string, Tone> = { live: "live", done: "ok", warning: "warn", unknown: "neutral" };
+
+/** What was typed in each session's composer and not sent, by device and
+ * session, so going to another session and back keeps it. In memory only:
+ * a draft never reaches storage, the Host or a peer. */
+const drafts = new Map<string, string>();
 
 /** One existing Claude Code or Codex session as a conversation: what it
  * holds (as much of it as this device may read), then what this device
@@ -61,7 +67,9 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
   const [base, setBase] = useState<SessionSnapshot | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-  const [prompt, setPrompt] = useState("");
+  const draftKey = `${target}:${key}`;
+  const [prompt, setPromptState] = useState(() => drafts.get(draftKey) ?? "");
+  const setPrompt = (value: string) => { if (value) drafts.set(draftKey, value); else drafts.delete(draftKey); setPromptState(value); };
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [details, setDetails] = useState(false);
@@ -154,10 +162,11 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
       label="Continue this session"
       value={prompt}
       onChange={setPrompt}
-      onSend={() => void send()}
+      onSend={send}
       canSend={!blocked && !!prompt.trim() && !sending}
-      disabled={!availability?.allowed || active || otherActive}
+      disabled={!!availability && !availability.allowed}
       sending={sending}
+      autoFocus
       placeholder={availability?.allowed ? `Continue this ${providerLabel(session.provider)} session…` : "This session can't be continued right now"}
       bar={<><Icon name="agent" small />{providerLabel(session.provider)} · in this session{route ? ` · ${hostName}` : ""}</>}
       hint={sendError ? sendError : blocked ? blocked : certain ? availability?.reason : <>You can try: {providerLabel(session.provider)} decides when it starts. {availability?.reason}</>}
@@ -179,7 +188,11 @@ function SessionHistory({ snapshot, hostName }: { snapshot: SessionSnapshot; hos
       : snapshot.recent.length && (shownPrompts < prompts || !snapshot.historyComplete)
         ? <SystemLine>Earlier messages are not shown here: {hostName === "this device" ? "the newest" : `${hostName} shares only short excerpts of the newest`} messages.</SystemLine>
         : null}
-    {snapshot.excerptsShared ? snapshot.recent.map((entry, index) => <Bubble key={index} from={entry.role === "user" ? "me" : "agent"} meta={<>{entry.role === "user" ? "Prompt" : `${providerLabel(session.provider)} said`}{entry.atMs ? ` · ${relativeTime(entry.atMs)}` : ""}{entry.role === "user" ? "" : " · its own account, not verified"}</>}>{entry.text}</Bubble>) : null}
+    {/* A prompt is shown exactly as written; the Agent's side is read as
+        Markdown. An excerpt from another device may end mid-sentence. */}
+    {snapshot.excerptsShared ? snapshot.recent.map((entry, index) => entry.role === "user"
+      ? <Bubble key={index} from="me" meta={<>Prompt{entry.atMs ? ` · ${relativeTime(entry.atMs)}` : ""}</>}>{entry.text}</Bubble>
+      : <Bubble key={index} from="agent" rich meta={<>{providerLabel(session.provider)} said{entry.atMs ? ` · ${relativeTime(entry.atMs)}` : ""} · its own account, not verified<CopyButton text={entry.text} label="Copy" /></>}><AgentMarkdown text={entry.text} /></Bubble>) : null}
     <SystemLine>{sessionStatusPresentation(session).label}{session.lastTurn.atMs ? ` · ${relativeTime(session.lastTurn.atMs)}` : ""}</SystemLine>
   </>;
 }

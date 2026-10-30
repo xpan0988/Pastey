@@ -67,6 +67,17 @@
   --shadow-pop: 0 12px 32px rgba(31, 30, 29, 0.14), 0 1px 3px rgba(31, 30, 29, 0.08);
   --scrim: rgba(31, 30, 29, 0.28);
   --terminal-bg: #141413;
+  /* Code in Agent replies */
+  --code-bg: #f4f3ed;
+  --syn-keyword: #8a3c92;
+  --syn-string: #2b7449;
+  --syn-comment: #75726a;
+  --syn-number: #9c5409;
+  --syn-title: #2f61a3;
+  --syn-attr: #78520f;
+  --syn-builtin: #a5402c;
+  --syn-add: rgba(44, 122, 79, 0.13);
+  --syn-del: rgba(181, 58, 46, 0.11);
   color-scheme: light;
 }
 
@@ -97,6 +108,16 @@
   --shadow-pop: 0 14px 40px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.3);
   --scrim: rgba(0, 0, 0, 0.5);
   --terminal-bg: #141413;
+  --code-bg: #282826;
+  --syn-keyword: #d49be0;
+  --syn-string: #8fd1a4;
+  --syn-comment: #a09d94;
+  --syn-number: #e8b467;
+  --syn-title: #8ab4ee;
+  --syn-attr: #e3c08a;
+  --syn-builtin: #f0937f;
+  --syn-add: rgba(108, 192, 143, 0.15);
+  --syn-del: rgba(240, 128, 112, 0.14);
   color-scheme: dark;
 }
 
@@ -127,6 +148,16 @@
     --focus-ring: 0 0 0 3px rgba(223, 132, 99, 0.38);
     --shadow-pop: 0 14px 40px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.3);
     --scrim: rgba(0, 0, 0, 0.5);
+    --code-bg: #282826;
+    --syn-keyword: #d49be0;
+    --syn-string: #8fd1a4;
+    --syn-comment: #a09d94;
+    --syn-number: #e8b467;
+    --syn-title: #8ab4ee;
+    --syn-attr: #e3c08a;
+    --syn-builtin: #f0937f;
+    --syn-add: rgba(108, 192, 143, 0.15);
+    --syn-del: rgba(240, 128, 112, 0.14);
     color-scheme: dark;
   }
 }
@@ -471,7 +502,10 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
 .composer { max-width: var(--content-w); margin: 0 auto; border: 1px solid var(--border-strong); border-radius: var(--radius-xl); background: var(--surface); box-shadow: 0 1px 3px rgba(0,0,0,.05); transition: border-color var(--duration), box-shadow var(--duration); }
 .composer:focus-within { border-color: var(--accent); box-shadow: var(--focus-ring); }
 .composer.dragging { border-style: dashed; border-color: var(--accent); background: var(--accent-soft); }
-.composer textarea { display: block; width: 100%; min-height: 52px; max-height: 220px; padding: 14px 16px 6px; border: 0; background: transparent; resize: none; font-size: var(--text-md); line-height: 1.5; }
+.composer textarea { display: block; width: 100%; min-height: 52px; max-height: min(45vh, 320px); padding: 14px 16px 6px; overflow-y: auto; border: 0; background: transparent; resize: none; font-size: var(--text-md); line-height: 1.5; }
+.composer textarea[readonly] { color: var(--text-2); }
+.composer textarea:disabled { cursor: not-allowed; }
+.composer.is-disabled { background: var(--surface-2); }
 .composer textarea:focus { outline: none; box-shadow: none; }
 .composer-bar { display: flex; align-items: center; gap: var(--space-2); padding: 6px 8px 8px 10px; }
 .composer-target { display: inline-flex; align-items: center; gap: 6px; color: var(--text-3); font-size: var(--text-xs); }
@@ -667,7 +701,17 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
 .msg-bubble.rich { display: grid; gap: var(--space-2); white-space: normal; }
 .turn-status { display: flex; align-items: center; gap: 8px; }
 .turn-status strong { font-size: var(--text-sm); font-weight: 620; }
-.turn-reply { white-space: pre-wrap; overflow-wrap: anywhere; }
+.thread-frame { position: relative; display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.jump-latest { position: absolute; bottom: var(--space-3); left: 50%; transform: translateX(-50%); border-radius: 999px; box-shadow: var(--shadow-pop); }
+/* An Agent's side of a turn may hold a long reply, code and tables: it
+   takes the conversation's column; what this device's user wrote stays a
+   bubble on the right. */
+.conversation-thread .msg.in { max-width: 100%; }
+.msg-meta { flex-wrap: wrap; }
+.copy-button { display: inline-flex; align-items: center; gap: 4px; }
+.msg-meta .copy-button { color: var(--text-3); }
+.composer-keys { white-space: nowrap; }
+@media (max-width: 680px) { .composer-keys { display: none; } }
 .turn-outcome { display: grid; gap: 4px; color: var(--text-2); font-size: var(--text-sm); }
 .turn-outcome p { margin: 0; }
 .turn-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
@@ -692,3 +736,49 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
 /* Full Access: the consent list and the banner above a controlled Bridge. */
 .consent-list { margin: 4px 0 10px; padding-left: 18px; display: grid; gap: 4px; }
 .full-access-banner { max-width: var(--content-w); width: 100%; margin: 0 auto 8px; padding: 0 16px; }
+
+/* Agent replies as Markdown (AgentMarkdown). Spacing is set by the
+   elements themselves, so a one-line reply reads like a message. */
+.md { min-width: 0; font-size: var(--text-md); line-height: 1.6; white-space: normal; overflow-wrap: anywhere; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md blockquote, .md .md-code, .md .md-table { margin: 0 0 0.7em; }
+.md ul, .md ol { padding-left: 1.4em; }
+.md li + li, .md li > ul, .md li > ol { margin-top: 0.25em; }
+.md li > p { margin-bottom: 0.3em; }
+.md .contains-task-list { padding-left: 0.3em; list-style: none; }
+.md .task-list-item input { margin: 0 6px 0 0; vertical-align: -1px; }
+.md .md-h { margin: 1em 0 0.4em; font-weight: 650; line-height: 1.35; }
+.md .md-h1 { font-size: 1.2em; }
+.md .md-h2 { font-size: 1.1em; }
+.md .md-h3, .md .md-h4, .md .md-h5, .md .md-h6 { font-size: 1em; }
+.md .md-h5, .md .md-h6 { color: var(--text-2); }
+.md blockquote { padding-left: 12px; border-left: 3px solid var(--border-strong); color: var(--text-2); }
+.md hr { margin: 1em 0; border: 0; border-top: 1px solid var(--border); }
+.md strong { font-weight: 650; }
+.md :not(pre) > code { padding: 1px 5px; border-radius: 5px; background: var(--code-bg); font-family: var(--font-mono); font-size: 0.88em; }
+.md-code { overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--code-bg); }
+.md-code-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 30px; padding: 0 6px 0 12px; border-bottom: 1px solid var(--border); color: var(--text-3); font-size: var(--text-xs); }
+.md-code-head .copy-button { height: 24px; padding: 0 6px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-3); font-size: var(--text-xs); }
+.md-code-head .copy-button:hover { background: var(--surface-3); color: var(--text); }
+.md-code pre { overflow-x: auto; padding: 10px 12px; font-family: var(--font-mono); font-size: var(--text-sm); line-height: 1.55; white-space: pre; overflow-wrap: normal; tab-size: 4; }
+.md-table { overflow-x: auto; }
+.md table { border-collapse: collapse; font-size: var(--text-sm); }
+.md th, .md td { padding: 6px 10px; border: 1px solid var(--border); text-align: left; vertical-align: top; overflow-wrap: normal; }
+.md th { background: var(--surface-2); font-weight: 620; }
+.md-link { display: inline; height: auto; padding: 0; border: 0; background: none; color: var(--info); font: inherit; text-align: inherit; text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--info) 45%, transparent); text-underline-offset: 2px; overflow-wrap: anywhere; }
+.md-link:hover { text-decoration-color: currentColor; }
+.md-link-host, .md-link-copied { display: inline-block; margin-left: 0.3em; color: var(--text-3); font-size: 0.9em; }
+.md-link-copied { color: var(--success); }
+.md-image { color: var(--text-3); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-meta .hljs-keyword, .hljs-doctag { color: var(--syn-keyword); }
+.hljs-string, .hljs-regexp, .hljs-selector-attr, .hljs-template-tag { color: var(--syn-string); }
+.hljs-comment, .hljs-quote { color: var(--syn-comment); font-style: italic; }
+.hljs-number, .hljs-literal, .hljs-symbol, .hljs-bullet, .hljs-variable.language_ { color: var(--syn-number); }
+.hljs-title, .hljs-section, .hljs-selector-id, .hljs-selector-class, .hljs-name { color: var(--syn-title); }
+.hljs-attr, .hljs-attribute, .hljs-property, .hljs-params, .hljs-tag { color: var(--syn-attr); }
+.hljs-built_in, .hljs-type, .hljs-meta { color: var(--syn-builtin); }
+.hljs-addition { display: inline-block; width: 100%; background: var(--syn-add); }
+.hljs-deletion { display: inline-block; width: 100%; background: var(--syn-del); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 650; }

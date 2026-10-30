@@ -122,12 +122,12 @@ export function NewConversation({ roomId, agent, peers, members, target, choice,
     if (typeof chosen === "string") agent.setWorkspace(chosen);
   }
 
-  function run() {
+  function run(): Promise<void> | undefined {
     if (!readiness.ready || taskActive || !place) return;
     if (place.kind !== "shared") rememberWorkspace(memoryKey, agent.workspace.trim());
-    if (!remote || !targetHostRef) { void agent.start(place, followUp); return; }
-    if (readiness.action === "review_movement") { void agent.proposeRemoteMovement(roomId, targetHostRef, place); return; }
-    void agent.startRemote(roomId, remote.peerSessionId, targetHostRef, place, followUp);
+    if (!remote || !targetHostRef) return agent.start(place, followUp);
+    if (readiness.action === "review_movement") return agent.proposeRemoteMovement(roomId, targetHostRef, place);
+    return agent.startRemote(roomId, remote.peerSessionId, targetHostRef, place, followUp);
   }
 
   const showTurns = current && (agent.origin?.kind === "new" || (!agent.origin && (agent.status || agent.movement)));
@@ -173,8 +173,8 @@ export function NewConversation({ roomId, agent, peers, members, target, choice,
       onChange={agent.setTaskText}
       onSend={run}
       canSend={readiness.ready && !taskActive && !!place}
-      disabled={locked}
       sending={agent.busy}
+      autoFocus
       placeholder={followUp ? "Reply to continue this conversation…" : "What should Codex do?"}
       above={above}
       bar={<><Icon name="agent" small />Codex · {label}{targetHostRef ? ` · ${targetName}` : ""}</>}

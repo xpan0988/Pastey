@@ -6,6 +6,12 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+### Changed
+
+- **Agent replies read as Markdown.** Codex and Claude Code replies, earlier turns and a session's Agent excerpts render headings, lists, task lists, tables, quotes and code blocks (language label, Copy, highlighting for a named language) instead of showing the syntax. The text stays untrusted: HTML is shown as text, images are never loaded, and links never open in Pastey; a link shows its host and copies its address. Each reply has Copy reply for its exact text. Your own prompts and Share text are shown exactly as written.
+- **Return no longer sends while an input method is composing.** The Return that confirms a Chinese, Japanese or Korean candidate never sends, including in the macOS webview's event order. Shift+Return adds a line, ⌘Return (Ctrl+Enter) always sends, and Settings → General → Return key in messages can make Return add a line. Holding Return or clicking Send twice sends once. The same composer is used in Share.
+- **Writing while an Agent works.** A running turn blocks sending, not typing the next message; while a message is being sent its text stays with the focus. The composer grows with its text, a session's unsent draft survives moving to another session, and the thread stays where you are reading, with **Newest** to return.
+
 ## 2.0.0 — Pastey 2.0 — 2026-10-29
 
 The first stable Pastey 2.0 release. It follows 1.9.2 and the 2.0.0-beta.1 and 2.0.0-beta.2 prereleases, whose sections below are part of 2.0.
