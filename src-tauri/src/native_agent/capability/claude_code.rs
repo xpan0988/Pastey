@@ -15,6 +15,12 @@
 //! When the turn ends, Pastey stops the background session (`claude stop`,
 //! which keeps the conversation) so the session is free again.
 //!
+//! A background session runs under Claude Code's own supervisor, not under
+//! Pastey, and outlives Pastey's process (measured). So after a restart the
+//! turn's outcome is unknown: the adapter observes the same session again
+//! from what its start recorded, never launching anything, until the
+//! registry and the transcript show how it ended.
+//!
 //! This adapter advertises no peer protocol: a Bridge peer cannot invoke it.
 
 use std::{
@@ -30,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::{
@@ -52,6 +58,9 @@ const NO_PEER_PROTOCOLS: [&str; 0] = [];
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL: Duration = Duration::from_secs(1);
+/// Registry polls (15 s at the default poll) a stopped session may stay
+/// listed before the stop counts as unconfirmed.
+const STOP_CONFIRM_POLLS: u32 = 15;
 /// How long one availability observation is reused.
 const AVAILABILITY_REUSE: Duration = Duration::from_secs(30);
 /// Consecutive unreadable registry polls before the outcome is unknown.
@@ -86,6 +95,18 @@ fn parse(input: &OpaqueCapabilityPayloadV1) -> AppResult<ContinueInputV1> {
     Ok(parsed)
 }
 
+/// What observing a continuation again after a restart takes. Host-private:
+/// Core keeps it with the task's envelope and gives it only to `reobserve`.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecoveryV1 {
+    session_id: String,
+    workspace: String,
+    prompt: String,
+    /// No later than the launch: the prompt's transcript entry is after it.
+    since_ms: u64,
+}
+
 /// The input that continues `session_id` in its canonical `workspace`.
 pub(in crate::native_agent) fn continue_input(
     session_id: &str,
@@ -103,8 +124,13 @@ pub(in crate::native_agent) fn continue_input(
 }
 
 /// What one task's run shares with `cancel` and `release`.
+#[derive(Default)]
 struct RunControlV1 {
     stop: AtomicBool,
+    /// Tests: the observing process is gone, as after a crash. The run
+    /// stops observing without doing or recording anything.
+    #[cfg(test)]
+    abandoned: AtomicBool,
 }
 
 pub(in crate::native_agent) struct ClaudeCodeNativeAdapterV1 {
@@ -151,6 +177,44 @@ impl ClaudeCodeNativeAdapterV1 {
         *self.config_dir.lock().unwrap() = Some(config_dir.to_path_buf());
         *self.poll.lock().unwrap() = Duration::from_millis(20);
         *self.observed.lock().unwrap() = None;
+    }
+
+    /// Tests: every run of this adapter stops observing silently, as if its
+    /// process had died; the native session is left as it is.
+    #[cfg(test)]
+    pub(in crate::native_agent) fn abandon_runs(&self) {
+        for control in self.runs.lock().unwrap().values() {
+            control.abandoned.store(true, Ordering::Release);
+        }
+    }
+
+    fn run_for(
+        &self,
+        task_id: &str,
+        cli: PathBuf,
+        recovery: RecoveryV1,
+        reobserving: bool,
+    ) -> Option<ClaudeSessionRunV1> {
+        let config_dir = self.config_dir()?;
+        let control = Arc::new(RunControlV1::default());
+        self.runs
+            .lock()
+            .ok()?
+            .insert(task_id.to_owned(), control.clone());
+        Some(ClaudeSessionRunV1 {
+            task_id: task_id.to_owned(),
+            cli,
+            transcript: project_dir(&config_dir, Path::new(&recovery.workspace))
+                .join(format!("{}.jsonl", recovery.session_id)),
+            workspace: PathBuf::from(recovery.workspace),
+            session_id: recovery.session_id,
+            prompt: recovery.prompt,
+            since_ms: recovery.since_ms,
+            reobserving,
+            poll: self.poll(),
+            control,
+            runs: self.runs.clone(),
+        })
     }
 
     fn request_stop(&self, task_id: &str, forget: bool) -> bool {
@@ -232,15 +296,22 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
 
     fn prepare(&self, input: &OpaqueCapabilityPayloadV1) -> AppResult<PreparedInvocationV1> {
         let parsed = parse(input)?;
+        let workspace = Path::new(&parsed.workspace)
+            .canonicalize()
+            .map_err(|_| AppError::InvalidInput("Claude Code workspace is unavailable.".into()))?;
         Ok(PreparedInvocationV1 {
             identity_digest: input.digest(),
-            // One Pastey invocation per native session at a time.
+            // One Pastey invocation per native session at a time. Claude
+            // Code itself keeps no writer lock on a session: this holds only
+            // against Pastey's own tasks.
             exclusivity: Some(ExclusivityKeyV1::new(
                 CLAUDE_CODE_CAPABILITY_ID,
                 &format!("session\n{}", parsed.session_id),
             )),
             label: "Claude Code session".into(),
-            host_workspace: None,
+            // The folder the turn may change, held against every Pastey
+            // task and movement on this Host.
+            host_workspace: Some(workspace),
             conversation: None,
         })
     }
@@ -255,31 +326,26 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
         let cli = self
             .cli()
             .ok_or_else(|| AppError::InvalidInput("Claude Code is not installed.".into()))?;
-        let config_dir = self
-            .config_dir()
+        let host_workspace = Path::new(&parsed.workspace).canonicalize().ok();
+        let recovery = RecoveryV1 {
+            session_id: parsed.session_id,
+            workspace: parsed.workspace,
+            prompt: parsed.prompt,
+            since_ms: now_ms(),
+        };
+        let recovery_payload = OpaqueCapabilityPayloadV1::new(
+            serde_json::to_value(&recovery).map_err(AppError::from)?,
+        );
+        recovery_payload.validate()?;
+        let run = self
+            .run_for(task_id, cli, recovery, false)
             .ok_or_else(|| AppError::InvalidInput("Claude Code's store is unavailable.".into()))?;
-        let control = Arc::new(RunControlV1 {
-            stop: AtomicBool::new(false),
-        });
-        if let Ok(mut runs) = self.runs.lock() {
-            runs.insert(task_id.to_owned(), control.clone());
-        }
         Ok(StartedInvocationV1 {
             session_reused: true,
             conversation: None,
-            host_workspace: None,
-            run: Box::new(ClaudeSessionRunV1 {
-                task_id: task_id.to_owned(),
-                cli,
-                transcript: project_dir(&config_dir, Path::new(&parsed.workspace))
-                    .join(format!("{}.jsonl", parsed.session_id)),
-                workspace: PathBuf::from(parsed.workspace),
-                session_id: parsed.session_id,
-                prompt: parsed.prompt,
-                poll: self.poll(),
-                control,
-                runs: self.runs.clone(),
-            }),
+            host_workspace,
+            recovery: Some(recovery_payload),
+            run: Box::new(run),
         })
     }
 
@@ -304,6 +370,25 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
             }
         }
     }
+
+    /// No: a background session belongs to Claude Code's supervisor.
+    fn native_execution_ends_with_pastey(&self) -> bool {
+        false
+    }
+
+    fn reobserve(
+        &self,
+        task_id: &str,
+        recovery: &OpaqueCapabilityPayloadV1,
+    ) -> Option<Box<dyn NativeInvocationRunV1>> {
+        let recovery: RecoveryV1 = serde_json::from_value(recovery.value().clone()).ok()?;
+        if !valid_session_id(&recovery.session_id) {
+            return None;
+        }
+        let cli = self.cli()?;
+        let run = self.run_for(task_id, cli, recovery, true)?;
+        Some(Box::new(run))
+    }
 }
 
 struct ClaudeSessionRunV1 {
@@ -313,6 +398,10 @@ struct ClaudeSessionRunV1 {
     workspace: PathBuf,
     session_id: String,
     prompt: String,
+    /// No later than the launch.
+    since_ms: u64,
+    /// Observing again after a restart: nothing is launched.
+    reobserving: bool,
     poll: Duration,
     control: Arc<RunControlV1>,
     runs: Arc<Mutex<HashMap<String, Arc<RunControlV1>>>>,
@@ -471,8 +560,19 @@ impl ClaudeSessionRunV1 {
             .find(|line| !line.is_empty())
             .unwrap_or("no output");
         let first_line: String = first_line.chars().take(200).collect();
-        Err(if success {
-            outcome(NativeTurnOutcomeV1::Unknown, format!("Claude Code's answer was not understood ({first_line}); it was not asked again."))
+        if success {
+            return Err(outcome(NativeTurnOutcomeV1::Unknown, format!("Claude Code's answer was not understood ({first_line}); it was not asked again.")));
+        }
+        // A refusal is a definite non-start only when nothing shows the
+        // prompt began: no process holds the session and its transcript has
+        // no entry for the prompt.
+        let began = !matches!(live_status(&self.cli, &self.session_id), Ok(None))
+            || turn_after_prompt(&self.transcript, &self.prompt, self.since_ms).is_some();
+        Err(if began {
+            outcome(
+                NativeTurnOutcomeV1::Unknown,
+                format!("Claude Code reported a failure ({first_line}), but the session shows activity, so the prompt may have begun; it was not asked again."),
+            )
         } else {
             outcome(
                 NativeTurnOutcomeV1::NotStarted,
@@ -481,22 +581,37 @@ impl ClaudeSessionRunV1 {
         })
     }
 
-    fn observe(
-        &self,
-        progress: &dyn NativeInvocationProgressV1,
-        since_ms: u64,
-    ) -> NativeInvocationOutcomeV1 {
-        let mut awaiting = false;
-        let mut unreadable = 0;
-        loop {
-            if self.control.stop.load(Ordering::Acquire) {
-                self.stop_background(self.short());
+    /// Asks Claude Code to stop the session, then waits for its registry to
+    /// stop listing it: only that shows the turn stopped.
+    fn stop_and_confirm(&self) -> NativeInvocationOutcomeV1 {
+        self.stop_background(self.short());
+        for _ in 0..STOP_CONFIRM_POLLS {
+            if matches!(live_status(&self.cli, &self.session_id), Ok(None)) {
                 return outcome(
                     NativeTurnOutcomeV1::Cancelled,
                     "Stopped. Claude Code keeps the conversation.",
                 );
             }
-            let turn = turn_after_prompt(&self.transcript, &self.prompt, since_ms);
+            thread::sleep(self.poll);
+        }
+        outcome(
+            NativeTurnOutcomeV1::Unknown,
+            "Stop was sent, but Claude Code still lists the session: it may still be working.",
+        )
+    }
+
+    fn observe(&self, progress: &dyn NativeInvocationProgressV1) -> NativeInvocationOutcomeV1 {
+        let mut awaiting = false;
+        let mut unreadable = 0;
+        loop {
+            #[cfg(test)]
+            while self.control.abandoned.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_secs(3600));
+            }
+            if self.control.stop.load(Ordering::Acquire) {
+                return self.stop_and_confirm();
+            }
+            let turn = turn_after_prompt(&self.transcript, &self.prompt, self.since_ms);
             match live_status(&self.cli, &self.session_id) {
                 Ok(Some(status)) if status == "busy" || status == "starting" => {
                     unreadable = 0;
@@ -554,7 +669,10 @@ impl ClaudeSessionRunV1 {
 
 impl NativeInvocationRunV1 for ClaudeSessionRunV1 {
     fn run(&mut self, progress: &dyn NativeInvocationProgressV1) -> NativeInvocationOutcomeV1 {
-        let result = if self.control.stop.load(Ordering::Acquire) {
+        let result = if self.reobserving {
+            // Started before a restart: only watched, never sent again.
+            self.observe(progress)
+        } else if self.control.stop.load(Ordering::Acquire) {
             outcome(
                 NativeTurnOutcomeV1::Cancelled,
                 "Stopped before anything was sent.",
@@ -562,9 +680,8 @@ impl NativeInvocationRunV1 for ClaudeSessionRunV1 {
         } else if let Err(why) = self.precheck() {
             outcome(NativeTurnOutcomeV1::NotStarted, why)
         } else {
-            let since_ms = now_ms();
             match self.launch() {
-                Ok(()) => self.observe(progress, since_ms),
+                Ok(()) => self.observe(progress),
                 Err(outcome) => outcome,
             }
         };
@@ -582,4 +699,4 @@ impl NativeInvocationRunV1 for ClaudeSessionRunV1 {
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(in crate::native_agent) mod tests;

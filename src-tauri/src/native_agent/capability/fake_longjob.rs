@@ -182,6 +182,7 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
             session_reused: false,
             conversation: None,
             host_workspace: None,
+            recovery: None,
             run: Box::new(LongJobRunV1 {
                 state: self.state.clone(),
                 task_id: task_id.to_owned(),
@@ -220,6 +221,11 @@ impl NativeCapabilityAdapterV1 for FakeLongJobAdapterV1 {
             state.hold = false;
             state.observation_lost = true;
         });
+    }
+
+    /// Its jobs are threads of Pastey's own process.
+    fn native_execution_ends_with_pastey(&self) -> bool {
+        true
     }
 }
 

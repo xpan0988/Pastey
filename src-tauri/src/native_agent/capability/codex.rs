@@ -770,6 +770,7 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
             session_reused: reused,
             conversation: reused.then_some(NativeConversationContinuityV1::Continued),
             host_workspace: Some(workspace.clone()),
+            recovery: None,
             run: Box::new(CodexInvocationRunV1 {
                 executable: self.executable(),
                 workspace,
@@ -868,6 +869,13 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
             }
             sessions.clear();
         }
+    }
+
+    /// The app-server is Pastey's child and exits when its stdin closes,
+    /// which Pastey's exit does (measured with 0.163.0: gone within 0.5 s
+    /// of its controller's SIGKILL).
+    fn native_execution_ends_with_pastey(&self) -> bool {
+        true
     }
 }
 

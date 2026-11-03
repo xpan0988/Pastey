@@ -10,25 +10,46 @@ use super::*;
 use crate::native_agent::sessions::claude::project_dir;
 use crate::native_agent::{NativeAgentServiceV1, NativeAgentTaskStateV1, NativeAgentTaskStatusV1};
 
-const SESSION: &str = "66666666-6666-4666-8666-666666666666";
+pub(in crate::native_agent) const SESSION: &str = "66666666-6666-4666-8666-666666666666";
 
 /// A fake `claude`: `agents --json` prints `registry.json`; `stop` empties
-/// it; `--bg --resume <id> -- <prompt>` behaves as `mode` says. Every call
-/// is appended to `invocations`.
-struct FixtureV1 {
+/// it (unless `stop-ignored` exists); `--bg --resume <id> -- <prompt>`
+/// behaves as `mode` says. Every call is appended to `invocations`.
+///
+/// Modes: `continue` finishes the turn by itself; `manual` (or any other
+/// unlisted mode) records the prompt and stays busy until `finish`;
+/// `awaiting` waits on a native approval; `starting` is listed without a
+/// status; `copy`, `untrusted`, `garbled` and `fail-after-start` answer the
+/// launch as their names say.
+pub(in crate::native_agent) struct FixtureV1 {
     root: PathBuf,
-    workspace: PathBuf,
+    pub(in crate::native_agent) workspace: PathBuf,
     cli: PathBuf,
     config: PathBuf,
 }
 
 impl FixtureV1 {
-    fn new(mode: &str) -> Self {
+    pub(in crate::native_agent) fn new(mode: &str) -> Self {
         let root = std::env::temp_dir().join(format!("pastey-claude-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
         let workspace = root.join("project");
         fs::create_dir(&workspace).unwrap();
+        Self::with_root(mode, root, workspace)
+    }
+
+    /// The fixture's session recorded in `workspace`, an existing folder.
+    pub(in crate::native_agent) fn in_workspace(mode: &str, workspace: &Path) -> Self {
+        let root = std::env::temp_dir().join(format!("pastey-claude-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        Self::with_root(
+            mode,
+            root.canonicalize().unwrap(),
+            workspace.canonicalize().unwrap(),
+        )
+    }
+
+    fn with_root(mode: &str, root: PathBuf, workspace: PathBuf) -> Self {
         let config = root.join("claude-config");
         let transcript = project_dir(&config, &workspace).join(format!("{SESSION}.jsonl"));
         fs::create_dir_all(transcript.parent().unwrap()).unwrap();
@@ -54,7 +75,7 @@ ROOT='{ROOT}'
 printf '%s\n' "$*" >> "$ROOT/invocations"
 case "$1" in
   agents) cat "$ROOT/registry.json"; exit 0 ;;
-  stop) printf '[]' > "$ROOT/registry.json"; printf 'stopped %s\n' "$2"; exit 0 ;;
+  stop) [ -f "$ROOT/stop-ignored" ] || printf '[]' > "$ROOT/registry.json"; printf 'stopped %s\n' "$2"; exit 0 ;;
   --bg)
     mode=$(cat "$ROOT/mode"); sid="$3"; short=$(printf '%s' "$sid" | cut -c1-8); prompt="$5"
     T=$(cat "$ROOT/transcript"); WS=$(cat "$ROOT/cwd")
@@ -62,6 +83,11 @@ case "$1" in
       untrusted) printf 'Workspace not trusted. Run claude in this folder once.\n' >&2; exit 1 ;;
       copy) printf 'note: session %s is open in another Claude Code process, so this started a copy as abcdef12. The original conversation is unchanged.\nbackgrounded · abcdef12 · x\n' "$short"; exit 0 ;;
       garbled) printf 'something unexpected\n'; exit 0 ;;
+      fail-after-start)
+        now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+        printf '{"type":"user","cwd":"%s","timestamp":"%s","message":{"role":"user","content":"%s"}}\n' "$WS" "$now" "$prompt" >> "$T"
+        printf '[{"sessionId":"%s","kind":"background","status":"busy"}]' "$sid" > "$ROOT/registry.json"
+        printf 'Error: the background service did not answer\n' >&2; exit 1 ;;
       *)
         now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
         printf '{"type":"user","cwd":"%s","timestamp":"%s","message":{"role":"user","content":"%s"}}\n' "$WS" "$now" "$prompt" >> "$T"
@@ -92,9 +118,43 @@ esac
         }
     }
 
-    fn service(&self) -> (NativeAgentServiceV1, Arc<ClaudeCodeNativeAdapterV1>) {
+    /// A Claude Code adapter that runs this fixture.
+    pub(in crate::native_agent) fn adapter(&self) -> Arc<ClaudeCodeNativeAdapterV1> {
         let adapter = Arc::new(ClaudeCodeNativeAdapterV1::default());
         adapter.use_fixture(&self.cli, &self.config);
+        adapter
+    }
+
+    /// Ends a `manual` turn: Claude Code's reply is recorded and the
+    /// session goes idle.
+    pub(in crate::native_agent) fn finish(&self, reply: &str) {
+        let transcript = fs::read_to_string(self.root.join("transcript")).unwrap();
+        let now = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let entry = serde_json::json!({
+            "type": "assistant",
+            "cwd": self.workspace,
+            "timestamp": now,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": reply}], "stop_reason": "end_turn"},
+        });
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(transcript.trim())
+            .unwrap();
+        std::io::Write::write_all(&mut file, format!("{entry}\n").as_bytes()).unwrap();
+        self.hold("idle");
+    }
+
+    /// `claude stop` no longer ends the session.
+    fn ignore_stop(&self) {
+        fs::write(self.root.join("stop-ignored"), b"").unwrap();
+    }
+
+    pub(in crate::native_agent) fn service(
+        &self,
+    ) -> (NativeAgentServiceV1, Arc<ClaudeCodeNativeAdapterV1>) {
+        let adapter = self.adapter();
         let paths =
             crate::storage::AppPaths::new(self.root.join("app-data"), self.root.join("logs"));
         paths.ensure_directories().unwrap();
@@ -104,12 +164,16 @@ esac
         (service, adapter)
     }
 
-    fn hold(&self, status: &str) {
+    pub(in crate::native_agent) fn hold(&self, status: &str) {
         fs::write(
             self.root.join("registry.json"),
             format!(r#"[{{"sessionId":"{SESSION}","kind":"interactive","status":"{status}"}}]"#),
         )
         .unwrap();
+    }
+
+    fn release_hold(&self) {
+        fs::write(self.root.join("registry.json"), "[]").unwrap();
     }
 
     fn invocations(&self) -> Vec<String> {
@@ -120,7 +184,13 @@ esac
             .collect()
     }
 
-    fn launches(&self) -> usize {
+    /// The fixture has recorded a launched prompt and lists it busy.
+    pub(in crate::native_agent) fn busy(&self) -> bool {
+        fs::read_to_string(self.root.join("registry.json"))
+            .is_ok_and(|registry| registry.contains("\"busy\""))
+    }
+
+    pub(in crate::native_agent) fn launches(&self) -> usize {
         self.invocations()
             .iter()
             .filter(|line| line.starts_with("--bg"))
@@ -303,6 +373,39 @@ fn a_session_waiting_on_its_own_client_is_shown_waiting_and_can_be_stopped() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(fixture.invocations().contains(&stop));
+}
+
+/// A running continuation holds its canonical folder for every Pastey task
+/// and movement on this Host, not only for Claude Code (found validating
+/// Claude Code as a second provider: occupancy was Codex's own key).
+#[test]
+fn a_running_continuation_holds_its_folder_against_every_workspace_capability() {
+    let fixture = FixtureV1::new("awaiting");
+    let (mut service, _) = fixture.service();
+    let started = service
+        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .unwrap();
+    for _ in 0..500 {
+        if service
+            .task_status(&started.task_id)
+            .unwrap()
+            .code
+            .as_deref()
+            == Some("native_agent_awaiting_native_decision")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let occupied = service
+        .workspace_has_authoritative_owner(&fixture.workspace, None, None)
+        .unwrap();
+    service.cancel_task(&started.task_id).unwrap();
+    wait_terminal(&service, &started.task_id);
+    assert!(
+        occupied,
+        "a Claude Code turn running in the folder must hold it for movement and Codex"
+    );
 }
 
 #[test]
@@ -537,4 +640,206 @@ fn installed_claude_code_continues_an_unheld_session_and_refuses_a_held_one() {
         .unwrap()
         .contains("must-not-run"));
     let _ = fs::remove_dir_all(root);
+}
+
+fn wait_until(mut done: impl FnMut() -> bool, what: &str) {
+    for _ in 0..500 {
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting until {what}");
+}
+
+#[test]
+fn a_second_pastey_continuation_of_a_running_session_is_refused() {
+    let fixture = FixtureV1::new("manual");
+    let (mut service, _) = fixture.service();
+    let first = service
+        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .unwrap();
+    wait_until(|| fixture.busy(), "the first turn launched");
+    // Refused by Core before the adapter sees it: one Pastey task per
+    // session. Against other Claude Code clients only the adapter's
+    // registry check and `--bg`'s copy-on-held apply (tests above).
+    assert!(service
+        .start_claude_session_task(&fixture.workspace, SESSION, "another turn")
+        .is_err());
+    assert_eq!(fixture.launches(), 1);
+    fixture.finish("Done");
+    assert_eq!(
+        wait_terminal(&service, &first.task_id).state,
+        NativeAgentTaskStateV1::Completed
+    );
+}
+
+#[test]
+fn a_launch_failure_after_the_session_showed_activity_is_unknown_not_a_non_start() {
+    let fixture = FixtureV1::new("fail-after-start");
+    let (mut service, _) = fixture.service();
+    let started = service
+        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .unwrap();
+    let terminal = wait_terminal(&service, &started.task_id);
+    assert_eq!(
+        terminal.state,
+        NativeAgentTaskStateV1::Interrupted,
+        "{terminal:?}"
+    );
+    assert_eq!(
+        terminal.code.as_deref(),
+        Some("native_agent_outcome_unknown")
+    );
+    assert_eq!(fixture.launches(), 1, "never sent again");
+    // Still held natively: the folder and session stay held meanwhile.
+    assert!(service
+        .workspace_has_authoritative_owner(&fixture.workspace, None, None)
+        .unwrap());
+    fixture.release_hold();
+}
+
+#[test]
+fn a_stop_claude_code_does_not_confirm_stays_a_request_and_keeps_the_folder_held() {
+    let fixture = FixtureV1::new("manual");
+    let (mut service, _) = fixture.service();
+    let started = service
+        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .unwrap();
+    wait_until(|| fixture.busy(), "the turn launched");
+    fixture.ignore_stop();
+    service.cancel_task(&started.task_id).unwrap();
+    // The stop is sent but the session stays listed: never "Stopped".
+    wait_until(
+        || {
+            service
+                .task_status(&started.task_id)
+                .unwrap()
+                .code
+                .as_deref()
+                == Some("native_agent_cancel_delivery_uncertain")
+        },
+        "the stop counted as unconfirmed",
+    );
+    assert!(service
+        .workspace_has_authoritative_owner(&fixture.workspace, None, None)
+        .unwrap());
+    // Once Claude Code no longer lists it, the folder is free again.
+    fixture.release_hold();
+    wait_until(
+        || {
+            !service
+                .workspace_has_authoritative_owner(&fixture.workspace, None, None)
+                .unwrap()
+        },
+        "the folder was released",
+    );
+    assert_eq!(
+        service.task_status(&started.task_id).unwrap().state,
+        NativeAgentTaskStateV1::Cancelled
+    );
+}
+
+/// Starts a `manual` turn, then lets the service "crash": its observer
+/// stops silently and the service is dropped without shutting anything
+/// down, while the fixture's session stays busy.
+fn crashed_while_running(fixture: &FixtureV1) -> String {
+    let (mut before, adapter) = fixture.service();
+    let started = before
+        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .unwrap();
+    wait_until(|| fixture.busy(), "the turn launched");
+    adapter.abandon_runs();
+    std::mem::forget(before);
+    started.task_id
+}
+
+#[test]
+fn a_restart_while_the_session_runs_keeps_the_outcome_unknown_then_observes_its_end() {
+    let fixture = FixtureV1::new("manual");
+    let task_id = crashed_while_running(&fixture);
+    let (mut after, _) = fixture.service();
+    let restored = after.task_status(&task_id).unwrap();
+    // Not failed, not stopped: Claude Code's supervisor may still run it.
+    assert_eq!(restored.state, NativeAgentTaskStateV1::Interrupted);
+    assert_eq!(
+        restored.code.as_deref(),
+        Some("native_agent_outcome_unknown")
+    );
+    // Everything it held stays held: its folder and its session.
+    assert!(after
+        .workspace_has_authoritative_owner(&fixture.workspace, None, None)
+        .unwrap());
+    assert!(after
+        .start_claude_session_task(&fixture.workspace, SESSION, "go on")
+        .is_err());
+
+    fixture.finish("Finished after the restart");
+    let terminal = wait_terminal_from(&after, &task_id, NativeAgentTaskStateV1::Interrupted);
+    // Only the native evidence (an ended turn after the prompt) completes it.
+    assert_eq!(
+        terminal.state,
+        NativeAgentTaskStateV1::Completed,
+        "{terminal:?}"
+    );
+    let output = serde_json::to_value(terminal.output.unwrap()).unwrap();
+    assert_eq!(output["text"], "Finished after the restart");
+    assert_eq!(fixture.launches(), 1, "observed again, never sent again");
+    let stop = format!("stop {}", &SESSION[..8]);
+    wait_until(
+        || fixture.invocations().contains(&stop),
+        "the session released",
+    );
+    wait_until(
+        || {
+            !after
+                .workspace_has_authoritative_owner(&fixture.workspace, None, None)
+                .unwrap()
+        },
+        "the folder was released",
+    );
+}
+
+#[test]
+fn stopping_a_task_restored_after_a_restart_stops_its_session_and_only_then_releases_it() {
+    let fixture = FixtureV1::new("manual");
+    let task_id = crashed_while_running(&fixture);
+    let (mut after, _) = fixture.service();
+    after.cancel_task(&task_id).unwrap();
+    let terminal = wait_terminal_from(&after, &task_id, NativeAgentTaskStateV1::Interrupted);
+    assert_eq!(terminal.state, NativeAgentTaskStateV1::Cancelled);
+    wait_until(
+        || after.task_status(&task_id).unwrap().code.as_deref() == Some("native_agent_cancelled"),
+        "Claude Code confirmed the stop",
+    );
+    assert!(fixture
+        .invocations()
+        .contains(&format!("stop {}", &SESSION[..8])));
+    assert_eq!(fixture.launches(), 1);
+    wait_until(
+        || {
+            !after
+                .workspace_has_authoritative_owner(&fixture.workspace, None, None)
+                .unwrap()
+        },
+        "the folder was released",
+    );
+}
+
+fn wait_terminal_from(
+    service: &NativeAgentServiceV1,
+    task_id: &str,
+    from: NativeAgentTaskStateV1,
+) -> NativeAgentTaskStatusV1 {
+    for _ in 0..500 {
+        let status = service.task_status(task_id).unwrap();
+        if status.state != from && status.state != NativeAgentTaskStateV1::Running {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "no terminal state: {:?}",
+        service.task_status(task_id).unwrap()
+    );
 }

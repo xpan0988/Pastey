@@ -127,8 +127,10 @@ pub(crate) struct PreparedInvocationV1 {
     pub(crate) exclusivity: Option<ExclusivityKeyV1>,
     /// Renderer-safe label for the task projection.
     pub(crate) label: String,
-    /// Host workspace bound to the task. Only workspace-scoped adapters
-    /// (Codex) set it; workspace movement and its recovery use it.
+    /// The canonical Host folder the invocation's native execution may
+    /// change. Every adapter whose execution runs in a folder sets it: Core
+    /// derives this Host's folder occupancy from it, whatever capability
+    /// holds the folder, and workspace movement and its recovery use it.
     pub(crate) host_workspace: Option<PathBuf>,
     /// Set by adapters whose native capability keeps a conversation.
     pub(crate) conversation: Option<PreparedConversationV1>,
@@ -163,6 +165,10 @@ pub(crate) struct StartedInvocationV1 {
     /// The Host workspace the run will actually use, re-resolved at start,
     /// so Core can confirm it is still the one it admitted.
     pub(crate) host_workspace: Option<PathBuf>,
+    /// What observing this invocation again after a Pastey restart takes,
+    /// for a capability whose native execution can outlive Pastey. Core
+    /// keeps it Host-private with the task and gives it only to `reobserve`.
+    pub(crate) recovery: Option<OpaqueCapabilityPayloadV1>,
     pub(crate) run: Box<dyn NativeInvocationRunV1>,
 }
 
@@ -303,4 +309,25 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     /// Burn: end the live native state of one conversation key.
     fn release_conversation(&self, _key: &str) {}
     fn shutdown(&self);
+
+    /// Whether every native process an invocation starts ends when Pastey's
+    /// own process ends (Codex's app-server, a child that exits when its
+    /// stdin closes). Only then may Core, after a restart, record a turn it
+    /// was observing as interrupted and release what it held. An adapter
+    /// that cannot show it keeps the default: such a turn's outcome stays
+    /// unknown and its folder and session stay held.
+    fn native_execution_ends_with_pastey(&self) -> bool {
+        false
+    }
+
+    /// After a restart, observes an invocation started before it, from the
+    /// `recovery` its start reported: never starts or sends it again. `None`
+    /// when the adapter cannot.
+    fn reobserve(
+        &self,
+        _task_id: &str,
+        _recovery: &OpaqueCapabilityPayloadV1,
+    ) -> Option<Box<dyn NativeInvocationRunV1>> {
+        None
+    }
 }

@@ -35,7 +35,7 @@ use capability::codex::codex_compatibility_at;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
 use capability::{
     codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1,
-    NativeInvocationOutcomeV1, NativeInvocationProgressV1,
+    NativeInvocationOutcomeV1, NativeInvocationProgressV1, NativeInvocationRunV1,
 };
 
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -324,6 +324,13 @@ pub(crate) enum NativeAgentWorkspaceMovementStateV1 {
     Interrupted,
 }
 
+/// Whether two canonical folders of this Host are one resource for
+/// occupancy: the same folder, or one inside the other (whole path
+/// components: `/a/b` is inside `/a`, `/a/bc` is not).
+fn workspaces_overlap(held: &Path, wanted: &Path) -> bool {
+    held.starts_with(wanted) || wanted.starts_with(held)
+}
+
 /// Review drafts do not own their source. Exactly one post-approval movement
 /// may own a canonical source workspace until it reaches a non-authoritative
 /// terminal state.
@@ -521,6 +528,10 @@ struct PersistedNativeAgentEnvelopeV1 {
     /// Held while the task's outcome is unresolved, also across restart.
     #[serde(default)]
     exclusivity_key: Option<ExclusivityKeyV1>,
+    /// What the adapter needs to observe the task again after a restart,
+    /// when its native execution can outlive Pastey. Host-private.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_recovery: Option<OpaqueCapabilityPayloadV1>,
 }
 
 /// The deliberately small renderer-safe projection used only to reopen
@@ -1109,6 +1120,9 @@ pub(crate) struct NativeAgentServiceV1 {
     task_workspaces: HashMap<String, PathBuf>,
     task_digests: HashMap<String, String>,
     task_exclusivity: HashMap<String, ExclusivityKeyV1>,
+    /// Each started task's `StartedInvocationV1::recovery`, durable with its
+    /// envelope.
+    task_recoveries: HashMap<String, OpaqueCapabilityPayloadV1>,
     /// The Bridge that owns each Bridge-derived task. A task in `tasks`
     /// without an entry here is Local. See `TaskOwnerV1`.
     task_bridges: HashMap<String, String>,
@@ -1188,6 +1202,7 @@ impl NativeAgentServiceV1 {
             task_workspaces: HashMap::new(),
             task_digests: HashMap::new(),
             task_exclusivity: HashMap::new(),
+            task_recoveries: HashMap::new(),
             task_bridges: HashMap::new(),
             revoked_bridges: HashSet::new(),
             pending_reviews: HashMap::new(),
@@ -1333,6 +1348,7 @@ impl NativeAgentServiceV1 {
             return Ok(());
         };
         let mut pending_conflict_discards = Vec::new();
+        let mut reobserve = Vec::new();
         for stored in crate::storage::list_native_agent_envelopes(&paths)? {
             let mut persisted: PersistedNativeAgentEnvelopeV1 =
                 serde_json::from_str(&stored.record_json).map_err(AppError::from)?;
@@ -1349,9 +1365,28 @@ impl NativeAgentServiceV1 {
                 persisted.task.code = Some(admission::ADMISSION_REVOKED_CODE.into());
                 changed = true;
             }
-            let unbound_local_restart = persisted.bridge_id.is_none()
+            // Only a capability that shows its native execution ends with
+            // Pastey's process lets a turn this process observed count as
+            // ended now; one no longer registered cannot show it either.
+            let may_outlive_pastey = !self
+                .adapter(&persisted.task.agent_id)
+                .is_ok_and(|adapter| adapter.native_execution_ends_with_pastey());
+            let uncertain = persisted.task.state == NativeAgentTaskStateV1::Running
+                || (persisted.task.state == NativeAgentTaskStateV1::Interrupted
+                    && matches!(
+                        persisted.task.code.as_deref(),
+                        Some("native_agent_outcome_unknown")
+                            | Some("native_agent_reconciliation_required")
+                    ));
+            let possibly_still_running = may_outlive_pastey && uncertain;
+            if possibly_still_running && persisted.native_recovery.is_some() {
+                reobserve.push(persisted.task.task_id.clone());
+            }
+            let unbound_local = persisted.bridge_id.is_none()
                 && persisted.remote_target.is_none()
-                && persisted.movement.is_none()
+                && persisted.movement.is_none();
+            let unbound_local_restart = unbound_local
+                && !possibly_still_running
                 && (matches!(
                     persisted.task.state,
                     NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running
@@ -1365,6 +1400,13 @@ impl NativeAgentServiceV1 {
                 if unbound_local_restart {
                     persisted.task.state = NativeAgentTaskStateV1::Failed;
                     persisted.task.code = Some("native_agent_interrupted_on_restart".into());
+                } else if possibly_still_running && unbound_local {
+                    // Its native turn may still be running: neither failed
+                    // nor stopped. Its folder and session stay held until
+                    // the adapter observes the end or this Host's user
+                    // stops it, and it never runs again.
+                    persisted.task.state = NativeAgentTaskStateV1::Interrupted;
+                    persisted.task.code = Some("native_agent_outcome_unknown".into());
                 } else {
                     persisted.task.state = NativeAgentTaskStateV1::Interrupted;
                     persisted.task.code = Some("native_agent_reconciliation_required".into());
@@ -1644,6 +1686,10 @@ impl NativeAgentServiceV1 {
                 self.task_exclusivity
                     .insert(persisted.task.task_id.clone(), key);
             }
+            if let Some(recovery) = persisted.native_recovery.clone() {
+                self.task_recoveries
+                    .insert(persisted.task.task_id.clone(), recovery);
+            }
             if let Some(bridge_id) = persisted.bridge_id.clone().or_else(|| {
                 persisted
                     .movement
@@ -1676,7 +1722,44 @@ impl NativeAgentServiceV1 {
             // never contact the Agent or source workspace.
             let _ = self.finish_pending_conflict_discard(&movement_id);
         }
+        for task_id in reobserve {
+            self.reobserve_task(&task_id);
+        }
         Ok(())
+    }
+
+    /// After a restart, watches a native turn that may have outlived the
+    /// previous process, through its adapter, until it can be seen to end.
+    /// Nothing is started or sent again. Meanwhile the task keeps its
+    /// unknown outcome and everything it held.
+    fn reobserve_task(&mut self, task_id: &str) {
+        let Ok(task) = self.task_status(task_id) else {
+            return;
+        };
+        let (Ok(adapter), Some(recovery)) = (
+            self.adapter(&task.agent_id),
+            self.task_recoveries.get(task_id),
+        ) else {
+            return;
+        };
+        let Some(run) = adapter.reobserve(task_id, recovery) else {
+            return;
+        };
+        log_native_lifecycle("reobserving", task_id, &lifecycle_state(&task));
+        let progress = ObservedTaskProgressV1 {
+            tasks: self.tasks.clone(),
+            task_id: task_id.to_owned(),
+            remote_decisions: false,
+            conversation: None,
+            durable_paths: self.durable_paths.clone(),
+        };
+        let held_key = self.task_exclusivity.get(task_id).cloned();
+        if let Err(error) = self.observe_invocation(task_id.to_owned(), run, held_key, progress) {
+            crate::logging::write_error_line(&format!(
+                "Native Agent task could not be observed again after restart: {}",
+                error.message()
+            ));
+        }
     }
 
     fn task_digest(task: &str) -> String {
@@ -1726,6 +1809,7 @@ impl NativeAgentServiceV1 {
                 .or_else(|| movement.as_ref().and_then(|value| value.bridge_id.clone())),
             movement: movement.clone(),
             exclusivity_key: self.task_exclusivity.get(task_id).cloned(),
+            native_recovery: self.task_recoveries.get(task_id).cloned(),
         };
         let immutable_correlation = serde_json::to_string(&json!({
             "taskId": task_id,
@@ -2988,14 +3072,19 @@ impl NativeAgentServiceV1 {
             return Ok(false);
         }
         if let Some(workspace) = workspace.as_ref() {
-            let active = self
-                .active_exclusivity
+            // Never while a run that may change the tree is still observed.
+            let observed = self
+                .observed_tasks
                 .lock()
                 .map_err(|_| {
                     AppError::InvalidInput("Native Agent session store is unavailable.".into())
                 })?
-                .contains_key(&capability::codex::workspace_exclusivity_key(workspace));
-            if active {
+                .clone();
+            if observed.iter().any(|task_id| {
+                self.task_workspaces
+                    .get(task_id)
+                    .is_some_and(|owned| workspaces_overlap(owned, workspace))
+            }) {
                 return Ok(false);
             }
         }
@@ -4815,8 +4904,32 @@ impl NativeAgentServiceV1 {
         if let Some(key) = prepared.exclusivity.clone() {
             self.task_exclusivity.insert(task_id.clone(), key);
         }
+        if let Some(recovery) = started.recovery {
+            self.task_recoveries.insert(task_id.clone(), recovery);
+        }
         self.persist_envelope(&task_id, Some(&prepared.identity_digest))?;
-        if let Some(key) = prepared.exclusivity.clone() {
+        let progress = ObservedTaskProgressV1 {
+            tasks: self.tasks.clone(),
+            task_id: task_id.clone(),
+            remote_decisions: self.task_requesters.contains_key(&task_id),
+            conversation: conversation.map(|(binding, _)| binding),
+            durable_paths: self.durable_paths.clone(),
+        };
+        self.observe_invocation(task_id, started.run, prepared.exclusivity, progress)?;
+        Ok(status)
+    }
+
+    /// Observes one started (or, after a restart, re-observed) invocation
+    /// on its own thread until it reports a terminal outcome. Its exclusivity
+    /// key and its folder stay held until the run lets go of what it holds.
+    fn observe_invocation(
+        &self,
+        task_id: String,
+        mut run: Box<dyn NativeInvocationRunV1>,
+        held_key: Option<ExclusivityKeyV1>,
+        progress: ObservedTaskProgressV1,
+    ) -> AppResult<()> {
+        if let Some(key) = held_key.clone() {
             self.active_exclusivity
                 .lock()
                 .map_err(|_| {
@@ -4834,15 +4947,6 @@ impl NativeAgentServiceV1 {
         let durable_paths = self.durable_paths.clone();
         let active_exclusivity = self.active_exclusivity.clone();
         let observed_tasks = self.observed_tasks.clone();
-        let held_key = prepared.exclusivity;
-        let mut run = started.run;
-        let progress = ObservedTaskProgressV1 {
-            tasks: tasks.clone(),
-            task_id: task_id.clone(),
-            remote_decisions: self.task_requesters.contains_key(&task_id),
-            conversation: conversation.map(|(binding, _)| binding),
-            durable_paths: durable_paths.clone(),
-        };
         thread::spawn(move || {
             let NativeInvocationOutcomeV1 {
                 kind: outcome,
@@ -4860,6 +4964,12 @@ impl NativeAgentServiceV1 {
                     if status.state == NativeAgentTaskStateV1::Cancelled {
                         if outcome == NativeTurnOutcomeV1::Cancelled {
                             status.code = Some("native_agent_cancelled".into());
+                        } else if outcome == NativeTurnOutcomeV1::Unknown
+                            && status.code.as_deref() == Some("native_agent_cancel_requested")
+                        {
+                            // Nothing shows the native turn stopped: the
+                            // stop stays a request, never "Stopped".
+                            status.code = Some("native_agent_cancel_delivery_uncertain".into());
                         }
                     } else {
                         match outcome {
@@ -4938,7 +5048,7 @@ impl NativeAgentServiceV1 {
                 .ok()
                 .map(|mut observed| observed.remove(&task_id));
         });
-        Ok(status)
+        Ok(())
     }
 
     /// Workspace movement's occupancy check for one canonical workspace.
@@ -4952,7 +5062,7 @@ impl NativeAgentServiceV1 {
             .canonicalize()
             .map_err(|_| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
         self.invocation_has_authoritative_owner(
-            Some(&capability::codex::workspace_exclusivity_key(&canonical)),
+            None,
             Some(&canonical),
             except_task_id,
             except_movement_id,
@@ -4960,10 +5070,16 @@ impl NativeAgentServiceV1 {
     }
 
     /// The one Host-local occupancy check shared by direct invocations and
-    /// approved workspace movement. A resource remains owned while any
-    /// observed execution, movement, uncertain outcome, or apply recovery can
-    /// still affect it. `key` is the adapter's opaque exclusivity key;
-    /// `workspace` is the canonical workspace of workspace-scoped capabilities.
+    /// approved workspace movement, whichever capability or movement holds
+    /// the resource. A resource remains owned while any observed execution,
+    /// movement, uncertain outcome, or apply recovery can still affect it.
+    ///
+    /// `key` is the adapter's opaque exclusivity key (a native session, for
+    /// example) and conflicts only with the same key. `workspace` is a
+    /// canonical folder of this Host and conflicts with the same folder and
+    /// with any folder inside or around it, since an Agent working in one
+    /// can change the other. Neither the capability, its provider nor the
+    /// Bridge is part of either; another Host's folder is another resource.
     fn invocation_has_authoritative_owner(
         &self,
         key: Option<&ExclusivityKeyV1>,
@@ -4996,11 +5112,11 @@ impl NativeAgentServiceV1 {
                     record
                         .source
                         .as_ref()
-                        .is_some_and(|source| source.workspace == canonical)
+                        .is_some_and(|source| workspaces_overlap(&source.workspace, canonical))
                         || record
                             .task_workspace
                             .as_ref()
-                            .is_some_and(|owned| owned == canonical)
+                            .is_some_and(|owned| workspaces_overlap(owned, canonical))
                 })
             {
                 return Ok(true);
@@ -5009,12 +5125,29 @@ impl NativeAgentServiceV1 {
         if key.is_none() && workspace.is_none() {
             return Ok(false);
         }
+        let observed = self
+            .observed_tasks
+            .lock()
+            .map_err(|_| {
+                AppError::InvalidInput("Native Agent session store is unavailable.".into())
+            })?
+            .clone();
         let tasks = self.tasks.lock().map_err(|_| {
             AppError::InvalidInput("Native Agent task store is unavailable.".into())
         })?;
         Ok(tasks.iter().any(|(task_id, task)| {
             if Some(task_id.as_str()) == except_task_id {
                 return false;
+            }
+            let holds_workspace = workspace.is_some_and(|canonical| {
+                self.task_workspaces
+                    .get(task_id)
+                    .is_some_and(|owned| workspaces_overlap(owned, canonical))
+            });
+            // A run still observed holds its folder until its observer lets
+            // go, whatever its visible state (its key is checked above).
+            if observed.contains(task_id) {
+                return holds_workspace;
             }
             task.state == NativeAgentTaskStateV1::Interrupted
                 && matches!(
@@ -5023,11 +5156,7 @@ impl NativeAgentServiceV1 {
                         | Some("native_agent_outcome_unknown")
                 )
                 && (key.is_some_and(|key| self.task_exclusivity.get(task_id) == Some(key))
-                    || workspace.is_some_and(|canonical| {
-                        self.task_workspaces
-                            .get(task_id)
-                            .is_some_and(|owned| owned == canonical)
-                    }))
+                    || holds_workspace)
         }))
     }
 
@@ -7468,6 +7597,8 @@ mod tests {
         use super::*;
         include!("native_agent_pair_harness.rs");
     }
+    #[cfg(unix)]
+    mod resource_occupancy;
 
     struct NoopEventSink;
     impl crate::host_runtime::HostEventSink for NoopEventSink {

@@ -329,6 +329,7 @@ impl NativeCapabilityAdapterV1 for CodexThreadAdapterV1 {
             session_reused: false,
             conversation: None,
             host_workspace: Some(workspace.clone()),
+            recovery: None,
             run: Box::new(CodexThreadRunV1 {
                 executable: self.executable(),
                 codex_home: self.codex_home(),
@@ -408,6 +409,11 @@ impl NativeCapabilityAdapterV1 for CodexThreadAdapterV1 {
             }
             tasks.clear();
         }
+    }
+
+    /// Each run's own app-server is Pastey's child, as Codex's.
+    fn native_execution_ends_with_pastey(&self) -> bool {
+        true
     }
 }
 

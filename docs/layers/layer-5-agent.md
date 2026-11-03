@@ -40,9 +40,30 @@ capability ID, and Core dispatches every invocation by that ID. The adapter
 owns HOW: what its input means, how it validates and starts, how it stops,
 and what its terminal output contains. It reports only an identity digest, an
 optional opaque exclusivity key, a renderer-safe label, and (for
-workspace-scoped capabilities) its Host workspace. An adapter receives no peer,
+capabilities that run in a folder) its canonical Host workspace. An adapter receives no peer,
 session, Bridge, or Review context and decides no authority; it can only
 refuse an input it cannot run or report a native failure.
+
+Two kinds of exclusivity are kept apart:
+- **Folder occupancy** is Core's and Host-local. It is derived from each adapter's
+  reported workspace, whatever the capability, provider or Bridge. One folder
+  is held while any Pastey execution, movement, uncertain outcome or apply
+  recovery can change it, and a folder inside or around it counts as the same
+  resource. Two Hosts never share it: another Host's folder is another
+  resource, even under the same path. Sibling folders, such as separate
+  worktrees, run at once.
+- **Native session exclusivity** is an adapter's opaque key, held against
+  Pastey's own tasks only. Whether other clients of the same native session
+  are excluded is the provider's guarantee: Codex's writer lock excludes
+  them; Claude Code keeps no writer lock for a session (see its continuation
+  below).
+
+An adapter also says whether its native execution ends when Pastey's process
+ends (Codex's app-server does). Core relies on that after a restart. A
+capability that cannot show it keeps a turn it was observing at an unknown
+outcome, holding its folder and session, and observes it again through the
+adapter when the adapter can (`reobserve`, from a Host-private record the
+start reported). It never starts or sends that turn again.
 
 Invocation input and terminal output are `OpaqueCapabilityPayloadV1`: JSON
 owned by the capability, bounded to 16 KiB, which Core carries, persists,
@@ -164,13 +185,13 @@ rules above apply.
 
 ### Native completion and consequence recovery
 
-Pastey persists only its outer task and movement facts: immutable correlation, Host-private Bridge binding, execution status, exact result snapshot/digest, and requester apply state. Agent execution, result capture, encrypted Return, conflict retention, result Apply, and movement completion are separate facts. A completed Agent task stays `Completed` if capture, Return, retention, Apply, or explicit recovery abandonment later fails. Recovery, Return retry, cancellation, and Burn never authorize a second Agent turn. Restart does not recreate a native process, session, or turn. Unproved Bridge-bound execution becomes interrupted/reconciliation-required, while a task still awaiting executor Review never started and becomes a definite non-start; an unbound local task that cannot be reconciled becomes terminal `failed` with `native_agent_interrupted_on_restart` and its unreachable envelope is removed.
+Pastey persists only its outer task and movement facts: immutable correlation, Host-private Bridge binding, execution status, exact result snapshot/digest, and requester apply state. Agent execution, result capture, encrypted Return, conflict retention, result Apply, and movement completion are separate facts. A completed Agent task stays `Completed` if capture, Return, retention, Apply, or explicit recovery abandonment later fails. Recovery, Return retry, cancellation, and Burn never authorize a second Agent turn. Restart does not recreate a native process, session, or turn. Unproved Bridge-bound execution becomes interrupted/reconciliation-required, while a task still awaiting executor Review never started and becomes a definite non-start; an unbound local task that cannot be reconciled becomes terminal `failed` with `native_agent_interrupted_on_restart` and its unreachable envelope is removed, but only when its capability's native execution ends with Pastey's process. Otherwise (Claude Code's background sessions, or a capability no longer registered) the task becomes `interrupted` with `native_agent_outcome_unknown`: its envelope, folder and session stay held. When its adapter can, it observes the turn again until its end is seen; otherwise, and meanwhile, only this Host's user's Stop resolves it.
 
 A durably completed received task can seal its exact result from its retained app-owned workspace if capture was interrupted, then retry only Return. Failed or unsafe capture is a consequence failure. After session loss, fresh authenticated reconciliation can prove a completed task and a validated durable snapshot digest. The requester retains that expected digest separately; it creates `result_identity` only from content actually received locally. The executor resends only its matching snapshot, never reruns the Agent. Lost final outbound Transfer acknowledgement, including a sender bookkeeping failure after receiver `/finish`, remains reconciliation-required and source-owning. Proven failure before Transfer finalization can become an ordinary interruption with best-effort cancellation of queued preparation.
 
 If the source changed, Pastey retains the exact returned result without overwriting the source. `conflict_result_retention_required` and `conflict_result_retention_failed` remain explicit consequence-recovery states; exact Return repair or explicit abandonment remains available, and the old movement keeps source ownership while repair is admissible, including across requester restarts. A rematerialized result is matched by exact logical file-set content rather than inode or mtime. `WorkspaceApplyTransactionV1` journals the received result identity before filesystem changes. Restart may restore the baseline, complete a provably staged result, or recognize an already committed result; unexpected canonical state stays blocked and untouched. Exact duplicate Return does not reapply over later edits. Abandonment cancels movement authority without rewriting completed Agent history.
 
-Reopening a Bridge projects one unresolved safe fact at a time into the existing card. Remote uncertainty offers Reconcile and Stop, durable Return offers Retry result Return, retained conflict offers Reveal result and Discard result, and consequence interruption can offer Abandon recovery. The projection excludes physical paths, native session/turn/process details, provider/auth state, result text, and reasoning/tool history. One canonical workspace remains owned while execution, movement, reconciliation, or apply recovery can affect it; only terminal resolution, explicit cancellation, or proven ordinary interruption releases that ownership. Session loss revokes Bridge transport authority but does not Burn the Bridge or terminate a still-observed Host-local turn. Burn removes Bridge authority and envelopes even when an apply journal cannot prove safe filesystem repair: canonical and uncertain sibling trees remain untouched, possible orphan residue does not block startup, and late observer writes cannot restore authority.
+Reopening a Bridge projects one unresolved safe fact at a time into the existing card. Remote uncertainty offers Reconcile and Stop, durable Return offers Retry result Return, retained conflict offers Reveal result and Discard result, and consequence interruption can offer Abandon recovery. The projection excludes physical paths, native session/turn/process details, provider/auth state, result text, and reasoning/tool history. One canonical workspace remains owned, against every capability on this Host and against folders inside or around it, while execution, movement, reconciliation, or apply recovery can affect it; only terminal resolution, explicit cancellation, or proven ordinary interruption releases that ownership. Session loss revokes Bridge transport authority but does not Burn the Bridge or terminate a still-observed Host-local turn. Burn removes Bridge authority and envelopes even when an apply journal cannot prove safe filesystem repair: canonical and uncertain sibling trees remain untouched, possible orphan residue does not block startup, and late observer writes cannot restore authority.
 
 ### Full Access
 
@@ -390,9 +411,11 @@ This Host's user can continue one discovered **Claude Code** session with a new 
   - Pastey then runs `claude stop` (the conversation is kept), so the session is free again.
   - If Claude Code started a copy, Pastey stops the copy and the outcome is unknown: the copy may have begun the prompt.
   - An answer Pastey does not understand, or no answer in time, is also unknown.
-  - A refusal before launch (for example an untrusted workspace) is a definite non-start.
+  - A refusal before launch (for example an untrusted workspace: `--bg` checks Claude Code's own workspace trust and runs nothing, measured) is a definite non-start, but only when nothing shows the prompt began: no process holds the session and its transcript has no entry for the prompt. Otherwise the outcome is unknown.
   - Nothing is ever sent twice.
-- **Approvals.** The session keeps its own permission settings. A registry status other than `busy` or `idle` is shown as waiting for a native decision. Pastey never answers it; Claude Code's own clients do (`claude attach`). Stop runs `claude stop`.
+  - The task holds its canonical folder for every Pastey task and movement on this Host, and its session for Pastey's own tasks.
+  - **Pastey restarts while it runs.** The background session belongs to Claude Code's supervisor and outlives Pastey (measured). The task is restored as unknown, not failed, and keeps its folder and session. The adapter then observes the same session again from what its start recorded (session, folder, prompt, start time; Host-private): the registry and the transcript decide the outcome as above, and the session is released afterwards. Nothing is launched again.
+- **Approvals.** The session keeps its own permission settings. A registry status other than `busy` or `idle` is shown as waiting for a native decision. Pastey never answers it; Claude Code's own clients do (`claude attach`). Stop runs `claude stop` and counts as stopped only once the registry no longer lists the session; otherwise it stays "Stop requested · not confirmed" and the folder stays held until the registry lets it go.
 - **Local only.** The adapter advertises no peer protocol and is left out of the capability facts sent to peers. Core refuses a Bridge invocation of any capability without peer protocols, so reading or discovering a session never gives a peer write control of it.
 - **Every continuation names the entry its user saw.** Discovery reports each session's `lastTurn.marker` (Claude Code's last main-chain entry `uuid`, Codex's newest turn id); `continue_native_session` refuses when the session no longer ends with it.
 
