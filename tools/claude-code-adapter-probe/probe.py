@@ -15,7 +15,7 @@ only for the probe's own harmless prompts, cut to 80 characters.
     python3 -I probe.py lifecycle        # new session, bounded reply, exact resume
     python3 -I probe.py outcomes         # failed and definite non-start shapes
     python3 -I probe.py cancel <interrupt|sigint|sigterm|stdin-eof>
-    python3 -I probe.py orphan           # the controlling process disappears
+    python3 -I probe.py orphan [bare|watchdog]  # the controlling process disappears
     python3 -I probe.py exclusivity      # two clients on one session id
     python3 -I probe.py permission <none-host|stdio-host>
 
@@ -370,9 +370,7 @@ def outcomes(cli):
 def sleeping_turn(cli, cwd, session, label):
     command = f"sleep {SLEEP_SECONDS}"
     return start_turn(
-        cli, cwd,
-        f"Use the Bash tool to run exactly this command and nothing else: {command}\n"
-        "When it finishes, reply with exactly the word SLEPT.",
+        cli, cwd, BASH_PROMPT.format(command=command),
         label, ["--session-id", session, "--allowedTools", f"Bash({command})"])
 
 
@@ -430,17 +428,21 @@ def cancel(cli, method):
         os.kill(pid, signal.SIGTERM)
 
 
+# Claude Code's Bash tool refuses a foreground `sleep` (2.1.317), so the
+# command runs as a background task, as the model chose by itself there.
+BASH_PROMPT = ("Use the Bash tool with run_in_background set to true to run exactly this "
+               "command and nothing else: {command}\n"
+               "When it finishes, reply with exactly the word SLEPT.")
+
 PARENT = r"""
 import subprocess, sys, json, time
-cli, cwd, session, command = sys.argv[1:5]
+cli, cwd, session, command, prompt = sys.argv[1:6]
 child = subprocess.Popen(
     [cli, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
      "--session-id", session, "--allowedTools", "Bash(" + command + ")"],
     cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-child.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content":
-    "Use the Bash tool to run exactly this command and nothing else: " + command +
-    "\nWhen it finishes, reply with exactly the word SLEPT."}, "parent_tool_use_id": None,
-    "session_id": ""}) + "\n")
+child.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt},
+    "parent_tool_use_id": None, "session_id": ""}) + "\n")
 child.stdin.flush()
 print(child.pid, flush=True)
 for line in child.stdout:
@@ -448,40 +450,24 @@ for line in child.stdout:
 """
 
 
-def orphan(cli):
-    """Pastey crashes: its process dies with SIGKILL while a turn runs."""
+def orphan(cli, mode="bare"):
+    """Pastey crashes: its process dies with SIGKILL while a real Bash tool
+    call of the turn runs."""
     cwd = workspace()
     session = str(uuid.uuid4())
     command = f"sleep {SLEEP_SECONDS}"
-    print(f"workspace {cwd}\nsession {short(session)}")
-    parent = subprocess.Popen([sys.executable, "-I", "-c", PARENT, cli, cwd, session, command],
-                              stdout=subprocess.PIPE, text=True)
-    claude_pid = int(parent.stdout.readline())
-    print(f"  stand-in Pastey pid {parent.pid}, its claude pid {claude_pid}")
-    deadline = time.monotonic() + 120
-    sleeps = []
-    while time.monotonic() < deadline and not sleeps:
-        time.sleep(1)
-        sleeps = [pid for pid, c in (descendants(claude_pid) or []) if command in c]
-    if not sleeps:
-        print("  the turn never reached its tool; stopping")
-        parent.kill()
+    print(f"workspace {cwd}\nsession {short(session)} ({mode})")
+    if mode == "watchdog":
+        parent, claude_pid = start_watched(
+            cli, cwd, BASH_PROMPT.format(command=command),
+            ["--session-id", session, "--allowedTools", f"Bash({command})"])
+        if claude_pid:
+            orphan_watch(cli, cwd, session, parent, claude_pid)
         return
-    print(f"  tool process {sleeps} running; killing the stand-in Pastey with SIGKILL")
-    killed_at = time.monotonic()
-    parent.kill()
-    parent.wait()
-    for second in (1, 5, 15, 30, SLEEP_SECONDS + 30):
-        time.sleep(max(0, killed_at + second - time.monotonic()))
-        print(f"  +{second:>3}s claude alive={alive(claude_pid)} "
-              f"tool alive={[p for p in sleeps if alive(p)]} "
-              f"registry={registry(cli, session)} transcript={transcript_summary(cwd, session)}")
-        if not alive(claude_pid) and not any(alive(p) for p in sleeps):
-            break
-    for pid in [claude_pid, *sleeps]:
-        if alive(pid):
-            os.kill(pid, signal.SIGTERM)
-            print(f"  cleanup: sent SIGTERM to leftover pid {pid}")
+    parent = subprocess.Popen([sys.executable, "-I", "-c", PARENT, cli, cwd, session, command,
+                               BASH_PROMPT.format(command=command)],
+                              stdout=subprocess.PIPE, text=True)
+    orphan_watch(cli, cwd, session, parent, int(parent.stdout.readline()))
 
 
 def exclusivity(cli):
@@ -640,17 +626,17 @@ sys.exit(child.wait())
 
 WATCHED_PARENT = r"""
 import os, subprocess, sys, json
-watchdog, cli, cwd, session, settings = sys.argv[1:6]
+watchdog, cli, cwd, prompt, extra = sys.argv[1:6]
 read_end, write_end = os.pipe()
 os.dup2(read_end, 3) if read_end != 3 else None
 child = subprocess.Popen(
     [sys.executable, "-I", "-c", watchdog, cli, "-p", "--input-format", "stream-json",
-     "--output-format", "stream-json", "--verbose", "--session-id", session, "--settings", settings],
+     "--output-format", "stream-json", "--verbose", *json.loads(extra)],
     cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
     pass_fds=(3,))
 os.close(read_end) if read_end != 3 else None
 os.close(3)
-child.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": "Reply OK."},
+child.stdin.write(json.dumps({"type": "user", "message": {"role": "user", "content": prompt},
     "parent_tool_use_id": None, "session_id": ""}) + "\n")
 child.stdin.flush()
 print(child.pid, flush=True)
@@ -659,28 +645,38 @@ for line in child.stdout:
 """
 
 
+def start_watched(cli, cwd, prompt, extra):
+    """A stand-in Pastey that runs claude under the lifeline watchdog:
+    (the stand-in, claude's pid), or claude's pid None if it never started."""
+    parent = subprocess.Popen(
+        [sys.executable, "-I", "-c", WATCHED_PARENT, WATCHDOG, cli, cwd, prompt, json.dumps(extra)],
+        stdout=subprocess.PIPE, text=True)
+    watchdog_pid = int(parent.stdout.readline())
+    deadline = time.monotonic() + 30
+    tree = []
+    while time.monotonic() < deadline and not tree:
+        time.sleep(0.2)
+        tree = [pid for pid, c in (descendants(watchdog_pid) or []) if " -p " in f" {c} "
+                or c.endswith("claude") or "/claude" in c.split(" ")[0]]
+    if not tree:
+        print("  watchdog started no claude; stopping")
+        parent.kill()
+        return parent, None
+    print(f"  watchdog pid {watchdog_pid}")
+    return parent, tree[0]
+
+
 def proxy_orphan(cli, mode="bare"):
     """The controlling process dies (SIGKILL) while claude's child runs."""
     cwd = workspace()
     session = str(uuid.uuid4())
     print(f"workspace {cwd}\nsession {short(session)} (hook stand-in, {mode})")
     if mode == "watchdog":
-        parent = subprocess.Popen(
-            [sys.executable, "-I", "-c", WATCHED_PARENT, WATCHDOG, cli, cwd, session,
-             hook_settings(SLEEP_SECONDS)], stdout=subprocess.PIPE, text=True)
-        watchdog_pid = int(parent.stdout.readline())
-        deadline = time.monotonic() + 30
-        tree = []
-        while time.monotonic() < deadline and not tree:
-            time.sleep(0.2)
-            tree = [pid for pid, c in (descendants(watchdog_pid) or []) if " -p " in f" {c} "
-                    or c.endswith("claude") or "/claude" in c.split(" ")[0]]
-        if not tree:
-            print("  watchdog started no claude; stopping")
-            parent.kill()
-            return
-        print(f"  watchdog pid {watchdog_pid}")
-        orphan_watch(cli, cwd, session, parent, tree[0])
+        parent, claude_pid = start_watched(
+            cli, cwd, "Reply OK.",
+            ["--session-id", session, "--settings", hook_settings(SLEEP_SECONDS)])
+        if claude_pid:
+            orphan_watch(cli, cwd, session, parent, claude_pid)
         return
     parent = subprocess.Popen(
         [sys.executable, "-I", "-c", PROXY_PARENT, cli, cwd, session, hook_settings(SLEEP_SECONDS)],
@@ -690,23 +686,23 @@ def proxy_orphan(cli, mode="bare"):
 
 def orphan_watch(cli, cwd, session, parent, claude_pid):
     print(f"  stand-in Pastey pid {parent.pid}, its claude pid {claude_pid}")
-    deadline = time.monotonic() + 60
+    deadline = time.monotonic() + 120
     sleeps = []
     while time.monotonic() < deadline and not sleeps:
         time.sleep(0.5)
         sleeps = [pid for pid, c in (descendants(claude_pid) or []) if f"sleep {SLEEP_SECONDS}" in c]
     if not sleeps:
-        print("  no hook process appeared; stopping")
+        print("  no child process appeared; stopping")
         parent.kill()
         return
-    print(f"  hook process {sleeps} running; killing the stand-in Pastey with SIGKILL")
+    print(f"  child {sleeps} running; killing the stand-in Pastey with SIGKILL")
     killed_at = time.monotonic()
     parent.kill()
     parent.wait()
     for second in (1, 5, 15, 30, SLEEP_SECONDS + 15, SLEEP_SECONDS + 45):
         time.sleep(max(0, killed_at + second - time.monotonic()))
         print(f"  +{second:>3}s claude alive={alive(claude_pid)} "
-              f"hook alive={[p for p in sleeps if alive(p)]} "
+              f"child alive={[p for p in sleeps if alive(p)]} "
               f"registry={registry(cli, session)} transcript={transcript_summary(cwd, session)}")
         if not alive(claude_pid) and not any(alive(p) for p in sleeps):
             break
@@ -790,9 +786,11 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     experiment, args = sys.argv[1], sys.argv[2:]
-    {"detect": detect, "lifecycle": lifecycle, "outcomes": outcomes, "orphan": orphan,
+    {"detect": detect, "lifecycle": lifecycle, "outcomes": outcomes,
      "exclusivity": exclusivity, "held-resume": held_resume,
      "trust": trust}.get(experiment, lambda _: None)(cli)
+    if experiment == "orphan":
+        orphan(cli, args[0] if args else "bare")
     if experiment == "proxy-orphan":
         proxy_orphan(cli, args[0] if args else "bare")
     if experiment == "cancel":

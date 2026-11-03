@@ -843,3 +843,249 @@ fn wait_terminal_from(
         service.task_status(task_id).unwrap()
     );
 }
+
+/// A fresh disposable session of the installed Claude Code in this crate's
+/// ignored `target/` folder (which inherits the repository's workspace
+/// trust), and a durable Pastey service directory.
+fn installed_session() -> (PathBuf, PathBuf, String, crate::storage::AppPaths, PathBuf) {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/claude-s2-live");
+    fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let cli = find_cli().expect("an installed claude");
+    let session = Uuid::new_v4().to_string();
+    let created = std::process::Command::new(&cli)
+        .args([
+            "-p",
+            "Reply with exactly: live-created",
+            "--session-id",
+            &session,
+        ])
+        .current_dir(&workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let root = std::env::temp_dir().join(format!("pastey-claude-restart-{}", Uuid::new_v4()));
+    let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
+    paths.ensure_directories().unwrap();
+    crate::storage::init_database(&paths).unwrap();
+    (workspace, cli, session, paths, root)
+}
+
+/// The prompt takes Claude Code some seconds to answer, with no tool.
+const LONG_PROMPT: &str =
+    "Write the whole numbers from 1 to 400, separated by single spaces, then the word done.";
+
+/// Runs a continuation in a separate Pastey process (this test binary,
+/// running `installed_claude_code_crash_child`), waits until Claude Code
+/// runs the turn, then kills that process with SIGKILL. Claude Code's own
+/// background session is left running; only the killed process's database
+/// remains.
+fn crash_during_installed_turn(root: &Path, workspace: &Path, cli: &Path, session: &str) -> String {
+    /// Kills the child Pastey however this helper ends, also on a failure.
+    struct KilledOnDrop(std::process::Child);
+    impl Drop for KilledOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "native_agent::capability::claude_code::tests::installed_claude_code_crash_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("PASTEY_LIVE_CRASH_ROOT", root)
+        .env("PASTEY_LIVE_CRASH_WORKSPACE", workspace)
+        .env("PASTEY_LIVE_CRASH_SESSION", session)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let child = KilledOnDrop(child);
+    // The test harness prints the test's name on the same line first.
+    let mut task_id = None;
+    for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+        let line = line.unwrap();
+        if let Some((_, id)) = line.split_once("PASTEY_LIVE_CRASH_TASK=") {
+            task_id = Some(id.trim().to_owned());
+            break;
+        }
+    }
+    let task_id = task_id.expect("the child Pastey started the task");
+    let mut busy = false;
+    for _ in 0..600 {
+        if live_status(cli, session).ok().flatten().as_deref() == Some("busy") {
+            busy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(busy, "Claude Code never ran the turn");
+    // SIGKILL: the child Pastey shuts nothing down.
+    drop(child);
+    task_id
+}
+
+/// The Pastey process the live crash tests kill: starts the continuation
+/// the parent test set up, says which task it is, then waits to be killed.
+/// Without the parent's setup it does nothing.
+#[test]
+#[ignore = "run only by the live crash tests, as their separate Pastey process"]
+fn installed_claude_code_crash_child() {
+    let (Ok(root), Ok(workspace), Ok(session)) = (
+        std::env::var("PASTEY_LIVE_CRASH_ROOT"),
+        std::env::var("PASTEY_LIVE_CRASH_WORKSPACE"),
+        std::env::var("PASTEY_LIVE_CRASH_SESSION"),
+    ) else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
+    let mut service = NativeAgentServiceV1::with_paths_and_adapters(
+        paths,
+        vec![Arc::new(ClaudeCodeNativeAdapterV1::default())],
+    )
+    .unwrap();
+    let started = service
+        .start_claude_session_task(Path::new(&workspace), &session, LONG_PROMPT)
+        .unwrap();
+    println!("PASTEY_LIVE_CRASH_TASK={}", started.task_id);
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn prompt_entries(workspace: &Path, session: &str) -> usize {
+    let transcript =
+        project_dir(&claude_config_dir().unwrap(), workspace).join(format!("{session}.jsonl"));
+    fs::read_to_string(transcript)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("\"type\":\"user\"") && line.contains(LONG_PROMPT))
+        .count()
+}
+
+/// Live: a real background session outlives a Pastey process killed with
+/// SIGKILL. After the restart the task is unknown, holds its folder and
+/// session, and is then observed to its real end; the prompt was sent once.
+#[test]
+#[ignore = "uses the installed, signed-in Claude Code and its quota"]
+fn installed_claude_code_turn_outlives_a_killed_pastey_and_is_observed_to_its_end() {
+    let (workspace, cli, session, paths, root) = installed_session();
+    let task_id = crash_during_installed_turn(&root, &workspace, &cli, &session);
+
+    let mut after = NativeAgentServiceV1::with_paths_and_adapters(
+        paths,
+        vec![Arc::new(ClaudeCodeNativeAdapterV1::default())],
+    )
+    .unwrap();
+    let restored = after.task_status(&task_id).unwrap();
+    eprintln!(
+        "restored: state={:?} code={:?}",
+        restored.state, restored.code
+    );
+    assert_eq!(restored.state, NativeAgentTaskStateV1::Interrupted);
+    assert_eq!(
+        restored.code.as_deref(),
+        Some("native_agent_outcome_unknown")
+    );
+    assert!(after
+        .workspace_has_authoritative_owner(&workspace, None, None)
+        .unwrap());
+    assert!(after
+        .start_claude_session_task(&workspace, &session, "Reply with exactly: must-not-run")
+        .is_err());
+
+    let mut terminal = None;
+    for _ in 0..1800 {
+        let status = after.task_status(&task_id).unwrap();
+        if status.state != NativeAgentTaskStateV1::Interrupted {
+            terminal = Some(status);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let terminal = terminal.expect("observed to an end");
+    eprintln!(
+        "observed: state={:?} code={:?} result={:?}",
+        terminal.state, terminal.code, terminal.result
+    );
+    assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+    let output = serde_json::to_value(terminal.output.unwrap()).unwrap();
+    assert!(output["text"].as_str().unwrap().contains("done"));
+    assert_eq!(
+        prompt_entries(&workspace, &session),
+        1,
+        "sent once, never again"
+    );
+    let mut released = false;
+    for _ in 0..100 {
+        if live_status(&cli, &session) == Ok(None)
+            && !after
+                .workspace_has_authoritative_owner(&workspace, None, None)
+                .unwrap()
+        {
+            released = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        released,
+        "the session and the folder are released after its end"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Live: after Pastey was killed, stopping the restored task stops Claude
+/// Code's real background session, and only its registry confirms it.
+#[test]
+#[ignore = "uses the installed, signed-in Claude Code and its quota"]
+fn installed_claude_code_stopping_a_restored_turn_stops_its_session() {
+    let (workspace, cli, session, paths, root) = installed_session();
+    let task_id = crash_during_installed_turn(&root, &workspace, &cli, &session);
+
+    let mut after = NativeAgentServiceV1::with_paths_and_adapters(
+        paths,
+        vec![Arc::new(ClaudeCodeNativeAdapterV1::default())],
+    )
+    .unwrap();
+    assert_eq!(
+        after.task_status(&task_id).unwrap().code.as_deref(),
+        Some("native_agent_outcome_unknown")
+    );
+    after.cancel_task(&task_id).unwrap();
+    let mut code = None;
+    for _ in 0..600 {
+        let status = after.task_status(&task_id).unwrap();
+        if matches!(
+            status.code.as_deref(),
+            Some("native_agent_cancelled") | Some("native_agent_cancel_delivery_uncertain")
+        ) {
+            code = status.code;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!(
+        "stopped: code={code:?} registry={:?}",
+        live_status(&cli, &session)
+    );
+    assert_eq!(code.as_deref(), Some("native_agent_cancelled"));
+    assert_eq!(live_status(&cli, &session), Ok(None));
+    assert_eq!(
+        prompt_entries(&workspace, &session),
+        1,
+        "sent once, never again"
+    );
+    let _ = fs::remove_dir_all(root);
+}

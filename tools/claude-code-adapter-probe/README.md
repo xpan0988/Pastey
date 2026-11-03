@@ -46,3 +46,25 @@ find ~/.claude/projects -maxdepth 1 -name '*pastey-cc-probe-*' -type d -exec rm 
 | `proxy-orphan watchdog` | Same, with `claude` started under a lifeline watchdog (its own process group; SIGINT, then SIGTERM, then SIGKILL when the controller's pipe closes): turn interrupted and child killed within 1 s, `claude` gone within 5 s, no process left. |
 
 Not run, because they need a model turn: a bounded reply and context continuity across resume; cancelling and orphaning a real Bash tool call (its process tree, background commands, subagents); exclusivity while the holder is mid-turn; permission requests (`permission_denied` without a host, `can_use_tool` with the `stdio` host); extra turns started by background work after a `result`. Windows was not run at all.
+
+## Evidence, 2026-11-04 (later), Claude Code 2.1.317, signed in
+
+Claude Code had auto-updated from 2.1.292. Signed in with claude.ai, so these are real model turns. The Bash prompt now asks for `run_in_background`: 2.1.317's Bash tool refuses a foreground `sleep`, and the model chose a background task by itself where it was not asked.
+
+| Experiment | Observed |
+|---|---|
+| `lifecycle` | Reply `ALPHA`: `success`, `is_error: false`, `end_turn`, under the requested id. A duplicate id is refused. `--resume` keeps the id, and the model recalled `ALPHA`. An unknown id gives only `error_during_execution`, no `init`. |
+| `outcomes` | `--max-turns 1`: a Bash call ran, then `error_max_turns` (`is_error`). Work can precede a failed result. |
+| `cancel interrupt` | The background `sleep` was running. Acknowledged, `error_during_execution`, the tool process was gone, exit 1 after stdin closed. |
+| `cancel sigint` | `task_notification` stopped, `error_during_execution`, tool process gone, exit 0. |
+| `cancel sigterm` | Tool process gone, exit 143, no `result`. |
+| `cancel stdin-eof` | `result: success` after 7 s ("started the same command in the background"). The process then waited about 60 s for the command and **took another turn** (`<task-notification>`, new reply), then exited 0. |
+| `orphan bare` | Controller SIGKILLed: `claude` stayed `busy` with the tool running; it ended its turn, took another when the tool finished, and exited after about 75 s. |
+| `orphan watchdog` | Controller SIGKILLed: the tool was gone within 1 s, and `claude` within 5 s. |
+| `exclusivity` | Holder mid-turn (background `sleep`). A second `-p --resume` was **accepted**: `task_notification` stopped (while the real `sleep` kept running), `success` with `num_turns: 0` and an empty `result`. Its prompt was answered later in the shared transcript, and the holder took an extra turn. The transcript forked. A second `--session-id` is refused. |
+| `held-resume` | Idle holder: the second client ran its own turn (`TWO`), the holder later answered `THREE`, and the transcript forked. |
+| `permission none-host` | Write: `permission_denied`, turn continued, `REFUSED`, no file. |
+| `permission stdio-host` | Write: `control_request` `can_use_tool` to the probe; Deny honoured; `REFUSED`, no file. |
+| `trust` | As before: `-p` ran the project's hooks and its MCP server (a hook before `init`); `--bg` refused and ran nothing. |
+
+New transcript records on 2.1.317: `queue-operation` (enqueue, dequeue) and `session-owner`. They are undocumented, and the `exclusivity` run shows they do not exclude a second writer.

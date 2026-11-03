@@ -269,6 +269,8 @@ All tests below use fixtures in one process (a "Host" is one `NativeAgentService
 
 ### F7. Still needs a real Claude Code run or Windows
 
+*Updated by F9:* the real-Claude-Code items in this list have since been run, signed in, on 2.1.317. The rest still stand.
+
 - A real Pastey restart during a real Claude Code turn: unknown, then observed to its end, then released. Tested with a fixture only.
 - `claude stop` confirmation and copy-on-held against a real background session, and the trust refusal through the adapter end to end.
 - Everything in C that needs a model turn: a real Bash tree under interrupt or crash, approvals, extra turns after a `result`.
@@ -304,3 +306,52 @@ Run the probe's `orphan`, `exclusivity` and `permission stdio-host` experiments 
 3. The task should read "Outcome unknown", its folder should be refused to a Codex run, and then it should complete or be stopped from Claude Code's evidence.
 
 After that, the production `-p` adapter per E, with a lifeline and the F5 boundary.
+
+## F9. Signed-in results, Claude Code 2.1.317
+
+Claude Code auto-updated from 2.1.292 to 2.1.317 during this work. Everything below was re-run on 2.1.317, signed in with claude.ai (Pro), on the same Mac, from a clean environment and outside the sandbox. The prompts were harmless, in disposable folders.
+
+**Through Pastey's own lifecycle** — `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_ -- --ignored --nocapture --test-threads=1` (run from a clean environment): **4 passed**.
+- **Continuation and a held session.** The existing live test passes with the corrections: the continuation completed from Claude Code's own records, and a session another process held was refused before anything was sent.
+- **Pastey killed mid-turn.** A separate Pastey process (this test binary, running `installed_claude_code_crash_child`) was killed with SIGKILL while Claude Code ran the turn. Its database was then reopened by a new service:
+  - The task was `interrupted` / `native_agent_outcome_unknown`, not failed.
+  - Its folder and session were held: a second continuation was refused.
+  - It was then observed to `Completed` with Claude Code's real reply.
+  - The prompt appears once in the transcript, and the session and folder were released afterwards.
+- **Pastey killed, then Stop.** After the same kill, Stop sent `claude stop` and recorded `native_agent_cancelled` only once Claude Code's registry no longer listed the session. The prompt was sent once.
+
+**Through the probe** (`claude -p`, real model turns; details in the [probe README](../../tools/claude-code-adapter-probe/README.md)):
+- **Bounded reply:** `success` with `is_error: false`. Resuming the same id recalled the earlier reply.
+- **A failed result can follow real work:** a turn ended `error_max_turns` after a real Bash call had already run.
+- **Background tool runs:** 2.1.317's Bash tool refuses a foreground `sleep`, and the model ran it as a background task.
+- **Cancelling a real background Bash task:**
+  - interrupt: acknowledged, `error_during_execution`, tool process killed;
+  - SIGINT: the same;
+  - SIGTERM: exit 143, no `result`, tool process killed;
+  - **stdin EOF does not stop it:** `result: success` came after 7 s, then the process waited for the background command and **took another turn** about 60 s later (a `<task-notification>` and a new reply in the transcript).
+- **Controller SIGKILL during a real tool call:**
+  - without a lifeline, `claude` stayed `busy`, its tool kept running, it took another turn, and it exited after about 75 s;
+  - under the lifeline watchdog, the tool was killed and `claude` exited within 5 s.
+- **No writer exclusion:** a second `-p --resume` was not refused.
+  - With an idle holder, both wrote and the transcript forked.
+  - With a busy holder, the second client reported `success` with **zero turns and an empty result**, while its prompt was answered later in the shared session.
+  - The mechanism is undocumented. New `queue-operation` and `session-owner` records appear in transcripts; they are not a lock.
+- **Approvals:**
+  - with no host, a Write was denied (`permission_denied`) and the turn went on;
+  - with the Agent SDK's `stdio` host, the Write arrived as a `can_use_tool` request, the probe's Deny was honoured, and no file was written.
+- **Trust:** unchanged from F5.
+
+**What this changes:**
+- **The completion rule for any future `-p` adapter is stricter than A–E said.** Completed requires all of these:
+  - the last `result` is `success` with `!is_error`;
+  - the run took at least one turn of its own;
+  - the process exited after stdin closed.
+- **Approval relay** through the `stdio` host works on 2.1.317. It is still not a documented CLI interface, so it is feasible but not established.
+- **Claude Code updates itself.** Behaviour relied on must be gated by version and re-measured, as the Codex adapters do.
+
+**Still open:**
+- Windows (all of F7's Windows items).
+- A restart of the real app through its UI: the tests kill a Pastey test process, not the app.
+- Whether `claude stop` ends a `--bg` session's background commands when Pastey releases a completed turn: not measured.
+- Re-observing a Bridge-owned task.
+- Linux bind-mount aliases.
