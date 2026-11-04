@@ -28,6 +28,7 @@ import type { AppConfig, RoomInfo } from "../../lib/types";
 import { DeviceTrustSettings } from "./DeviceTrustSettings";
 import { InternetSettings } from "./InternetSettings";
 import { KnownDevicesSettings } from "./KnownDevicesSettings";
+import { CLAUDE_CODE_AGENT_ID } from "./AgentTaskLifecycle";
 import { availabilityCopy } from "./NativeAgentPanel";
 import { SessionReadingSettings } from "./SessionReadingSettings";
 import { ThisDeviceSettings } from "./ThisDeviceSettings";
@@ -205,6 +206,7 @@ function AgentSettings() {
   }
   useEffect(() => { void check(); }, []);
   const codex = capabilities?.find((capability) => capability.agentId === "agent.coding.codex");
+  const claude = capabilities?.find((capability) => capability.agentId === CLAUDE_CODE_AGENT_ID);
   return <>
     <section className="section" aria-label="Native Agents on this device">
       <div className="section-head-row"><div className="section-head"><h2>On this device</h2><p>Native Agents keep their own sign-in, tools, sandbox and context. Pastey only starts them, moves files when you approve, and reports what they return.</p></div>
@@ -212,6 +214,8 @@ function AgentSettings() {
       <div className="card">
         <div className="setting-row"><span><strong>Codex</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(codex ? { state: codex.state, reason: codex.reason, detail: codex.detail, backend: codex.backend } : { state: "unavailable" }, null, false)}</small></span>
           {capabilities === null ? <Dot pulse /> : <Badge tone={codex?.state === "available" ? "ok" : "warn"}>{codex?.state === "available" ? "Available" : codex?.state === "incompatible" ? "Needs update" : "Unavailable"}</Badge>}</div>
+        <div className="setting-row"><span><strong>Claude Code</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(claude ? { state: claude.state, reason: claude.reason, detail: claude.detail } : { state: "unavailable" }, null, false, CLAUDE_CODE_AGENT_ID)} This device only.</small></span>
+          {capabilities === null ? <Dot pulse /> : <Badge tone={claude?.state === "available" ? "ok" : "warn"}>{claude?.state === "available" ? "Available" : claude?.state === "incompatible" ? "Needs update" : "Unavailable"}</Badge>}</div>
       </div>
     </section>
     <section className="section" aria-label="Approvals">

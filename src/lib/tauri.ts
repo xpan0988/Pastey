@@ -304,6 +304,12 @@ export function startNativeCodexTask(workspace: string, task: string, newConvers
   return invoke("start_native_codex_task", { workspace, task, newConversation });
 }
 
+/** Runs Claude Code in a folder of this device: continuing this device's
+ * Claude Code conversation there, or beginning one. This device only. */
+export function startNativeClaudeCodeTask(workspace: string, task: string, newConversation = false): Promise<NativeAgentTaskStatus> {
+  return invoke("start_native_claude_code_task", { workspace, task, newConversation });
+}
+
 export function getNativeAgentTaskStatus(taskId: string): Promise<NativeAgentTaskStatus> {
   return invoke("get_native_agent_task_status", { taskId });
 }

@@ -79,7 +79,7 @@ export function TaskTurn({ roomId, agent, peers, members, fullAccess = null }: {
         {outcome.detail ? <p>{outcome.detail}</p> : null}
         {outcome.next ? <p><strong>Next:</strong> {outcome.next}</p> : null}
       </div> : null}
-      {status?.conversation === "new" && followUp ? <p className="small muted">Codex could not find this conversation and started a new one, without the earlier turns.</p> : null}
+      {status?.conversation === "new" && followUp ? <p className="small muted">{agentName} could not find this conversation and started a new one, without the earlier turns.</p> : null}
       {status ? <NativeDecisionPanel status={status} roomId={roomId} remote={!!agent.taskHostRef} hostName={hostName} /> : null}
       {nativeAgentAwaitingNativeDecision(status) && !nativeDecisionsAwaitUser(status!, !!agent.taskHostRef, Date.now() / 1000) ? <Notice tone="warn">{agentName} on {hostName} is waiting for a native request that cannot be answered from here, so the task cannot continue; stop it to interrupt the turn. To run without approval prompts, change the approval policy in that device’s own Codex configuration.</Notice> : null}
       {agent.movement ? <div className="stack">

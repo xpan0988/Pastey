@@ -188,6 +188,17 @@ Run them one at a time, from a clean environment: a shell inside a Claude Code s
 env -i HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="$TMPDIR" LANG=en_US.UTF-8 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_ -- --ignored --nocapture --test-threads=1
 ```
 
+The same command also runs the Claude Code conversation checks. They go through Pastey's own entry point (`start_claude_code_conversation_task`, what the app's `start_native_claude_code_task` command calls) and the real lifeline, which is the built `pastey` executable, so build it first:
+- a conversation and a follow-up that remembers it;
+- Stop during a turn;
+- a Pastey process killed with SIGKILL during a turn: Claude Code must end without anyone stopping it, and the restored task must never read failed.
+
+They run in folders under `src-tauri/target/`, which Claude Code must trust as part of this repository.
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml
+```
+
 The test-only `native_agent::tests::pair_harness` scenarios use Requester Host A and Executor Host B with separate `AppPaths`, SQLite databases, and `NativeAgentServiceV1` instances, each independently restarted from durable state. Two compositions share it. The Codex workspace-movement pair uses a deterministic fake Codex app-server that writes app-server launches and native turns to external ledgers. The capability pair registers only the test-only `fake.longjob.v1` adapter, with Codex absent, to prove the lifecycle is capability-neutral. Executor admission scenarios in both show that a direct remote invocation or a landed workspace waits for executor Review without any adapter `prepare`/`start` or app-server launch. The fixture controls delivery and fault timing while exercising production state, movement, regular-file-set package/materialization, task, reconciliation, Return, apply, cancellation, and Burn code; it does not implement another Native Agent state machine. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey native_agent::tests::pair_harness`. It gives deterministic evidence for authority, task ownership, executor admission and Review, movement, restart, reconciliation, exact Return and retry, conflict retention, apply idempotence, cancellation, Burn, late completion/observer behavior, and Agent-at-most-once. It does not prove APFS ↔ NTFS behavior, real macOS/Windows process lifecycle, installed and authenticated Codex, real app-server behavior, LAN/socket interruption and reconnect, sleep/wake, firewall/platform behavior, or packaged release UX. Those boundaries still require physical Mac ↔ Windows acceptance.
 
 The remaining Phase 2 gate is a Native Agent physical multi-device procedure and recorded Mac ↔ Windows evidence before claiming movement reliability across actual devices. It must exercise a connected remote Host, explicit requester movement review, the executing Host's Accept and Deny, encrypted outbound and return transfer, stale/replaced-session rejection, interruption and restart behavior, cancellation races, replay rejection, source-change conflict retention, and recovery presentation. Keep recorded evidence non-secret: never include provider credentials, native session identifiers, Host paths, grants, ObjectRefs, or raw Agent/terminal content.

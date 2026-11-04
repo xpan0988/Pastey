@@ -111,11 +111,11 @@ use crate::{
         select_managed_execute_runtime, select_managed_worker_provider,
         send_developer_terminal_input, send_file_to_room, send_text_to_room,
         set_bridge_peer_address, set_internet_connectivity, share_bridge_workspace,
-        start_bridge_plan_attempt, start_native_codex_task, start_native_v2_plan_attempt,
-        start_remote_native_capability_task, start_remote_native_codex_task,
-        stop_bridge_native_agent_task, stop_sharing_workspace, trust_peer_device, update_config,
-        update_managed_worker_provider, update_transfer_window, update_workspace_share,
-        withdraw_bridge_plan_revision, write_temp_file,
+        start_bridge_plan_attempt, start_native_claude_code_task, start_native_codex_task,
+        start_native_v2_plan_attempt, start_remote_native_capability_task,
+        start_remote_native_codex_task, stop_bridge_native_agent_task, stop_sharing_workspace,
+        trust_peer_device, update_config, update_managed_worker_provider, update_transfer_window,
+        update_workspace_share, withdraw_bridge_plan_revision, write_temp_file,
     },
     error::{AppError, AppResult},
     host_runtime::{HostEvent, HostEventSink, HostRuntime, RuntimeTask, RuntimeTaskSpawner},
@@ -147,6 +147,11 @@ impl RuntimeTaskSpawner for TauriRuntimeTaskSpawner {
 fn main() {
     #[cfg(windows)]
     if windows_codex_backend::run_helper_if_requested() {
+        return;
+    }
+    // A Claude Code run's lifeline: Pastey's own executable, started again.
+    #[cfg(unix)]
+    if native_agent::run_claude_code_lifeline_if_requested() {
         return;
     }
     let app = tauri::Builder::default()
@@ -276,6 +281,7 @@ fn main() {
             revoke_authorized_search_folder,
             list_remote_native_agent_capabilities,
             start_native_codex_task,
+            start_native_claude_code_task,
             get_native_agent_task_status,
             cancel_native_agent_task,
             list_native_invocation_reviews,

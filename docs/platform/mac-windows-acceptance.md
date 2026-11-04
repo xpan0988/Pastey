@@ -327,6 +327,27 @@ Prerequisites: N1–N5. Run at the default window size (about 760 px wide) and o
 | Q6 | New conversation: "List the files"; Accept; then reply "and count them"; Accept. | The first turn starts a new thread (Task details → Conversation: new); the reply continues it (continued). The conversation is listed in PasteySessionTest as "your new conversation, from this device". Starting another New conversation begins a new thread again. |
 | Q7 | While Q6 runs, open another session. | The navigator shows a banner with the running turn; clicking it returns to the conversation. The other session's composer says Codex is working on another task in this Bridge. |
 
+## R. Claude Code conversations (this device; Windows boundary)
+
+Claude Code conversations run on the device that starts them (local only); peers neither see nor invoke them. They are enabled on macOS and Linux only: on Windows the capability reports "only on macOS and Linux for now" until R8–R12 pass there.
+
+Prerequisites: Claude Code 2.1.317 or later, signed in (`claude auth status` → `loggedIn: true`); a folder Claude Code trusts (run `claude` there once and accept), and a second, never-trusted folder containing `.claude/settings.json`.
+
+| # | Do | Expect / record |
+|---|---|---|
+| R1 | Mac: Agents on This device → add the trusted folder → New conversation. | An Agent choice, Codex / Claude Code. Choose Claude Code: the navigator says "Claude Code ready" (with Codex's state beside it); Settings → Agents lists Claude Code, "This device only". |
+| R2 | Send "Reply with the word ok". | Sent → Running → Completed with the reply, "Claude Code on this device". Task details: Conversation new. |
+| R3 | Reply "What did you reply last time?". | Completed, it answers "ok"; Conversation continued. In a terminal, `claude --resume` lists that session once. |
+| R4 | New conversation (Claude Code) with a long task ("Write the numbers 1 to 2000"), Stop while it runs. | "Stopped". In a terminal, `claude agents` lists no process for that folder; no `claude` process remains (`ps`). |
+| R5 | Same long task, then force-quit Pastey (Activity Monitor → Force Quit). Relaunch. | Within about 15 s of the quit, no `claude` process remains for that folder. After relaunch the task reads "Outcome unknown" (never "Failed" or "Stopped when Pastey quit"), then what Claude Code's transcript shows; the folder is free once it ends. The prompt appears once in the session. |
+| R6 | In the never-trusted folder, send anything. | "Did not start · nothing ran", naming `.claude/settings.json` and asking to trust the folder in Claude Code. Its hooks did not run. After `claude` there and accepting trust, the same message runs. |
+| R7 | While R4's run is going, try Codex in the same folder, and a Claude Code conversation in another folder. | Same folder: refused (the folder is held). Another folder: runs at once. |
+| R8 | Windows: Settings → Agents. | Claude Code: "Pastey runs Claude Code conversations only on macOS and Linux for now." Nothing in the Agents view offers it. |
+| R9 | Windows, before enabling it: from a terminal, run the probe's `lifecycle`, `cancel interrupt` and `trust` experiments (tools/claude-code-adapter-probe). | Record whether `--replay-user-messages` echoes the prompt's uuid, the interrupt ends the turn and its tools, and `-p` runs untrusted project hooks as on macOS. |
+| R10 | Windows: run a `claude -p` turn with a Bash tool under a parent that is then killed (Task Manager → End task on the parent). | Record whether `claude` and its tool outlive the parent. They do on macOS, which is why the lifeline exists; Windows needs its own containment (a Job Object) measured before enabling. |
+| R11 | Windows: canonical folder identity: open the same folder through a junction, a different case spelling and a subst drive. | One folder for occupancy, or not; record it. Occupancy relies on it. |
+| R12 | Both: from the Mac, look at Windows's capabilities (Device details → Agents). | Codex only. Claude Code conversations are never offered to or invocable by a peer. |
+
 ## O. Control channel over a long session
 
 What failed on real devices before this build: after about 64 Codex availability checks (each Run or Continue checks first; the Agents tab checks every 15 s), every later check failed with "Room control inbox is full" until Pastey restarted. Use both devices on this build. Record the Control channel facts (Device Details → Advanced → Check control channel, on each device) at the start and the end.

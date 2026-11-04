@@ -39,6 +39,8 @@ export interface CodexRunInput {
    * and whether it gave this device Full Access. */
   shares?: PeerShareKnowledge;
   sharedWorkspace?: SharedWorkspace | null;
+  /** The Agent that runs, by name; Codex unless said. */
+  agentName?: string;
 }
 
 export type CodexRequirementId = "device" | "codex" | "workspace" | "task" | "movement";
@@ -69,6 +71,7 @@ export function codexRunAction(target: CodexRunTarget, source: CodexWorkspaceSou
 
 export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
   const { target, availability } = input;
+  const agent = input.agentName ?? "Codex";
   const where = target.kind === "remote" ? target.name : "this device";
   const action = codexRunAction(target, input.workspaceSource);
   const requirements: CodexRequirement[] = [];
@@ -78,16 +81,16 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
       id: "device",
       label: `${target.name} is connected`,
       met: target.connected,
-      reason: target.connected ? null : `${target.name} is not connected right now. Codex can run there once this Bridge reconnects.`,
+      reason: target.connected ? null : `${target.name} is not connected right now. ${agent} can run there once this Bridge reconnects.`,
     });
   }
 
   const codexReady = availability.state === "available";
   requirements.push({
     id: "codex",
-    label: `Codex is available on ${where}`,
+    label: `${agent} is available on ${where}`,
     met: codexReady,
-    reason: codexReady ? null : availabilityBlocker(availability, where),
+    reason: codexReady ? null : availabilityBlocker(availability, where, agent),
   });
 
   if (target.kind === "remote" && input.workspaceSource === "shared") {
@@ -109,10 +112,10 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
       label: action === "run_remote" ? `Folder on ${where}` : "Folder on this device",
       met: hasWorkspace,
       reason: hasWorkspace ? null : action === "run_remote"
-        ? `Enter the full path of the folder on ${where} where Codex should work.`
+        ? `Enter the full path of the folder on ${where} where ${agent} should work.`
         : action === "review_movement"
           ? "Choose the folder on this device to send."
-          : "Choose the folder Codex should work in.",
+          : `Choose the folder ${agent} should work in.`,
     });
   }
 
@@ -121,7 +124,7 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
     id: "task",
     label: "Task description",
     met: hasTask,
-    reason: hasTask ? null : "Describe what Codex should do.",
+    reason: hasTask ? null : `Describe what ${agent} should do.`,
   });
 
   if (input.movementBlocksNewRun) {
@@ -136,7 +139,7 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
   const blocker = requirements.find((requirement) => !requirement.met)?.reason ?? null;
   return {
     action,
-    actionLabel: input.busy ? "Starting…" : action === "review_movement" ? "Review movement" : "Run with Codex",
+    actionLabel: input.busy ? "Starting…" : action === "review_movement" ? "Review movement" : `Run with ${agent}`,
     requirements,
     blocker,
     ready: blocker === null && !input.busy,
@@ -144,7 +147,7 @@ export function codexRunReadiness(input: CodexRunInput): CodexRunReadiness {
       ? `${remoteStartLine(where, knownFullAccess(input.shares))} No files move.`
       : action === "review_movement"
         ? `Next you review exactly what is sent to ${where}. Nothing moves until you approve.`
-        : "Codex runs on this device in its own native session.",
+        : `${agent} runs on this device in its own native session.`,
   };
 }
 
@@ -154,12 +157,12 @@ export function knownFullAccess(shares: PeerShareKnowledge | undefined): boolean
   return shares?.state === "known" ? shares.fullAccess === true : null;
 }
 
-function availabilityBlocker(availability: NativeAgentTargetAvailability, where: string): string {
+function availabilityBlocker(availability: NativeAgentTargetAvailability, where: string, agent: string): string {
   switch (availability.state) {
-    case "checking": return `Checking Codex on ${where}…`;
-    case "unknown": return `Pastey could not check Codex on ${where}. Check again.`;
-    case "incompatible": return `Codex on ${where} needs an update before Pastey can use it.`;
-    case "unavailable": return `Codex is not available on ${where}.`;
+    case "checking": return `Checking ${agent} on ${where}…`;
+    case "unknown": return `Pastey could not check ${agent} on ${where}. Check again.`;
+    case "incompatible": return `${agent} on ${where} needs an update before Pastey can use it.`;
+    case "unavailable": return `${agent} is not available on ${where}.`;
     case "available": return "";
   }
 }

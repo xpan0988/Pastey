@@ -1212,6 +1212,28 @@ pub fn start_native_codex_task(
         .map_err(|error| error.message())
 }
 
+/// Runs Claude Code in a folder of this device: continuing this device's
+/// user's Claude Code conversation there, or beginning one. Local only, as
+/// Codex's own local run is; Claude Code keeps its own sign-in, model,
+/// settings and tools.
+#[tauri::command]
+pub fn start_native_claude_code_task(
+    workspace: String,
+    task: String,
+    new_conversation: Option<bool>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    state
+        .native_agents
+        .lock()
+        .start_claude_code_conversation_task(
+            std::path::Path::new(&workspace),
+            &task,
+            new_conversation.unwrap_or(false),
+        )
+        .map_err(|error| error.message())
+}
+
 /// Observes one native capability through the existing Layer 4
 /// current-session resolver. Compatibility is only a bounded Host fact: it
 /// does not select the Host or grant invocation, Transfer, or Review authority.

@@ -8,6 +8,10 @@ import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
 import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
 import {
+  CLAUDE_CODE_AGENT_ID,
+  CODEX_AGENT_ID,
+  conversationAgent,
+  isConversationAgent,
   nativeAgentInterruptedRecoveryRequiresAction,
   nativeAgentMovementBlocksNewRun,
   observeNativeAgentMovementAfterReturnRetry,
@@ -615,7 +619,11 @@ test("A selected remote Host shows its own advertised Codex availability", () =>
   const bindings = readFileSync("src/lib/tauri.ts", "utf8");
   // A chosen remote target never falls back to this device's local Codex
   // state, even while it is disconnected (it is chosen by HostRef).
-  assert.match(card, /const availability: NativeAgentTargetAvailability = targetHostRef\s*\? nativeAgentTargetAvailability\("agent\.coding\.codex", remoteCapabilities\.observation\)\s*: localAvailability\(agent\.capabilities\.find\(\(capability\) => capability\.agentId === "agent\.coding\.codex"\)\);/);
+  // On this device, the Agent the view runs with decides (Codex or Claude
+  // Code); another device runs Codex only.
+  assert.match(card, /const availability: NativeAgentTargetAvailability = targetHostRef\s*\? nativeAgentTargetAvailability\(CODEX_AGENT_ID, remoteCapabilities\.observation\)\s*: localAvailability\(agent\.capabilities\.find\(\(capability\) => capability\.agentId === viewAgent\)\);/);
+  assert.match(card, /const viewAgent: ConversationAgentId = targetHostRef \? CODEX_AGENT_ID/);
+  assert.match(card, /onChooseAgent=\{targetHostRef \|\| shownView\?\.kind === "current" \? undefined : chooseLocalAgent\}/);
   assert.match(composer, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
   assert.match(lifecycle, /listRemoteNativeAgentCapabilities\(roomId, hostRef\)/);
   assert.match(bindings, /invoke\("list_remote_native_agent_capabilities", \{ roomId, targetHostRef \}\)/);
@@ -659,15 +667,20 @@ test("Continued and new Agent conversations are shown only once confirmed, and a
   // from this device never does.
   assert.match(card, /const conversationRan = current && agent\.origin\?\.kind === "new"/);
   assert.match(card, /const followUp = conversationRan && kind !== "send";/);
-  assert.match(card, /agent\.start\(place, followUp\)/);
+  assert.match(card, /agent\.start\(place, followUp, agentId\)/);
   assert.match(card, /agent\.startRemote\(roomId, remote\.peerSessionId, targetHostRef, place, followUp\)/);
   assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), sent, !followUp\)/);
   assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, sent, followUp, shared\?\.label \?\? null\)/);
-  assert.match(lifecycle, /const start = useCallback\(async \(place: ConversationPlace, followUp = false\)/);
+  assert.match(lifecycle, /const start = useCallback\(async \(place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID\)/);
+  // A follow-up keeps its conversation's Agent; a new one runs the chosen.
+  assert.match(lifecycle, /const agentId = followUp && origin\?\.kind === "new" \? conversationAgent\(origin\) : chosen;/);
+  assert.match(lifecycle, /startNativeClaudeCodeTask\(workspace\.trim\(\), sent, !followUp\)/);
+  assert.match(bindings, /invoke\("start_native_claude_code_task", \{ workspace, task, newConversation \}\)/);
   assert.match(lifecycle, /const startRemote = useCallback\(async \(roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false\)/);
   // A follow-up stays in the conversation its view began; anything else
   // begins a new one, with its own id.
-  assert.match(lifecycle, /const sameConversation = followUp && origin\?\.kind === "new" \? origin : null;/);
+  // …and with the same Agent: a follow-up never crosses into another Agent's conversation.
+  assert.match(lifecycle, /const sameConversation = followUp && origin\?\.kind === "new" && conversationAgent\(origin\) === agentId \? origin : null;/);
   assert.match(lifecycle, /const conversationId = sameConversation\?\.conversationId \?\? crypto\.randomUUID\(\);/);
   // A shared folder is sent by its reference only, never a path from here.
   assert.match(lifecycle, /const target = shared \? shared\.scopeRef : workspace\.trim\(\);/);
@@ -1873,8 +1886,53 @@ test("every composer shares one input: IME-safe keys, kept focus while sending, 
   assert.match(run, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
   // Each sender hands its promise to the guard.
   assert.match(session, /onSend=\{send\}/);
-  assert.match(run, /if \(!remote \|\| !targetHostRef\) return agent\.start\(place, followUp\);/);
+  assert.match(run, /if \(!remote \|\| !targetHostRef\) return agent\.start\(place, followUp, agentId\);/);
   // A session's unsent draft survives moving to another session, in memory only.
   assert.match(session, /const drafts = new Map<string, string>\(\);/);
   assert.doesNotMatch(session, /localStorage/);
+});
+
+test("Claude Code is a second Agent of the same conversation view, on this device only", () => {
+  assert.equal(nativeAgentDisplayName(CLAUDE_CODE_AGENT_ID), "Claude Code");
+  assert.equal(nativeAgentDisplayName(CODEX_AGENT_ID), "Codex");
+  // A conversation keeps its own Agent; one remembered from before Claude
+  // Code could be chosen is Codex's.
+  const place = { kind: "local" as const, path: "/Users/me/app", label: "app" };
+  assert.equal(conversationAgent({ kind: "new", conversationId: "c1", place, agentId: CLAUDE_CODE_AGENT_ID }), CLAUDE_CODE_AGENT_ID);
+  assert.equal(conversationAgent({ kind: "new", conversationId: "c1", place }), CODEX_AGENT_ID);
+  assert.equal(conversationAgent(null), CODEX_AGENT_ID);
+  assert.equal(isConversationAgent("agent.coding.claude_code"), false, "the session continuation is not a conversation Agent");
+  assert.equal(isConversationAgent(CLAUDE_CODE_AGENT_ID), true);
+
+  // The same readiness, in the chosen Agent's name; Codex's copy unchanged.
+  const local: CodexRunInput = {
+    target: { kind: "local" },
+    availability: { state: "available" },
+    workspaceSource: "send_from_here",
+    workspace: "/Users/me/app",
+    taskText: "",
+    busy: false,
+    movementBlocksNewRun: false,
+    agentName: "Claude Code",
+  };
+  assert.equal(codexRunReadiness(local).blocker, "Describe what Claude Code should do.");
+  const ready = codexRunReadiness({ ...local, taskText: "Fix the test" });
+  assert.equal(ready.actionLabel, "Run with Claude Code");
+  assert.equal(ready.next, "Claude Code runs on this device in its own native session.");
+  assert.equal(codexRunReadiness({ ...local, availability: { state: "unavailable" }, taskText: "x" }).blocker, "Claude Code is not available on this device.");
+  assert.equal(codexRunReadiness({ ...local, agentName: undefined, taskText: "x" }).actionLabel, "Run with Codex");
+
+  // Each unusable Claude Code says which layer failed.
+  const card = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  const claudeCopy = card.slice(card.indexOf("export function claudeCodeUnavailableCopy"), card.indexOf("export function availabilityCopy"));
+  for (const reason of ["native_agent_not_installed", "native_agent_signed_out", "native_agent_probe_failed", "native_agent_incompatible", "native_agent_platform_unverified", "native_agent_launch_failed"]) {
+    assert.match(claudeCopy, new RegExp(`case "${reason}"`));
+  }
+  // The choice is offered for a new conversation on this device only, and
+  // the composer runs the view's Agent.
+  const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  assert.match(card, /\{onChooseAgent \? <Segmented label="Agent" value=\{agentId\} options=\{AGENT_CHOICES\}/);
+  assert.match(workspace, /const LOCAL_AGENT_KEY = "pastey:agents-local-agent-v1";/);
+  const settings = readFileSync("src/features/workspace/SettingsScreens.tsx", "utf8");
+  assert.match(settings, /<strong>Claude Code<\/strong>/);
 });

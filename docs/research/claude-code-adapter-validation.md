@@ -355,3 +355,28 @@ Claude Code auto-updated from 2.1.292 to 2.1.317 during this work. Everything be
 - Whether `claude stop` ends a `--bg` session's background commands when Pastey releases a completed turn: not measured.
 - Re-observing a Bridge-owned task.
 - Linux bind-mount aliases.
+
+## G. Production local adapter, 2026-11-04
+
+Claude Code is now a second native Agent of Pastey's conversation view, on this Host only and on macOS and Linux. It is `agent.coding.claude_code_conversation`, built from F and F9 with no new framework. Layer 5's "Claude Code conversations" describes it. In brief:
+- `claude -p` runs with stream-json in and out, the user's own installation and settings, a session id Pastey chooses, and exact `--resume`.
+- Completion needs the echoed prompt `uuid`, a `success` result for this session after at least one turn, and a clean process exit. The output is the last result.
+- With no approval host, Claude Code denies what would prompt; Pastey answers nothing.
+- A folder with untrusted project configuration is refused, unless Claude Code's own trust record covers it.
+- Containment is a lifeline: Pastey's own executable is `claude`'s parent and interrupts it when Pastey dies.
+- After a restart the turn is unknown and is observed again.
+- It is gated on version 2.1.317 or later and signed-in state.
+- Windows is refused until acceptance R passes.
+- The renderer offers Codex or Claude Code for a new conversation on this device. A conversation keeps its Agent; Settings lists both.
+
+What was verified, and how:
+- **Fixture tests (Rust):** 14 adapter tests and 3 lifeline tests. The native Agent suites give 272 passed.
+- **Full Rust suite:** 902 passed, 0 failed, 12 ignored (the live checks). Codex's tests unchanged.
+- **Renderer:** 74 of 74 frontend integration tests pass; type-check and `vite build` are clean.
+- **Live:** Claude Code 2.1.317, signed in, through `start_claude_code_conversation_task` (what the `start_native_claude_code_task` command calls) and the built `pastey` executable as the lifeline. Run with `installed_claude_code_conversation -- --ignored --test-threads=1`: 4 passed.
+  - **Conversation:** a new conversation completed with its reply.
+  - **Follow-up:** it continued the same session and recalled that reply. It ran in a folder of this repository only because Claude Code's own record trusts the repository.
+  - **Stop:** recorded `native_agent_cancelled`, and no Claude Code process was left.
+  - **Pastey killed:** a separate Pastey process was killed with SIGKILL during a turn. Claude Code's run ended **0.15 s** later through the lifeline, with nobody stopping it. The restored task was `native_agent_outcome_unknown`, then observed `interrupted` from the transcript, never `failed`. The prompt was sent once.
+- **Not driven:** the app's UI with a mouse, and the Tauri IPC layer itself. The live checks call the method the command calls.
+- **Not run:** Windows. Acceptance R is the boundary.

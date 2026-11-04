@@ -45,6 +45,13 @@ const MAX_TASK_BYTES: usize = 16 * 1024;
 /// revoked that Full Access. Like Stop, a request: not proof the turn ended.
 pub(crate) const FULL_ACCESS_REVOKED_CODE: &str = "native_agent_full_access_revoked";
 
+/// In a process started as a Claude Code lifeline helper: runs it and exits.
+/// `false` in every other process (see `capability::claude_code::lifeline`).
+#[cfg(unix)]
+pub(crate) fn run_claude_code_lifeline_if_requested() -> bool {
+    capability::claude_code::lifeline::run_if_requested()
+}
+
 /// Continuing an existing Codex thread (`capability::codex::thread_continuation`).
 pub(crate) const CODEX_THREAD_CAPABILITY: &str =
     capability::codex::thread_continuation::CODEX_THREAD_CAPABILITY_ID;
@@ -1174,6 +1181,11 @@ impl Default for NativeAgentServiceV1 {
         #[cfg(not(test))]
         adapters.push(Arc::new(
             capability::claude_code::ClaudeCodeNativeAdapterV1::default(),
+        ));
+        // Claude Code conversations Pastey begins in a folder (local only).
+        #[cfg(not(test))]
+        adapters.push(Arc::new(
+            capability::claude_code::conversation::ClaudeCodeConversationAdapterV1::default(),
         ));
         // Continuing an existing Codex thread under Codex's own writer lock
         // (local only). Tests register it explicitly with a fixture.
@@ -3978,6 +3990,37 @@ impl NativeAgentServiceV1 {
         self.codex.use_executable(executable);
         let input = capability::codex::codex_input(workspace, task, resume)?;
         self.start_local_invocation(CODEX_CAPABILITY_ID, task_id, &input)
+    }
+
+    /// Runs `task` with Claude Code in `workspace` on this Host: continuing
+    /// this Host's user's Claude Code conversation there, or beginning one
+    /// when none exists; `new_conversation` always begins a new one. Local
+    /// only.
+    pub(crate) fn start_claude_code_conversation_task(
+        &mut self,
+        workspace: &Path,
+        task: &str,
+        new_conversation: bool,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
+            return invalid("Native Agent task is empty or exceeds its bound.");
+        }
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|_| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
+        if !workspace.is_dir() {
+            return invalid("Native Agent workspace must be a directory.");
+        }
+        let input = capability::claude_code::conversation::conversation_input(
+            &workspace,
+            task,
+            !new_conversation,
+        )?;
+        self.start_local_invocation(
+            capability::claude_code::conversation::CLAUDE_CODE_CONVERSATION_ID,
+            &format!("native-agent:{}", Uuid::new_v4()),
+            &input,
+        )
     }
 
     /// Continues one existing Claude Code session that this Host's user

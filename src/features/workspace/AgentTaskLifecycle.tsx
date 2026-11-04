@@ -17,6 +17,7 @@ import {
   revealNativeAgentConflictResult,
   reconcileRemoteNativeAgentTask,
   retryNativeAgentWorkspaceResultReturn,
+  startNativeClaudeCodeTask,
   startNativeCodexTask,
   startRemoteNativeCodexTask,
   stopBridgeNativeAgentTask,
@@ -158,10 +159,22 @@ export function nativeAgentConversationUnavailable(status: NativeAgentTaskStatus
   return status?.state === "failed" && status.code === CONVERSATION_UNAVAILABLE_CODE;
 }
 
+export const CODEX_AGENT_ID = "agent.coding.codex";
+export const CLAUDE_CODE_AGENT_ID = "agent.coding.claude_code_conversation";
+/** The Agents a new conversation runs with on this device. Another device
+ * runs Codex only: Claude Code is not offered to Bridge peers. */
+export const LOCAL_CONVERSATION_AGENTS = [CODEX_AGENT_ID, CLAUDE_CODE_AGENT_ID] as const;
+export type ConversationAgentId = typeof LOCAL_CONVERSATION_AGENTS[number];
+
+export function isConversationAgent(value: unknown): value is ConversationAgentId {
+  return (LOCAL_CONVERSATION_AGENTS as readonly unknown[]).includes(value);
+}
+
 const AGENT_NAMES: Record<string, string> = {
   "agent.coding.codex": "Codex",
   "agent.coding.codex_thread": "Codex",
   "agent.coding.claude_code": "Claude Code",
+  "agent.coding.claude_code_conversation": "Claude Code",
 };
 
 export function nativeAgentDisplayName(agentId: string | null | undefined): string {
@@ -287,8 +300,15 @@ export type ConversationPlace =
  * never mixed: a new conversation never continues another session, and a
  * continuation always names its session. */
 export type TaskOrigin =
-  | { kind: "new"; conversationId: string; place: ConversationPlace }
+  /** `agentId` is the Agent the conversation runs with; absent, Codex (a
+   * conversation remembered from before Claude Code could be chosen). */
+  | { kind: "new"; conversationId: string; place: ConversationPlace; agentId?: ConversationAgentId }
   | { kind: "session"; conversationId: string; session: ContinuedSession };
+
+/** The Agent a new conversation runs with. */
+export function conversationAgent(origin: TaskOrigin | null | undefined): ConversationAgentId {
+  return origin?.kind === "new" && isConversationAgent(origin.agentId) ? origin.agentId : CODEX_AGENT_ID;
+}
 
 /** An earlier turn of the new conversation this Bridge follows. */
 export interface PastTurn {
@@ -696,11 +716,11 @@ export function useNativeAgentTask(roomId: string) {
   /** Records a turn this device just started. A follow-up stays in the
    * new conversation the shown task belongs to, after its earlier turns;
    * anything else begins a new conversation. */
-  const beginTurn = useCallback((taskId: string, hostRef: string | null, place: ConversationPlace, followUp: boolean, sent: string, movementId: string | null = null) => {
-    const sameConversation = followUp && origin?.kind === "new" ? origin : null;
+  const beginTurn = useCallback((taskId: string, hostRef: string | null, place: ConversationPlace, followUp: boolean, sent: string, movementId: string | null = null, agentId: ConversationAgentId = CODEX_AGENT_ID) => {
+    const sameConversation = followUp && origin?.kind === "new" && conversationAgent(origin) === agentId ? origin : null;
     const conversationId = sameConversation?.conversationId ?? crypto.randomUUID();
     const turns = sameConversation && status && prompt !== null ? [...pastTurns, { taskId: status.taskId, prompt, status }] : [];
-    const nextOrigin: TaskOrigin = { kind: "new", conversationId, place };
+    const nextOrigin: TaskOrigin = { kind: "new", conversationId, place, agentId };
     setOrigin(nextOrigin);
     setPrompt(sent);
     setPastTurns(turns);
@@ -709,20 +729,24 @@ export function useNativeAgentTask(roomId: string) {
     rememberStartedNativeTask(roomId, { taskId, hostRef, movementId, origin: nextOrigin, prompt: sent });
   }, [origin, pastTurns, prompt, roomId, status]);
 
-  /** Starts Codex on this device. A new conversation unless `followUp`,
-   * which continues the conversation the shown task belongs to. */
-  const start = useCallback(async (place: ConversationPlace, followUp = false) => {
+  /** Starts an Agent on this device: `chosen` for a new conversation, or,
+   * with `followUp`, the Agent of the conversation the shown task belongs
+   * to, which it continues. */
+  const start = useCallback(async (place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID) => {
     const sent = taskText.trim();
     if (!workspace.trim() || !sent || busy) return;
+    const agentId = followUp && origin?.kind === "new" ? conversationAgent(origin) : chosen;
     setBusy(true); setMessage(null);
     try {
-      const started = await startNativeCodexTask(workspace.trim(), sent, !followUp);
+      const started = agentId === CLAUDE_CODE_AGENT_ID
+        ? await startNativeClaudeCodeTask(workspace.trim(), sent, !followUp)
+        : await startNativeCodexTask(workspace.trim(), sent, !followUp);
       setStatus(started); setTaskHostRef(null);
-      beginTurn(started.taskId, null, place, followUp, sent);
+      beginTurn(started.taskId, null, place, followUp, sent, null, agentId);
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start Codex."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)}.`); }
     finally { setBusy(false); }
-  }, [beginTurn, busy, taskText, workspace]);
+  }, [beginTurn, busy, origin, taskText, workspace]);
 
   /** A shared place names a folder that Host shares with this device by its
    * reference, which that Host resolves itself; otherwise the typed path.
@@ -785,9 +809,9 @@ export function useNativeAgentTask(roomId: string) {
     if (!cancellableTaskId) return;
     setBusy(true);
     try { setStatus(await cancelNativeAgentTask(cancellableTaskId)); }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not cancel Codex."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not stop ${nativeAgentDisplayName(status?.agentId)}.`); }
     finally { setBusy(false); }
-  }, [cancellableTaskId]);
+  }, [cancellableTaskId, status?.agentId]);
 
   const cancelRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string) => {
     if (!cancellableTaskId) return;

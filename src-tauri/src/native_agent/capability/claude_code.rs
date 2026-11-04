@@ -52,6 +52,10 @@ use crate::native_agent::sessions::claude::{
 use crate::native_agent::sessions::{in_workspaces, now_ms, LastTurnV1};
 use crate::native_agent::{NativeAgentCapabilityStateV1, NativeTurnOutcomeV1, MAX_TASK_BYTES};
 
+pub(in crate::native_agent) mod conversation;
+#[cfg(unix)]
+pub(in crate::native_agent) mod lifeline;
+
 pub(in crate::native_agent) const CLAUDE_CODE_CAPABILITY_ID: &str = "agent.coding.claude_code";
 /// No peer protocol: continuation is local to this Host's user.
 const NO_PEER_PROTOCOLS: [&str; 0] = [];
@@ -418,9 +422,38 @@ fn outcome(kind: NativeTurnOutcomeV1, summary: impl Into<String>) -> NativeInvoc
 /// Runs a short `claude` command; its stdout and stderr together, or `None`
 /// if it did not finish in time.
 fn run_claude(cli: &Path, args: &[&str], cwd: &Path, timeout: Duration) -> Option<(bool, String)> {
-    let mut child = Command::new(cli)
-        .args(args)
-        .current_dir(cwd)
+    let mut command = Command::new(cli);
+    command.args(args).current_dir(cwd);
+    run_command(command, timeout)
+}
+
+/// `claude`, without the session variables of a Claude Code session Pastey
+/// itself was started from (a developer's terminal or app session). A child
+/// `claude` inheriting them runs bare and signs in as that session's, not
+/// as the user's own installation (measured). Pastey started normally has
+/// none of them, and then passes its environment unchanged.
+fn claude_command(cli: &Path) -> Command {
+    let mut command = Command::new(cli);
+    if std::env::var_os("CLAUDECODE").is_some() {
+        for (name, _) in std::env::vars_os() {
+            let text = name.to_string_lossy();
+            if text == "CLAUDECODE"
+                || text == "CLAUDE_PID"
+                || text == "ANTHROPIC_BASE_URL"
+                || text.starts_with("CLAUDE_CODE_")
+                || text.starts_with("CLAUDE_AGENT_SDK_")
+            {
+                command.env_remove(&name);
+            }
+        }
+    }
+    command
+}
+
+/// Runs `command` to its end, bounded; its stdout and stderr together, or
+/// `None` if it did not finish in time.
+fn run_command(mut command: Command, timeout: Duration) -> Option<(bool, String)> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

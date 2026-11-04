@@ -6,10 +6,16 @@ import type { BridgePeerSession } from "../../lib/bridgePeers";
 import { getDeviceIdentity, getDeviceProfile, openRemoteFolder, presentDeviceIdentity, type NativeAgentCapability, type SharedWorkspace } from "../../lib/tauri";
 import type { RoomInfo } from "../../lib/types";
 import {
+  CODEX_AGENT_ID,
+  LOCAL_CONVERSATION_AGENTS,
   continuedSessionKey,
+  conversationAgent,
+  isConversationAgent,
+  nativeAgentDisplayName,
   nativeAgentRecoveryRequiresAction,
   nativeAgentTargetAvailability,
   useRemoteNativeCapabilities,
+  type ConversationAgentId,
   type ConversationPlace,
   type NativeAgentTargetAvailability,
 } from "./AgentTaskLifecycle";
@@ -26,6 +32,8 @@ type AgentView = { kind: "new" } | { kind: "current" } | { kind: "session"; sess
 
 const PLACE_KEY = "pastey:agents-place-v1";
 const LOCAL_FOLDERS_KEY = "pastey:agents-local-folders-v1";
+/** The Agent last chosen for a new conversation on this device. */
+const LOCAL_AGENT_KEY = "pastey:agents-local-agent-v1";
 
 function readStored<T>(key: string, fallback: T): T {
   try { return (JSON.parse(window.localStorage.getItem(key) ?? "null") as T | null) ?? fallback; }
@@ -82,9 +90,16 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   const connected = targetHostRef ? !!remote : true;
   const shares = usePeerSharedWorkspaces(room.id, targetHostRef, connected, remote?.peerSessionId ?? null);
   const remoteCapabilities = useRemoteNativeCapabilities(room.id, remote ? targetHostRef : null, remote?.peerSessionId ?? null);
-  const availability: NativeAgentTargetAvailability = targetHostRef
-    ? nativeAgentTargetAvailability("agent.coding.codex", remoteCapabilities.observation)
-    : localAvailability(agent.capabilities.find((capability) => capability.agentId === "agent.coding.codex"));
+  // A new conversation on this device runs with the Agent chosen for it;
+  // another device runs Codex. A conversation keeps its own Agent.
+  const [localAgent, setLocalAgent] = useState<ConversationAgentId>(() => {
+    const stored = readStored<unknown>(LOCAL_AGENT_KEY, CODEX_AGENT_ID);
+    return isConversationAgent(stored) ? stored : CODEX_AGENT_ID;
+  });
+  const chooseLocalAgent = useCallback((next: ConversationAgentId) => {
+    setLocalAgent(next);
+    writeStored(LOCAL_AGENT_KEY, next);
+  }, []);
   const sharedList = shares.knowledge.state === "known" ? shares.knowledge.workspaces : [];
   const fullAccess = shares.knowledge.state === "known" && shares.knowledge.fullAccess === true;
   const [addingFolder, setAddingFolder] = useState(false);
@@ -154,6 +169,14 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   const taskShown = (shownView?.kind === "current" && ownsCurrent) || (openKey !== null && openKey === liveKey);
   const taskNeedsAttention = !!agent.movement || nativeAgentRecoveryRequiresAction(agent.status, agent.movement)
     || taskActive;
+  const viewAgent: ConversationAgentId = targetHostRef ? CODEX_AGENT_ID
+    : shownView?.kind === "current" && agent.origin?.kind === "new" ? conversationAgent(agent.origin) : localAgent;
+  const availability: NativeAgentTargetAvailability = targetHostRef
+    ? nativeAgentTargetAvailability(CODEX_AGENT_ID, remoteCapabilities.observation)
+    : localAvailability(agent.capabilities.find((capability) => capability.agentId === viewAgent));
+  const readyHere = LOCAL_CONVERSATION_AGENTS
+    .filter((agentId) => agent.capabilities.some((capability) => capability.agentId === agentId && capability.state === "available"))
+    .map(nativeAgentDisplayName);
 
   function openTask() {
     const origin = agent.origin;
@@ -173,7 +196,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   const main = shownView?.kind === "session"
     ? <SessionConversation key={`${target}:${openKey}`} roomId={room.id} agent={agent} peers={peers} members={members} target={target} session={shownView.session} folder={choice?.kind === "local" ? choice.path : ""} share={targetHostRef ? share : undefined} onBack={back} />
     : choice || shownView?.kind === "current"
-      ? <NewConversation key={`${target}:${placeKey(choice)}:${shownView?.kind === "current"}`} roomId={room.id} agent={agent} peers={peers} members={members} target={target} choice={choice} shares={shares} availability={availability} onRecheck={() => void (remote ? remoteCapabilities.refresh() : agent.refreshCapabilities())} current={shownView?.kind === "current"} onNewDraft={() => setView({ kind: "new" })} onBack={back} />
+      ? <NewConversation key={`${target}:${placeKey(choice)}:${shownView?.kind === "current"}`} roomId={room.id} agent={agent} agentId={viewAgent} onChooseAgent={targetHostRef || shownView?.kind === "current" ? undefined : chooseLocalAgent} peers={peers} members={members} target={target} choice={choice} shares={shares} availability={availability} onRecheck={() => void (remote ? remoteCapabilities.refresh() : agent.refreshCapabilities())} current={shownView?.kind === "current"} onNewDraft={() => setView({ kind: "new" })} onBack={back} />
       : <div className="conversation conversation-empty"><EmptyState title={targetHostRef ? `Nothing to work in on ${targetName} yet` : "Choose a folder"}>{targetHostRef
         ? peerShareGuidance(targetName, shares.knowledge, "run") ?? `Choose a workspace ${targetName} shares, or a folder by path.`
         : "Add a folder on this device to see its sessions and start conversations there."}</EmptyState></div>;
@@ -189,8 +212,10 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
           <option value="local">This device</option>
         </select>
         <div className="nav-host-status" role="status">
-          <Dot tone={!connected ? "neutral" : availability.state === "available" ? "ok" : availability.state === "checking" ? "neutral" : "warn"} pulse={availability.state === "checking"} />
-          <span>{!connected ? "Not connected" : availability.state === "available" ? targetHostRef ? `Connected · Codex ready${fullAccess ? " · Full Access" : ""}` : "Codex ready" : availabilityCopy(availability, targetHostRef ? targetName : null, false)}</span>
+          <Dot tone={!connected ? "neutral" : (targetHostRef ? availability.state === "available" : readyHere.length > 0) ? "ok" : availability.state === "checking" ? "neutral" : "warn"} pulse={availability.state === "checking"} />
+          <span>{!connected ? "Not connected"
+            : targetHostRef ? availability.state === "available" ? `Connected · Codex ready${fullAccess ? " · Full Access" : ""}` : availabilityCopy(availability, targetName, false)
+              : readyHere.length ? readyHere.map((name) => `${name} ready`).join(" · ") : availabilityCopy(availability, null, false, viewAgent)}</span>
         </div>
         {targetHostRef ? <div className="row nav-host-actions">
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => setAccessOpen(true)}><Icon name="shield" small />Access</button>
@@ -328,7 +353,7 @@ function PlaceBody({ canRun, runBlocked, agent, ownsCurrent, shownView, onNew, o
     {!canRun && runBlocked ? <p className="nav-note">{runBlocked}</p> : null}
     {ownsCurrent ? <button type="button" className={`nav-session${shownView?.kind === "current" ? " selected" : ""}`} onClick={onCurrent}>
       <span className="nav-session-title">{active ? <Dot tone="live" pulse /> : null}{currentTitle}</span>
-      <span className="nav-session-meta">Codex · your new conversation, from this device</span>
+      <span className="nav-session-meta">{nativeAgentDisplayName(conversationAgent(agent.origin))} · your new conversation, from this device</span>
     </button> : null}
     <SessionListView list={list} target={target} openKey={openKey} liveKey={liveKey} onOpen={onOpenSession} />
   </>;
