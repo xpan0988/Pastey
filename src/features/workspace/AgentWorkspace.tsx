@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { remoteAccessGuidance, type AccessLine } from "../../lib/accessGuidance";
 import { peerShareGuidance, shareSummary, type PeerShareKnowledge } from "../../lib/workspaceShares";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
@@ -23,6 +23,7 @@ import { TaskBanner } from "./AgentTaskTracker";
 import { availabilityCopy, folderLabel, NewConversation, type NativeAgentController, type PlaceChoice } from "./NativeAgentPanel";
 import { SessionListView, useSessionList, type SessionList, type SessionRef } from "./NativeSessionsCard";
 import { SessionConversation } from "./SessionDetail";
+import { conversationTitle, reconcileWithCurrent, sameNativeSession, type NativeSessionIdentity } from "../../lib/sessionList";
 import { usePeerSharedWorkspaces } from "./BridgeWorkspaces";
 import { Badge, Dialog, Dot, EmptyState, Icon, Notice } from "./ui";
 
@@ -164,7 +165,15 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   const ownsCurrent = agent.origin?.kind === "new" && taskTarget === target && placeKey(choiceOf(agent.origin.place)) === placeKey(choice);
   const taskActive = !!agent.status && ["queued", "running"].includes(agent.status.state);
   const liveKey = agent.origin?.kind === "session" && taskTarget === target ? continuedSessionKey(agent.origin.session) : null;
-  const shownView: AgentView | null = view ?? (ownsCurrent ? { kind: "current" } : null);
+  // The native session the followed conversation runs in, once this
+  // device's Agent confirmed it: that session is this conversation, shown
+  // once, as it. Never known for another device's task.
+  const currentSession: NativeSessionIdentity | null = ownsCurrent && taskTarget === "local" && agent.origin?.kind === "new" ? agent.origin.nativeSession ?? null : null;
+
+  // Its session, opened from anywhere, is this conversation.
+  const shownView: AgentView | null = view?.kind === "session" && sameNativeSession(view.session, currentSession)
+    ? { kind: "current" }
+    : view ?? (ownsCurrent ? { kind: "current" } : null);
   const openKey = shownView?.kind === "session" ? continuedSessionKey(shownView.session) : null;
   const taskShown = (shownView?.kind === "current" && ownsCurrent) || (openKey !== null && openKey === liveKey);
   const taskNeedsAttention = !!agent.movement || nativeAgentRecoveryRequiresAction(agent.status, agent.movement)
@@ -174,6 +183,21 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   const availability: NativeAgentTargetAvailability = targetHostRef
     ? nativeAgentTargetAvailability(CODEX_AGENT_ID, remoteCapabilities.observation)
     : localAvailability(agent.capabilities.find((capability) => capability.agentId === viewAgent));
+  // A task this device ran here may have changed the folder's sessions:
+  // read them again once it has ended (not while it runs, and not by polling).
+  const ranHere = taskTarget === "local" && target === "local" && choice?.kind === "local" && (
+    (agent.origin?.kind === "new" && agent.origin.place.kind === "local" && agent.origin.place.path === choice.path)
+    || (agent.origin?.kind === "session" && agent.origin.session.scopeRef === choice.path));
+  const endedHere = ranHere && agent.status && !["queued", "running"].includes(agent.status.state) ? agent.status.taskId : null;
+  const seenRunning = useRef<string | null>(null);
+  if (ranHere && taskActive && agent.status) seenRunning.current = agent.status.taskId;
+  const lookAgain = list.look;
+  useEffect(() => {
+    if (!endedHere || seenRunning.current !== endedHere) return;
+    seenRunning.current = null;
+    void lookAgain();
+  }, [endedHere, lookAgain]);
+
   const readyHere = LOCAL_CONVERSATION_AGENTS
     .filter((agentId) => agent.capabilities.some((capability) => capability.agentId === agentId && capability.state === "available"))
     .map(nativeAgentDisplayName);
@@ -190,8 +214,10 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
     }
   }
 
-  const openSession = (session: SessionRef) => setView({ kind: "session", session: { provider: session.provider, sessionId: session.sessionId } });
-  const placeBody = (canRun: boolean, runBlocked: string | null) => <PlaceBody canRun={canRun} runBlocked={runBlocked} agent={agent} ownsCurrent={ownsCurrent} shownView={shownView} onNew={() => setView({ kind: "new" })} onCurrent={() => setView({ kind: "current" })} list={list} target={target} openKey={openKey} liveKey={taskActive ? liveKey : null} onOpenSession={openSession} />;
+  const openSession = (session: SessionRef) => setView(sameNativeSession(session, currentSession)
+    ? { kind: "current" }
+    : { kind: "session", session: { provider: session.provider, sessionId: session.sessionId } });
+  const placeBody = (canRun: boolean, runBlocked: string | null) => <PlaceBody canRun={canRun} runBlocked={runBlocked} agent={agent} ownsCurrent={ownsCurrent} currentSession={currentSession} shownView={shownView} onNew={() => setView({ kind: "new" })} onCurrent={() => setView({ kind: "current" })} list={list} target={target} openKey={openKey} liveKey={taskActive ? liveKey : null} onOpenSession={openSession} />;
   const back = () => setView(null);
   const main = shownView?.kind === "session"
     ? <SessionConversation key={`${target}:${openKey}`} roomId={room.id} agent={agent} peers={peers} members={members} target={target} session={shownView.session} folder={choice?.kind === "local" ? choice.path : ""} share={targetHostRef ? share : undefined} onBack={back} />
@@ -332,11 +358,13 @@ function Grants({ share }: { share: SharedWorkspace }) {
 
 /** Inside the selected workspace: start something new, return to the
  * conversation this device began there, or open one of its sessions. */
-function PlaceBody({ canRun, runBlocked, agent, ownsCurrent, shownView, onNew, onCurrent, list, target, openKey, liveKey, onOpenSession }: {
+function PlaceBody({ canRun, runBlocked, agent, ownsCurrent, currentSession, shownView, onNew, onCurrent, list, target, openKey, liveKey, onOpenSession }: {
   canRun: boolean;
   runBlocked: string | null;
   agent: NativeAgentController;
   ownsCurrent: boolean;
+  /** The native session of the conversation this device follows here. */
+  currentSession: NativeSessionIdentity | null;
   shownView: AgentView | null;
   onNew: () => void;
   onCurrent: () => void;
@@ -346,7 +374,8 @@ function PlaceBody({ canRun, runBlocked, agent, ownsCurrent, shownView, onNew, o
   liveKey: string | null;
   onOpenSession: (session: SessionRef) => void;
 }) {
-  const currentTitle = agent.pastTurns[0]?.prompt ?? agent.prompt ?? "Conversation";
+  // Named as its session is once that is known, else by its first prompt.
+  const currentTitle = conversationTitle(reconcileWithCurrent(list.sessions, currentSession).currentSession, agent.pastTurns[0]?.prompt ?? agent.prompt);
   const active = !!agent.status && ["queued", "running"].includes(agent.status.state);
   return <>
     <button type="button" className={`nav-new${shownView === null || shownView.kind === "new" ? " selected" : ""}`} disabled={!canRun} title={canRun ? undefined : runBlocked ?? undefined} onClick={onNew}><Icon name="plus" small />New conversation</button>
@@ -355,7 +384,7 @@ function PlaceBody({ canRun, runBlocked, agent, ownsCurrent, shownView, onNew, o
       <span className="nav-session-title">{active ? <Dot tone="live" pulse /> : null}{currentTitle}</span>
       <span className="nav-session-meta">{nativeAgentDisplayName(conversationAgent(agent.origin))} · your new conversation, from this device</span>
     </button> : null}
-    <SessionListView list={list} target={target} openKey={openKey} liveKey={liveKey} onOpen={onOpenSession} />
+    <SessionListView list={list} target={target} openKey={openKey} liveKey={liveKey} current={ownsCurrent ? currentSession : null} onOpen={onOpenSession} />
   </>;
 }
 

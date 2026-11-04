@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import test from "node:test";
 
 import { mergeRoomItems, reconcileRoomItems, reconcileRooms } from "../src/lib/authoritativeSnapshots";
@@ -45,6 +45,8 @@ import { controlLine, expiryLabel, FULL_ACCESS_ENDS, fullAccessAllows, fullAcces
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
 import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
+import { conversationTitle, createLookGate, mergeSessionRead, nativeSessionKey, reconcileWithCurrent, sameNativeSession, type SessionListState } from "../src/lib/sessionList";
+import { SessionListView, type SessionList } from "../src/features/workspace/NativeSessionsCard";
 import type { NativeDecisionReview, SharedWorkspace, WorkspaceShare } from "../src/lib/tauri";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server.browser";
@@ -1594,8 +1596,8 @@ test("a continuation is followed in the session it continues, and the list fills
   const browser = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   const detail = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
   const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
-  // Looks once per workspace while shown, only where reading is allowed.
-  assert.match(browser, /if \(!active \|\| busy \|\| !scopeKey \|\| looked\.current === scopeKey\) return;/);
+  // Looks each time a workspace is shown, only where reading is allowed.
+  assert.match(browser, /if \(active && scopeKey\) void look\(\);/);
   assert.match(browser, /choice\?\.kind === "shared" && remote && share\?\.readSessions \? `\$\{target\}\|\$\{choice\.scopeRef\}` : null/);
   // This device's turns are shown in the session's own thread, under the
   // session as it was read before them, so no turn shows twice.
@@ -1935,4 +1937,150 @@ test("Claude Code is a second Agent of the same conversation view, on this devic
   assert.match(workspace, /const LOCAL_AGENT_KEY = "pastey:agents-local-agent-v1";/);
   const settings = readFileSync("src/features/workspace/SettingsScreens.tsx", "utf8");
   assert.match(settings, /<strong>Claude Code<\/strong>/);
+});
+
+// Session discovery for one real folder (HL_tech on macOS, 2026-11-05): one
+// Claude Code session Pastey began and continued once, and six Codex threads
+// (one by Pastey). Ids are shortened; titles as each provider records them.
+const HL_FOLDER = "/Users/me/HL_tech";
+const HL_CLAUDE = "c78d89ff-17d7-4df9-af2d-20c2fffba05b";
+function hlSession(provider: "claude_code" | "codex", sessionId: string, title: string, lastActivityAtMs: number, origin = "desktop"): SessionView {
+  return sessionView({ provider, sessionId, title, lastActivityAtMs, origin, scopeRef: HL_FOLDER, workspaceLabel: "HL_tech" });
+}
+function hlSessions(): SessionView[] {
+  return [
+    hlSession("claude_code", HL_CLAUDE, "这个文件夹做的什么", 1793814533523, "sdk"),
+    hlSession("codex", "01a1a7ab", "看看这个项目", 1793814433000, "pastey"),
+    hlSession("codex", "01a0d379", "Update the founders page", 1790295411000),
+    hlSession("codex", "01a0d1eb", "Fix the contact form layout", 1790254372000),
+    hlSession("codex", "01a0d0de", "Add the team photos section", 1790228275000),
+    hlSession("codex", "01a0bf90", "Make the hero responsive", 1790210613000),
+    hlSession("codex", "01a0b990", "Set up the Next.js project", 1789919608000),
+  ];
+}
+const READABLE = [
+  { provider: "claude_code" as const, historyReadable: true, note: null },
+  { provider: "codex" as const, historyReadable: true, note: "History read with the cli Codex." },
+];
+function listOf(found: SessionListState | null, extra: Partial<SessionList> = {}): SessionList {
+  return { sessions: found?.sessions ?? null, notes: found?.notes ?? [], unread: found?.unread ?? [], message: null, busy: false, lookedAt: found?.lookedAt ?? null, look: async () => {}, unavailable: null, share: null, hostName: "this device", remote: null, ...extra } as SessionList;
+}
+function rows(markup: string): number {
+  return markup.split('<button type="button" class="nav-session').length - 1;
+}
+
+test("one native session is one conversation row, matched by identity, under a name follow-ups never change", () => {
+  const found = mergeSessionRead(null, `local|${HL_FOLDER}`, { providers: READABLE, sessions: hlSessions(), at: 10 });
+  // The conversation Pastey follows runs in the Claude Code session: that
+  // session is this conversation, shown once, as it.
+  const current = { provider: "claude_code" as const, sessionId: HL_CLAUDE };
+  const { listed, currentSession } = reconcileWithCurrent(found.sessions, current);
+  assert.equal(currentSession?.sessionId, HL_CLAUDE);
+  assert.equal(listed?.length, 6);
+  assert.ok(listed?.every((session) => session.provider === "codex"));
+  // Its name is the one its session records, its first prompt; a follow-up
+  // ("这个官网中创始人有几位") renames neither the row nor the session.
+  assert.equal(conversationTitle(currentSession, "这个文件夹做的什么"), "这个文件夹做的什么");
+  assert.equal(conversationTitle(null, "这个文件夹做的什么"), "这个文件夹做的什么", "before discovery knows it, its first prompt");
+  assert.equal(conversationTitle({ title: "Founders" }, "这个文件夹做的什么"), "Founders", "a name its user or provider gave it wins");
+  // The list shows the six Codex threads once each, and no second Claude Code row.
+  const markup = renderToStaticMarkup(createElement(SessionListView, { list: listOf(found), target: "local", openKey: null, liveKey: null, current, onOpen: () => {} }));
+  assert.equal(rows(markup), 6);
+  assert.doesNotMatch(markup, /这个文件夹做的什么/);
+  assert.match(markup, /Update the founders page/);
+  assert.match(markup, />Refresh</);
+  // Without a known session nothing is merged: all seven are listed.
+  assert.equal(rows(renderToStaticMarkup(createElement(SessionListView, { list: listOf(found), target: "local", openKey: null, liveKey: null, current: null, onOpen: () => {} }))), 7);
+
+  // Only provider and id count: never a title, a folder or a time.
+  const lookalike = hlSession("codex", "01a2ffff", "这个文件夹做的什么", 1793814533523);
+  const sameIdOtherAgent = hlSession("codex", HL_CLAUDE, "Elsewhere", 1);
+  const kept = reconcileWithCurrent([...found.sessions, lookalike, sameIdOtherAgent], current).listed!;
+  assert.ok(kept.some((session) => nativeSessionKey(session) === nativeSessionKey(lookalike)));
+  assert.ok(kept.some((session) => nativeSessionKey(session) === nativeSessionKey(sameIdOtherAgent)));
+  assert.equal(sameNativeSession(current, { provider: "codex", sessionId: HL_CLAUDE }), false);
+});
+
+test("a transient Codex discovery failure keeps its sessions, says so, and recovers on the next read", () => {
+  const scope = `local|${HL_FOLDER}`;
+  const first = mergeSessionRead(null, scope, { providers: READABLE, sessions: hlSessions(), at: 1_000 });
+  // Codex's history cannot be read this time; Claude Code's can.
+  const failed = mergeSessionRead(first, scope, {
+    providers: [READABLE[0], { provider: "codex", historyReadable: false, note: "Codex history unavailable: a read timed out" }],
+    sessions: hlSessions().filter((session) => session.provider === "claude_code"),
+    at: 2_000,
+  });
+  assert.equal(failed.sessions.length, 7, "a failed read is not a deletion");
+  assert.deepEqual(failed.unread, [{ provider: "codex", note: "Codex history unavailable: a read timed out", lastReadAt: 1_000 }]);
+  const markup = renderToStaticMarkup(createElement(SessionListView, { list: listOf(failed), target: "local", openKey: null, liveKey: null, current: null, onOpen: () => {} }));
+  assert.match(markup, /Codex history could not be read just now; its sessions are as found [^.]+\. Nothing was removed\./);
+  assert.equal(rows(markup), 7);
+  // A whole read that fails keeps the list too, and says so.
+  const unreachable = renderToStaticMarkup(createElement(SessionListView, { list: listOf(first, { message: "Session discovery stopped unexpectedly." }), target: "local", openKey: null, liveKey: null, current: null, onOpen: () => {} }));
+  assert.match(unreachable, /Could not read the sessions again: Session discovery stopped unexpectedly\. Showing what was found/);
+  assert.equal(rows(unreachable), 7);
+  // The next read that reaches Codex is exact again: a new thread appears,
+  // one deleted in Codex is gone, and the warning clears.
+  const recovered = mergeSessionRead(failed, scope, {
+    providers: READABLE,
+    sessions: [...hlSessions().filter((session) => session.sessionId !== "01a0b990"), hlSession("codex", "01a1b000", "Translate the about page", 1793900000000, "pastey")],
+    at: 3_000,
+  });
+  assert.deepEqual(recovered.unread, []);
+  assert.equal(recovered.sessions.length, 7);
+  assert.equal(recovered.sessions[0].sessionId, "01a1b000", "newest activity first");
+  assert.ok(!recovered.sessions.some((session) => session.sessionId === "01a0b990"));
+  // Nothing is carried from another folder or device.
+  const elsewhere = mergeSessionRead(first, "host:win|scope:0123456789abcdef", {
+    providers: [READABLE[0], { provider: "codex", historyReadable: false, note: null }],
+    sessions: [],
+    at: 4_000,
+  });
+  assert.deepEqual(elsewhere.sessions, []);
+  assert.deepEqual(elsewhere.unread, [{ provider: "codex", note: null, lastReadAt: null }]);
+});
+
+test("an older discovery answer never replaces a newer one, per folder and device", () => {
+  const gate = createLookGate();
+  const older = gate.begin("local|/Users/me/HL_tech");
+  const newer = gate.begin("local|/Users/me/HL_tech");
+  const otherFolder = gate.begin("local|/Users/me/Pastey");
+  assert.equal(gate.isNewest("local|/Users/me/HL_tech", older), false);
+  assert.equal(gate.isNewest("local|/Users/me/HL_tech", newer), true, "a look of another folder does not supersede it");
+  assert.equal(gate.isNewest("local|/Users/me/Pastey", otherFolder), true);
+  const browser = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
+  // An answer is kept only as its folder's newest, and shown only while that
+  // folder (on that device) is the one shown.
+  assert.match(browser, /if \(!gate\.current\.isNewest\(key, lookNumber\)\) return;\s*known\.current\.set\(key, next\);\s*if \(shown\.current === key\) \{ setFound\(next\.found\); setMessage\(next\.message\); setBusy\(false\); \}/);
+  assert.match(browser, /const scopeKey = choice\?\.kind === "local" \? `local\|\$\{choice\.path\}`/);
+  // A withdrawn share is authority, not a failed read: nothing earlier stays.
+  assert.match(browser, /if \(response\.outcome === "not_authorized"\) \{\s*\/\/ Withdrawn authority, not a failed read: nothing earlier stays\.\s*next = \{ found: null,/);
+  assert.match(browser, /\} catch \(error\) \{\s*next = \{ found: earlier, message:/);
+});
+
+test("a conversation learns its native session on this device only, keeps it across follow-ups, and the list is read again when a local task ends", () => {
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  // Asked once the Agent confirmed the conversation, only for this device's
+  // own task, and kept with the conversation it belongs to.
+  assert.match(bindings, /invoke\("get_native_agent_task_session", \{ taskId \}\)/);
+  assert.match(lifecycle, /if \(!taskId \|\| !conversationConfirmed \|\| taskHostRef !== null \|\| origin\?\.kind !== "new" \|\| askedSessionOf\.current === taskId\) return;/);
+  assert.match(lifecycle, /if \(shown\?\.kind !== "new" \|\| shown\.conversationId !== conversationId \|\| sameNativeSession\(shown\.nativeSession, session\)\) return shown;/);
+  // A follow-up runs in the same native session, so it keeps the identity.
+  assert.match(lifecycle, /const nextOrigin: TaskOrigin = \{ kind: "new", conversationId, place, agentId, \.\.\.\(sameConversation\?\.nativeSession \? \{ nativeSession: sameConversation\.nativeSession \} : \{\}\) \};/);
+  // Another device's task never has one here.
+  assert.match(workspace, /const currentSession: NativeSessionIdentity \| null = ownsCurrent && taskTarget === "local" && agent\.origin\?\.kind === "new" \? agent\.origin\.nativeSession \?\? null : null;/);
+  assert.match(workspace, /current=\{ownsCurrent \? currentSession : null\}/);
+  // Opening that session from anywhere opens this conversation, with its turns in order.
+  assert.match(workspace, /const openSession = \(session: SessionRef\) => setView\(sameNativeSession\(session, currentSession\)\s*\? \{ kind: "current" \}/);
+  assert.match(workspace, /const currentTitle = conversationTitle\(reconcileWithCurrent\(list\.sessions, currentSession\)\.currentSession, agent\.pastTurns\[0\]\?\.prompt \?\? agent\.prompt\);/);
+  // Read again once a task this device ran in this folder has ended, not by polling.
+  assert.match(workspace, /if \(!endedHere \|\| seenRunning\.current !== endedHere\) return;\s*seenRunning\.current = null;\s*void lookAgain\(\);/);
+  assert.doesNotMatch(readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8"), /setInterval/);
+  // The identity never travels over a Bridge: no Room Control code uses it.
+  const roomControl = [readFileSync("src-tauri/src/room_control.rs", "utf8"), ...readdirSync("src-tauri/src/room_control", { recursive: true })
+    .filter((name) => String(name).endsWith(".rs"))
+    .map((name) => readFileSync(`src-tauri/src/room_control/${name}`, "utf8"))];
+  assert.ok(roomControl.every((source) => !source.includes("local_task_native_session") && !source.includes("NativeSessionRefV1")));
 });

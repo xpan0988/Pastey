@@ -32,10 +32,12 @@ use admission::{
 };
 #[cfg(test)]
 use capability::codex::codex_compatibility_at;
+pub(crate) use capability::NativeSessionRefV1 as LocalNativeSessionRefV1;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
 use capability::{
     codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1,
     NativeInvocationOutcomeV1, NativeInvocationProgressV1, NativeInvocationRunV1,
+    NativeSessionRefV1,
 };
 
 const MAX_LINE_BYTES: usize = 64 * 1024;
@@ -907,7 +909,15 @@ struct ObservedTaskProgressV1 {
     remote_decisions: bool,
     conversation: Option<NativeConversationBindingV1>,
     durable_paths: Option<crate::storage::AppPaths>,
+    /// For a conversation of this Host's own user: the adapter that names
+    /// its native session, and where Core keeps that name per task.
+    local_session: Option<(Arc<dyn NativeCapabilityAdapterV1>, LocalTaskSessionsV1)>,
 }
+
+/// The native session each of this Host's own user's tasks runs in, as its
+/// adapter named it once the conversation was confirmed. Process-local and
+/// never sent over a Bridge.
+type LocalTaskSessionsV1 = Arc<Mutex<HashMap<String, NativeSessionRefV1>>>;
 
 impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
     fn awaiting_native_decision(&self, waiting: bool) {
@@ -991,6 +1001,13 @@ impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
         continuity: NativeConversationContinuityV1,
         continuation: OpaqueCapabilityPayloadV1,
     ) {
+        if let Some((adapter, sessions)) = &self.local_session {
+            if let (Some(session), Ok(mut sessions)) =
+                (adapter.native_session(&continuation), sessions.lock())
+            {
+                sessions.insert(self.task_id.clone(), session);
+            }
+        }
         // The native conversation exists whatever becomes of this task, so
         // it is kept even if the task was cancelled meanwhile. A burned
         // Bridge's tombstone refuses it inside the same storage transaction.
@@ -1161,6 +1178,9 @@ pub(crate) struct NativeAgentServiceV1 {
     /// The conversation key each Bridge-owned task ran in, so Burn can end
     /// that conversation's live native state.
     task_conversations: HashMap<String, String>,
+    /// The native session of each conversation task this Host's own user
+    /// started, for this Host's renderer only.
+    local_task_sessions: LocalTaskSessionsV1,
     /// The device, proven in its session, that requested each Bridge task:
     /// the only one whose user may decide that task's native requests.
     /// Process-local; a restart never resumes a native turn.
@@ -1225,6 +1245,7 @@ impl NativeAgentServiceV1 {
             movement_devices: HashMap::new(),
             full_access_tasks: HashSet::new(),
             task_conversations: HashMap::new(),
+            local_task_sessions: Arc::default(),
             task_requesters: HashMap::new(),
             workspace_movements: HashMap::new(),
             durable_paths: None,
@@ -1764,6 +1785,7 @@ impl NativeAgentServiceV1 {
             remote_decisions: false,
             conversation: None,
             durable_paths: self.durable_paths.clone(),
+            local_session: None,
         };
         let held_key = self.task_exclusivity.get(task_id).cloned();
         if let Err(error) = self.observe_invocation(task_id.to_owned(), run, held_key, progress) {
@@ -1856,6 +1878,14 @@ impl NativeAgentServiceV1 {
                 crate::storage::update_native_agent_observed_task_if_present(paths, task_id, &task);
         }
     }
+    /// The native session a task this Host's own user started runs in, once
+    /// its Agent confirmed the conversation: what lets this Host's renderer
+    /// show one conversation once, beside session discovery. `None` for a
+    /// Bridge peer's task, an unconfirmed one, or after a restart.
+    pub(crate) fn local_task_native_session(&self, task_id: &str) -> Option<NativeSessionRefV1> {
+        self.local_task_sessions.lock().ok()?.get(task_id).cloned()
+    }
+
     /// Session discovery's sources, taken under the service lock and used
     /// after the caller releases it: discovery launches bounded read-only
     /// processes. The threads Pastey's own app-servers have open are named,
@@ -4951,12 +4981,17 @@ impl NativeAgentServiceV1 {
             self.task_recoveries.insert(task_id.clone(), recovery);
         }
         self.persist_envelope(&task_id, Some(&prepared.identity_digest))?;
+        let local_session = conversation
+            .as_ref()
+            .filter(|(binding, _)| binding.owner == NativeConversationOwnerV1::Local)
+            .map(|_| (adapter.clone(), self.local_task_sessions.clone()));
         let progress = ObservedTaskProgressV1 {
             tasks: self.tasks.clone(),
             task_id: task_id.clone(),
             remote_decisions: self.task_requesters.contains_key(&task_id),
             conversation: conversation.map(|(binding, _)| binding),
             durable_paths: self.durable_paths.clone(),
+            local_session,
         };
         self.observe_invocation(task_id, started.run, prepared.exclusivity, progress)?;
         Ok(status)
@@ -8982,6 +9017,22 @@ done
             elsewhere.conversation,
             Some(NativeConversationContinuityV1::New)
         );
+        // This device's renderer learns the thread of its own user's
+        // conversations, as discovery names it; never a peer's.
+        let named = |task_id: &str| {
+            service
+                .local_task_native_session(task_id)
+                .map(|session| (session.provider, session.session_id))
+        };
+        assert_eq!(named(&local.task_id), Some(("codex", "thread-1".into())));
+        assert_eq!(
+            named(&elsewhere.task_id).map(|(provider, _)| provider),
+            Some("codex")
+        );
+        assert_ne!(named(&elsewhere.task_id), named(&local.task_id));
+        for peer in [&peer_a, &peer_b, &other_bridge] {
+            assert_eq!(named(&peer.task_id), None);
+        }
         service.shutdown();
         drop(service);
 

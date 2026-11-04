@@ -8,6 +8,7 @@ import {
   discardNativeAgentConflictResult,
   cancelRemoteNativeAgentTask,
   getNativeAgentRecoveryProjection,
+  getNativeAgentTaskSession,
   getNativeAgentTaskStatus,
   getNativeAgentWorkspaceMovementStatus,
   getNativeV2PlanStatus,
@@ -30,6 +31,7 @@ import {
   type NativeV2ProductState,
 } from "../../lib/tauri";
 import { ownAsyncDisposer } from "../../lib/subscriptionLifecycle";
+import { sameNativeSession, type NativeSessionIdentity } from "../../lib/sessionList";
 
 const ONE_DAY_SECONDS = 24 * 60 * 60;
 
@@ -301,8 +303,10 @@ export type ConversationPlace =
  * continuation always names its session. */
 export type TaskOrigin =
   /** `agentId` is the Agent the conversation runs with; absent, Codex (a
-   * conversation remembered from before Claude Code could be chosen). */
-  | { kind: "new"; conversationId: string; place: ConversationPlace; agentId?: ConversationAgentId }
+   * conversation remembered from before Claude Code could be chosen).
+   * `nativeSession` is the native session it runs in, once this device's
+   * Agent confirmed it: what reconciles it with discovered sessions. */
+  | { kind: "new"; conversationId: string; place: ConversationPlace; agentId?: ConversationAgentId; nativeSession?: NativeSessionIdentity }
   | { kind: "session"; conversationId: string; session: ContinuedSession };
 
 /** The Agent a new conversation runs with. */
@@ -713,6 +717,28 @@ export function useNativeAgentTask(roomId: string) {
     return () => { cancelled = true; };
   }, [returnRetryObservation, roomId]);
 
+  // Once this device's Agent confirms a new conversation's native session,
+  // remember which one it is (this device only, never over a Bridge), so the
+  // conversation and its discovered session are shown as one.
+  const askedSessionOf = useRef<string | null>(null);
+  const conversationConfirmed = !!status?.conversation;
+  useEffect(() => {
+    const taskId = status?.taskId;
+    if (!taskId || !conversationConfirmed || taskHostRef !== null || origin?.kind !== "new" || askedSessionOf.current === taskId) return;
+    askedSessionOf.current = taskId;
+    const conversationId = origin.conversationId;
+    void getNativeAgentTaskSession(taskId).then((session) => {
+      if (!session) return;
+      setOrigin((shown) => {
+        if (shown?.kind !== "new" || shown.conversationId !== conversationId || sameNativeSession(shown.nativeSession, session)) return shown;
+        const next: TaskOrigin = { ...shown, nativeSession: { provider: session.provider, sessionId: session.sessionId } };
+        const remembered = rememberedNativeTask(roomId);
+        if (remembered?.taskId === taskId) rememberStartedNativeTask(roomId, { ...remembered, origin: next });
+        return next;
+      });
+    }).catch(() => { if (askedSessionOf.current === taskId) askedSessionOf.current = null; });
+  }, [conversationConfirmed, origin, roomId, status?.taskId, taskHostRef]);
+
   /** Records a turn this device just started. A follow-up stays in the
    * new conversation the shown task belongs to, after its earlier turns;
    * anything else begins a new conversation. */
@@ -720,7 +746,9 @@ export function useNativeAgentTask(roomId: string) {
     const sameConversation = followUp && origin?.kind === "new" && conversationAgent(origin) === agentId ? origin : null;
     const conversationId = sameConversation?.conversationId ?? crypto.randomUUID();
     const turns = sameConversation && status && prompt !== null ? [...pastTurns, { taskId: status.taskId, prompt, status }] : [];
-    const nextOrigin: TaskOrigin = { kind: "new", conversationId, place, agentId };
+    // A follow-up runs in the same native session; a new conversation's is
+    // learned once its Agent confirms it.
+    const nextOrigin: TaskOrigin = { kind: "new", conversationId, place, agentId, ...(sameConversation?.nativeSession ? { nativeSession: sameConversation.nativeSession } : {}) };
     setOrigin(nextOrigin);
     setPrompt(sent);
     setPastTurns(turns);

@@ -50,14 +50,15 @@ use uuid::Uuid;
 use super::super::{
     CapabilityAvailabilityV1, NativeCapabilityAdapterV1, NativeConversationV1,
     NativeInvocationOutcomeV1, NativeInvocationProgressV1, NativeInvocationRunV1,
-    OpaqueCapabilityPayloadV1, PreparedConversationV1, PreparedInvocationV1, StartedInvocationV1,
+    NativeSessionRefV1, OpaqueCapabilityPayloadV1, PreparedConversationV1, PreparedInvocationV1,
+    StartedInvocationV1,
 };
 use super::{claude_command, outcome, run_command, ClaudeCodeNativeAdapterV1, RecoveryV1};
 use crate::error::{AppError, AppResult};
 use crate::native_agent::sessions::claude::{
     claude_config_dir, find_cli, live_status, project_dir,
 };
-use crate::native_agent::sessions::now_ms;
+use crate::native_agent::sessions::{now_ms, PROVIDER_CLAUDE_CODE};
 use crate::native_agent::{
     NativeAgentCapabilityStateV1, NativeConversationContinuityV1, NativeTurnOutcomeV1,
     MAX_TASK_BYTES,
@@ -674,6 +675,13 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
         recovery: &OpaqueCapabilityPayloadV1,
     ) -> Option<Box<dyn NativeInvocationRunV1>> {
         self.reobserver.reobserve(task_id, recovery)
+    }
+
+    fn native_session(
+        &self,
+        continuation: &OpaqueCapabilityPayloadV1,
+    ) -> Option<NativeSessionRefV1> {
+        NativeSessionRefV1::from_continuation(PROVIDER_CLAUDE_CODE, continuation, "sessionId")
     }
 }
 

@@ -310,6 +310,13 @@ export function startNativeClaudeCodeTask(workspace: string, task: string, newCo
   return invoke("start_native_claude_code_task", { workspace, task, newConversation });
 }
 
+/** The native session (as session discovery names it) a conversation task
+ * this device's user started runs in, once its Agent confirmed it; null
+ * otherwise. This device only: it never travels over a Bridge. */
+export function getNativeAgentTaskSession(taskId: string): Promise<{ provider: NativeSessionProvider; sessionId: string } | null> {
+  return invoke("get_native_agent_task_session", { taskId });
+}
+
 export function getNativeAgentTaskStatus(taskId: string): Promise<NativeAgentTaskStatus> {
   return invoke("get_native_agent_task_status", { taskId });
 }

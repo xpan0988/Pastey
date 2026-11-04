@@ -365,11 +365,13 @@ fn session_from(
         provider: PROVIDER_CLAUDE_CODE,
         session_id,
         workspace: workspace.to_string_lossy().into_owned(),
+        // A name its user or Claude Code gave it, else what began it: a
+        // follow-up never renames a conversation.
         title: transcript
             .custom_title
             .as_deref()
-            .or(transcript.last_prompt.as_deref())
             .or(transcript.first_prompt.as_deref())
+            .or(transcript.last_prompt.as_deref())
             .map(|title| quote(title, MAX_TITLE_CHARS)),
         origin: match transcript.entrypoint.as_deref() {
             Some("claude-desktop") => "desktop",

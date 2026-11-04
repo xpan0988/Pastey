@@ -330,4 +330,45 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     ) -> Option<Box<dyn NativeInvocationRunV1>> {
         None
     }
+
+    /// The native session a conversation `continuation` this adapter
+    /// reported names, in session discovery's terms, so this Host's own
+    /// renderer can show one conversation once. `None` when it names none.
+    fn native_session(
+        &self,
+        _continuation: &OpaqueCapabilityPayloadV1,
+    ) -> Option<NativeSessionRefV1> {
+        None
+    }
+}
+
+/// One native session as session discovery names it: its provider
+/// (`claude_code`, `codex`) and the provider's own id. Host-private: given
+/// only to this Host's own renderer, for tasks this Host's user started,
+/// never over a Bridge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeSessionRefV1 {
+    pub(crate) provider: &'static str,
+    pub(crate) session_id: String,
+}
+
+impl NativeSessionRefV1 {
+    /// The id under `field` of a continuation, when it is one an id can be.
+    pub(super) fn from_continuation(
+        provider: &'static str,
+        continuation: &OpaqueCapabilityPayloadV1,
+        field: &str,
+    ) -> Option<Self> {
+        let id = continuation.value().get(field)?.as_str()?;
+        (!id.is_empty()
+            && id.len() <= 128
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .then(|| Self {
+            provider,
+            session_id: id.to_owned(),
+        })
+    }
 }

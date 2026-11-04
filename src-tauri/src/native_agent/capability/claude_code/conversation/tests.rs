@@ -263,16 +263,20 @@ fn a_follow_up_continues_exactly_that_session_and_a_new_conversation_begins_anot
             .unwrap();
         let status = wait_terminal(&service, &started.task_id);
         wait_released(&service, &fixture.workspace);
-        status
+        // What this device's renderer learns of the task's session.
+        let session = service.local_task_native_session(&started.task_id);
+        (status, session)
     };
-    assert_eq!(finish(true).state, NativeAgentTaskStateV1::Completed);
-    let continued = finish(false);
+    let (first_status, first_session) = finish(true);
+    assert_eq!(first_status.state, NativeAgentTaskStateV1::Completed);
+    let (continued, continued_session) = finish(false);
     assert_eq!(continued.state, NativeAgentTaskStateV1::Completed);
     assert_eq!(
         continued.conversation,
         Some(NativeConversationContinuityV1::Continued)
     );
-    assert_eq!(finish(true).state, NativeAgentTaskStateV1::Completed);
+    let (another, another_session) = finish(true);
+    assert_eq!(another.state, NativeAgentTaskStateV1::Completed);
     let runs = fixture.runs();
     let first = runs[0].rsplit(' ').next().unwrap().to_owned();
     assert!(runs[1].ends_with(&format!("--resume {first}")), "{runs:?}");
@@ -280,6 +284,19 @@ fn a_follow_up_continues_exactly_that_session_and_a_new_conversation_begins_anot
         runs[2].contains("--session-id ") && !runs[2].ends_with(&first),
         "{runs:?}"
     );
+    // One conversation, one native session, named as discovery names it:
+    // the follow-up's task names the first one's session, a new
+    // conversation another.
+    let first_session = first_session.expect("the first turn names its session");
+    assert_eq!(
+        (first_session.provider, first_session.session_id.as_str()),
+        ("claude_code", first.as_str())
+    );
+    assert_eq!(continued_session.as_ref(), Some(&first_session));
+    let another_session = another_session.expect("a new conversation names its session");
+    assert_eq!(another_session.provider, "claude_code");
+    assert_ne!(another_session.session_id, first);
+    assert!(runs[2].ends_with(&another_session.session_id), "{runs:?}");
 }
 
 #[test]
@@ -693,6 +710,40 @@ fn installed_claude_code_conversation_runs_and_continues_through_pastey() {
     assert!(text(&follow_up).unwrap().contains("pastey-claude-one"));
     wait_released(&service, &workspace);
     assert!(!claude_runs_in(&workspace), "no Claude Code process left");
+
+    // One conversation is one native session: both turns name the same
+    // one, and Claude Code's own record of the folder lists it exactly once,
+    // under its first prompt (a follow-up renames nothing). Earlier runs'
+    // sessions here share that title and stay separate.
+    let session = service
+        .local_task_native_session(&first.task_id)
+        .expect("the first turn names its session");
+    assert_eq!(
+        service
+            .local_task_native_session(&follow_up.task_id)
+            .as_ref(),
+        Some(&session)
+    );
+    let (discovered, _) = crate::native_agent::sessions::ClaudeSessionSourceV1::installed()
+        .discover(&[workspace.canonicalize().unwrap()]);
+    let rows: Vec<_> = discovered
+        .iter()
+        .filter(|found| {
+            found.provider == session.provider && found.session_id == session.session_id
+        })
+        .collect();
+    eprintln!(
+        "session {}: {} row(s) of {} in the folder, title {:?}",
+        session.session_id,
+        rows.len(),
+        discovered.len(),
+        rows.first().and_then(|row| row.title.as_deref())
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].title.as_deref(),
+        Some("Reply with exactly: pastey-claude-one")
+    );
     let _ = fs::remove_dir_all(root);
 }
 

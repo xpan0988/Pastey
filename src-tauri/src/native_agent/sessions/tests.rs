@@ -422,6 +422,65 @@ fn claude_store() -> (PathBuf, PathBuf, PathBuf) {
     (root, config, workspace)
 }
 
+/// As Claude Code records a conversation Pastey continued (HL_tech, 2.1.317):
+/// each prompt is followed by a `last-prompt` entry naming it. The session
+/// is one, and keeps the name its first prompt gave it.
+#[cfg(unix)]
+#[test]
+fn a_claude_code_follow_up_never_renames_its_session() {
+    const FOLLOWED_UP: &str = "66666666-6666-4666-8666-666666666666";
+    let (root, config, workspace) = claude_store();
+    let followed_up = |custom_title: Option<&str>| {
+        let mut entries = vec![
+            user(
+                &workspace,
+                "2026-10-17T05:00:00Z",
+                "What does this folder do?",
+            ),
+            json!({"type": "last-prompt", "lastPrompt": "What does this folder do?", "sessionId": FOLLOWED_UP}),
+            assistant(
+                &workspace,
+                "2026-10-17T05:00:05Z",
+                json!([{"type": "text", "text": "A website."}]),
+                "end_turn",
+            ),
+            user(
+                &workspace,
+                "2026-10-17T05:01:00Z",
+                "How many founders does it list?",
+            ),
+            json!({"type": "last-prompt", "lastPrompt": "How many founders does it list?", "sessionId": FOLLOWED_UP}),
+            assistant(
+                &workspace,
+                "2026-10-17T05:01:05Z",
+                json!([{"type": "text", "text": "Three."}]),
+                "end_turn",
+            ),
+        ];
+        if let Some(title) = custom_title {
+            entries.push(
+                json!({"type": "custom-title", "customTitle": title, "sessionId": FOLLOWED_UP}),
+            );
+        }
+        write_transcript(&config, &encoded(&workspace), FOLLOWED_UP, &entries);
+        let source = ClaudeSessionSourceV1::at(&config, Some(&fake_claude(&root, "[]")));
+        let (sessions, _) = source.discover(std::slice::from_ref(&workspace));
+        let rows: Vec<_> = sessions
+            .into_iter()
+            .filter(|session| session.session_id == FOLLOWED_UP)
+            .collect();
+        assert_eq!(rows.len(), 1, "one native session is one row");
+        rows[0].title.clone()
+    };
+    assert_eq!(
+        followed_up(None).as_deref(),
+        Some("What does this folder do?")
+    );
+    // Renamed by its user (or named by Claude Code): that name wins.
+    assert_eq!(followed_up(Some("Founders")).as_deref(), Some("Founders"));
+    let _ = fs::remove_dir_all(root);
+}
+
 #[cfg(unix)]
 #[test]
 fn claude_sessions_are_found_only_in_authorized_workspaces_with_live_state_from_claude() {

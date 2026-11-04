@@ -1234,6 +1234,21 @@ pub fn start_native_claude_code_task(
         .map_err(|error| error.message())
 }
 
+/// The native session (provider and id, as session discovery names it) a
+/// conversation task this device's user started runs in, once its Agent
+/// confirmed it. Local only: it lets this device show one conversation
+/// once beside its discovered sessions, and never travels over a Bridge.
+#[tauri::command]
+pub fn get_native_agent_task_session(
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Option<crate::native_agent::LocalNativeSessionRefV1> {
+    state
+        .native_agents
+        .lock()
+        .local_task_native_session(&task_id)
+}
+
 /// Observes one native capability through the existing Layer 4
 /// current-session resolver. Compatibility is only a bounded Host fact: it
 /// does not select the Host or grant invocation, Transfer, or Review authority.

@@ -40,9 +40,11 @@ use serde_json::{json, Value};
 use super::{
     CapabilityAvailabilityV1, ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1,
     NativeInvocationOutcomeV1, NativeInvocationProgressV1, NativeInvocationRunV1,
-    OpaqueCapabilityPayloadV1, PreparedConversationV1, PreparedInvocationV1, StartedInvocationV1,
+    NativeSessionRefV1, OpaqueCapabilityPayloadV1, PreparedConversationV1, PreparedInvocationV1,
+    StartedInvocationV1,
 };
 use crate::error::{AppError, AppResult};
+use crate::native_agent::sessions::PROVIDER_CODEX as PROVIDER_CODEX_SESSIONS;
 use crate::native_agent::{
     invalid, native_decision_content_digest, NativeAgentCapabilityStateV1, NativeAgentServiceV1,
     NativeConversationContinuityV1, NativeDecisionContentV1, NativeDecisionKindV1,
@@ -876,6 +878,13 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
     /// of its controller's SIGKILL).
     fn native_execution_ends_with_pastey(&self) -> bool {
         true
+    }
+
+    fn native_session(
+        &self,
+        continuation: &OpaqueCapabilityPayloadV1,
+    ) -> Option<NativeSessionRefV1> {
+        NativeSessionRefV1::from_continuation(PROVIDER_CODEX_SESSIONS, continuation, "threadId")
     }
 }
 
