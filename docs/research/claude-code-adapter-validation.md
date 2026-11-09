@@ -453,7 +453,7 @@ The re-observer read the transcript, then asked the registry. A turn that ended 
 
 ### H6. Remaining risks
 
-- **The app itself is not yet driven on Windows** (W-CC4: no console window, the UI's states, a forced quit from Task Manager, a paired Mac's view). H7 covers Pastey's lifecycle code, not the Tauri app or its IPC.
+- **A paired Mac's view of the capability (W-CC4 step 8) is not run** (H8); the app's own steps 1–7 are.
 - **Broker-started processes** (WMI, Task Scheduler, services, COM servers) are outside any job. The same class of escape exists on macOS (a process leaving its group).
 - **Mapped network drives in trust keys** are resolved like local paths; an unreachable share can delay a start. UNC keys count only as spelled.
 - **macOS was not built or tested here** (no cross toolchain on this Host). The Unix code paths change only by `cfg` structure and the H5 fix; the trust matching on Unix now also accepts a key that resolves to the same folder (for example `/tmp/…` for `/private/tmp/…`).
@@ -470,4 +470,21 @@ Same Host, the user's own standalone Claude Code (`%USERPROFILE%\.local\bin\clau
   - **Pastey killed with `TerminateProcess` while the tool ran:** `claude` and the `ping` were gone **17–20 ms** later (three runs), with nobody stopping them. The restored task was `native_agent_outcome_unknown`, then observed `interrupted` (`native_agent_interrupted`) from the transcript, never failed or completed; the run's session holds the prompt once.
 - **W-CC3:** after every run, no `ping -n 90` and no `claude -p` process existed; the monitor recorded every process of the runs as ended.
 - **First attempt, corrected in the tests only:** headless Claude Code denied the Bash call (it would have asked for approval), so the turn completed before Stop and the Stop test failed as it should. The tool tests now allow `Bash(ping:*)` in their disposable folder's own `.claude\settings.local.json`, and wait for the real `ping` before stopping or killing. Separately, the crash test counted the prompt across earlier runs' sessions of the folder, which Claude Code keeps; it now counts only this run's.
-- **Not run:** W-CC4, the app's own steps, including the paired Mac's view.
+- **Not run here:** W-CC4; see H8.
+
+### H8. The app on Windows (W-CC4, 2026-11-09)
+
+The real app (`target\debug\pastey.exe`, this branch, with `WINDOWS_ACCEPTED_VERSION` set to `(2, 1, 319)` for the run only and restored to `None` afterwards), on throwaway data (`PASTEY_APP_DATA_DIR`), with the same signed-in Claude Code 2.1.319. Desktop control was not available to the session, so the page was driven through WebView2's DevTools port: real mouse and key events in the app's own page, through its real IPC. Two substitutions, both outside what is under test: folders were added through the renderer's own stored folder list instead of Windows' folder dialog (which the DevTools port cannot answer), and the backend's folder rule in step 7 was exercised by calling the app's own `start_native_claude_code_task` command, because the renderer refuses a second task in the same Bridge before it reaches the backend. A watcher logged every new visible top-level window every 25 ms; a process monitor logged every `claude`, `bash`, `ping` and `conhost`.
+
+| # | Result |
+|---|---|
+| 1 | Settings → Agents: "Claude Code is ready … This device only. Available"; the Bridge's Agents tab: "Codex ready · Claude Code ready". **Pass.** |
+| 2 | New conversation → Claude Code → "Reply with the word ok": Completed, "ok"; Task details: `agent.coding.claude_code_conversation`, completed, Conversation new. No console window appeared at any point of the run (0 console-class windows across 7 `claude -p` runs and every probe). **Pass.** |
+| 3 | "What did you reply last time?": Completed, "I replied with "ok"."; Conversation continued; Claude Code holds both prompts in one session. **Pass.** |
+| 4 | A Bash `ping -n 120` turn, Stop after ~10 s: the `ping` ended within 0.7 s and `claude` within 2.6 s; the task was recorded `native_agent_cancelled` only after that; Claude Code's transcript records its own interrupt. **Pass**, with the renderer finding below. |
+| 5 | Same turn, Pastey killed with `taskkill /F` (as Task Manager's End task): `claude` and the `ping` were gone by the monitor's next poll, under 0.42 s. After relaunch the task was `interrupted` / `native_agent_interrupted` (the "outcome unknown" phase had already been resolved from the transcript by the first look), never failed or stopped; the folder list shows the session "Interrupted (inferred)"; the prompt is in its session once. **Pass.** |
+| 6 | A never-trusted folder with `.claude\settings.json`: "Did not start · nothing ran", naming `.claude/settings.json`; no `claude -p` started and Claude Code has no record of the folder. The trust-acceptance half was not driven (it needs Claude Code's interactive trust prompt); the `trusted` folder's own `.claude\settings.local.json` ran in steps 2–5 only through Claude Code's `C:/Users/admin/Pastey` trust record. **Pass (refusal); acceptance half covered by the repository's recorded trust.** |
+| 7 | While a turn held `trusted`: the junction alias, the upper-case spelling, the plain and verbatim (`\\?\`) forms and the parent folder were all refused before anything started ("already has an unresolved invocation for this resource"); the sibling folder started at once and completed. Once free, the junction ran and was recorded under the canonical folder. **Pass** (backend through the app's command; the UI shows "Claude Code is working on another task in this Bridge" for any second task). |
+| 8 | A paired Mac's view (Device details → Agents): **not run**, no Mac. Covered only by `no_bridge_peer_learns_of_it_or_can_invoke_it` and Core's refusal of a Bridge invocation of a capability without peer protocols. |
+
+**Renderer finding (all platforms, not Windows-specific).** After Stop, the task's headline reads "Stopped" while its code is still `native_agent_cancel_requested`, that is, before the native run is confirmed to have ended (here `claude` ran 2.3 s longer). `nativeTaskOutcome.ts` words every `cancelled` state "Stopped" except `native_agent_full_access_revoked` and `native_agent_cancel_delivery_uncertain`. The backend's record is right; the wording claims a stop before it is shown.
