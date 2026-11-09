@@ -32,6 +32,7 @@ import {
 } from "../../lib/tauri";
 import { ownAsyncDisposer } from "../../lib/subscriptionLifecycle";
 import { sameNativeSession, type NativeSessionIdentity } from "../../lib/sessionList";
+import { STOP_PENDING } from "../../lib/nativeTaskOutcome";
 
 const ONE_DAY_SECONDS = 24 * 60 * 60;
 
@@ -100,7 +101,14 @@ export function nativeAgentConsequenceAbandonmentRequired(
 export function nativeAgentTaskNeedsObservation(status: NativeAgentTaskStatus | null): boolean {
   return !!status && (["queued", "running"].includes(status.state)
     || (status.state === "interrupted"
-      && ["native_agent_reconciliation_required", "native_agent_outcome_unknown"].includes(status.code ?? "")));
+      && ["native_agent_reconciliation_required", "native_agent_outcome_unknown"].includes(status.code ?? ""))
+    // Stopped is shown only once the Agent is seen to end.
+    || nativeAgentStopPending(status));
+}
+
+/** Stop was asked, and the Agent is not yet seen to have ended. */
+export function nativeAgentStopPending(status: NativeAgentTaskStatus | null): boolean {
+  return status?.state === "cancelled" && status.code === STOP_PENDING;
 }
 
 export const NATIVE_TEXT_OUTPUT_SCHEMA = "pastey-native-text-output-v1";
@@ -679,6 +687,20 @@ export function useNativeAgentTask(roomId: string) {
     return () => window.clearTimeout(timer);
   }, [movement]);
   useEffect(() => {
+    const stopping = status && nativeAgentStopPending(status) ? status : null;
+    if (!roomId || !stopping || !taskHostRef) return;
+    // Whether a stop on another device took effect is that device's fact:
+    // ask it (the same reconciliation as after a lost connection) until it
+    // shows the run ended or that it cannot confirm it.
+    const movementId = movement?.taskId === stopping.taskId ? movement.movementId : null;
+    const query = () => {
+      void reconcileRemoteNativeAgentTask(roomId, taskHostRef, stopping.taskId, movementId).catch(() => {});
+    };
+    query();
+    const timer = window.setInterval(query, 5_000);
+    return () => window.clearInterval(timer);
+  }, [roomId, taskHostRef, status?.taskId, status?.state, status?.code, movement?.taskId, movement?.movementId]);
+  useEffect(() => {
     if (!roomId || status?.state !== "completed"
       || movement?.state !== "returning_result" || movement.code
       || !movement.targetHostRef) return;
@@ -942,7 +964,7 @@ export function useNativeAgentTask(roomId: string) {
   /** Puts away a finished task's card. Only a task that has ended and needs
    * nothing more: its record stays with the Host, and nothing is undone. */
   const canDismiss = !!status && ["completed", "failed", "cancelled"].includes(status.state)
-    && !movement && !nativeAgentRecoveryRequiresAction(status, movement) && !busy;
+    && !nativeAgentStopPending(status) && !movement && !nativeAgentRecoveryRequiresAction(status, movement) && !busy;
   const dismiss = useCallback(() => {
     if (!canDismiss) return;
     setStatus(null);

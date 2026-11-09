@@ -19,6 +19,7 @@ import {
   nativeAgentRemoteReconciliationRequired,
   nativeAgentConsequenceAbandonmentRequired,
   nativeAgentTaskNeedsObservation,
+  nativeAgentStopPending,
   nativeAgentAwaitingNativeDecision,
   nativeAgentDisplayName,
   nativeAgentLifecycleLabel,
@@ -891,6 +892,50 @@ test("Full Access is one informed, directional decision made only on the control
   assert.match(lifecycle, /waiting for the other device to accept \(it has not given this device Full Access\)/);
 });
 
+test("Stop reads Stopped only once Rust shows the Agent ended, for every Agent and device", () => {
+  const local = { hostName: "this device", remote: false, continuing: false };
+  const remote = { hostName: "Home PC", remote: true, continuing: false };
+  const task = {
+    schemaVersion: "pastey-native-agent-task-v1" as const,
+    taskId: "task-stop",
+    agentId: "agent.coding.claude_code_conversation",
+    workspaceName: "workspace",
+    state: "cancelled" as const,
+    code: "native_agent_cancel_requested",
+  };
+  for (const agentName of ["Claude Code", "Codex"]) {
+    for (const context of [local, remote]) {
+      // Requested, still ending: never "Stopped", and still watched.
+      const pending = taskOutcome({ ...task, result: null }, { ...context, agentName });
+      assert.equal(pending.headline, "Stopping…", `${agentName} ${context.hostName}`);
+      assert.equal(pending.tone, "pending");
+      assert.match(pending.detail ?? "", /may still be working until it ends/);
+      assert.doesNotMatch(`${pending.headline} ${pending.detail}`, /^Stopped|Stopped at your request/);
+      const stages = taskStages(task, context);
+      assert.deepEqual(stages.find((stage) => stage.id === "result"), { id: "result", label: "Stopping", state: "current" });
+      // Confirmed by Rust: Stopped.
+      const confirmed = taskOutcome({ ...task, code: "native_agent_cancelled", result: null }, { ...context, agentName });
+      assert.equal(confirmed.headline, "Stopped");
+      assert.deepEqual(taskStages({ ...task, code: "native_agent_cancelled" }, context).find((stage) => stage.id === "result"), { id: "result", label: "Stopped", state: "stopped" });
+      // Requested, never confirmed: says so.
+      const uncertain = taskOutcome({ ...task, code: "native_agent_cancel_delivery_uncertain", result: null }, { ...context, agentName });
+      assert.equal(uncertain.headline, "Stop requested · not confirmed");
+      assert.equal(taskStages({ ...task, code: "native_agent_cancel_delivery_uncertain" }, context).find((stage) => stage.id === "result")!.label, "Stop requested");
+    }
+  }
+  // Only a pending stop keeps being observed; a settled one does not.
+  assert.equal(nativeAgentStopPending(task), true);
+  assert.equal(nativeAgentTaskNeedsObservation(task), true);
+  for (const code of ["native_agent_cancelled", "native_agent_cancel_delivery_uncertain", "native_agent_full_access_revoked"]) {
+    assert.equal(nativeAgentStopPending({ ...task, code }), false, code);
+    assert.equal(nativeAgentTaskNeedsObservation({ ...task, code }), false, code);
+  }
+  // A pending stop cannot be put away, and a remote one asks its Host.
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  assert.match(lifecycle, /!nativeAgentStopPending\(status\) && !movement/);
+  assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(roomId, taskHostRef, stopping\.taskId, movementId\)/);
+});
+
 test("Codex requests are shown as untrusted text and answered only once, by the requesting device", () => {
   const review: NativeDecisionReview = {
     reviewRef: "native-decision:r1",
@@ -1613,7 +1658,7 @@ test("a continuation is followed in the session it continues, and the list fills
   // A session's turns are kept by that session and device; another starts its own.
   assert.match(lifecycle, /const conversationId = `session:\$\{hostRef \?\? "local"\}:\$\{continuedSessionKey\(session\)\}`;/);
   // Only an ended task that needs nothing more can be put away.
-  assert.match(lifecycle, /const canDismiss = !!status && \["completed", "failed", "cancelled"\]\.includes\(status\.state\)\s*&& !movement && !nativeAgentRecoveryRequiresAction\(status, movement\) && !busy;/);
+  assert.match(lifecycle, /const canDismiss = !!status && \["completed", "failed", "cancelled"\]\.includes\(status\.state\)\s*&& !nativeAgentStopPending\(status\) && !movement && !nativeAgentRecoveryRequiresAction\(status, movement\) && !busy;/);
   // Evidence is one step away, never in the way of the conversation.
   assert.match(detail, /\{details && snapshot \? <SessionDetails snapshot=\{snapshot\} hostName=\{hostName\} \/> : null\}/);
 });

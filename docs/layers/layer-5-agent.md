@@ -198,6 +198,18 @@ The second native Agent of a conversation, beside Codex, on this Host only (`cap
 - **Windows folder identity and trust.** `claude` runs in the plain form of the canonical folder (`C:\…`, never `\\?\C:\…`), which Claude Code names its records after. A folder is one resource under any name that resolves to it: another case spelling, a junction, an 8.3 short name, the verbatim form, or a folder inside or around it. Claude Code records trust on Windows as `C:/…` with forward slashes; a trust key counts for the folder when it is spelled as the folder or, being a local absolute path, resolves to the same canonical folder (case, junction, symlink, short name). A network key counts only as spelled.
 - **Local only.** No peer protocol: not described to peers, and Core refuses a Bridge invocation of it.
 
+### Stop
+
+Stop revokes Pastey's authority first: the task is `cancelled` at once and no later result is taken. Whether the native run has ended is a separate fact, carried by the task's code, for every capability and device:
+
+| Code | Meaning | Shown |
+|---|---|---|
+| `native_agent_cancel_requested` | Stop asked; the run is not yet shown to have ended. Never final. | "Stopping…" (still observed) |
+| `native_agent_cancelled` | The run is shown ended: the adapter confirmed its stop, or its run finished, failed or was interrupted as the stop arrived, or it never started. | "Stopped" |
+| `native_agent_cancel_delivery_uncertain` | Nothing can show the run ended: the stop could not be delivered, the observer could not tell, no observer survives, or Pastey restarted with the stop pending under a capability that may outlive it. | "Stop requested · not confirmed" |
+
+A requested stop is settled when the observer ends (it records the code before it lets go of the task), at once when no observer exists for it, and at restart (`native_agent_cancelled` only where the capability's runs end with Pastey's process, as Codex's do). A requester's stop of a task on another Host is settled only by that Host's report, through the existing status and reconciliation messages: its run shown ended confirms it, its own unconfirmed stop leaves it unconfirmed, and nothing returns it to pending. While a remote stop is pending, the requesting device asks the executing Host through reconciliation. Folder occupancy does not depend on these codes: it is held until the observer exits.
+
 ### Native completion and consequence recovery
 
 Pastey persists only its outer task and movement facts: immutable correlation, Host-private Bridge binding, execution status, exact result snapshot/digest, and requester apply state. Agent execution, result capture, encrypted Return, conflict retention, result Apply, and movement completion are separate facts. A completed Agent task stays `Completed` if capture, Return, retention, Apply, or explicit recovery abandonment later fails. Recovery, Return retry, cancellation, and Burn never authorize a second Agent turn. Restart does not recreate a native process, session, or turn. Unproved Bridge-bound execution becomes interrupted/reconciliation-required, while a task still awaiting executor Review never started and becomes a definite non-start; an unbound local task that cannot be reconciled becomes terminal `failed` with `native_agent_interrupted_on_restart` and its unreachable envelope is removed, but only when its capability's native execution ends with Pastey's process. Otherwise (Claude Code's background sessions, or a capability no longer registered) the task becomes `interrupted` with `native_agent_outcome_unknown`: its envelope, folder and session stay held. When its adapter can, it observes the turn again until its end is seen; otherwise, and meanwhile, only this Host's user's Stop resolves it.

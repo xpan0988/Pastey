@@ -15,6 +15,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- **Stop no longer says "Stopped" before the Agent has stopped.** A stopped task read "Stopped" as soon as Stop was clicked, and its card stopped updating, so a run still ending (or one whose stop could not be confirmed) kept that word. It now reads "Stopping…" until Pastey sees the run end, then "Stopped", or "Stop requested · not confirmed" when nothing can show it ended. This holds for Codex and Claude Code, on this device and on another one, whose own report decides it.
 - **A Claude Code turn that finished while Pastey was checking on it after a restart could be recorded as interrupted.** The transcript is now read again once Claude Code's registry shows no process, so the recorded outcome is the one the transcript ends with.
 
 ## 2.0.0 — Pastey 2.0 — 2026-10-29

@@ -1400,23 +1400,124 @@ fn cancel_intent_wins_over_a_late_native_completion() {
         Some("native_agent_cancel_requested")
     );
     assert!(h.fake.cancel_requested(task));
+    // While the job still runs, neither side says it stopped.
+    assert_eq!(
+        h.requester_status(task).code.as_deref(),
+        Some("native_agent_cancel_requested")
+    );
     h.fake.release();
     let after = h.settle(task);
     // The job finished natively, but no completion or output is recorded.
+    // Its end is the evidence the stop needed: nothing runs now.
     assert_eq!(h.fake.progress(task), Some(2));
     assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
-    assert_eq!(after.code.as_deref(), Some("native_agent_cancel_requested"));
+    assert_eq!(after.code.as_deref(), Some("native_agent_cancelled"));
     assert_eq!(after.output, None);
-    assert_eq!(
-        h.deliver_status(task).state,
-        NativeAgentTaskStateV1::Cancelled
-    );
+    // The requester learns it from the executor's own status.
+    let delivered = h.deliver_status(task);
+    assert_eq!(delivered.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(delivered.code.as_deref(), Some("native_agent_cancelled"));
+    assert_eq!(delivered.output, None);
     h.reconcile(task).unwrap();
     assert_eq!(
         h.requester_status(task).state,
         NativeAgentTaskStateV1::Cancelled
     );
     assert_eq!(h.requester_status(task).output, None);
+}
+
+/// Stop on the requester: "Stop requested" until the executor shows its run
+/// ended, learned from the executor's own status or reconciliation.
+#[test]
+fn a_stop_is_confirmed_on_both_hosts_only_once_the_run_is_seen_to_end() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-stop-evidence";
+    h.fake.hold();
+    h.invoke(task, json!({ "steps": 2, "payload": "evidence" }));
+    assert_eq!(
+        h.deliver_status(task).state,
+        NativeAgentTaskStateV1::Running
+    );
+    // The requester's Stop has not reached the executor yet: the run goes
+    // on, and nothing it reports settles the stop.
+    h.requester.cancel_remote_task(task, PAIR_EXECUTOR).unwrap();
+    assert_eq!(
+        h.deliver_status(task).code.as_deref(),
+        Some("native_agent_cancel_requested")
+    );
+    h.reconcile(task).unwrap();
+    assert_eq!(
+        h.requester_status(task).code.as_deref(),
+        Some("native_agent_cancel_requested")
+    );
+    h.executor.cancel_bridge_task(CAP_BRIDGE, task).unwrap();
+    assert_eq!(
+        h.settle(task).code.as_deref(),
+        Some("native_agent_cancelled")
+    );
+    h.reconcile(task).unwrap();
+    let confirmed = h.requester_status(task);
+    assert_eq!(confirmed.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(confirmed.code.as_deref(), Some("native_agent_cancelled"));
+    assert_eq!(confirmed.output, None);
+}
+
+#[test]
+fn a_stop_the_executor_cannot_confirm_is_never_confirmed_on_the_requester() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-stop-unconfirmed";
+    h.fake.hold();
+    h.fake.complete_despite_cancel();
+    h.fake.lose_observation();
+    h.invoke(task, json!({ "steps": 2, "payload": "lost" }));
+    h.deliver_status(task);
+    h.requester.cancel_remote_task(task, PAIR_EXECUTOR).unwrap();
+    h.executor.cancel_bridge_task(CAP_BRIDGE, task).unwrap();
+    h.fake.release();
+    h.fake.drop_observation();
+    assert_eq!(
+        h.settle(task).code.as_deref(),
+        Some("native_agent_cancel_delivery_uncertain")
+    );
+    assert_eq!(
+        h.deliver_status(task).code.as_deref(),
+        Some("native_agent_cancel_delivery_uncertain")
+    );
+}
+
+#[test]
+fn stopping_a_task_that_never_started_is_confirmed_at_once() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-stop-unstarted";
+    let wire = h.send_invoke(task, json!({ "steps": 1, "payload": "review" }));
+    h.review_invoke(wire).unwrap();
+    let stopped = h.executor.cancel_bridge_task(CAP_BRIDGE, task).unwrap();
+    assert_eq!(stopped.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(stopped.code.as_deref(), Some("native_agent_cancelled"));
+    assert_eq!(h.total_starts(), 0);
+}
+
+/// A stop still pending when the executor's Pastey ends is settled at
+/// restart, by whether the capability's runs end with Pastey (this one's
+/// are threads of the process).
+#[test]
+fn a_stop_pending_at_restart_is_settled_by_the_capability_s_containment() {
+    let mut h = CapabilityPairV1::new();
+    let task = "task-cap-stop-restart";
+    h.fake.hold();
+    h.fake.complete_despite_cancel();
+    h.invoke(task, json!({ "steps": 2, "payload": "restart" }));
+    let requested = h.executor.cancel_bridge_task(CAP_BRIDGE, task).unwrap();
+    assert_eq!(
+        requested.code.as_deref(),
+        Some("native_agent_cancel_requested")
+    );
+    let held = h.fake.clone();
+    h.restart_executor();
+    let restored = h.executor.task_status(task).unwrap();
+    assert_eq!(restored.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(restored.code.as_deref(), Some("native_agent_cancelled"));
+    held.release();
 }
 
 #[test]

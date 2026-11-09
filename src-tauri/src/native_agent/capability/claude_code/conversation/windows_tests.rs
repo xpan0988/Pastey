@@ -342,6 +342,51 @@ fn no_bridge_peer_learns_of_it_or_can_invoke_it() {
     assert!(fixture.adapter().supported_protocols().is_empty());
 }
 
+/// With the Windows gate open and Claude Code available here, a peer is
+/// still told of Codex only: what this Host describes, and what a peer's
+/// view makes of it.
+#[test]
+fn with_the_gate_open_a_peer_still_sees_codex_only() {
+    let fixture = FixtureV1::new("complete");
+    fs::write(fixture.root.join("version"), "2.1.319 (Claude Code)\n").unwrap();
+    let claude = fixture.adapter();
+    claude.accept_windows_for_tests(Some((2, 1, 319)));
+    assert_eq!(
+        claude.availability_report().state,
+        NativeAgentCapabilityStateV1::Available
+    );
+    let codex = Arc::new(crate::native_agent::capability::codex::CodexNativeAdapterV1::default());
+    let service =
+        NativeAgentServiceV1::with_paths_and_adapters(fixture.paths(), vec![codex, claude.clone()])
+            .unwrap();
+    let facts = service.native_capability_facts();
+    let described: Vec<_> = facts
+        .iter()
+        .map(|fact| serde_json::to_value(fact).unwrap())
+        .collect();
+    assert_eq!(facts.len(), 1, "{described:?}");
+    assert!(
+        described
+            .iter()
+            .all(|fact| !fact.to_string().contains("claude")),
+        "{described:?}"
+    );
+    let seen = crate::native_agent::remote_native_capabilities(
+        &crate::peer_capabilities::PeerCapabilityProjection {
+            schema_version: crate::peer_capabilities::PEER_CAPABILITY_SCHEMA.into(),
+            peer_session_id: "peer".into(),
+            observed_at: 1,
+            capabilities: facts,
+        },
+    );
+    assert_eq!(
+        seen.iter()
+            .map(|capability| capability.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        ["agent.coding.codex"]
+    );
+}
+
 // New sessions and exact continuation.
 
 #[test]
@@ -618,6 +663,104 @@ fn a_run_that_ignores_stop_is_ended_with_its_whole_job() {
         );
     }
     wait_released(&service, &fixture.workspace);
+}
+
+/// Whether process `pid` still runs now.
+fn alive(pid: u32) -> bool {
+    !ended_within(pid, Duration::ZERO)
+}
+
+/// The task reads "stop requested" exactly while any process of the run is
+/// alive, and "stopped" only once none is: sampled throughout the stop.
+#[test]
+fn a_stop_reads_confirmed_only_once_no_process_of_the_run_is_left() {
+    let fixture = FixtureV1::new("stubborn");
+    let mut service = fixture.service();
+    let started = service
+        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .unwrap();
+    wait_until(
+        || fixture.busy() && fixture.processes().len() == 2,
+        "the run started",
+    );
+    let processes = fixture.processes();
+    let requested = service.cancel_task(&started.task_id).unwrap();
+    assert_eq!(
+        requested.code.as_deref(),
+        Some("native_agent_cancel_requested")
+    );
+    let mut pending_while_alive = 0;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stop was never settled"
+        );
+        // Processes first: a code read after them can only be later.
+        let any_alive = processes.iter().any(|pid| alive(*pid));
+        let code = service.task_status(&started.task_id).unwrap().code;
+        match code.as_deref() {
+            Some("native_agent_cancel_requested") => {
+                if any_alive {
+                    pending_while_alive += 1;
+                }
+            }
+            Some("native_agent_cancelled") => {
+                assert!(
+                    processes.iter().all(|pid| !alive(*pid)),
+                    "confirmed while a process of the run was alive"
+                );
+                break;
+            }
+            other => panic!("unexpected code {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The stubborn run outlived the interrupt for the whole grace, and the
+    // task said so throughout.
+    assert!(pending_while_alive > 10, "{pending_while_alive}");
+    wait_released(&service, &fixture.workspace);
+}
+
+/// A stop still pending when Pastey ends is never read as stopped after a
+/// restart: this capability does not claim its runs end with Pastey.
+#[test]
+fn a_stop_pending_at_restart_reads_not_confirmed() {
+    let fixture = FixtureV1::new("stubborn");
+    let paths = fixture.paths();
+    let adapter = fixture.adapter();
+    let mut before =
+        NativeAgentServiceV1::with_paths_and_adapters(paths.clone(), vec![adapter.clone()])
+            .unwrap();
+    let started = before
+        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .unwrap();
+    wait_until(
+        || fixture.busy() && fixture.processes().len() == 2,
+        "the run started",
+    );
+    adapter.abandon_runs();
+    assert_eq!(
+        before
+            .cancel_task(&started.task_id)
+            .unwrap()
+            .code
+            .as_deref(),
+        Some("native_agent_cancel_requested")
+    );
+    std::mem::forget(before);
+
+    let after =
+        NativeAgentServiceV1::with_paths_and_adapters(paths, vec![fixture.adapter()]).unwrap();
+    let restored = after.task_status(&started.task_id).unwrap();
+    assert_eq!(restored.state, NativeAgentTaskStateV1::Cancelled);
+    assert_eq!(
+        restored.code.as_deref(),
+        Some("native_agent_cancel_delivery_uncertain")
+    );
+    // The abandoned run is still contained by its job, which this test
+    // process holds; end it.
+    fs::write(fixture.root.join("finish"), b"").unwrap();
 }
 
 #[test]

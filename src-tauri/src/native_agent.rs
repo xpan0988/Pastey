@@ -46,6 +46,11 @@ const MAX_TASK_BYTES: usize = 16 * 1024;
 /// A task Full Access admitted, asked to stop because its Host's user
 /// revoked that Full Access. Like Stop, a request: not proof the turn ended.
 pub(crate) const FULL_ACCESS_REVOKED_CODE: &str = "native_agent_full_access_revoked";
+/// Stop was asked and Pastey's authority over the turn has ended, but the
+/// native run is not yet shown to have ended. Never final: it becomes
+/// `native_agent_cancelled` once the adapter shows the run ended, or
+/// `native_agent_cancel_delivery_uncertain` when nothing can show it.
+const CANCEL_REQUESTED_CODE: &str = "native_agent_cancel_requested";
 
 /// In a process started as a Claude Code lifeline helper: runs it and exits.
 /// `false` in every other process (see `capability::claude_code::lifeline`).
@@ -391,6 +396,46 @@ fn task_accepts_remote_fact(
         }
         Interrupted => matches!(next.state, Completed | Failed | Cancelled),
         Queued => true,
+    }
+}
+
+/// How what the executing Host reports settles a stop this requester asked
+/// for, if it does: its run shown ended (stopped, or finished, failed or
+/// interrupted on its own) confirms it; its own unconfirmed stop leaves it
+/// unconfirmed. Anything else, its own pending stop included, settles
+/// nothing. Cancellation still wins: no result is taken.
+fn remote_stop_settlement(
+    current: &NativeAgentTaskStatusV1,
+    executor_state: &NativeAgentTaskStateV1,
+    executor_code: Option<&str>,
+) -> Option<&'static str> {
+    use NativeAgentTaskStateV1::*;
+    if current.state != Cancelled
+        || !matches!(
+            current.code.as_deref(),
+            Some(CANCEL_REQUESTED_CODE) | Some("native_agent_cancel_delivery_uncertain")
+        )
+    {
+        return None;
+    }
+    let ended = match executor_state {
+        Cancelled => executor_code == Some("native_agent_cancelled"),
+        Completed | Failed => true,
+        Interrupted => !matches!(
+            executor_code,
+            Some("native_agent_outcome_unknown") | Some("native_agent_reconciliation_required")
+        ),
+        Queued | Running => false,
+    };
+    if ended {
+        Some("native_agent_cancelled")
+    } else if *executor_state == Cancelled
+        && executor_code == Some("native_agent_cancel_delivery_uncertain")
+        && current.code.as_deref() == Some(CANCEL_REQUESTED_CODE)
+    {
+        Some("native_agent_cancel_delivery_uncertain")
+    } else {
+        None
     }
 }
 
@@ -1412,6 +1457,24 @@ impl NativeAgentServiceV1 {
                             | Some("native_agent_reconciliation_required")
                     ));
             let possibly_still_running = may_outlive_pastey && uncertain;
+            // A stop still pending when Pastey ended is settled now: no
+            // observer survives the restart. Its run ended with Pastey's
+            // process only where the capability shows that it does; a remote
+            // task's stop is settled by what its executing Host reports.
+            if persisted.task.state == NativeAgentTaskStateV1::Cancelled
+                && persisted.task.code.as_deref() == Some(CANCEL_REQUESTED_CODE)
+                && persisted.remote_target.is_none()
+            {
+                persisted.task.code = Some(
+                    if may_outlive_pastey {
+                        "native_agent_cancel_delivery_uncertain"
+                    } else {
+                        "native_agent_cancelled"
+                    }
+                    .into(),
+                );
+                changed = true;
+            }
             if possibly_still_running && persisted.native_recovery.is_some() {
                 reobserve.push(persisted.task.task_id.clone());
             }
@@ -3264,6 +3327,16 @@ impl NativeAgentServiceV1 {
             AppError::InvalidInput("Remote native Agent task is unavailable.".into())
         })?;
         let cancellation_won = task.state == NativeAgentTaskStateV1::Cancelled;
+        // A movement's fact carries the movement's code, not the task's.
+        let task_code = fact
+            .movement_id
+            .is_none()
+            .then_some(fact.code.as_deref())
+            .flatten();
+        let settled = remote_stop_settlement(task, &fact.task_state, task_code);
+        if let Some(code) = settled {
+            task.code = Some(code.into());
+        }
         if !cancellation_won {
             let next = NativeAgentTaskStatusV1 {
                 state: fact.task_state.clone(),
@@ -5042,12 +5115,21 @@ impl NativeAgentServiceV1 {
                     if status.state == NativeAgentTaskStateV1::Cancelled {
                         if outcome == NativeTurnOutcomeV1::Cancelled {
                             status.code = Some("native_agent_cancelled".into());
-                        } else if outcome == NativeTurnOutcomeV1::Unknown
-                            && status.code.as_deref() == Some("native_agent_cancel_requested")
-                        {
-                            // Nothing shows the native turn stopped: the
-                            // stop stays a request, never "Stopped".
-                            status.code = Some("native_agent_cancel_delivery_uncertain".into());
+                        } else if status.code.as_deref() == Some(CANCEL_REQUESTED_CODE) {
+                            status.code = Some(
+                                if outcome == NativeTurnOutcomeV1::Unknown {
+                                    // Nothing shows the native turn stopped:
+                                    // the stop stays a request, never
+                                    // "Stopped".
+                                    "native_agent_cancel_delivery_uncertain"
+                                } else {
+                                    // The adapter observed its run end (it
+                                    // finished, failed or was interrupted as
+                                    // the stop arrived): nothing runs now.
+                                    "native_agent_cancelled"
+                                }
+                                .into(),
+                            );
                         }
                     } else {
                         match outcome {
@@ -5445,7 +5527,18 @@ impl NativeAgentServiceV1 {
             AppError::InvalidInput("Remote native Agent task is unavailable.".into())
         })?;
         if current.state == NativeAgentTaskStateV1::Cancelled {
-            let status = current;
+            let settled = remote_stop_settlement(
+                &current,
+                &remote.status.state,
+                remote.status.code.as_deref(),
+            );
+            let status = match (settled, tasks.get_mut(&remote.task_id)) {
+                (Some(code), Some(task)) => {
+                    task.code = Some(code.into());
+                    task.clone()
+                }
+                _ => current,
+            };
             drop(tasks);
             self.cancel_matching_workspace_movement(
                 &remote.task_id,
@@ -5856,13 +5949,16 @@ impl NativeAgentServiceV1 {
                 movement.status.code = Some("native_agent_recovery_abandoned".into());
             }
         }
-        self.persist_envelope(task_id, None)?;
         if self.unstarted_review_tasks.contains(task_id) {
+            let status = self.settle_unobserved_stop(task_id, true)?;
+            self.persist_envelope(task_id, None)?;
             return Ok(status);
         }
         if let Ok(adapter) = self.adapter(&status.agent_id) {
             let _ = adapter.cancel(task_id);
         }
+        let status = self.settle_unobserved_stop(task_id, false)?;
+        self.persist_envelope(task_id, None)?;
         Ok(status)
     }
 
@@ -6225,6 +6321,43 @@ impl NativeAgentServiceV1 {
         stopped
     }
 
+    /// Settles a requested stop of a task run on this Host that no observer
+    /// will ever settle: confirmed when it never started (nothing native
+    /// exists), otherwise not confirmed. A live observer settles its own
+    /// (it records the outcome before it lets go of the task), and a remote
+    /// task's stop is settled by what its executing Host reports.
+    fn settle_unobserved_stop(
+        &self,
+        task_id: &str,
+        never_started: bool,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        let observed = self
+            .observed_tasks
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Native Agent task store is unavailable.".into()))?
+            .contains(task_id);
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            AppError::InvalidInput("Native Agent task store is unavailable.".into())
+        })?;
+        let task = tasks
+            .get_mut(task_id)
+            .ok_or_else(|| AppError::InvalidInput("Native Agent task is unavailable.".into()))?;
+        if task.code.as_deref() == Some(CANCEL_REQUESTED_CODE)
+            && !self.remote_targets.contains_key(task_id)
+            && (never_started || !observed)
+        {
+            task.code = Some(
+                if never_started {
+                    "native_agent_cancelled"
+                } else {
+                    "native_agent_cancel_delivery_uncertain"
+                }
+                .into(),
+            );
+        }
+        Ok(task.clone())
+    }
+
     fn cancel_task_with_code(
         &mut self,
         task_id: &str,
@@ -6267,17 +6400,27 @@ impl NativeAgentServiceV1 {
             task_id,
             status.code.as_deref().unwrap_or("native_agent_cancelled"),
         );
-        self.persist_envelope(task_id, None)?;
         if !native_execution_needs_cancellation {
+            // It never started: nothing native runs that a stop must wait
+            // for.
+            let status = self.settle_unobserved_stop(task_id, true)?;
+            self.persist_envelope(task_id, None)?;
             return Ok(status);
         }
+        self.persist_envelope(task_id, None)?;
         // The adapter owns how its native execution stops; Pastey's authority
         // was revoked above whatever this returns.
         let native_stop = self
             .adapter(&status.agent_id)
             .and_then(|adapter| adapter.cancel(task_id));
         match native_stop {
-            Ok(()) => Ok(status),
+            Ok(()) => {
+                let settled = self.settle_unobserved_stop(task_id, false)?;
+                if settled.code != status.code {
+                    self.persist_envelope(task_id, None)?;
+                }
+                Ok(settled)
+            }
             Err(_) => {
                 let status = {
                     let mut tasks = self.tasks.lock().map_err(|_| {
@@ -8202,10 +8345,16 @@ done
 
         let cancelled = service.cancel_task(&started.task_id).unwrap();
         assert_eq!(cancelled.state, NativeAgentTaskStateV1::Cancelled);
+        assert_eq!(
+            cancelled.code.as_deref(),
+            Some("native_agent_cancel_requested")
+        );
         wait_for_workspace_release(&service, &workspace);
+        // Codex's turn is shown ended: the stop is confirmed, never left a
+        // request.
         let after = service.task_status(&started.task_id).unwrap();
         assert_eq!(after.state, NativeAgentTaskStateV1::Cancelled);
-        assert_eq!(after.code.as_deref(), Some("native_agent_cancel_requested"));
+        assert_eq!(after.code.as_deref(), Some("native_agent_cancelled"));
         assert!(!workspace.join("approval-answered").exists());
         service.shutdown();
         let _ = fs::remove_dir_all(root);
@@ -12058,6 +12207,104 @@ done
         let _ = fs::remove_dir_all(root);
     }
 
+    /// What an executing Host reports settles a requester's stop only when
+    /// it shows the run ended, or that its own stop is unconfirmed; never
+    /// back to pending, and never a stop that was not pending.
+    #[test]
+    fn a_requester_s_stop_is_settled_only_by_evidence_from_its_executor() {
+        use NativeAgentTaskStateV1::*;
+        let requester = |state, code: &str| NativeAgentTaskStatusV1 {
+            schema_version: "pastey-native-agent-task-v1".into(),
+            task_id: "task".into(),
+            agent_id: "agent.coding.codex".into(),
+            workspace_name: "workspace".into(),
+            session_reused: false,
+            state,
+            result: None,
+            code: Some(code.into()),
+            output: None,
+            conversation: None,
+            native_decisions: Vec::new(),
+        };
+        let pending = requester(Cancelled, CANCEL_REQUESTED_CODE);
+        let unconfirmed = requester(Cancelled, "native_agent_cancel_delivery_uncertain");
+        let cases: [(
+            &NativeAgentTaskStatusV1,
+            NativeAgentTaskStateV1,
+            Option<&str>,
+            Option<&str>,
+        ); 13] = [
+            (&pending, Queued, None, None),
+            (&pending, Running, None, None),
+            (&pending, Cancelled, Some(CANCEL_REQUESTED_CODE), None),
+            (&pending, Cancelled, None, None),
+            (
+                &pending,
+                Cancelled,
+                Some("native_agent_cancelled"),
+                Some("native_agent_cancelled"),
+            ),
+            (
+                &pending,
+                Cancelled,
+                Some("native_agent_cancel_delivery_uncertain"),
+                Some("native_agent_cancel_delivery_uncertain"),
+            ),
+            (&pending, Completed, None, Some("native_agent_cancelled")),
+            (
+                &pending,
+                Failed,
+                Some("native_agent_failed"),
+                Some("native_agent_cancelled"),
+            ),
+            (
+                &pending,
+                Interrupted,
+                Some("native_agent_interrupted"),
+                Some("native_agent_cancelled"),
+            ),
+            (
+                &pending,
+                Interrupted,
+                Some("native_agent_outcome_unknown"),
+                None,
+            ),
+            (
+                &pending,
+                Interrupted,
+                Some("native_agent_reconciliation_required"),
+                None,
+            ),
+            // The requester's own undelivered stop is confirmed by evidence,
+            // and never made pending again.
+            (
+                &unconfirmed,
+                Cancelled,
+                Some("native_agent_cancelled"),
+                Some("native_agent_cancelled"),
+            ),
+            (&unconfirmed, Cancelled, Some(CANCEL_REQUESTED_CODE), None),
+        ];
+        for (current, state, code, settled) in cases {
+            assert_eq!(
+                remote_stop_settlement(current, &state, code),
+                settled,
+                "{:?} after {:?} {:?}",
+                current.code,
+                state,
+                code
+            );
+        }
+        // Nothing but a pending or unconfirmed stop is settled.
+        for other in [
+            requester(Cancelled, "native_agent_cancelled"),
+            requester(Cancelled, FULL_ACCESS_REVOKED_CODE),
+            requester(Running, CANCEL_REQUESTED_CODE),
+        ] {
+            assert_eq!(remote_stop_settlement(&other, &Completed, None), None);
+        }
+    }
+
     #[test]
     fn remote_status_requires_the_exact_selected_host_and_cancellation_wins() {
         let mut service = NativeAgentServiceV1::default();
@@ -12124,10 +12371,12 @@ done
                 task_output: None,
             })
             .unwrap();
-        assert_eq!(
-            service.task_status("request-1").unwrap().state,
-            NativeAgentTaskStateV1::Cancelled
-        );
+        let settled = service.task_status("request-1").unwrap();
+        assert_eq!(settled.state, NativeAgentTaskStateV1::Cancelled);
+        // The executor's run is shown ended: the stop is no longer in doubt,
+        // and still no result is taken.
+        assert_eq!(settled.code.as_deref(), Some("native_agent_cancelled"));
+        assert_eq!(settled.output, None);
     }
 
     #[test]

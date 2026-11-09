@@ -44,6 +44,11 @@ const NOTHING_RAN = new Set([
   "native_agent_conversation_unavailable",
 ]);
 
+/** Stop was asked and the result is no longer accepted, but the Agent is not
+ * yet shown to have ended. Rust always settles it: to `native_agent_cancelled`
+ * once the run is shown ended, or to `native_agent_cancel_delivery_uncertain`. */
+export const STOP_PENDING = "native_agent_cancel_requested";
+
 /** A cancellation Pastey asked the Agent for but cannot confirm. */
 const STOP_REQUESTED_ONLY = new Set([
   "native_agent_full_access_revoked",
@@ -103,6 +108,10 @@ export function taskStages(status: Pick<NativeAgentTaskStatus, "state" | "code">
           : "running";
         through(refusedAt);
         set(refusedAt, "stopped");
+      } else if (status.state === "cancelled" && status.code === STOP_PENDING) {
+        // Still ending: not stopped until that is shown.
+        through("result");
+        set("result", "current");
       } else {
         through("result");
         set("result", "stopped");
@@ -118,7 +127,10 @@ export function taskStages(status: Pick<NativeAgentTaskStatus, "state" | "code">
       todo: context.fullAccess ? "Starts there (Full Access)" : "Accept there",
     },
     running: { stopped: status.state === "failed" && taskNothingRan(status) ? "Did not start" : "Running" },
-    result: { stopped: status.state === "interrupted" ? "Outcome unknown" : status.state === "cancelled" ? STOP_REQUESTED_ONLY.has(status.code ?? "") ? "Stop requested" : "Stopped" : "Failed" },
+    result: {
+      current: status.state === "cancelled" ? "Stopping" : undefined,
+      stopped: status.state === "interrupted" ? "Outcome unknown" : status.state === "cancelled" ? STOP_REQUESTED_ONLY.has(status.code ?? "") ? "Stop requested" : "Stopped" : "Failed",
+    },
   };
   for (const stage of stages) stage.label = words[stage.id][stage.state] ?? stage.label;
   return stages;
@@ -144,6 +156,9 @@ export function taskOutcome(status: Pick<NativeAgentTaskStatus, "state" | "code"
     case "cancelled":
       if (status.code === "native_agent_full_access_revoked") {
         return { tone: "danger", headline: "Stop requested: Full Access ended", detail: `${hostName}'s user revoked this device's Full Access while ${agentName} worked, so ${hostName} asked it to stop and no longer accepts its result. Whatever it did before it stopped stays there; Pastey cannot confirm when it stopped.`, next: `Check the folder on ${hostName}. To run there again, someone on ${hostName} must accept, or give Full Access again.`, nothingRan: false };
+      }
+      if (status.code === STOP_PENDING) {
+        return { tone: "pending", headline: "Stopping…", detail: `Pastey asked ${agentName}${there} to stop and no longer accepts its result. ${agentName} may still be working until it ends; this says Stopped once ${remote ? hostName : "Pastey"} has seen it end.`, next: null, nothingRan: false };
       }
       if (status.code === "native_agent_cancel_delivery_uncertain") {
         return { tone: "danger", headline: "Stop requested · not confirmed", detail: `Pastey${there} no longer accepts this run's result, but could not confirm that ${agentName} received the request to stop. It may still be working.`, next: `Check the folder${there} before relying on it. Nothing runs again on its own.`, nothingRan: false };
