@@ -379,13 +379,13 @@ What was verified, and how:
   - **Stop:** recorded `native_agent_cancelled`, and no Claude Code process was left.
   - **Pastey killed:** a separate Pastey process was killed with SIGKILL during a turn. Claude Code's run ended **0.15 s** later through the lifeline, with nobody stopping it. The restored task was `native_agent_outcome_unknown`, then observed `interrupted` from the transcript, never `failed`. The prompt was sent once.
 - **Not driven:** the app's UI with a mouse, and the Tauri IPC layer itself. The live checks call the method the command calls.
-- **Not run:** Windows. Acceptance R is the boundary. *(Section H: Windows containment, identity and trust are now implemented and tested on Windows; enabling it waits on a signed-in run.)*
+- **Not run:** Windows. Acceptance R is the boundary. *(Section H: Windows containment, identity and trust are now implemented and tested on Windows, signed in (H7); enabling it waits on the app steps of its acceptance.)*
 
 ## H. Windows, 2026-11-09
 
 Scope: `agent.coding.claude_code_conversation` on Windows, local only. Not in scope: remote Claude Code, Layer 4 or Bridge authority, `--bg` continuation (now reported unavailable on Windows), UI.
 
-Environment: Windows 11 Pro 10.0.26200, x86_64, Rust 1.95.0, from a shell with every Claude Code session variable removed. The only Claude Code on this Host is the Claude desktop app's own copy, **2.1.309**, under `%LOCALAPPDATA%\Claude-Data\…\claude-code\2.1.309\…\claude.exe`: not on `PATH`, and **signed out** when run on its own. So no model turn ran, and 2.1.309 is older than the measured minimum (2.1.317).
+Environment: Windows 11 Pro 10.0.26200, x86_64, Rust 1.95.0, from a shell with every Claude Code session variable removed. The only Claude Code on this Host is the Claude desktop app's own copy, **2.1.309**, under `%LOCALAPPDATA%\Claude-Data\…\claude-code\2.1.309\…\claude.exe`: not on `PATH`, and **signed out** when run on its own. So no model turn ran in H1–H6, and 2.1.309 is older than the measured minimum (2.1.317). H7 adds the signed-in run on the user's standalone 2.1.319.
 
 Evidence levels used here:
 - **Physical**: real Windows processes on this Host, in the product's own Job Object code.
@@ -440,7 +440,8 @@ Evidence levels used here:
 | Trust: untrusted `.claude/settings.json`, `.claude/settings.local.json`, `.mcp.json`, `.claude/skills` refused before anything runs; trusted as Claude Code keys it (`C:/…`), backslashes, lowercase, verbatim, through a junction; not by another folder, the parent outside a repository or a relative key; a repository's trust covers its subfolder | 3 trust tests | Physical, fixture |
 | Windows gate: unavailable whatever is installed; an older version than accepted is incompatible; 2.1.309 is older than 2.1.317; signed out | `windows_stays_unavailable_until_its_acceptance_passes`, `availability_…` | Physical, fixture |
 | `--bg` continuation unavailable on Windows; no Bridge peer sees or invokes the conversation adapter | 2 tests | Physical, fixture |
-| Real model turn, real Bash tree under Stop and under a killed Pastey, interrupt of a running turn, the app's UI | `installed_claude_code_conversation_*` (ignored) and the app steps | **Not run** |
+| Real model turn, real Bash tree under Stop and under a killed Pastey, interrupt of a running turn | `installed_claude_code_conversation_*` (ignored) | Physical, signed in: see H7 |
+| The app's UI (W-CC4), and a paired Mac's view of the capability | the acceptance's in-app steps | **Not run** |
 
 **Mutation checks** (each reverted): without the leftover termination, the leftover test fails; without `KILL_ON_JOB_CLOSE`, both killed-owner tests fail (and the fixture's processes visibly outlive the killed process); without canonical trust matching, the trust test fails; without the H5 fix, its test fails 3 of 3 runs.
 
@@ -452,8 +453,21 @@ The re-observer read the transcript, then asked the registry. A turn that ended 
 
 ### H6. Remaining risks
 
-- **No signed-in run on Windows.** Whether the interrupt ends a running turn and its Bash tree, whether Claude Code (a Bun executable) starts its tools so they stay in the job, and real timing are inferred from macOS evidence and the physical job checks. The acceptance's W-CC2 and W-CC3 decide them.
+- **The app itself is not yet driven on Windows** (W-CC4: no console window, the UI's states, a forced quit from Task Manager, a paired Mac's view). H7 covers Pastey's lifecycle code, not the Tauri app or its IPC.
 - **Broker-started processes** (WMI, Task Scheduler, services, COM servers) are outside any job. The same class of escape exists on macOS (a process leaving its group).
 - **Mapped network drives in trust keys** are resolved like local paths; an unreachable share can delay a start. UNC keys count only as spelled.
 - **macOS was not built or tested here** (no cross toolchain on this Host). The Unix code paths change only by `cfg` structure and the H5 fix; the trust matching on Unix now also accepts a key that resolves to the same folder (for example `/tmp/…` for `/private/tmp/…`).
-- **2.1.309 is the only version measured on Windows**, and it is the desktop app's copy. The gate opens only for the version the acceptance measures.
+- **2.1.319 is the only signed-in version measured on Windows.** The gate opens only for the version the full acceptance measures.
+
+### H7. Signed-in results, Claude Code 2.1.319 (2026-11-09)
+
+Same Host, the user's own standalone Claude Code (`%USERPROFILE%\.local\bin\claude.exe`, 2.1.319), signed in with claude.ai (Pro). Run from a shell with every Claude Code session variable removed, past the Windows gate by the tests' stand-in (`accept_windows_for_tests`); the product's gate stayed closed. Prompts were harmless, in disposable folders under `src-tauri\target\`. A process monitor recorded every `claude`, `bash`, `ping`, `node` and `conhost` process for the whole run.
+
+- **W-CC1:** the deterministic suites, 27 passed.
+- **W-CC2** (`installed_claude_code_conversation_ -- --ignored --test-threads=1`): **3 passed**, twice as a set and once each alone.
+  - **Conversation:** availability `Available` ("Claude Code 2.1.319 at …"). A new session completed with its reply; the follow-up resumed exactly it and recalled the reply; both turns name one session; no `claude` process was left.
+  - **Stop with a real tool:** Claude Code's Bash tool ran through Git Bash (`claude.exe` → `bash.exe` → `ping.exe -n 90`). Stop recorded `native_agent_cancelled` **1.8 s** after it was asked, so through Claude Code's own interrupt, well inside the 10 s before the job would have been terminated. `claude`, its Bash and the `ping` had all ended. Whether the `ping` was ended by Claude Code's interrupt or by Pastey ending what was left in the job was not distinguished; either way nothing remained before "cancelled" was recorded.
+  - **Pastey killed with `TerminateProcess` while the tool ran:** `claude` and the `ping` were gone **17–20 ms** later (three runs), with nobody stopping them. The restored task was `native_agent_outcome_unknown`, then observed `interrupted` (`native_agent_interrupted`) from the transcript, never failed or completed; the run's session holds the prompt once.
+- **W-CC3:** after every run, no `ping -n 90` and no `claude -p` process existed; the monitor recorded every process of the runs as ended.
+- **First attempt, corrected in the tests only:** headless Claude Code denied the Bash call (it would have asked for approval), so the turn completed before Stop and the Stop test failed as it should. The tool tests now allow `Bash(ping:*)` in their disposable folder's own `.claude\settings.local.json`, and wait for the real `ping` before stopping or killing. Separately, the crash test counted the prompt across earlier runs' sessions of the folder, which Claude Code keeps; it now counts only this run's.
+- **Not run:** W-CC4, the app's own steps, including the paired Mac's view.

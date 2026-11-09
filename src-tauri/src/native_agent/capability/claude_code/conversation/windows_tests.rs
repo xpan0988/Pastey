@@ -1013,6 +1013,50 @@ fn live_workspace(name: &str) -> PathBuf {
     workspace.canonicalize().unwrap()
 }
 
+/// A live folder in which Claude Code's own project settings allow the long
+/// prompt's `ping` without asking: headless, it would otherwise deny it, and
+/// no tool process would run. Pastey still passes no permission of its own.
+fn live_tool_workspace(name: &str) -> PathBuf {
+    let workspace = live_workspace(name);
+    fs::create_dir_all(workspace.join(".claude")).unwrap();
+    fs::write(
+        workspace.join(".claude").join("settings.local.json"),
+        r#"{"permissions":{"allow":["Bash(ping:*)"]}}"#,
+    )
+    .unwrap();
+    workspace
+}
+
+/// The ids of the long prompt's `ping` processes running now, wherever they
+/// are in the process tree.
+fn live_pings() -> Vec<u32> {
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Where-Object { $_.CommandLine -match '-n 90 127\\.0\\.0\\.1' } | ForEach-Object { $_.ProcessId }",
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Waits until Claude Code's Bash tool runs the long prompt's `ping`.
+fn wait_for_live_ping() -> Vec<u32> {
+    for _ in 0..120 {
+        let pings = live_pings();
+        if !pings.is_empty() {
+            return pings;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    panic!("Claude Code never ran the tool");
+}
+
 fn live_service(root: &Path) -> NativeAgentServiceV1 {
     let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
     paths.ensure_directories().unwrap();
@@ -1124,18 +1168,17 @@ fn installed_claude_code_conversation_runs_and_continues_on_windows() {
 #[test]
 #[ignore = "uses the installed, signed-in Claude Code and its quota"]
 fn installed_claude_code_conversation_stops_with_its_tool_processes_on_windows() {
-    let workspace = live_workspace("claude-windows-stop-live");
+    let workspace = live_tool_workspace("claude-windows-stop-live");
     let root = std::env::temp_dir().join(format!("pastey-claude-live-{}", Uuid::new_v4()));
     let mut service = live_service(&root);
     let started = service
         .start_claude_code_conversation_task(&workspace, LIVE_LONG_PROMPT, true)
         .unwrap();
-    wait_until(
-        || !claude_processes_in(&workspace).is_empty(),
-        "Claude Code ran",
-    );
-    std::thread::sleep(Duration::from_secs(8));
+    let pings = wait_for_live_ping();
+    std::thread::sleep(Duration::from_secs(2));
     let processes = claude_processes_in(&workspace);
+    eprintln!("running: claude {processes:?}, tool {pings:?}");
+    let stopped = std::time::Instant::now();
     service.cancel_task(&started.task_id).unwrap();
     let mut status = service.task_status(&started.task_id).unwrap();
     for _ in 0..300 {
@@ -1148,13 +1191,23 @@ fn installed_claude_code_conversation_stops_with_its_tool_processes_on_windows()
         std::thread::sleep(Duration::from_millis(100));
     }
     eprintln!(
-        "stopped: {:?} {:?} {:?}",
-        status.state, status.code, status.result
+        "stopped after {:?}: {:?} {:?} {:?}",
+        stopped.elapsed(),
+        status.state,
+        status.code,
+        status.result
     );
     assert_eq!(status.code.as_deref(), Some("native_agent_cancelled"));
     for pid in processes {
         assert!(ended_within(pid as u32, Duration::from_secs(1)));
     }
+    for pid in pings {
+        assert!(
+            ended_within(pid, Duration::from_secs(1)),
+            "the tool's ping {pid} outlived Stop"
+        );
+    }
+    assert!(live_pings().is_empty(), "a tool process is left");
     wait_released(&service, &workspace);
     assert!(
         claude_processes_in(&workspace).is_empty(),
@@ -1185,9 +1238,18 @@ fn installed_killed_pastey_helper() {
 #[test]
 #[ignore = "uses the installed, signed-in Claude Code and its quota"]
 fn installed_claude_code_conversation_ends_when_pastey_is_killed_on_windows() {
-    let workspace = live_workspace("claude-windows-crash-live");
+    let workspace = live_tool_workspace("claude-windows-crash-live");
     let root = std::env::temp_dir().join(format!("pastey-claude-live-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
+    // Claude Code keeps earlier runs' sessions of this folder; only this
+    // run's are counted below.
+    let transcripts = project_dir(&claude_config_dir().unwrap(), &workspace);
+    let earlier: Vec<PathBuf> = fs::read_dir(&transcripts)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
     let mut pastey = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
@@ -1210,12 +1272,12 @@ fn installed_claude_code_conversation_ends_when_pastey_is_killed_on_windows() {
                 .map(|(_, id)| id.trim().to_owned())
         })
         .expect("the helper started the task");
-    wait_until(
-        || !claude_processes_in(&workspace).is_empty(),
-        "Claude Code ran",
-    );
-    std::thread::sleep(Duration::from_secs(8));
+    let pings = wait_for_live_ping();
+    std::thread::sleep(Duration::from_secs(2));
     let processes = claude_processes_in(&workspace);
+    eprintln!("running: claude {processes:?}, tool {pings:?}");
+    assert!(!processes.is_empty(), "Claude Code is listed");
+    // TerminateProcess: no handler, no cleanup, as a crash or forced quit.
     pastey.kill().unwrap();
     pastey.wait().unwrap();
     let killed = std::time::Instant::now();
@@ -1225,10 +1287,17 @@ fn installed_claude_code_conversation_ends_when_pastey_is_killed_on_windows() {
             "Claude Code outlived Pastey"
         );
     }
+    for pid in &pings {
+        assert!(
+            ended_within(*pid, Duration::from_secs(3)),
+            "the tool's ping {pid} outlived Pastey"
+        );
+    }
     eprintln!(
-        "Claude Code ended {:?} after Pastey was killed",
+        "Claude Code and its tool ended {:?} after Pastey was killed",
         killed.elapsed()
     );
+    assert!(live_pings().is_empty(), "a tool process is left");
 
     let after = live_service(&root);
     let restored = after.task_status(&task_id).unwrap();
@@ -1248,10 +1317,10 @@ fn installed_claude_code_conversation_ends_when_pastey_is_killed_on_windows() {
     eprintln!("observed: {:?} {:?}", terminal.state, terminal.code);
     assert_ne!(terminal.state, NativeAgentTaskStateV1::Failed);
     assert_ne!(terminal.state, NativeAgentTaskStateV1::Completed);
-    let transcripts = project_dir(&claude_config_dir().unwrap(), &workspace);
     let prompts: usize = fs::read_dir(&transcripts)
         .unwrap()
         .flatten()
+        .filter(|entry| !earlier.contains(&entry.path()))
         .map(|entry| {
             fs::read_to_string(entry.path())
                 .unwrap_or_default()

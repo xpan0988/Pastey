@@ -46,25 +46,22 @@ Expect 3 passed (the two `_helper` entries print nothing and pass):
 | Test | Shows |
 |---|---|
 | `…runs_and_continues_on_windows` | A new session completes with its reply; the follow-up resumes exactly it and recalls the reply; both turns name one session; no `claude` process is left. |
-| `…stops_with_its_tool_processes_on_windows` | Stop during a real Bash `ping` records `native_agent_cancelled`; the `claude` processes have ended and the folder is released. |
-| `…ends_when_pastey_is_killed_on_windows` | A separate Pastey process is killed with `TerminateProcess` mid-turn. `claude` has ended within 3 s (printed). The restored task is never `native_agent_interrupted_on_restart`, `Failed` or `Completed`; the prompt is in the transcript once. |
+| `…stops_with_its_tool_processes_on_windows` | Once Claude Code's Bash tool runs a real `ping -n 90`, Stop records `native_agent_cancelled`; the `claude` process and the `ping` have ended, none is left, and the folder is released. |
+| `…ends_when_pastey_is_killed_on_windows` | Once the tool's `ping` runs, a separate Pastey process is killed with `TerminateProcess`. `claude` and the `ping` have ended within 3 s (printed). The restored task is never `native_agent_interrupted_on_restart`, `Failed` or `Completed`; this run's session holds the prompt once. |
+
+The two tool tests write `.claude\settings.local.json` allowing `Bash(ping:*)` into their disposable folder under `src-tauri\target\`: headless, Claude Code denies a Bash call that would ask, and no tool process would run. This is Claude Code's own project setting; Pastey passes no permission.
 
 Also record, from the first test's output, the `availability:` line (expected `Available`, `Claude Code <version> at <path>`).
 
-## W-CC3 — Real tool processes under Stop and under a killed Pastey
+## W-CC3 — No tool process survives
 
-W-CC2 checks `claude.exe` itself. Check its tool processes by hand once:
-
-1. Start the stop test again with `--nocapture`. While it waits (it sleeps 8 s after Claude Code starts), run:
+The tool tests above assert it. Confirm once by hand after W-CC2:
 
 ```powershell
-Get-CimInstance Win32_Process | Where-Object { $_.Name -in 'bash.exe','ping.exe','claude.exe','node.exe' } | Select-Object ProcessId, ParentProcessId, Name
+Get-CimInstance Win32_Process | Where-Object { ($_.Name -eq 'PING.EXE' -and $_.CommandLine -match '-n 90') -or ($_.Name -eq 'claude.exe' -and $_.CommandLine -match ' -p ') }
 ```
 
-2. After the test passes, run it again. Expect no `ping.exe` and no `bash.exe` from that run.
-3. Repeat for `…ends_when_pastey_is_killed_on_windows`.
-
-Any process from the run that remains is a **failure**: containment did not hold.
+Expect no output. Any process from the run that remains is a **failure**: containment did not hold.
 
 ## W-CC4 — The app
 
