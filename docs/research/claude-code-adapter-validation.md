@@ -487,4 +487,28 @@ The real app (`target\debug\pastey.exe`, this branch, with `WINDOWS_ACCEPTED_VER
 | 7 | While a turn held `trusted`: the junction alias, the upper-case spelling, the plain and verbatim (`\\?\`) forms and the parent folder were all refused before anything started ("already has an unresolved invocation for this resource"); the sibling folder started at once and completed. Once free, the junction ran and was recorded under the canonical folder. **Pass** (backend through the app's command; the UI shows "Claude Code is working on another task in this Bridge" for any second task). |
 | 8 | A paired Mac's view (Device details → Agents): **not run**, no Mac. Covered only by `no_bridge_peer_learns_of_it_or_can_invoke_it` and Core's refusal of a Bridge invocation of a capability without peer protocols. |
 
-**Renderer finding (all platforms, not Windows-specific).** After Stop, the task's headline reads "Stopped" while its code is still `native_agent_cancel_requested`, that is, before the native run is confirmed to have ended (here `claude` ran 2.3 s longer). `nativeTaskOutcome.ts` words every `cancelled` state "Stopped" except `native_agent_full_access_revoked` and `native_agent_cancel_delivery_uncertain`. The backend's record is right; the wording claims a stop before it is shown.
+**Renderer finding (all platforms, not Windows-specific).** After Stop, the task's headline reads "Stopped" while its code is still `native_agent_cancel_requested`, that is, before the native run is confirmed to have ended (here `claude` ran 2.3 s longer). `nativeTaskOutcome.ts` words every `cancelled` state "Stopped" except `native_agent_full_access_revoked` and `native_agent_cancel_delivery_uncertain`. The backend's record is right; the wording claims a stop before it is shown. *Fixed in H9.*
+
+### H9. Stop presentation follows lifecycle evidence (2026-11-09)
+
+**Trace.** Stop revokes authority first (`cancel_task_with_code`): state `cancelled`, code `native_agent_cancel_requested`, at once. The adapter's observer later writes `native_agent_cancelled` (its run returned Cancelled) or `native_agent_cancel_delivery_uncertain` (Unknown). The renderer learns task changes only by polling `get_native_agent_task_status` every second (no Tauri event carries them), and `nativeAgentTaskNeedsObservation` stopped polling at any `cancelled` state. So it froze at `cancel_requested`, which `nativeTaskOutcome.ts` worded "Stopped", and never saw the confirmation or the uncertainty. Core could also leave `cancel_requested` final: when the observer ended with any outcome but Cancelled or Unknown, for a task stopped before it started, with no observer, after a restart, and on every remote requester (the executor's status loop ends at its first settled status, and the requester ignored later facts for a cancelled task).
+
+**Change.** The three cases are now distinct codes and words (Layer 5, "Stop"), settled only by evidence: the observer's end, the absence of any observer, the capability's containment at restart, or the executing Host's report through the existing status and reconciliation messages. No timer, no hidden message, no protocol or execution change.
+
+**Real app, Windows, Claude Code 2.1.319** (an isolated worktree build with the gate open, removed afterwards; sampled every ~50 ms after a real click on Stop while Claude Code's Bash tool ran `ping`):
+
+| After Stop | Shown | `claude` and its `ping` |
+|---|---|---|
+| +0.07 s | Stopping… | alive |
+| +2.13 s | Stopping… | ended |
+| +3.14 s | Stopped | ended |
+
+"Stopped" never showed while a process of the run was alive (the 1 s lag after the end is the renderer's poll).
+
+**Codex on Windows (finding, not changed).** The same check with Codex 0.163.0 (`agent.coding.codex`): "Stopping…" at +0.08 s, then "Stopped" at +0.95 s, recorded `native_agent_cancelled`, because Codex reported its turn interrupted. But the command that turn ran (`codex-command-runner` → PowerShell → `ping -n 120`) kept running and ended at its natural end, about two minutes after Stop. Pastey's presentation now follows its adapter's evidence exactly, and for Codex on Windows that evidence (Codex's own interrupted turn) does not cover the sandboxed command. Changing what the Codex adapter accepts as a stop is a change to Codex's execution contract and was left out of scope. It needs its own decision (for example, holding Codex's stop as pending until its command runners exit). Codex's app-server, which Pastey started, ended with Pastey.
+
+**Tests.** Rust: a Windows test samples a stubborn run's processes and the task throughout the stop (pending while any is alive, confirmed only after); restart with a pending stop (Claude Code: not confirmed; contained fake: confirmed); two-Host settlement through status and through reconciliation; an unconfirmed executor stop; a never-started stop; a rule table for remote settlement; the late-completion test now expects confirmation. Frontend: both Agents, local and remote, in all three states, plus observation and dismissal. Disabling each of the four Core rules fails at least one test. Windows suites 38/38 twice; frontend 79/79. Codex tests that use Unix shell fixtures (among the 95 that fail on Windows before and after) were updated where they asserted the old final code, but were not run here.
+
+### H10. Step 8 preparation
+
+`with_the_gate_open_a_peer_still_sees_codex_only` builds a Host with Codex and an **Available** Claude Code (gate opened to 2.1.319, fixture 2.1.319) and checks what it describes to peers (one fact, Codex) and what a peer's view makes of it (`agent.coding.codex` only). Peer filtering is by peer protocols, which Claude Code has none of, not by availability. The physical check with a paired Mac is the acceptance's step 8, run on an isolated worktree build with the gate open; its gate-opening command was run here and changes exactly one line. **Not run:** the Mac half.
