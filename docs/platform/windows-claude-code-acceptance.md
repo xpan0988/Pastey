@@ -1,6 +1,6 @@
 # Windows Claude Code acceptance (this device)
 
-This procedure opens `agent.coding.claude_code_conversation` on Windows. Until every step passes, the capability reports `native_agent_platform_unverified` there, whatever Claude Code is installed: the gate is `WINDOWS_ACCEPTED_VERSION` in `src-tauri/src/native_agent/capability/claude_code/conversation.rs`, which is `None`. Background-session continuation (`agent.coding.claude_code`, `claude --bg`) stays unavailable on Windows; this procedure does not cover it.
+This procedure opened `agent.coding.claude_code_conversation` on Windows. W-CC1 to W-CC4 steps 1–7 passed with Claude Code 2.1.319 on 2026-11-09 on a Windows 11 PC ([validation record](../research/claude-code-adapter-validation.md#h-windows-2026-11-09)). **Step 8, with a paired Mac, must pass and be recorded in section H11 of that record before this gate is used.** The gate, `WINDOWS_ACCEPTED_VERSION` in `src-tauri/src/native_agent/capability/claude_code/conversation.rs`, is `Some((2, 1, 319))`. Run it again before accepting an older version, or after a Claude Code change to its headless interface. Background-session continuation (`agent.coding.claude_code`, `claude --bg`) stays unavailable on Windows; this procedure does not cover it.
 
 What is already established, and how, is in [the validation record, section H](../research/claude-code-adapter-validation.md#h-windows-2026-11-09). This procedure covers what that could not: a signed-in Claude Code, real model turns and real tool processes, and the app itself.
 

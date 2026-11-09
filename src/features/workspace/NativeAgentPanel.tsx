@@ -250,7 +250,7 @@ export function claudeCodeUnavailableCopy(reason: string | null | undefined): st
     case "native_agent_incompatible":
       return "Claude Code on this device needs an update before Pastey can use it. Update Claude Code, then check again.";
     case "native_agent_platform_unverified":
-      return "Pastey runs Claude Code conversations only on macOS and Linux for now.";
+      return "Pastey runs Claude Code conversations only on macOS, Linux and Windows.";
     case "native_agent_launch_failed":
       return "Pastey cannot start Claude Code under its own supervision on this device.";
     default:

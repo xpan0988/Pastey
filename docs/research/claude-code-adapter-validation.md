@@ -512,3 +512,19 @@ The real app (`target\debug\pastey.exe`, this branch, with `WINDOWS_ACCEPTED_VER
 ### H10. Step 8 preparation
 
 `with_the_gate_open_a_peer_still_sees_codex_only` builds a Host with Codex and an **Available** Claude Code (gate opened to 2.1.319, fixture 2.1.319) and checks what it describes to peers (one fact, Codex) and what a peer's view makes of it (`agent.coding.codex` only). Peer filtering is by peer protocols, which Claude Code has none of, not by availability. The physical check with a paired Mac is the acceptance's step 8, run on an isolated worktree build with the gate open; its gate-opening command was run here and changes exactly one line. **Not run:** the Mac half.
+
+### H11. Windows gate: Claude Code 2.1.319
+
+This commit sets `WINDOWS_ACCEPTED_VERSION` to `Some((2, 1, 319))`: on Windows, Claude Code conversations run with 2.1.319 or later, and an older version is `Incompatible`. Evidence: H7 (signed-in lifecycle, Stop and a killed Pastey with real tool processes), H8 (the app, steps 1–7), H9 (Stop presentation), H10 (peer filtering with the gate open). Background-session continuation (`--bg`) stays unavailable on Windows.
+
+**Step 8 (paired Mac, gate open): to be recorded here before this gate is used.**
+
+| # | Result |
+|---|---|
+| Windows Settings → Agents (isolated build) | _not yet run_ |
+| 8a Mac: Device details (Windows) → Agents | _not yet run_ |
+| 8b Mac: Agents on Windows | _not yet run_ |
+| 8c Mac: Settings → Agents | _not yet run_ |
+| Restored (worktree removed, gate `None` on the base branch) | _not yet run_ |
+
+Known limitation carried with it: Codex's own stop on Windows does not end its sandboxed command (H9); that is Codex's behaviour, outside this gate.

@@ -35,8 +35,9 @@
 //! outcome is decided only once its job holds no process. Measured on
 //! Windows with Claude Code 2.1.309, signed out: the session id is honoured
 //! and a duplicate refused, an unknown `--resume` is refused, and the
-//! interrupt is acknowledged. Windows stays unavailable until a signed-in
-//! physical acceptance passes (`WINDOWS_ACCEPTED_VERSION`).
+//! interrupt is acknowledged. Signed in, 2.1.319 passed the physical
+//! acceptance; Windows runs only that version or later
+//! (`WINDOWS_ACCEPTED_VERSION`).
 //!
 //! Local only: no peer protocol.
 
@@ -82,10 +83,11 @@ const NO_PEER_PROTOCOLS: [&str; 0] = [];
 /// measured. Claude Code updates itself; older ones are refused.
 const MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 317);
 /// The oldest Claude Code whose Windows behaviour passed the signed-in
-/// physical acceptance (docs/platform/windows-claude-code-acceptance.md).
-/// `None` until it has: Windows is then unavailable, whatever is installed.
+/// physical acceptance (docs/platform/windows-claude-code-acceptance.md):
+/// 2.1.319, on Windows 11, 2026-11-09. `None` would make Windows
+/// unavailable, whatever is installed.
 #[cfg(windows)]
-const WINDOWS_ACCEPTED_VERSION: Option<(u64, u64, u64)> = None;
+const WINDOWS_ACCEPTED_VERSION: Option<(u64, u64, u64)> = Some((2, 1, 319));
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const AVAILABILITY_REUSE: Duration = Duration::from_secs(30);
 /// Bound for one stream-json line; a longer line is skipped.

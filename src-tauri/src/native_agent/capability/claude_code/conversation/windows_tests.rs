@@ -293,13 +293,32 @@ fn windows_stays_unavailable_until_its_acceptance_passes() {
     if WINDOWS_ACCEPTED_VERSION.is_none() {
         assert_eq!(gated.state, NativeAgentCapabilityStateV1::Unavailable);
         assert_eq!(gated.reason, Some("native_agent_platform_unverified"));
-        assert!(gated.detail.unwrap().contains("2.1.317"));
+        assert!(gated.detail.as_deref().unwrap().contains("2.1.317"));
         let mut service =
-            NativeAgentServiceV1::with_paths_and_adapters(fixture.paths(), vec![adapter]).unwrap();
+            NativeAgentServiceV1::with_paths_and_adapters(fixture.paths(), vec![adapter.clone()])
+                .unwrap();
         assert!(service
             .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
             .is_err());
         assert!(fixture.runs().is_empty(), "nothing ran");
+    }
+    if let Some(accepted) = WINDOWS_ACCEPTED_VERSION {
+        // The version the Windows acceptance measured, and only it or later.
+        assert_eq!(accepted, (2, 1, 319));
+        let shown = format!("{}.{}.{}", accepted.0, accepted.1, accepted.2);
+        assert_eq!(gated.state, NativeAgentCapabilityStateV1::Incompatible);
+        assert!(gated.detail.as_deref().unwrap().contains(&shown));
+        fs::write(
+            fixture.root.join("version"),
+            format!("{shown} (Claude Code)\n"),
+        )
+        .unwrap();
+        adapter.accept_windows_for_tests(WINDOWS_ACCEPTED_VERSION);
+        assert_eq!(
+            adapter.availability_report().state,
+            NativeAgentCapabilityStateV1::Available
+        );
+        fs::write(fixture.root.join("version"), "2.1.317 (Claude Code)\n").unwrap();
     }
 
     // A version older than the one accepted on Windows.
