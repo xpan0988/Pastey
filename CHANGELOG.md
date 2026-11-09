@@ -15,6 +15,7 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ### Fixed
 
+- **Stopping Codex on Windows now stops the command it was running.** Codex reported a stopped turn as interrupted at once, but a command the turn ran in Codex's Windows sandbox (for example a long build or `ping`) kept running to its end, while Pastey already read "Stopped". Codex now runs in a Job Object of its own on Windows. A stopped turn ends its Codex session and everything it started, and reads "Stopped" only once nothing is left. The conversation continues in a reopened session.
 - **Stop no longer says "Stopped" before the Agent has stopped.** A stopped task read "Stopped" as soon as Stop was clicked, and its card stopped updating, so a run still ending (or one whose stop could not be confirmed) kept that word. It now reads "Stopping…" until Pastey sees the run end, then "Stopped", or "Stop requested · not confirmed" when nothing can show it ended. This holds for Codex and Claude Code, on this device and on another one, whose own report decides it.
 - **A Claude Code turn that finished while Pastey was checking on it after a restart could be recorded as interrupted.** The transcript is now read again once Claude Code's registry shows no process, so the recorded outcome is the one the transcript ends with.
 

@@ -147,7 +147,18 @@ and a session that cannot open is a definite non-start
 before each new session. On Windows, `codex` resolves through absolute PATH
 directories, preferring `codex.exe` over the npm `codex.cmd` shim within each;
 the app-server is started in a non-verbatim working directory and shut down by
-closing its stdin, which also ends it behind the shim.
+closing its stdin, which also ends it behind the shim. It runs in a Job Object
+of its own (kill on close, no breakaway), with everything it starts,
+including the sandbox's command runners, which run as another user. Codex's
+interrupted turn does not show that the turn's command ended there: measured
+with 0.163.0, a sandboxed `ping` ran two minutes past `turn/interrupt`'s
+`interrupted`. So a stopped turn on Windows ends its session: stdin closes
+(Codex then ends its runners), whatever is left after 3 s is terminated, and
+the observer reports only once the job holds no process (otherwise unknown,
+"Stop requested · not confirmed"). The conversation is reopened with
+`thread/resume` when it continues. On macOS and Linux Codex's own
+cancellation ends the command's process group, and its interrupted turn is
+taken as the end.
 
 Pastey uses either backend, and a separate CLI install is not required when the
 ChatGPT desktop app with Codex is installed:
