@@ -725,8 +725,13 @@ fn a_stop_reads_confirmed_only_once_no_process_of_the_run_is_left() {
                 }
             }
             Some("native_agent_cancelled") => {
+                // A process leaves its job's count when its last thread
+                // ends, and its process object is signaled about 1 ms later
+                // (validation record, H11): nothing of it runs in between.
                 assert!(
-                    processes.iter().all(|pid| !alive(*pid)),
+                    processes
+                        .iter()
+                        .all(|pid| ended_within(*pid, Duration::from_millis(100))),
                     "confirmed while a process of the run was alive"
                 );
                 break;

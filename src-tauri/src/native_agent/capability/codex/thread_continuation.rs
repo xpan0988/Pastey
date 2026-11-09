@@ -628,6 +628,13 @@ impl NativeInvocationRunV1 for CodexThreadRunV1 {
             Some(&self.client_message_id),
             progress,
         );
+        if report.stop_requested && !controller.end_after_stop() {
+            return NativeInvocationOutcomeV1 {
+                kind: NativeTurnOutcomeV1::Unknown,
+                summary: None,
+                output: None,
+            };
+        }
         match report.outcome {
             NativeTurnOutcomeV1::Completed => report.response.into_completed_outcome(),
             kind => NativeInvocationOutcomeV1 {

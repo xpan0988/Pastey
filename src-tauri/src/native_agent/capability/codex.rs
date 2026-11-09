@@ -56,6 +56,8 @@ use crate::native_agent::{
 
 pub(in crate::native_agent) mod own_holds;
 pub(in crate::native_agent) mod thread_continuation;
+#[cfg(all(test, windows))]
+mod windows_stop_tests;
 pub(in crate::native_agent) mod writer_lock;
 
 /// The configured executable that names the user's installed Codex.
@@ -288,6 +290,12 @@ struct AvailabilityCacheStateV1 {
 
 type AvailabilityCacheV1 = Arc<Mutex<AvailabilityCacheStateV1>>;
 type SessionStoreV1 = Arc<Mutex<HashMap<String, NativeCodexSessionV1>>>;
+
+fn forget_session(sessions: &SessionStoreV1, controller: &Arc<CodexAppServerV1>) {
+    if let Ok(mut sessions) = sessions.lock() {
+        sessions.retain(|_, session| !Arc::ptr_eq(&session.controller, controller));
+    }
+}
 
 /// Availability for describing and admitting. A fresh fact is reused; a
 /// stale fact of the same executable is answered at once and re-observed in
@@ -632,9 +640,7 @@ impl CodexNativeAdapterV1 {
     }
 
     fn forget_session_of(&self, controller: &Arc<CodexAppServerV1>) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            sessions.retain(|_, session| !Arc::ptr_eq(&session.controller, controller));
-        }
+        forget_session(&self.sessions, controller);
     }
 }
 
@@ -1076,6 +1082,19 @@ impl NativeInvocationRunV1 for CodexInvocationRunV1 {
             },
         };
         let report = controller.run_turn(&thread_id, &self.prompt, None, progress);
+        // Windows ends a stopped turn's session (`end_after_stop`): no later
+        // task may reuse it. Elsewhere the session is kept, as before.
+        #[cfg(windows)]
+        if report.stop_requested {
+            forget_session(&self.sessions, &controller);
+        }
+        if report.stop_requested && !controller.end_after_stop() {
+            return NativeInvocationOutcomeV1 {
+                kind: NativeTurnOutcomeV1::Unknown,
+                summary: None,
+                output: None,
+            };
+        }
         match report.outcome {
             NativeTurnOutcomeV1::Completed => report.response.into_completed_outcome(),
             kind => NativeInvocationOutcomeV1 {
@@ -1191,6 +1210,8 @@ impl CodexResponseCaptureV1 {
 struct CodexTurnReportV1 {
     outcome: NativeTurnOutcomeV1,
     response: CodexResponseCaptureV1,
+    /// Pastey asked Codex to interrupt this turn (Stop, release or Burn).
+    stop_requested: bool,
 }
 
 fn turn_start_ack_timeout() -> Duration {
@@ -1993,6 +2014,10 @@ pub(in crate::native_agent) struct CodexAppServerV1 {
     decisions: Mutex<HashMap<String, PendingNativeDecisionV1>>,
     /// The Codex version this app-server reported when it started.
     version: OnceLock<String>,
+    /// The Job Object holding the app-server and everything it starts
+    /// (Windows). `None` only once dropped.
+    #[cfg(windows)]
+    job: Option<super::claude_code::job::ContainedJobV1>,
 }
 
 /// One native request awaiting its requesting user, as only this adapter
@@ -2275,14 +2300,24 @@ impl CodexAppServerV1 {
         // authentication and any native configuration. Pastey owns none of it.
         // A plain (not `\\?\`) working directory: a Windows launcher shim runs
         // under cmd.exe, which cannot start in a verbatim path.
-        let mut child = launcher
-            .command()
+        let mut command = launcher.command();
+        command
             .args(["app-server", "--stdio"])
             .current_dir(dunce::simplified(workspace))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
+        // On Windows the app-server runs only once it is in a Job Object of
+        // its own, with everything it starts: the launcher shim, Node, and
+        // the sandbox's command runners with their shells and commands (all
+        // measured inside it with 0.163.0's elevated sandbox, which runs them
+        // as another user). See `end_after_stop`.
+        #[cfg(windows)]
+        let job = super::claude_code::job::ContainedJobV1::create()?;
+        #[cfg(windows)]
+        let mut child = job.spawn(&mut command)?;
+        #[cfg(not(windows))]
+        let mut child = command.spawn()?;
         let stdin = child
             .stdin
             .take()
@@ -2308,6 +2343,8 @@ impl CodexAppServerV1 {
             in_use: AtomicBool::new(false),
             decisions: Mutex::default(),
             version: OnceLock::new(),
+            #[cfg(windows)]
+            job: Some(job),
         };
         controller.send(json!({"id": INITIALIZE_ID, "method": "initialize", "params": {"clientInfo": {"name": "Pastey", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
         let initialized = controller.await_result(
@@ -2391,6 +2428,7 @@ impl CodexAppServerV1 {
         let unknown = |response| CodexTurnReportV1 {
             outcome: NativeTurnOutcomeV1::Unknown,
             response,
+            stop_requested: self.interrupt_requested.load(Ordering::Acquire),
         };
         if self
             .send(match client_message_id {
@@ -2574,8 +2612,13 @@ impl CodexAppServerV1 {
             progress.awaiting_native_decision(false);
         }
         self.clear_decisions();
+        let stop_requested = self.interrupt_requested.load(Ordering::Acquire);
         let _ = self.clear_active_turn();
-        CodexTurnReportV1 { outcome, response }
+        CodexTurnReportV1 {
+            outcome,
+            response,
+            stop_requested,
+        }
     }
 
     fn clear_decisions(&self) {
@@ -2821,9 +2864,62 @@ impl CodexAppServerV1 {
     }
 }
 
+/// How long Codex has to end its own processes once its stdin closes,
+/// before Pastey ends them (Windows). Measured with 0.163.0: under 0.1 s.
+#[cfg(windows)]
+const CODEX_EXIT_GRACE: Duration = Duration::from_secs(3);
+/// Bound for the job to show itself empty after Pastey terminates it.
+#[cfg(windows)]
+const CODEX_TERMINATION_BOUND: Duration = Duration::from_secs(5);
+
+impl CodexAppServerV1 {
+    /// A stop counts only once the turn's processes are shown ended.
+    ///
+    /// Windows: Codex's interrupted turn does not show it. Measured with
+    /// 0.163.0 (elevated sandbox): `turn/interrupt` was answered and the turn
+    /// reported `interrupted` within 0.06 s, while the command the turn ran
+    /// (`codex-command-runner` -> PowerShell -> `ping -n 120`) ran on to its
+    /// natural end two minutes later, which Codex then reported as a
+    /// completed command. Pastey cannot tell that runner from the
+    /// app-server's other processes, so it ends this app-server: its stdin
+    /// closes (Codex then ends its runners itself, measured within 0.6 s),
+    /// whatever is left after `CODEX_EXIT_GRACE` is terminated, and the stop
+    /// counts only once the job holds no process. `false` when the job cannot
+    /// be shown empty. The conversation is reopened with `thread/resume` when
+    /// it continues, as after eviction.
+    ///
+    /// Elsewhere Codex's own interrupted turn is taken as the turn's end
+    /// (Layer 5, "Stop").
+    fn end_after_stop(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.shutdown();
+            let Some(job) = self.job.as_ref() else {
+                return false;
+            };
+            job.wait_empty(CODEX_EXIT_GRACE) || job.end_remaining(CODEX_TERMINATION_BOUND).is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+}
+
 impl Drop for CodexAppServerV1 {
     fn drop(&mut self) {
         self.shutdown();
+        // Closing the job's handle would end at once whatever Codex is still
+        // closing: give it its grace first, off the caller's thread, then end
+        // the rest. Pastey's own exit still ends everything at once.
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            thread::spawn(move || {
+                if !job.wait_empty(CODEX_EXIT_GRACE) {
+                    let _ = job.end_remaining(CODEX_TERMINATION_BOUND);
+                }
+            });
+        }
     }
 }
 
