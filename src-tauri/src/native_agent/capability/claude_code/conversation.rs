@@ -28,7 +28,17 @@
 //!   process holds is refused before anything is sent; a client that opens
 //!   it later is not prevented.
 //!
-//! Local only: no peer protocol. Unix only until Windows is validated.
+//! On Windows the lifeline is a Job Object (`job`): `claude` and everything
+//! it starts end when Pastey's process does, however it ends. Stop sends
+//! Claude Code's own interrupt control request (Windows has no SIGINT for a
+//! process without a shared console), then ends the whole job. A run's
+//! outcome is decided only once its job holds no process. Measured on
+//! Windows with Claude Code 2.1.309, signed out: the session id is honoured
+//! and a duplicate refused, an unknown `--resume` is refused, and the
+//! interrupt is acknowledged. Windows stays unavailable until a signed-in
+//! physical acceptance passes (`WINDOWS_ACCEPTED_VERSION`).
+//!
+//! Local only: no peer protocol.
 
 use std::{
     collections::HashMap,
@@ -53,7 +63,7 @@ use super::super::{
     NativeSessionRefV1, OpaqueCapabilityPayloadV1, PreparedConversationV1, PreparedInvocationV1,
     StartedInvocationV1,
 };
-use super::{claude_command, outcome, run_command, ClaudeCodeNativeAdapterV1, RecoveryV1};
+use super::{claude_command, outcome, run_probe, ClaudeCodeNativeAdapterV1, RecoveryV1};
 use crate::error::{AppError, AppResult};
 use crate::native_agent::sessions::claude::{
     claude_config_dir, find_cli, live_status, project_dir,
@@ -71,6 +81,11 @@ const NO_PEER_PROTOCOLS: [&str; 0] = [];
 /// The oldest Claude Code whose headless behaviour, as relied on above, was
 /// measured. Claude Code updates itself; older ones are refused.
 const MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 317);
+/// The oldest Claude Code whose Windows behaviour passed the signed-in
+/// physical acceptance (docs/platform/windows-claude-code-acceptance.md).
+/// `None` until it has: Windows is then unavailable, whatever is installed.
+#[cfg(windows)]
+const WINDOWS_ACCEPTED_VERSION: Option<(u64, u64, u64)> = None;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const AVAILABILITY_REUSE: Duration = Duration::from_secs(30);
 /// Bound for one stream-json line; a longer line is skipped.
@@ -80,8 +95,15 @@ const MAX_STDERR_BYTES: usize = 8 * 1024;
 /// Bound for reading Claude Code's global configuration (its trust record).
 const MAX_GLOBAL_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 /// After Stop: how long the interrupted run may take, then the terminated.
+/// On Windows there is no terminate step: the job is ended after the first.
+#[cfg(not(all(test, windows)))]
 const STOP_INTERRUPT_GRACE: Duration = Duration::from_secs(10);
+#[cfg(all(test, windows))]
+const STOP_INTERRUPT_GRACE: Duration = Duration::from_millis(1500);
 const STOP_TERMINATE_GRACE: Duration = Duration::from_secs(5);
+/// How long processes a run left behind may take to end once terminated.
+#[cfg(windows)]
+const LEFTOVER_GRACE: Duration = Duration::from_secs(5);
 const EVENT_POLL: Duration = Duration::from_millis(100);
 
 #[derive(Deserialize)]
@@ -137,17 +159,36 @@ pub(in crate::native_agent) fn conversation_input(
 #[derive(Clone)]
 enum LauncherV1 {
     /// Under the lifeline helper, Pastey's own executable (the product).
+    #[cfg(unix)]
     Lifeline(PathBuf),
+    /// In a Job Object of its own that ends with Pastey (Windows: the
+    /// product and its tests).
+    #[cfg(windows)]
+    Job,
     /// Directly, in its own process group (tests, with a fixture `claude`).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Direct,
 }
 
+impl LauncherV1 {
+    fn product() -> Option<Self> {
+        #[cfg(unix)]
+        return std::env::current_exe().ok().map(LauncherV1::Lifeline);
+        #[cfg(windows)]
+        return Some(LauncherV1::Job);
+        #[cfg(not(any(unix, windows)))]
+        return None;
+    }
+}
+
 /// The started process: the lifeline helper, or (tests) `claude` itself.
+/// On Windows, `claude` and the job that holds it and all it starts.
 struct ClaudeProcessV1 {
     child: Child,
     #[cfg(unix)]
     lifeline: Option<std::io::PipeWriter>,
+    #[cfg(windows)]
+    job: super::job::ContainedJobV1,
 }
 
 impl ClaudeProcessV1 {
@@ -173,10 +214,43 @@ impl ClaudeProcessV1 {
         unsafe { libc::kill(target, signal) == 0 }
     }
 
-    #[cfg(not(unix))]
+    /// Windows: an interrupt is Claude Code's own control request, which
+    /// the run's observer writes to its stdin; here it only reports whether
+    /// `claude` still runs. Anything stronger ends the whole job.
+    #[cfg(windows)]
+    fn request(&mut self, request: u8) -> bool {
+        match request {
+            INTERRUPT => matches!(self.child.try_wait(), Ok(None)),
+            _ => self.job.terminate().is_ok(),
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn request(&mut self, _request: u8) -> bool {
         self.child.kill().is_ok()
     }
+}
+
+/// Claude Code's own interrupt control request (as the Agent SDK sends it)
+/// on the run's stdin. `false` when stdin is closed or the write failed.
+#[cfg(windows)]
+fn interrupt_through(stdin: &mut Option<ChildStdin>) -> bool {
+    let Some(input) = stdin.as_mut() else {
+        return false;
+    };
+    let request = json!({
+        "type": "control_request",
+        "request_id": format!("pastey-interrupt-{}", Uuid::new_v4()),
+        "request": {"subtype": "interrupt"},
+    });
+    let sent = input
+        .write_all(format!("{request}\n").as_bytes())
+        .and_then(|()| input.flush())
+        .is_ok();
+    if !sent {
+        stdin.take();
+    }
+    sent
 }
 
 #[cfg(unix)]
@@ -221,6 +295,9 @@ pub(in crate::native_agent) struct ClaudeCodeConversationAdapterV1 {
     /// Observes a run again after a restart, from the same transcript and
     /// registry the session continuation adapter watches.
     reobserver: ClaudeCodeNativeAdapterV1,
+    /// `WINDOWS_ACCEPTED_VERSION`, which tests may stand in for.
+    #[cfg(windows)]
+    windows_accepted: Mutex<Option<(u64, u64, u64)>>,
 }
 
 impl Default for ClaudeCodeConversationAdapterV1 {
@@ -229,10 +306,12 @@ impl Default for ClaudeCodeConversationAdapterV1 {
             cli: Mutex::new(None),
             config_dir: Mutex::new(None),
             global_config: Mutex::new(None),
-            launcher: Mutex::new(std::env::current_exe().ok().map(LauncherV1::Lifeline)),
+            launcher: Mutex::new(LauncherV1::product()),
             runs: Arc::default(),
             observed: Mutex::new(None),
             reobserver: ClaudeCodeNativeAdapterV1::default(),
+            #[cfg(windows)]
+            windows_accepted: Mutex::new(WINDOWS_ACCEPTED_VERSION),
         }
     }
 }
@@ -272,22 +351,39 @@ impl ClaudeCodeConversationAdapterV1 {
     }
 
     /// Tests: a fixture `claude`, store and global configuration, started
-    /// without the lifeline helper.
+    /// without the lifeline helper (on Windows, in its Job Object as in the
+    /// product, and past the acceptance gate).
     #[cfg(test)]
     pub(in crate::native_agent) fn use_fixture(&self, cli: &Path, config_dir: &Path) {
         *self.cli.lock().unwrap() = Some(cli.to_path_buf());
         *self.config_dir.lock().unwrap() = Some(config_dir.to_path_buf());
         *self.global_config.lock().unwrap() = Some(config_dir.join(".claude.json"));
-        *self.launcher.lock().unwrap() = Some(LauncherV1::Direct);
+        #[cfg(unix)]
+        {
+            *self.launcher.lock().unwrap() = Some(LauncherV1::Direct);
+        }
+        #[cfg(windows)]
+        self.accept_windows_for_tests(Some(MINIMUM_VERSION));
         *self.observed.lock().unwrap() = None;
         self.reobserver.use_fixture(cli, config_dir);
     }
 
     /// Tests: the installed `claude` under a real lifeline helper (the
     /// built `pastey` executable).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(in crate::native_agent) fn use_lifeline_helper(&self, helper: &Path) {
         *self.launcher.lock().unwrap() = Some(LauncherV1::Lifeline(helper.to_path_buf()));
+    }
+
+    /// Tests: stands in for `WINDOWS_ACCEPTED_VERSION` (the live acceptance
+    /// runs past the gate it is meant to open).
+    #[cfg(all(test, windows))]
+    pub(in crate::native_agent) fn accept_windows_for_tests(
+        &self,
+        accepted: Option<(u64, u64, u64)>,
+    ) {
+        *self.windows_accepted.lock().unwrap() = accepted;
+        *self.observed.lock().unwrap() = None;
     }
 
     /// Tests: every live run stops observing silently, as if Pastey's
@@ -306,10 +402,10 @@ impl ClaudeCodeConversationAdapterV1 {
             detail: Some(detail),
             backend: None,
         };
-        if cfg!(not(unix)) {
+        if cfg!(not(any(unix, windows))) {
             return unavailable(
                 "native_agent_platform_unverified",
-                "Pastey runs Claude Code conversations only on macOS and Linux until they are validated on Windows.".into(),
+                "Pastey runs Claude Code conversations only on macOS, Linux and Windows.".into(),
             );
         }
         let Some(cli) = self.cli() else {
@@ -320,7 +416,7 @@ impl ClaudeCodeConversationAdapterV1 {
         };
         let mut command = claude_command(&cli);
         command.arg("--version").current_dir(std::env::temp_dir());
-        let Some((true, text)) = run_command(command, PROBE_TIMEOUT) else {
+        let Some((true, text)) = run_probe(command, PROBE_TIMEOUT) else {
             return unavailable(
                 "native_agent_probe_failed",
                 format!("`{} --version` did not answer.", cli.display()),
@@ -346,6 +442,31 @@ impl ClaudeCodeConversationAdapterV1 {
                 backend: None,
             };
         }
+        #[cfg(windows)]
+        {
+            let accepted = self
+                .windows_accepted
+                .lock()
+                .ok()
+                .and_then(|accepted| *accepted);
+            let Some(accepted) = accepted else {
+                return unavailable(
+                    "native_agent_platform_unverified",
+                    format!("Claude Code {shown} is installed, but Pastey runs Claude Code conversations on Windows only once their physical acceptance has passed."),
+                );
+            };
+            if version < accepted {
+                return CapabilityAvailabilityV1 {
+                    state: NativeAgentCapabilityStateV1::Incompatible,
+                    reason: Some("native_agent_incompatible"),
+                    detail: Some(format!(
+                        "Claude Code {shown} is older than {}.{}.{}, the oldest version Pastey has accepted on Windows. Update Claude Code.",
+                        accepted.0, accepted.1, accepted.2
+                    )),
+                    backend: None,
+                };
+            }
+        }
         if signed_out(&cli) {
             return unavailable(
                 "native_agent_signed_out",
@@ -356,6 +477,13 @@ impl ClaudeCodeConversationAdapterV1 {
             return unavailable(
                 "native_agent_launch_failed",
                 "Pastey cannot find its own executable to keep Claude Code on its lifeline.".into(),
+            );
+        }
+        #[cfg(windows)]
+        if let Err(error) = super::job::ContainedJobV1::create() {
+            return unavailable(
+                "native_agent_launch_failed",
+                format!("Pastey cannot create the Job Object that keeps Claude Code contained: {error}."),
             );
         }
         CapabilityAvailabilityV1 {
@@ -381,7 +509,7 @@ fn signed_out(cli: &Path) -> bool {
     command
         .args(["auth", "status"])
         .current_dir(std::env::temp_dir());
-    let Some((_, text)) = run_command(command, PROBE_TIMEOUT) else {
+    let Some((_, text)) = run_probe(command, PROBE_TIMEOUT) else {
         return false;
     };
     let Some(start) = text.find('{') else {
@@ -455,7 +583,7 @@ fn trust_problem(workspace: &Path, global_config: Option<&Path>) -> Option<Strin
     ))
 }
 
-/// Claude Code's own trust record for any of `folders`:
+/// Claude Code's own trust record for any of `folders` (canonical):
 /// `projects["<folder>"].hasTrustDialogAccepted` in its global
 /// configuration, keyed by the repository root or the folder itself.
 fn claude_code_trusts(global_config: Option<&Path>, folders: &[&Path]) -> bool {
@@ -476,22 +604,34 @@ fn claude_code_trusts(global_config: Option<&Path>, folders: &[&Path]) -> bool {
     let Ok(config) = serde_json::from_str::<Value>(&text) else {
         return false;
     };
-    folders.iter().any(|folder| {
-        [
-            folder.to_string_lossy().into_owned(),
-            dunce::simplified(folder).to_string_lossy().into_owned(),
-        ]
+    let Some(projects) = config.get("projects").and_then(Value::as_object) else {
+        return false;
+    };
+    let trusted: Vec<&str> = projects
         .iter()
-        .any(|key| {
-            config
-                .pointer(&format!(
-                    "/projects/{}",
-                    key.replace('~', "~0").replace('/', "~1")
-                ))
-                .and_then(|project| project.get("hasTrustDialogAccepted"))
-                == Some(&Value::Bool(true))
-        })
-    })
+        .filter(|(_, project)| project.get("hasTrustDialogAccepted") == Some(&Value::Bool(true)))
+        .map(|(key, _)| key.as_str())
+        .collect();
+    folders
+        .iter()
+        .any(|folder| trusted.iter().any(|key| names_folder(key, folder)))
+}
+
+/// Whether Claude Code's project key `key` names the canonical `folder`:
+/// as Claude Code spells it (on Windows `C:/…`, with forward slashes), or
+/// as another local path that resolves to the same folder (another case, a
+/// junction or symlink, a short name). A network path counts only as
+/// spelled: resolving one can hang on an unreachable share.
+fn names_folder(key: &str, folder: &Path) -> bool {
+    let plain = dunce::simplified(folder).to_string_lossy();
+    if key == folder.to_string_lossy() || key == plain || key == plain.replace('\\', "/") {
+        return true;
+    }
+    let path = Path::new(key);
+    if !path.is_absolute() || key.starts_with("\\\\") || key.starts_with("//") {
+        return false;
+    }
+    path.canonicalize().is_ok_and(|resolved| resolved == folder)
 }
 
 impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
@@ -788,43 +928,52 @@ impl ConversationRunV1 {
                     lifeline: Some(writer),
                 })
             }
-            #[cfg(not(unix))]
-            LauncherV1::Lifeline(_) => Err(std::io::Error::other(
-                "Claude Code conversations run only on macOS and Linux for now.",
-            )),
-            #[cfg(test)]
-            LauncherV1::Direct => {
+            #[cfg(windows)]
+            LauncherV1::Job => {
+                let job = super::job::ContainedJobV1::create()?;
                 let mut command = claude_command(&self.cli);
                 command.args(args);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::CommandExt;
-                    // SAFETY: only an async-signal-safe call before exec.
-                    unsafe {
-                        command.pre_exec(|| {
-                            if libc::setpgid(0, 0) != 0 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            Ok(())
-                        });
-                    }
+                self.prepare(&mut command);
+                let child = job.spawn(&mut command)?;
+                Ok(ClaudeProcessV1 { child, job })
+            }
+            #[cfg(all(test, unix))]
+            LauncherV1::Direct => {
+                use std::os::unix::process::CommandExt;
+                let mut command = claude_command(&self.cli);
+                command.args(args);
+                // SAFETY: only an async-signal-safe call before exec.
+                unsafe {
+                    command.pre_exec(|| {
+                        if libc::setpgid(0, 0) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
                 }
                 Ok(ClaudeProcessV1 {
                     child: self.spawn(command)?,
-                    #[cfg(unix)]
                     lifeline: None,
                 })
             }
         }
     }
 
-    fn spawn(&self, mut command: Command) -> std::io::Result<Child> {
+    /// In the folder, with piped stdio. The folder is given as a plain path
+    /// (on Windows `C:\…`, never the verbatim `\\?\C:\…` a canonical path
+    /// is), as a terminal would: Claude Code names its records after it.
+    fn prepare(&self, command: &mut Command) {
         command
-            .current_dir(&self.workspace)
+            .current_dir(dunce::simplified(&self.workspace))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .stderr(Stdio::piped());
+    }
+
+    #[cfg(unix)]
+    fn spawn(&self, mut command: Command) -> std::io::Result<Child> {
+        self.prepare(&mut command);
+        command.spawn()
     }
 
     fn user_message(&self) -> String {
@@ -872,6 +1021,12 @@ impl ConversationRunV1 {
             }
             if self.control.stop.load(Ordering::Acquire) {
                 let since = *stopping.get_or_insert_with(|| {
+                    // Windows: Claude Code's own interrupt, or, with no way
+                    // left to ask it (stdin closed after a result), the job.
+                    #[cfg(windows)]
+                    if !interrupt_through(&mut stdin) {
+                        self.with_process(|process| process.request(KILL));
+                    }
                     self.with_process(|process| process.request(INTERRUPT));
                     Instant::now()
                 });
@@ -976,12 +1131,26 @@ impl ConversationRunV1 {
         }
     }
 
+    /// `left` is what was left of the run once `claude` exited: how many
+    /// processes it left running that Pastey then ended (on Windows counting
+    /// the hidden console's host; always 0 where nothing contains them), or
+    /// why they could not be shown to have ended.
     fn classify(
         &self,
         observed: ObservedV1,
         status: Option<std::process::ExitStatus>,
         stderr: &str,
+        left: Result<u32, String>,
     ) -> NativeInvocationOutcomeV1 {
+        let left = match left {
+            Ok(left) => left,
+            // Something the run started may still be working: neither a
+            // stop nor a result proves the turn is over.
+            Err(why) => return outcome(
+                NativeTurnOutcomeV1::Unknown,
+                format!("Claude Code exited, but what it started could not be shown to have ended ({why}); it may still be working."),
+            ),
+        };
         let ended_cleanly = status.is_some_and(|status| status.success());
         if self.control.stop.load(Ordering::Acquire) && status.is_some() {
             return outcome(
@@ -1061,11 +1230,14 @@ impl ConversationRunV1 {
                 "Claude Code did not end cleanly after its last result; the outcome is unknown.",
             );
         }
-        let summary = match result.denials {
+        let mut summary = match result.denials {
             0 => "Claude Code completed the turn.".to_string(),
             1 => "Claude Code completed the turn. It denied 1 action that needed approval; its own settings decide which do.".to_string(),
             count => format!("Claude Code completed the turn. It denied {count} actions that needed approval; its own settings decide which do."),
         };
+        if left > 0 {
+            summary.push_str(" It left processes running, which Pastey ended.");
+        }
         NativeInvocationOutcomeV1 {
             kind: NativeTurnOutcomeV1::Completed,
             summary: Some(summary),
@@ -1136,7 +1308,10 @@ impl ConversationRunV1 {
             });
         }
         let mut stdin = stdin;
-        if let Some(input) = stdin.as_mut() {
+        // Windows: a Stop already asked for is sent through stdin, and the
+        // prompt is never sent after it.
+        let stopped = cfg!(windows) && self.control.stop.load(Ordering::Acquire);
+        if let Some(input) = stdin.as_mut().filter(|_| !stopped) {
             let message = format!("{}\n", self.user_message());
             if input
                 .write_all(message.as_bytes())
@@ -1148,13 +1323,21 @@ impl ConversationRunV1 {
             }
         }
         let (observed, status) = self.observe(progress, stdin, events);
+        // Windows: whatever `claude` left running in its job is ended, and
+        // must be shown gone, before anything is concluded.
+        #[cfg(windows)]
+        let left = self
+            .with_process(|process| process.job.end_remaining(LEFTOVER_GRACE))
+            .unwrap_or_else(|| Err("the run's Job Object is gone".into()));
+        #[cfg(not(windows))]
+        let left = Ok(0);
         // Give the stderr reader a moment to finish what the exit flushed.
         thread::sleep(Duration::from_millis(50));
         let stderr = stderr_text
             .lock()
             .map(|text| text.clone())
             .unwrap_or_default();
-        self.classify(observed, status, &stderr)
+        self.classify(observed, status, &stderr, left)
     }
 }
 
@@ -1215,3 +1398,5 @@ impl NativeInvocationRunV1 for ConversationRunV1 {
 
 #[cfg(all(test, unix))]
 mod tests;
+#[cfg(all(test, windows))]
+mod windows_tests;

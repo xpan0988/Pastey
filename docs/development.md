@@ -195,6 +195,14 @@ The same command also runs the Claude Code conversation checks. They go through 
 
 They run in folders under `src-tauri/target/`, which Claude Code must trust as part of this repository.
 
+On Windows, the Claude Code conversation adapter has its own suites. They run real Windows processes in the product's Job Object (a fixture `claude.cmd` with PowerShell `-p` runs, `ping`, `conhost`), and no Claude Code:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- claude_code::job:: conversation::windows_tests --test-threads=4
+```
+
+Their live checks, and the steps that open the capability on Windows, are in the [Windows Claude Code acceptance](platform/windows-claude-code-acceptance.md). Until it passes, the capability reports `native_agent_platform_unverified` on Windows.
+
 ```bash
 cargo build --manifest-path src-tauri/Cargo.toml
 ```

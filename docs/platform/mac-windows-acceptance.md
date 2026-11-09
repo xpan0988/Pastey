@@ -329,7 +329,7 @@ Prerequisites: N1–N5. Run at the default window size (about 760 px wide) and o
 
 ## R. Claude Code conversations (this device; Windows boundary)
 
-Claude Code conversations run on the device that starts them (local only); peers neither see nor invoke them. They are enabled on macOS and Linux only: on Windows the capability reports "only on macOS and Linux for now" until R8–R12 pass there.
+Claude Code conversations run on the device that starts them (local only); peers neither see nor invoke them. They are enabled on macOS and Linux only: on Windows the capability reports "only on macOS and Linux for now" until the [Windows Claude Code acceptance](windows-claude-code-acceptance.md) passes there. Windows containment (a Job Object), folder identity and trust handling are implemented; R9–R11 below were answered on 2026-11-09 ([section H](../research/claude-code-adapter-validation.md#h-windows-2026-11-09)) except where a signed-in run is needed, which that procedure covers.
 
 Prerequisites: Claude Code 2.1.317 or later, signed in (`claude auth status` → `loggedIn: true`); a folder Claude Code trusts (run `claude` there once and accept), and a second, never-trusted folder containing `.claude/settings.json`.
 

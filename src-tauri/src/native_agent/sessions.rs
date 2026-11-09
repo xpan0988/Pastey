@@ -590,14 +590,19 @@ pub(crate) fn quote(text: &str, limit: usize) -> String {
 }
 
 /// Runs a short read-only command with a time bound; `None` on any failure.
+/// On Windows it runs in a Job Object of its own, without a console window,
+/// and nothing it started outlives it.
 pub(crate) fn bounded_output(mut command: Command, timeout: Duration) -> Option<Vec<u8>> {
     use std::io::Read;
-    let mut child = command
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    let (mut child, job) =
+        crate::native_agent::capability::claude_code::job::spawn_probe(&mut command).ok()?;
+    #[cfg(not(windows))]
+    let mut child = command.spawn().ok()?;
     let mut stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut output = Vec::new();
@@ -611,6 +616,9 @@ pub(crate) fn bounded_output(mut command: Command, timeout: Duration) -> Option<
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // Nothing it left behind keeps the output open.
+                #[cfg(windows)]
+                let _ = job.end_remaining(Duration::from_secs(1));
                 let output = reader.join().ok()?;
                 return status.success().then_some(output);
             }

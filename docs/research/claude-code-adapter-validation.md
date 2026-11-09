@@ -379,4 +379,81 @@ What was verified, and how:
   - **Stop:** recorded `native_agent_cancelled`, and no Claude Code process was left.
   - **Pastey killed:** a separate Pastey process was killed with SIGKILL during a turn. Claude Code's run ended **0.15 s** later through the lifeline, with nobody stopping it. The restored task was `native_agent_outcome_unknown`, then observed `interrupted` from the transcript, never `failed`. The prompt was sent once.
 - **Not driven:** the app's UI with a mouse, and the Tauri IPC layer itself. The live checks call the method the command calls.
-- **Not run:** Windows. Acceptance R is the boundary.
+- **Not run:** Windows. Acceptance R is the boundary. *(Section H: Windows containment, identity and trust are now implemented and tested on Windows; enabling it waits on a signed-in run.)*
+
+## H. Windows, 2026-11-09
+
+Scope: `agent.coding.claude_code_conversation` on Windows, local only. Not in scope: remote Claude Code, Layer 4 or Bridge authority, `--bg` continuation (now reported unavailable on Windows), UI.
+
+Environment: Windows 11 Pro 10.0.26200, x86_64, Rust 1.95.0, from a shell with every Claude Code session variable removed. The only Claude Code on this Host is the Claude desktop app's own copy, **2.1.309**, under `%LOCALAPPDATA%\Claude-Data\…\claude-code\2.1.309\…\claude.exe`: not on `PATH`, and **signed out** when run on its own. So no model turn ran, and 2.1.309 is older than the measured minimum (2.1.317).
+
+Evidence levels used here:
+- **Physical**: real Windows processes on this Host, in the product's own Job Object code.
+- **Physical, fixture**: the same, with a fixture `claude.cmd` (PowerShell `-p` runs that speak stream-json) in place of Claude Code. Pastey's behaviour is real; Claude Code's is simulated.
+- **Measured**: the real `claude.exe` 2.1.309, signed out.
+- **Not run**: needs a signed-in Claude Code; covered by the [Windows Claude Code acceptance](../platform/windows-claude-code-acceptance.md).
+
+### H1. Unix and macOS assumptions found
+
+| Where | Assumption | Effect on Windows | Now |
+|---|---|---|---|
+| Conversation probe | `cfg!(not(unix))` refused Windows | Unavailable | Gated on `WINDOWS_ACCEPTED_VERSION` instead |
+| Lifeline | Descriptor 3, `setpgid`, SIGINT/SIGTERM/SIGKILL | No containment at all | Job Object (`job.rs`) |
+| Trust record | Keys compared as `\\?\C:\…` or `C:\…` | Claude Code writes `C:/…` (measured in `~/.claude.json`): a trusted folder with project configuration was always refused (fail-closed, but unusable) | Matched as spelled, with forward slashes, or by canonical identity |
+| Working folder | The canonical, verbatim `\\?\C:\…` | Measured: Claude Code normalises it to `C:\…`, so no defect | Passes the plain form, as a terminal would |
+| Probes, registry reads | `child.kill()` on timeout ends only the root | An npm `claude.cmd`'s Node child could outlive a timed-out probe; console windows would flash from the GUI | Each in its own Job Object, without a console window |
+| `--bg` continuation | Registered on every platform | Never measured on Windows; prompt passed as an argument through `cmd.exe` for a `.cmd` | Reported `native_agent_platform_unverified` |
+| Re-observation (all platforms) | Transcript read, then registry | See H5 | Fixed |
+
+### H2. Claude Code 2.1.309 on Windows (measured, signed out)
+
+- `--version`: `2.1.309 (Claude Code)`. `auth status`: JSON with `loggedIn: false`, `authMethod: none` (Pastey: `native_agent_signed_out`). `agents --json`: a list with `pid`, `cwd` (`C:\…`), `kind`, `sessionId`, `status`. None of the three leaves a process behind.
+- `-p` stream-json, `--session-id U`: `system/init` for exactly `U`; the replay echoes Pastey's own prompt `uuid`, which the transcript records; signed out, the result is `success` with `is_error: true` and one turn (Pastey: Failed). Reusing `U`: `Session ID … is already in use`, exit 1, no events. Unknown `--resume`: `No conversation found`, an `error_during_execution` result with 0 turns, exit 1.
+- The interrupt control request is acknowledged (`control_response`, `success`) within 0.3 s. Its effect on a running turn was not seen (no turn ran).
+- 2.1.309 also emits `command_lifecycle` events; the adapter ignores them.
+- The transcript folder is named from `C:\…` (`C--Users-…`), as Pastey's `project_dir` computes.
+
+### H3. Containment design
+
+- `claude` is created suspended (`CREATE_SUSPENDED | CREATE_NO_WINDOW`), assigned to a new Job Object, then resumed. A process that cannot join is terminated before it ran (a definite non-start).
+- Limits: `KILL_ON_JOB_CLOSE`, and neither `BREAKAWAY_OK` nor `SILENT_BREAKAWAY_OK`. The job is unnamed and its handle not inheritable: Pastey's process holds the only handle, so its end, however it ends, ends every process in the job.
+- Stop: Claude Code's interrupt control request on stdin (there is no SIGINT for a process without a shared console, and `CTRL_BREAK` is a termination for Node and Bun). After 10 s, or at once when stdin is already closed after a result, `TerminateJobObject`. No SIGTERM step.
+- After `claude` exits, what it left in the job is terminated, and the job must report no active process within 5 s before any outcome is recorded. Otherwise the outcome is `native_agent_outcome_unknown` (Stop must not claim a termination it cannot show).
+- Restart: unchanged. The adapter does not declare that its execution ends with Pastey (a broker-started process could outlive it), so a restored turn is unknown and re-observed from the registry and transcript, never sent again.
+
+### H4. Results
+
+| Guarantee | Evidence | Level |
+|---|---|---|
+| Nothing a contained process starts can leave: explicit `CREATE_BREAKAWAY_FROM_JOB` refused (`ERROR_ACCESS_DENIED`); a child of a process in a nested job that allows silent breakaway (as libuv's) stays in Pastey's job | `nothing_started_inside_the_job_can_leave_it` | Physical |
+| The hidden console's `conhost.exe` is in the job too | `a_contained_tree_starts_inside_the_job_and_ends_with_its_termination` (prints the tree) | Physical |
+| Owner killed with `TerminateProcess`: `cmd`, two `ping`, `conhost` ended about 1 ms later | `when_the_owner_is_killed_windows_ends_everything_it_contained` | Physical |
+| A probe runs inside its own job, without a console window | `a_probe_runs_without_a_console_window_inside_its_own_job` | Physical |
+| New session under Pastey's id, exact `--resume`, a new conversation is another session, one session per conversation | `a_new_conversation_…`, `a_follow_up_…` | Physical, fixture |
+| Completion only on every piece of evidence; a result is not the end; denials reported; refusal and gone session; a held session refused | 7 tests, as on macOS | Physical, fixture |
+| Stop: interrupt through stdin, `claude` ends, its descendant ended with the job, then "cancelled" | `stop_asks_claude_code_itself_then_confirms_every_process_ended` | Physical, fixture |
+| Stop ignored: the whole job terminated after the grace (1.5 s in tests, 10 s in the product) | `a_run_that_ignores_stop_is_ended_with_its_whole_job` | Physical, fixture |
+| A finished run's leftover process ended before the turn counts | `processes_a_finished_run_left_running_are_ended_before_it_counts` | Physical, fixture |
+| Pastey killed (`TerminateProcess`, separate process): the fixture's PowerShell and its `ping` end within 3 s; the restored task is unknown, then `interrupted` from the transcript; never sent again | `killing_pastey_ends_the_run_and_all_it_started_and_a_restart_never_reruns_it` | Physical, fixture |
+| Restart during a run: unknown, folder held, observed to Completed | `a_restart_during_a_run_…`, `a_turn_that_ends_while_the_registry_is_asked_…` | Physical, fixture |
+| One folder under every name: case (upper, lower), junction, junction + subfolder, verbatim `\\?\`, 8.3 short name when the volume has one, a nested folder and the parent; a sibling folder and another Host run at once | `a_running_folder_is_held_under_every_name_and_independent_folders_run_at_once` | Physical, fixture |
+| Trust: untrusted `.claude/settings.json`, `.claude/settings.local.json`, `.mcp.json`, `.claude/skills` refused before anything runs; trusted as Claude Code keys it (`C:/…`), backslashes, lowercase, verbatim, through a junction; not by another folder, the parent outside a repository or a relative key; a repository's trust covers its subfolder | 3 trust tests | Physical, fixture |
+| Windows gate: unavailable whatever is installed; an older version than accepted is incompatible; 2.1.309 is older than 2.1.317; signed out | `windows_stays_unavailable_until_its_acceptance_passes`, `availability_…` | Physical, fixture |
+| `--bg` continuation unavailable on Windows; no Bridge peer sees or invokes the conversation adapter | 2 tests | Physical, fixture |
+| Real model turn, real Bash tree under Stop and under a killed Pastey, interrupt of a running turn, the app's UI | `installed_claude_code_conversation_*` (ignored) and the app steps | **Not run** |
+
+**Mutation checks** (each reverted): without the leftover termination, the leftover test fails; without `KILL_ON_JOB_CLOSE`, both killed-owner tests fail (and the fixture's processes visibly outlive the killed process); without canonical trust matching, the trust test fails; without the H5 fix, its test fails 3 of 3 runs.
+
+Runs: the two Windows suites (`claude_code::job::` and `conversation::windows_tests`) gave 27 passed, 0 failed, 7 ignored in each of 5 consecutive runs.
+
+### H5. A re-observation race (all platforms)
+
+The re-observer read the transcript, then asked the registry. A turn that ended between the two was seen with no process and a stale transcript, and recorded `interrupted` though it had completed. Windows widened the window (a registry read takes about 0.5 s with the real CLI), so a fixture test failed about half the time. The transcript is now read again once the registry shows no process. `a_turn_that_ends_while_the_registry_is_asked_is_observed_as_it_ended` reproduces the interleaving deterministically (the fixture's registry read itself finishes the turn). This is in the shared `ClaudeSessionRunV1::observe`, so it also corrects `--bg` continuation and restored conversations on macOS; the macOS suites were not run here.
+
+### H6. Remaining risks
+
+- **No signed-in run on Windows.** Whether the interrupt ends a running turn and its Bash tree, whether Claude Code (a Bun executable) starts its tools so they stay in the job, and real timing are inferred from macOS evidence and the physical job checks. The acceptance's W-CC2 and W-CC3 decide them.
+- **Broker-started processes** (WMI, Task Scheduler, services, COM servers) are outside any job. The same class of escape exists on macOS (a process leaving its group).
+- **Mapped network drives in trust keys** are resolved like local paths; an unreachable share can delay a start. UNC keys count only as spelled.
+- **macOS was not built or tested here** (no cross toolchain on this Host). The Unix code paths change only by `cfg` structure and the H5 fix; the trust matching on Unix now also accepts a key that resolves to the same folder (for example `/tmp/…` for `/private/tmp/…`).
+- **2.1.309 is the only version measured on Windows**, and it is the desktop app's copy. The gate opens only for the version the acceptance measures.

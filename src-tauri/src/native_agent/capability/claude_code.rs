@@ -22,6 +22,8 @@
 //! registry and the transcript show how it ended.
 //!
 //! This adapter advertises no peer protocol: a Bridge peer cannot invoke it.
+//! It is unavailable on Windows: `--bg`, `claude stop` and Claude Code's
+//! supervisor have not been measured there.
 
 use std::{
     collections::HashMap,
@@ -53,6 +55,8 @@ use crate::native_agent::sessions::{in_workspaces, now_ms, LastTurnV1};
 use crate::native_agent::{NativeAgentCapabilityStateV1, NativeTurnOutcomeV1, MAX_TASK_BYTES};
 
 pub(in crate::native_agent) mod conversation;
+#[cfg(windows)]
+pub(in crate::native_agent) mod job;
 #[cfg(unix)]
 pub(in crate::native_agent) mod lifeline;
 
@@ -265,6 +269,12 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
             }
         }
         let report = match self.cli() {
+            _ if cfg!(windows) => CapabilityAvailabilityV1 {
+                state: NativeAgentCapabilityStateV1::Unavailable,
+                reason: Some("native_agent_platform_unverified"),
+                detail: Some("Pastey continues Claude Code background sessions only on macOS and Linux until they are validated on Windows.".into()),
+                backend: None,
+            },
             None => CapabilityAvailabilityV1 {
                 state: NativeAgentCapabilityStateV1::Unavailable,
                 reason: Some("native_agent_not_installed"),
@@ -453,12 +463,33 @@ fn claude_command(cli: &Path) -> Command {
 /// Runs `command` to its end, bounded; its stdout and stderr together, or
 /// `None` if it did not finish in time.
 fn run_command(mut command: Command, timeout: Duration) -> Option<(bool, String)> {
-    let mut child = command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .ok()?;
+    wait_bounded(child, timeout)
+}
+
+/// As `run_command`, for a short probe (`--version`, `auth status`). On
+/// Windows it runs in a Job Object of its own, without a console window,
+/// and nothing it started outlives it.
+fn run_probe(mut command: Command, timeout: Duration) -> Option<(bool, String)> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        let (child, _job) = job::spawn_probe(&mut command).ok()?;
+        return wait_bounded(child, timeout);
+    }
+    #[cfg(not(windows))]
+    wait_bounded(command.spawn().ok()?, timeout)
+}
+
+fn wait_bounded(mut child: std::process::Child, timeout: Duration) -> Option<(bool, String)> {
     let mut stdout = child.stdout.take()?;
     let mut stderr = child.stderr.take()?;
     let out = thread::spawn(move || {
@@ -673,7 +704,10 @@ impl ClaudeSessionRunV1 {
                     }
                 }
                 Ok(None) => {
-                    // No process holds the session any more.
+                    // No process holds the session any more. Its transcript
+                    // is read again: the turn may have ended after the read
+                    // above, while the registry was being asked.
+                    let turn = turn_after_prompt(&self.transcript, &self.prompt, self.since_ms);
                     return match turn {
                         Some((turn, reply)) if turn != LastTurnV1::InProgress => {
                             self.turn_outcome(turn, reply)
