@@ -3,9 +3,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { remoteAccessGuidance, type AccessLine } from "../../lib/accessGuidance";
 import { peerShareGuidance, shareSummary, type PeerShareKnowledge } from "../../lib/workspaceShares";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
-import { getDeviceIdentity, getDeviceProfile, openRemoteFolder, presentDeviceIdentity, type NativeAgentCapability, type SharedWorkspace } from "../../lib/tauri";
+import { getDeviceIdentity, getDeviceProfile, openRemoteFolder, presentDeviceIdentity, type NativeAgentCapability, type NativeSessionProvider, type SharedWorkspace } from "../../lib/tauri";
 import type { RoomInfo } from "../../lib/types";
 import {
+  CLAUDE_CODE_AGENT_ID,
   CODEX_AGENT_ID,
   LOCAL_CONVERSATION_AGENTS,
   continuedSessionKey,
@@ -218,11 +219,14 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
     ? { kind: "current" }
     : { kind: "session", session: { provider: session.provider, sessionId: session.sessionId } });
   const placeBody = (canRun: boolean, runBlocked: string | null) => <PlaceBody canRun={canRun} runBlocked={runBlocked} agent={agent} ownsCurrent={ownsCurrent} currentSession={currentSession} shownView={shownView} onNew={() => setView({ kind: "new" })} onCurrent={() => setView({ kind: "current" })} list={list} target={target} openKey={openKey} liveKey={taskActive ? liveKey : null} onOpenSession={openSession} />;
+  // What the followed conversation's own session recorded, once its
+  // session is known and read: shown instead of the native default.
+  const currentSessionConfig = reconcileWithCurrent(list.sessions, currentSession).currentSession?.agentConfig ?? null;
   const back = () => setView(null);
   const main = shownView?.kind === "session"
     ? <SessionConversation key={`${target}:${openKey}`} roomId={room.id} agent={agent} peers={peers} members={members} target={target} session={shownView.session} folder={choice?.kind === "local" ? choice.path : ""} share={targetHostRef ? share : undefined} onBack={back} />
     : choice || shownView?.kind === "current"
-      ? <NewConversation key={`${target}:${placeKey(choice)}:${shownView?.kind === "current"}`} roomId={room.id} agent={agent} agentId={viewAgent} onChooseAgent={targetHostRef || shownView?.kind === "current" ? undefined : chooseLocalAgent} peers={peers} members={members} target={target} choice={choice} shares={shares} availability={availability} onRecheck={() => void (remote ? remoteCapabilities.refresh() : agent.refreshCapabilities())} current={shownView?.kind === "current"} onNewDraft={() => setView({ kind: "new" })} onBack={back} />
+      ? <NewConversation key={`${target}:${placeKey(choice)}:${shownView?.kind === "current"}`} nativeDefault={list.defaults[nativeSessionProvider(viewAgent)] ?? null} sessionConfig={currentSessionConfig} roomId={room.id} agent={agent} agentId={viewAgent} onChooseAgent={targetHostRef || shownView?.kind === "current" ? undefined : chooseLocalAgent} peers={peers} members={members} target={target} choice={choice} shares={shares} availability={availability} onRecheck={() => void (remote ? remoteCapabilities.refresh() : agent.refreshCapabilities())} current={shownView?.kind === "current"} onNewDraft={() => setView({ kind: "new" })} onBack={back} />
       : <div className="conversation conversation-empty"><EmptyState title={targetHostRef ? `Nothing to work in on ${targetName} yet` : "Choose a folder"}>{targetHostRef
         ? peerShareGuidance(targetName, shares.knowledge, "run") ?? `Choose a workspace ${targetName} shares, or a folder by path.`
         : "Add a folder on this device to see its sessions and start conversations there."}</EmptyState></div>;
@@ -432,6 +436,11 @@ function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, 
     {onOpenDetails ? <button type="button" className="btn btn-link small" onClick={onOpenDetails}>This device's own shares: Bridge details → Workspaces</button> : null}
     {shown ? <Notice tone={shown.ok ? "ok" : "bad"}>{shown.text}</Notice> : null}
   </div>;
+}
+
+/** The session provider a conversation Agent's sessions are listed under. */
+function nativeSessionProvider(agentId: ConversationAgentId): NativeSessionProvider {
+  return agentId === CLAUDE_CODE_AGENT_ID ? "claude_code" : "codex";
 }
 
 function localAvailability(codex: NativeAgentCapability | undefined): NativeAgentTargetAvailability {

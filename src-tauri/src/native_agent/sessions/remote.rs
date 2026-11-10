@@ -37,6 +37,9 @@ use super::{
     ResolutionOutcomeV1, ResumeVerdictV1, SessionStatusV1, PROVIDER_CLAUDE_CODE, PROVIDER_CODEX,
 };
 use crate::error::{AppError, AppResult};
+use crate::native_agent::agent_config::{
+    remote_projection, AgentConfigScopeV1, NativeAgentConfigV1,
+};
 use crate::session_read_access::SessionReadScopeV1;
 
 pub(crate) const NATIVE_SESSION_SCHEMA: &str = "pastey-native-session-v1";
@@ -182,6 +185,10 @@ pub(crate) struct RemoteSessionV1 {
     pub(crate) status: SessionStatusV1,
     pub(crate) status_basis: EvidenceBasisV1,
     pub(crate) resume: RemoteResumeV1,
+    /// The model configuration the session recorded, as its provider
+    /// reports it: identifiers and the kind of layer, never a path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_config: Option<NativeAgentConfigV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -191,6 +198,10 @@ pub(crate) struct RemoteProviderV1 {
     pub(crate) history_readable: bool,
     pub(crate) live_source: Option<String>,
     pub(crate) note: Option<String>,
+    /// What a new task in the one shared folder asked about would start
+    /// with, as the provider on that Host reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) native_default: Option<NativeAgentConfigV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +312,18 @@ fn valid_scope_ref(scope: &str) -> bool {
         .is_some_and(|hex| hex.len() == 16 && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// A configuration report, if any, is bounded, about this provider and of
+/// the expected scope.
+fn valid_config(
+    config: Option<&NativeAgentConfigV1>,
+    provider: &str,
+    scope: AgentConfigScopeV1,
+) -> bool {
+    config.is_none_or(|config| {
+        config.is_valid() && config.agent == provider && config.scope == scope
+    })
+}
+
 fn valid_provider(provider: &str) -> bool {
     provider == PROVIDER_CLAUDE_CODE || provider == PROVIDER_CODEX
 }
@@ -364,6 +387,11 @@ fn validate_session(session: &RemoteSessionV1) -> AppResult<()> {
         Some(session.last_turn.source.as_str()),
     ];
     if !valid_provider(&session.provider)
+        || !valid_config(
+            session.agent_config.as_ref(),
+            &session.provider,
+            AgentConfigScopeV1::Session,
+        )
         || !valid_session_id(&session.session_id)
         || !valid_scope_ref(&session.scope_ref)
         || session.last_turn.marker.as_deref().is_some_and(|marker| {
@@ -417,6 +445,11 @@ pub(crate) fn validate_response(response: &RemoteSessionResponseV1) -> AppResult
         }
         for provider in &discovery.providers {
             if !valid_provider(&provider.provider)
+                || !valid_config(
+                    provider.native_default.as_ref(),
+                    &provider.provider,
+                    AgentConfigScopeV1::NativeDefault,
+                )
                 || [provider.live_source.as_deref(), provider.note.as_deref()]
                     .into_iter()
                     .flatten()
@@ -549,6 +582,7 @@ fn remote_session(session: &NativeSessionV1, scope: &SessionReadScopeV1) -> Remo
                 .map(|reason| safe(reason))
                 .collect(),
         },
+        agent_config: session.agent_config.as_ref().map(remote_projection),
     }
 }
 
@@ -558,6 +592,7 @@ fn remote_provider(observation: &ProviderObservationV1) -> RemoteProviderV1 {
         history_readable: observation.history_readable,
         live_source: observation.live_source.as_deref().map(safe),
         note: observation.note.as_deref().map(safe),
+        native_default: observation.native_default.as_ref().map(remote_projection),
     }
 }
 

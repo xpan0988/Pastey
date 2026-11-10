@@ -2935,8 +2935,14 @@ pub(in crate::native_agent) struct CodexHistoryReaderV1 {
 }
 
 /// Methods the history reader may send. Nothing that starts or changes a
-/// thread or turn is allowed.
-const HISTORY_METHODS: [&str; 3] = ["thread/list", "thread/turns/list", "thread/items/list"];
+/// thread or turn, or writes configuration, is allowed: `config/read` only
+/// reports the effective configuration (its writes are other methods).
+const HISTORY_METHODS: [&str; 4] = [
+    "thread/list",
+    "thread/turns/list",
+    "thread/items/list",
+    "config/read",
+];
 const HISTORY_RPC_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Why a read failed: its answer exceeded the line bound, or anything else.
@@ -2970,6 +2976,16 @@ impl CodexHistoryReaderV1 {
         method: &str,
         params: Value,
     ) -> Result<Value, HistoryReadErrorV1> {
+        self.request_within(method, params, HISTORY_RPC_TIMEOUT)
+    }
+
+    /// As `request`, answered within `timeout`.
+    pub(in crate::native_agent) fn request_within(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, HistoryReadErrorV1> {
         if !HISTORY_METHODS.contains(&method) {
             return Err(HistoryReadErrorV1::Failed(format!(
                 "{method} is not a history read"
@@ -2979,7 +2995,7 @@ impl CodexHistoryReaderV1 {
         self.server
             .send(json!({"id": id, "method": method, "params": params}))
             .map_err(|error| HistoryReadErrorV1::Failed(error.message()))?;
-        let deadline = Instant::now() + HISTORY_RPC_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         loop {
             match self.server.next_message(deadline) {
                 Err(error) => return Err(HistoryReadErrorV1::Failed(error.message())),

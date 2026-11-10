@@ -47,6 +47,9 @@ import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeL
 import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
 import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
 import { conversationTitle, createLookGate, mergeSessionRead, nativeSessionKey, reconcileWithCurrent, sameNativeSession, type SessionListState } from "../src/lib/sessionList";
+import { agentConfigLine, conversationConfig, effortLabel, presentAgentConfig } from "../src/lib/nativeAgentConfig";
+import { AgentConfigSummary } from "../src/features/workspace/AgentConfigSummary";
+import type { NativeAgentConfig } from "../src/lib/tauri";
 import { SessionListView, type SessionList } from "../src/features/workspace/NativeSessionsCard";
 import type { NativeDecisionReview, SharedWorkspace, WorkspaceShare } from "../src/lib/tauri";
 import { createElement } from "react";
@@ -2128,4 +2131,80 @@ test("a conversation learns its native session on this device only, keeps it acr
     .filter((name) => String(name).endsWith(".rs"))
     .map((name) => readFileSync(`src-tauri/src/room_control/${name}`, "utf8"))];
   assert.ok(roomControl.every((source) => !source.includes("local_task_native_session") && !source.includes("NativeSessionRefV1")));
+});
+
+const CODEX_DEFAULT: NativeAgentConfig = {
+  agent: "codex", scope: "native_default", modelProvider: null, model: "gpt-6.1-sol", reasoningEffort: "high",
+  modelOrigin: "project", reasoningEffortOrigin: "user", source: "Codex config/read", note: null, observedAtMs: 1,
+};
+const CODEX_THREAD: NativeAgentConfig = {
+  agent: "codex", scope: "session", modelProvider: "openai", model: "gpt-6-sol", reasoningEffort: "xhigh",
+  source: "Codex thread record", note: null, observedAtMs: 2,
+};
+const CLAUDE_DEFAULT: NativeAgentConfig = {
+  agent: "claude_code", scope: "native_default", source: "Claude Code", observedAtMs: 3,
+  note: "Claude Code has no read-only query for its default model or effort. A conversation shows what it used once Claude Code has replied.",
+};
+
+test("a native Agent's model is shown as it reported it, Unknown where it did not, with whose configuration it is", () => {
+  assert.equal(agentConfigLine(CODEX_DEFAULT), "Model: gpt-6.1-sol · Reasoning: High");
+  assert.equal(effortLabel("xhigh"), "Extra high");
+  assert.equal(effortLabel("ultra-9"), "ultra-9", "an effort Pastey does not know is shown as reported");
+  const shown = presentAgentConfig(CODEX_DEFAULT);
+  assert.equal(shown.complete, true);
+  assert.match(shown.detail, /Native default · Codex config\/read\. Model from this folder's project configuration\. Reasoning from the user's own configuration\./);
+  // Nothing reported, or nothing could be asked: Unknown, never a guess.
+  const claude = presentAgentConfig(CLAUDE_DEFAULT);
+  assert.deepEqual([claude.model, claude.reasoning, claude.complete], ["Unknown", "Unknown", false]);
+  assert.match(claude.detail, /no read-only query/);
+  assert.deepEqual(presentAgentConfig(null, "Windows PC reports this only for folders it shares with “Sessions” on."), {
+    model: "Unknown", reasoning: "Unknown", complete: false, detail: "Windows PC reports this only for folders it shares with “Sessions” on.",
+  });
+  const markup = renderToStaticMarkup(createElement(AgentConfigSummary, { config: CODEX_DEFAULT, agentName: "Codex", hostName: "Windows PC", label: "native default for a new conversation here" }));
+  assert.match(markup, /Codex · Windows PC/);
+  assert.match(markup, /Model: <strong class="mono">gpt-6\.1-sol<\/strong>/);
+  assert.match(markup, /Reasoning: <strong>High<\/strong>/);
+  const unknown = renderToStaticMarkup(createElement(AgentConfigSummary, { config: CLAUDE_DEFAULT, agentName: "Claude Code", hostName: "Mac", label: "native default for a new conversation here" }));
+  assert.match(unknown, /Claude Code · Mac/);
+  assert.match(unknown, /Reasoning: <strong class="subtle">Unknown<\/strong>/);
+  assert.match(unknown, /no read-only query/);
+});
+
+test("a conversation shows its session's own record over the native default, and a different default separately", () => {
+  // Before the session recorded anything: the default, labelled as such.
+  const before = conversationConfig({ ...CODEX_THREAD, model: null, reasoningEffort: null, note: "Codex reported no model or reasoning effort for this thread." }, CODEX_DEFAULT);
+  assert.equal(before.shown, CODEX_DEFAULT);
+  assert.match(before.label, /Native default · not yet confirmed/);
+  assert.equal(conversationConfig(null, null).shown, null);
+  // Recorded: the session's values; the default differs and is named apart,
+  // never merged into the session's line.
+  const after = conversationConfig(CODEX_THREAD, CODEX_DEFAULT);
+  assert.equal(after.shown, CODEX_THREAD);
+  assert.equal(after.label, "This session");
+  assert.equal(after.newer, CODEX_DEFAULT);
+  assert.equal(agentConfigLine(after.shown), "Model: gpt-6-sol · Reasoning: Extra high");
+  assert.equal(conversationConfig(CODEX_THREAD, { ...CODEX_DEFAULT, model: "gpt-6-sol", reasoningEffort: "xhigh" }).newer, null);
+  // An unknown default is no reason to say the session differs.
+  assert.equal(conversationConfig(CODEX_THREAD, CLAUDE_DEFAULT).newer, null);
+  const strip = renderToStaticMarkup(createElement(AgentConfigSummary, { strip: true, config: after.shown, agentName: "Codex", hostName: "This device", label: after.label, newer: after.newer }));
+  assert.match(strip, /New conversations now start with gpt-6\.1-sol · High \(native default\)\. This session keeps its own\./);
+});
+
+test("a folder's native defaults come from its newest read only, and a change is seen on the next read", () => {
+  const scope = "local|/Users/me/HL_tech";
+  const withDefaults = (codex: NativeAgentConfig | null) => [
+    { ...READABLE[0], nativeDefault: CLAUDE_DEFAULT },
+    { ...READABLE[1], nativeDefault: codex },
+  ];
+  const first = mergeSessionRead(null, scope, { providers: withDefaults(CODEX_DEFAULT), sessions: hlSessions(), at: 1_000 });
+  assert.equal(first.defaults.codex?.reasoningEffort, "high");
+  assert.equal(first.defaults.claude_code?.model, undefined);
+  // The user changed Codex's effort in Codex: the next read reports it.
+  const changed = mergeSessionRead(first, scope, { providers: withDefaults({ ...CODEX_DEFAULT, reasoningEffort: "medium" }), sessions: hlSessions(), at: 2_000 });
+  assert.equal(changed.defaults.codex?.reasoningEffort, "medium");
+  // A read that reports no default: unknown now, not what it was.
+  const unreported = mergeSessionRead(changed, scope, { providers: withDefaults(null), sessions: hlSessions(), at: 3_000 });
+  assert.equal(unreported.defaults.codex, undefined);
+  // An older Host's answer without defaults reads as before.
+  assert.deepEqual(mergeSessionRead(null, scope, { providers: READABLE, sessions: [], at: 4_000 }).defaults, {});
 });

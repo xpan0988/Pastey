@@ -152,6 +152,7 @@ fn session(
         status,
         status_basis,
         resume,
+        agent_config: None,
     }
 }
 
@@ -632,8 +633,12 @@ fn only_codex_processes_that_can_hold_a_thread_count_as_holders() {
 #[cfg(unix)]
 fn scripted_history_codex(root: &Path, workspace: &Path, outside: &Path) -> PathBuf {
     let thread = |id: &str, cwd: &Path, originator: &str, updated: u64| {
+        // As Codex 0.163 lists them: the model configuration it records
+        // for the thread (t-live from a version that recorded none).
+        let (model, effort) = if id == "t-live" { (serde_json::Value::Null, serde_json::Value::Null) } else { (json!("gpt-6-sol"), json!("xhigh")) };
         json!({"id": id, "cwd": cwd, "name": format!("thread {id}"), "originator": originator,
-               "createdAt": 1_792_000_000u64, "updatedAt": updated, "gitInfo": {"branch": "main"}, "status": {"type": "notLoaded"}})
+               "createdAt": 1_792_000_000u64, "updatedAt": updated, "gitInfo": {"branch": "main"}, "status": {"type": "notLoaded"},
+               "model": model, "modelProvider": "openai", "reasoningEffort": effort})
     };
     // The server is asked for this workspace only; a wrong answer including
     // another directory must still be filtered out.
@@ -666,10 +671,18 @@ while IFS= read -r line; do
     *'"method":"thread/turns/list"'*'"threadId":"t-live"'*) printf '{{"id":%s,"result":%s}}\n' "$id" '{live}' ;;
     *'"method":"thread/items/list"'*'"threadId":"t-done"'*) printf '{{"id":%s,"result":%s}}\n' "$id" '{items}' ;;
     *'"method":"thread/'*) printf '{{"id":%s,"error":{{"message":"refused"}}}}\n' "$id" ;;
+    *'"method":"config/read"'*)
+      # Codex's effective configuration, as seen from the folder asked
+      # about (project layer) or from no project; read afresh each time.
+      # Without the file, this "version" does not know the method.
+      case "$line" in *'"cwd":"{ws}"'*) file='{cfg}.project' ;; *) file='{cfg}' ;; esac
+      if [ -f "$file" ]; then printf '{{"id":%s,"result":%s}}\n' "$id" "$(cat "$file")"
+      else printf '{{"id":%s,"error":{{"code":-32600,"message":"Invalid request: unknown variant `config/read`"}}}}\n' "$id"; fi ;;
   esac
 done
 "#,
         ws = workspace.to_string_lossy(),
+        cfg = root.join("codex-config.json").to_string_lossy(),
         list = list,
         done = turns_done,
         live = turns_live,
@@ -850,7 +863,7 @@ fn installed_sessions_are_discovered_and_inspected_read_only() {
     );
     for session in &discovery.sessions {
         eprintln!(
-            "  {} {}… origin={}({:?}) title_len={} last_activity={:?} live={:?}[{}] last_turn={:?} status={:?}/{:?} resume={:?}",
+            "  {} {}… origin={}({:?}) title_len={} last_activity={:?} live={:?}[{}] last_turn={:?} status={:?}/{:?} resume={:?} model={:?}/{:?}",
             session.provider,
             &session.session_id[..8.min(session.session_id.len())],
             session.origin,
@@ -862,7 +875,9 @@ fn installed_sessions_are_discovered_and_inspected_read_only() {
             session.last_turn.outcome,
             session.status,
             session.status_basis,
-            session.resume.verdict
+            session.resume.verdict,
+            session.agent_config.as_ref().and_then(|c| c.model.as_deref()),
+            session.agent_config.as_ref().and_then(|c| c.reasoning_effort.as_deref())
         );
     }
     for provider in [PROVIDER_CLAUDE_CODE, PROVIDER_CODEX] {
@@ -987,4 +1002,241 @@ fn continuing_needs_the_session_the_user_saw_and_a_safe_or_codex_enforced_state(
     codex.last_turn.outcome = LastTurnV1::Completed;
     codex.workspace = "/definitely/not/a/folder".into();
     assert!(continuation_problem(PROVIDER_CODEX, &codex, None).is_some());
+}
+
+/// Codex: the native default comes only from its own `config/read`, as seen
+/// from the folder, with the kind of layer each value came from and never
+/// the layer's file; each thread keeps what Codex recorded for it. The two
+/// are reported apart, a change is seen on the next read, and a Codex that
+/// cannot answer leaves the default unknown without touching the sessions.
+#[cfg(unix)]
+#[test]
+fn codex_reports_its_default_and_each_threads_configuration_apart() {
+    use crate::native_agent::agent_config::{AgentConfigScopeV1, ConfigOriginV1};
+    let root = temp_root();
+    let workspace = root.join("project");
+    let outside = root.join("private-project");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let agent = scripted_history_codex(&root, &workspace, &outside);
+    let source = CodexSessionSourceV1::new(agent.clone(), vec![]).with_holders(no_holders);
+    let general = root.join("codex-config.json");
+    let project = root.join("codex-config.json.project");
+
+    // A Codex without `config/read`: unknown, and why; sessions unaffected.
+    let (sessions, observation) = source.discover(&[workspace.clone()]);
+    assert_eq!(sessions.len(), 2);
+    let default = observation.native_default.clone().unwrap();
+    assert_eq!(
+        (default.scope, default.model.as_deref(), default.reasoning_effort.as_deref()),
+        (AgentConfigScopeV1::NativeDefault, None, None)
+    );
+    assert!(default.note.unwrap().contains("does not answer config/read"));
+    let thread_config = |sessions: &[NativeSessionV1], id: &str| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == id)
+            .and_then(|session| session.agent_config.clone())
+            .unwrap()
+    };
+    let done = thread_config(&sessions, "t-done");
+    assert_eq!(
+        (
+            done.scope,
+            done.source.as_str(),
+            done.model_provider.as_deref(),
+            done.model.as_deref(),
+            done.reasoning_effort.as_deref()
+        ),
+        (
+            AgentConfigScopeV1::Session,
+            "Codex thread record",
+            Some("openai"),
+            Some("gpt-6-sol"),
+            Some("xhigh")
+        )
+    );
+    let unrecorded = thread_config(&sessions, "t-live");
+    assert_eq!((unrecorded.model, unrecorded.reasoning_effort), (None, None));
+    assert!(unrecorded.note.unwrap().contains("no model"));
+
+    // Codex answers: the folder's project layer sets the model, the user's
+    // configuration the effort. The layer's file is not carried.
+    let answer = |model: &str, model_layer: &str, effort: serde_json::Value| {
+        let layer = |kind: &str| json!({"name": {"type": kind, "file": "/Users/me/.codex/config.toml", "profile": null}, "version": "sha256:1"});
+        json!({"config": {"model": model, "model_provider": null, "model_reasoning_effort": effort},
+               "origins": {"model": layer(model_layer), "model_reasoning_effort": layer("user")}})
+        .to_string()
+    };
+    fs::write(&project, answer("gpt-6.1-sol", "project", json!("high"))).unwrap();
+    fs::write(&general, answer("gpt-6-sol", "user", serde_json::Value::Null)).unwrap();
+    let (sessions, observation) = source.discover(&[workspace.clone()]);
+    let default = observation.native_default.clone().unwrap();
+    assert_eq!(
+        (
+            default.model.as_deref(),
+            default.model_origin,
+            default.reasoning_effort.as_deref(),
+            default.reasoning_effort_origin,
+            default.model_provider.as_deref(),
+            default.note.as_deref()
+        ),
+        (
+            Some("gpt-6.1-sol"),
+            Some(ConfigOriginV1::Project),
+            Some("high"),
+            Some(ConfigOriginV1::User),
+            None,
+            None
+        )
+    );
+    assert!(!serde_json::to_string(&observation).unwrap().contains("config.toml"));
+    // The thread keeps what it recorded: not the default, and not merged.
+    assert_eq!(
+        thread_config(&sessions, "t-done").reasoning_effort.as_deref(),
+        Some("xhigh")
+    );
+
+    // Outside any folder (Settings): no project layer. An unset effort is
+    // unknown, never a guessed model default.
+    let outside_folder = source.native_default(None);
+    assert_eq!(
+        (
+            outside_folder.model.as_deref(),
+            outside_folder.model_origin,
+            outside_folder.reasoning_effort,
+            outside_folder.reasoning_effort_origin
+        ),
+        (Some("gpt-6-sol"), Some(ConfigOriginV1::User), None, None)
+    );
+    assert!(outside_folder.note.unwrap().contains("model's own default"));
+
+    // The user changes Codex's configuration: the next read reports it.
+    fs::write(&project, answer("gpt-6.1-sol", "project", json!("medium"))).unwrap();
+    let (_, observation) = source.discover(&[workspace.clone()]);
+    assert_eq!(
+        observation.native_default.unwrap().reasoning_effort.as_deref(),
+        Some("medium")
+    );
+    // Several folders could each see another default: none is reported.
+    let (_, observation) = source.discover(&[workspace.clone(), outside.clone()]);
+    assert!(observation.native_default.is_none());
+
+    // The reader can only read: starting a thread or turn, or writing
+    // configuration, is refused before anything is sent.
+    let reader = crate::native_agent::capability::codex::CodexHistoryReaderV1::open(&agent, &workspace).unwrap();
+    for method in ["thread/start", "turn/start", "thread/resume", "config/value/write", "config/batchWrite"] {
+        match reader.request(method, json!({})) {
+            Err(crate::native_agent::capability::codex::HistoryReadErrorV1::Failed(reason)) => {
+                assert!(reason.contains("is not a history read"), "{method}: {reason}")
+            }
+            _ => panic!("{method} must be refused"),
+        }
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Claude Code: a session reports the model and effort its latest reply
+/// recorded (not a sidechain's, not a reply Claude Code wrote itself); an
+/// older transcript without effort says so; a session without a reply and
+/// the native default are unknown, never read from a settings file.
+#[cfg(unix)]
+#[test]
+fn claude_code_sessions_report_their_latest_reply_and_the_default_stays_unknown() {
+    use crate::native_agent::agent_config::AgentConfigScopeV1;
+    const SWITCHED: &str = "66666666-6666-4666-8666-666666666666";
+    const NO_EFFORT: &str = "77777777-7777-4777-8777-777777777777";
+    const NO_REPLY: &str = "88888888-8888-4888-8888-888888888888";
+    let root = temp_root();
+    let config = root.join("claude-config");
+    let workspace = root.join("project");
+    let other = root.join("other-project");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    // A settings file that names another model: never taken as the answer.
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("settings.json"), r#"{"model": "claude-haiku-5-5", "effortLevel": "low"}"#).unwrap();
+    let reply = |at: &str, model: &str, effort: Option<&str>| {
+        let mut entry = assistant(&workspace, at, json!([{"type": "text", "text": "ok"}]), "end_turn");
+        entry["message"]["model"] = json!(model);
+        if let Some(effort) = effort {
+            entry["effort"] = json!(effort);
+        }
+        entry
+    };
+    let dir = encoded(&workspace);
+    let mut sidechain = reply("2026-10-17T01:00:40Z", "claude-haiku-5-5", Some("low"));
+    sidechain["isSidechain"] = json!(true);
+    write_transcript(
+        &config,
+        &dir,
+        SWITCHED,
+        &[
+            user(&workspace, "2026-10-17T01:00:00Z", "Plan it"),
+            reply("2026-10-17T01:00:05Z", "claude-sonnet-5-5", Some("medium")),
+            user(&workspace, "2026-10-17T01:00:10Z", "Now build it"),
+            reply("2026-10-17T01:00:30Z", "claude-opus-5-5", Some("high")),
+            reply("2026-10-17T01:00:35Z", "<synthetic>", None),
+            sidechain,
+        ],
+    );
+    write_transcript(
+        &config,
+        &dir,
+        NO_EFFORT,
+        &[
+            user(&workspace, "2026-10-17T02:00:00Z", "Older version"),
+            reply("2026-10-17T02:00:05Z", "claude-opus-5-5", None),
+        ],
+    );
+    write_transcript(
+        &config,
+        &dir,
+        NO_REPLY,
+        &[user(&workspace, "2026-10-17T03:00:00Z", "Just asked")],
+    );
+    let cli = fake_claude(&root, "[]");
+    let source = ClaudeSessionSourceV1::at(&config, Some(&cli));
+    let (sessions, observation) = source.discover(&[workspace.clone()]);
+    let config_of = |id: &str| {
+        sessions
+            .iter()
+            .find(|session| session.session_id == id)
+            .and_then(|session| session.agent_config.clone())
+            .unwrap()
+    };
+    let switched = config_of(SWITCHED);
+    assert_eq!(
+        (
+            switched.scope,
+            switched.model.as_deref(),
+            switched.reasoning_effort.as_deref(),
+            switched.model_provider.as_deref(),
+            switched.note.as_deref()
+        ),
+        (AgentConfigScopeV1::Session, Some("claude-opus-5-5"), Some("high"), None, None)
+    );
+    let older = config_of(NO_EFFORT);
+    assert_eq!((older.model.as_deref(), older.reasoning_effort.as_deref()), (Some("claude-opus-5-5"), None));
+    assert!(older.note.unwrap().contains("no effort level"));
+    let unanswered = config_of(NO_REPLY);
+    assert_eq!((unanswered.model, unanswered.reasoning_effort), (None, None));
+    assert!(unanswered.note.unwrap().contains("No reply"));
+
+    let default = observation.native_default.unwrap();
+    assert_eq!(
+        (default.scope, default.model, default.reasoning_effort),
+        (AgentConfigScopeV1::NativeDefault, None, None)
+    );
+    assert!(default.note.unwrap().contains("no read-only query"));
+    let (_, several) = source.discover(&[workspace.clone(), other.clone()]);
+    assert!(several.native_default.is_none());
+
+    let snapshot = source.inspect(&[workspace.clone()], SWITCHED).unwrap().unwrap();
+    let inspected = snapshot.session.agent_config.unwrap();
+    assert_eq!(
+        (inspected.model, inspected.reasoning_effort),
+        (switched.model, switched.reasoning_effort)
+    );
+    let _ = fs::remove_dir_all(root);
 }

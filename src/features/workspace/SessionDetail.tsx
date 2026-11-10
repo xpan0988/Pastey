@@ -21,6 +21,8 @@ import {
   sessionStatusPresentation,
   snapshotActivityLine,
 } from "../../lib/nativeSessions";
+import { agentConfigLine, presentAgentConfig } from "../../lib/nativeAgentConfig";
+import { AgentConfigSummary } from "./AgentConfigSummary";
 import { continuedSessionKey, type ContinuedSession } from "./AgentTaskLifecycle";
 import { AgentMarkdown, CopyButton } from "./AgentMarkdown";
 import { PastTurnView, TaskTurn } from "./AgentTaskTracker";
@@ -150,6 +152,7 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
         <button type="button" className={`btn btn-ghost btn-icon btn-sm${details ? " active" : ""}`} aria-label="Details" title="Details and evidence" aria-pressed={details} onClick={() => setDetails(!details)}><Icon name="info" /></button>
       </>}
     />
+    {view ? <AgentConfigSummary strip config={view.agentConfig} agentName={providerLabel(view.provider)} hostName={hostName === "this device" ? "This device" : hostName} label="this session" unreported={`${hostName === "this device" ? "This device" : hostName} reported no model for it.`} /> : null}
     {details && snapshot ? <SessionDetails snapshot={snapshot} hostName={hostName} /> : null}
     <ConversationThread follow={`${shown?.recent.length}:${agent.pastTurns.length}:${agent.status?.state}:${ours}`}>
       {shown ? <SessionHistory snapshot={shown} hostName={hostName} /> : message ? <SystemLine tone="bad">{message}</SystemLine> : <SystemLine>Reading the session on {hostName}…</SystemLine>}
@@ -214,6 +217,7 @@ function SessionDetails({ snapshot, hostName }: { snapshot: SessionSnapshot; hos
       <dt>Folder now</dt><dd>{workspace.exists ? workspace.gitBranch ? `${workspace.gitBranch} at ${workspace.head ?? "?"}, ${workspace.uncommittedPaths ?? "?"} uncommitted path(s)${workspace.commitsSinceLastActivity != null ? `, ${workspace.commitsSinceLastActivity} commit(s) since the session's last activity` : ""}.` : "Not a Git repository." : "The folder no longer exists."}</dd>
       <dt>Live state</dt><dd><Dot tone={session.live.state === "running" ? "live" : "neutral"} /> {session.live.state.replace("_", " ")} · from {session.live.source}{session.live.detail ? ` · ${session.live.detail}` : ""}</dd>
       <dt>Last turn</dt><dd>{session.lastTurn.outcome.replace("_", " ")} ({session.lastTurn.source}{session.lastTurn.atMs ? `, ${relativeTime(session.lastTurn.atMs)}` : ""})</dd>
+      <dt>Model</dt><dd>{agentConfigLine(session.agentConfig)} <span className="subtle">({presentAgentConfig(session.agentConfig, "Not reported.").detail})</span></dd>
       <dt>Ids</dt><dd className="mono">{session.provider === "codex" ? "thread" : "session"} {session.sessionId}{session.lastTurn.marker ? ` · ends with ${session.lastTurn.marker}` : ""}</dd>
     </dl>
     <div className="evidence">

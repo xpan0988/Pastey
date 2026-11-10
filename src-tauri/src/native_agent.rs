@@ -23,6 +23,7 @@ use crate::error::{AppError, AppResult};
 use crate::host_identity::HostSessionBinding;
 
 mod admission;
+pub(crate) mod agent_config;
 mod capability;
 pub(crate) mod sessions;
 pub(crate) use admission::NativeInvocationReviewV1;

@@ -2,7 +2,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect } from "react";
 import type { BridgePeerSession } from "../../lib/bridgePeers";
 import { remoteStartLine } from "../../lib/fullAccess";
+import { conversationConfig } from "../../lib/nativeAgentConfig";
 import { codexRunReadiness, knownFullAccess, looksLikeFullPath, type CodexWorkspaceSource } from "../../lib/nativeAgentReadiness";
+import type { NativeAgentConfig } from "../../lib/tauri";
 import {
   CLAUDE_CODE_AGENT_ID,
   CODEX_AGENT_ID,
@@ -13,6 +15,7 @@ import {
   type NativeAgentTargetAvailability,
   type useNativeAgentTask,
 } from "./AgentTaskLifecycle";
+import { AgentConfigSummary } from "./AgentConfigSummary";
 import { PastTurnView, TaskTurn } from "./AgentTaskTracker";
 import type { PeerShares } from "./BridgeWorkspaces";
 import { Composer, ConversationHeader, ConversationThread } from "./Conversation";
@@ -60,7 +63,7 @@ const AGENT_CHOICES: ReadonlyArray<{ value: ConversationAgentId; label: string }
  * messages in this same view continue the conversation this view began,
  * with its Agent. The device is chosen by its durable HostRef, so a
  * reconnect keeps it instead of falling back to this device. */
-export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, members, target, choice, shares, availability, onRecheck, current, onNewDraft, onBack }: {
+export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, members, target, choice, shares, availability, onRecheck, current, onNewDraft, onBack, nativeDefault, sessionConfig }: {
   roomId: string;
   agent: NativeAgentController;
   /** The Agent this view runs: the conversation's own once it began. */
@@ -82,6 +85,11 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
   current: boolean;
   onNewDraft: () => void;
   onBack?: () => void;
+  /** What a new conversation with this Agent in this folder would start
+   * with, as the Agent there reported it (read only). */
+  nativeDefault?: NativeAgentConfig | null;
+  /** What this conversation's own session recorded, once known. */
+  sessionConfig?: NativeAgentConfig | null;
 }) {
   const targetHostRef = target === "local" ? null : target;
   const remote = targetHostRef ? peers.find((peer) => peer.hostRef === targetHostRef) ?? null : null;
@@ -148,6 +156,13 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
   }
 
   const showTurns = current && (agent.origin?.kind === "new" || (!agent.origin && (agent.status || agent.movement)));
+  const hostLabel = targetHostRef ? targetName : "This device";
+  // Reported with a folder's sessions: on another device, only for a
+  // folder it shares with “Sessions” on.
+  const unreported = targetHostRef
+    ? `${targetName} reports this only for folders it shares with “Sessions” on.`
+    : "Not read yet for this folder.";
+  const configView = conversationConfig(sessionConfig, nativeDefault);
   const firstPrompt = agent.pastTurns[0]?.prompt ?? agent.prompt;
   const above = conversationPlace ? null
     : kind === "path" ? <div className="field">
@@ -166,6 +181,7 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
       subtitle={<>{agentName} · {label} · {targetHostRef ? targetName : "this device"}</>}
       side={showTurns ? <button type="button" className="btn btn-sm" disabled={taskActive} onClick={onNewDraft}><Icon name="plus" small />New</button> : null}
     />
+    {showTurns ? <AgentConfigSummary strip config={configView.shown} agentName={agentName} hostName={hostLabel} label={configView.label} unreported={unreported} newer={configView.newer} /> : null}
     <ConversationThread follow={`${agent.pastTurns.length}:${agent.status?.state}:${agent.status?.code}:${agent.movement?.state}`}>
       {showTurns ? <>
         {agent.pastTurns.map((turn) => <PastTurnView key={turn.taskId} turn={turn} hostName={agent.taskHostRef ? targetName : "this device"} />)}
@@ -183,6 +199,7 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
           <span className="spacer">{targetHostRef && !remote ? `${targetName} is not connected right now.` : availabilityCopy(availability, targetHostRef ? targetName : null, kind === "send", agentId)}</span>
           {availability.state !== "available" || targetHostRef ? <button type="button" className="btn btn-link small" disabled={availability.state === "checking"} onClick={onRecheck}>Check again</button> : null}
         </div>
+        <AgentConfigSummary config={nativeDefault} agentName={agentName} hostName={hostLabel} label="native default for a new conversation here" unreported={unreported} />
         {readiness.blocker && readiness.requirements.some((requirement) => !requirement.met && requirement.id !== "task") ? <Checklist items={readiness.requirements} /> : null}
       </div>}
     </ConversationThread>

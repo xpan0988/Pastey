@@ -140,6 +140,8 @@ export function useSessionList({ roomId, peers, members, target, shares, choice,
     message,
     busy,
     lookedAt: found?.lookedAt ?? null,
+    /** Each provider's native default in this workspace, from the newest read. */
+    defaults: found?.defaults ?? {},
     look,
     unavailable,
     share,

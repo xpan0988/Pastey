@@ -16,7 +16,9 @@ authority, executor admission, task ownership, cross-Host movement,
 consequences, completion, cancellation, and recovery. The capability's native
 provider/auth, model selection, input interpretation, workspace behavior,
 tools, sandbox, reasoning, subagents, safety, and persistent conversation
-remain Host-private and opaque to Pastey.
+remain Host-private and opaque to Pastey. Pastey only shows the model and
+reasoning effort an Agent itself reports, read only
+([native model configuration](#native-model-configuration-read-only)).
 
 The default local path is intentionally direct:
 
@@ -391,6 +393,29 @@ Pastey can find the Claude Code and Codex sessions that already exist on this Ho
 - **Titles.** A session is named by what its provider records as its name (Codex: the thread `name`, else its `preview`, the first message; Claude Code: a `custom-title` or `ai-title`, else its first prompt). Claude Code writes a `last-prompt` entry after every prompt; it is only a last resort, so a follow-up never renames a conversation.
 - **One session, one row (Agents sidebar).** Pastey's own conversation in a folder and the session discovery finds for it are the same thing, matched only by provider and session id, never by title, folder or time. Once this device's Agent confirms a conversation, Core keeps the session its adapter names from the continuation (`NativeCapabilityAdapterV1::native_session`, `get_native_agent_task_session`), for this Host's own user's tasks only and in this process only; it never enters the task status or any Bridge message. The renderer keeps it with the conversation (a follow-up keeps it) and shows that session as the conversation's row, with its live task, instead of a second discovered row. Another device's task has no such identity here, so its conversation and the session the other device lists stay separate rows.
 - **Reading the list (`src/lib/sessionList.ts`).** The sidebar reads a folder's sessions each time it is shown (showing what it last found there meanwhile), on Refresh, and once a task this device ran in that folder has ended; it never polls. An answer is applied only if it is the newest look of its folder on its device. A provider whose history could not be read keeps the sessions an earlier read found, and the list says so ("Codex history could not be read just now … Nothing was removed"); a whole read that fails keeps the list and says so. A successful read is exact again: what the provider no longer lists is gone. A withdrawn share is authority, not a failed read, so nothing is kept.
+
+### Native model configuration (read only)
+
+Pastey shows which model and reasoning effort a native Agent uses, as that Agent reports it (`src-tauri/src/native_agent/agent_config.rs`, readers in `sessions/codex.rs` and `sessions/claude.rs`). It keeps no model setting of its own and never sets one: no `--model`, `--effort` or other override is passed, no configuration file is read as the answer or written, no prompt is sent and no session is created to find out. A value the Agent did not report is Unknown; it is never inferred from a version, a provider or another value.
+
+Each report (`NativeAgentConfigV1`) says whose configuration it is, and the two are never merged:
+- **Native default** (`native_default`): what a new task would start with, as the Agent reports it now.
+- **Session** (`session`): what one existing session recorded. It keeps that record when the default changes later.
+
+It carries the model provider, model and effort as bounded identifiers (1–96 characters of letters, digits and `-._:/@+[]`, never starting like a path; anything else stays Unknown), the kind of configuration layer each came from (`user`, `project`, `managed`, `session_flags`, `packaged_default`, `other`, never its file), the native interface that answered (`source`) and why something is unknown (`note`).
+
+What the installed versions answer (measured on macOS: Codex 0.163.0, read-only `initialize` → `config/read` → `thread/list`; Claude Code transcripts written by 2.1.284 to 2.1.317, CLI 2.1.318):
+
+| | Native default | Session |
+| --- | --- | --- |
+| **Codex** | `config/read` (with `cwd` = the folder, so its project layer counts) on Pastey's read-only app-server child: `model`, `model_provider`, `model_reasoning_effort`, and `origins` per key. An unset key is Unknown: Codex then picks its own default, which this interface does not report. A Codex without `config/read` answers an error: Unknown, "This Codex version does not answer config/read". 5 s bound. | `thread/list` items (already read by discovery): `model`, `modelProvider`, `reasoningEffort`. Codex documents them as the configured value when the thread is loaded, otherwise the latest it saved, not per-turn telemetry. |
+| **Claude Code** | Unknown. Claude Code has no read-only query for it: the effective model and effort follow managed policy, flags, environment variables and several settings files, and an unset model depends on the account. Pastey does not read one `settings.json` as the answer. | The transcript's latest main-conversation reply: `message.model` (the model that answered) and the entry's `effort`. Replies Claude Code writes itself (`<synthetic>`) and sidechains are skipped. No model provider is recorded. A reply without `effort` (older versions) says so; a session without a reply, or a transcript larger than Pastey reads, is Unknown. |
+
+- **Reading.** The Codex reader's method allowlist is `thread/list`, `thread/turns/list`, `thread/items/list` and `config/read`; anything else (`thread/start`, `turn/start`, configuration writes) is refused before it is sent. The reader is its own app-server child, separate from any session that runs a task, so reading never affects a running Agent.
+- **Where it is read.** Discovery of one folder reports each provider's native default for that folder (`nativeDefault`) and each session's record (`agentConfig`); several folders at once report no default. Settings → Agents reads the default outside any project folder (`read_native_agent_defaults`).
+- **Refresh.** No polling and no cache: it is read with a folder's sessions (each time the folder is shown, on Refresh, after a local task there ends) and on Check again in Settings. A newer read replaces an older one, an older answer arriving late is dropped, and a default the newest read did not report is Unknown, not what it was. A change the user makes in the Agent's own settings appears on the next read.
+- **Another device.** The same reports travel with remote session reading (`native_agent.session_response`), so only for a folder that device shares with Sessions on (or under its Full Access). The default is the Agent's default *there*, for that folder. Values are identifiers; notes and sources lose anything path-like; no file, credential, environment variable or configuration content is sent. The requester refuses an answer whose report is out of bounds, about another provider, or of the wrong scope.
+- **Shown.** New conversation shows the native default for the chosen Agent and device ("Codex · Windows PC · native default for a new conversation here — Model … Reasoning …"). A conversation shows its session's own record once it has one, else the default labelled "not yet confirmed for this conversation"; when the default now differs, it is named separately. A session shows its own record. Settings → Agents shows each local Agent's default outside any folder. Hovering shows the source, layers and notes.
 
 #### Sessions, processes and tasks
 

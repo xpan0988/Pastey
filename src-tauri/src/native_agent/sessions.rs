@@ -13,7 +13,7 @@
 //! taken as the current state, and an agent's own claim of completion is
 //! reported as a claim, not as proof.
 
-pub(in crate::native_agent) mod claude;
+pub(crate) mod claude;
 mod codex;
 pub(crate) mod remote;
 
@@ -25,6 +25,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::agent_config::NativeAgentConfigV1;
 use crate::error::{AppError, AppResult};
 
 pub(crate) use claude::ClaudeSessionSourceV1;
@@ -180,6 +181,9 @@ pub(crate) struct NativeSessionV1 {
     pub(crate) status: SessionStatusV1,
     pub(crate) status_basis: EvidenceBasisV1,
     pub(crate) resume: ResumeAssessmentV1,
+    /// The model configuration this session recorded, as its provider
+    /// reports it (read only; never the native default).
+    pub(crate) agent_config: Option<NativeAgentConfigV1>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -268,6 +272,9 @@ pub(crate) struct ProviderObservationV1 {
     pub(crate) history_readable: bool,
     pub(crate) live_source: Option<String>,
     pub(crate) note: Option<String>,
+    /// What a new task in the queried workspace would start with, as the
+    /// provider reports it now. Only when exactly one workspace was queried.
+    pub(crate) native_default: Option<NativeAgentConfigV1>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

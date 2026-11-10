@@ -149,11 +149,12 @@ Native sessions are Host-private. The Codex adapter keeps its app-server session
 
 ### Native session discovery facts
 
-Three local Tauri commands. They are not Room Control events, and no Bridge peer reaches them.
+Four local Tauri commands. They are not Room Control events, and no Bridge peer reaches them.
 
 - `discover_native_sessions(query)`:
   - **Query:** `workspaces` (1 to 8 shareable folders), optional `provider` (`claude_code` or `codex`), optional `text`, optional `activeWithinSecs`. Unknown fields are refused.
-  - **Result:** `observedAtMs`; per provider `historyReadable`, `liveSource` and `note`; `sessions`, newest activity first; `resolution` (`unique`, `ambiguous` or `none`), with `sessionId` only when unique.
+  - **Result:** `observedAtMs`; per provider `historyReadable`, `liveSource`, `note` and, when exactly one workspace was queried, `nativeDefault`; `sessions`, newest activity first; `resolution` (`unique`, `ambiguous` or `none`), with `sessionId` only when unique.
+- `read_native_agent_defaults()`: Codex's and Claude Code's native defaults outside any project folder, as two `NativeAgentConfigV1` reports. Read only.
 - `inspect_native_session(request)`: `workspaces`, `provider` and `sessionId`. It answers only for a session whose recorded directory is one of the workspaces. Session ids must be a UUID (Claude Code) or `[A-Za-z0-9-]{1,64}` (Codex).
 
 - `continue_native_session(request)`: `workspaces`, `provider`, `sessionId` and `prompt`. It accepts only `claude_code`, and only a session whose resume verdict is `safe`; otherwise it refuses with the reasons. Discovered Codex threads are refused. It returns the Native Agent task status of capability `agent.coding.claude_code`, which then follows `get_native_agent_task_status` and `cancel_native_agent_task`. That capability advertises no peer protocol, is not among the capability facts sent to peers, and Core refuses any Bridge invocation of it.
@@ -165,7 +166,10 @@ Each session carries:
 - `live`: `state` (`running`, `attached`, `not_running` or `unknown`), with `source`, `observedAtMs` and `detail`;
 - `lastTurn`: `outcome` (`completed`, `interrupted`, `failed`, `in_progress`, `none` or `unreadable`), with `atMs` and `source`;
 - `status` (`running`, `idle`, `completed`, `interrupted`, `failed` or `unknown`) and `statusBasis` (`fact`, `inference` or `unknown`);
-- `resume`: `verdict` (`safe`, `unsafe` or `unknown`) and `reasons`.
+- `resume`: `verdict` (`safe`, `unsafe` or `unknown`) and `reasons`;
+- `agentConfig`: what the session recorded (below).
+
+`NativeAgentConfigV1` (`src-tauri/src/native_agent/agent_config.rs`; [semantics](layers/layer-5-agent.md#native-model-configuration-read-only)): `agent` (`codex` or `claude_code`), `scope` (`native_default` or `session`), optional `modelProvider`, `model` and `reasoningEffort` (identifiers of 1–96 characters from `[A-Za-z0-9-._:/@+[]]`, not starting with `/`, `.`, `~` or a drive letter, without `//`), optional `modelOrigin` and `reasoningEffortOrigin` (`user`, `project`, `managed`, `session_flags`, `packaged_default` or `other`), `source` (at most 120 characters), optional `note` (at most 400), `observedAtMs`. Unknown fields are refused. Codex `config/read` has 5 s.
 
 A snapshot adds:
 - `activity`: user turns, agent replies, tool calls, commands and failed commands, up to 20 changed files, errors;
@@ -213,6 +217,7 @@ A requester asks one exact current Bridge Host about its native sessions with `n
   - changed files appear only relative to the workspace, at most 20, and files outside it are only counted (`changedElsewhere`);
   - `recent` holds at most 4 excerpts of 300 characters, only when a permission for that folder allows excerpts (`excerptsShared`), never whole transcripts.
 - **Statuses** are the same as local discovery's: live state from a live source, history only for a stopped session.
+- **Model configuration.** Each session may carry `agentConfig` and each provider `nativeDefault` (only for a query of one scope), both `NativeAgentConfigV1` with notes and sources path-redacted. They are omitted when absent. The requester refuses the answer if a report is out of bounds, names another provider, or has the wrong `scope`.
 - **Requester checks.** The requester accepts an answer only for a query it has outstanding (`register`, 60 s), on the same Bridge, from the Host it asked, once.
 
 The requester's commands are `discover_remote_native_sessions(roomId, targetHostRef, provider?, text?, activeWithinSecs?, scopeRef?)`, `inspect_remote_native_session(roomId, targetHostRef, provider, sessionId)` and `open_remote_folder(roomId, targetHostRef, folder)`. Each waits up to 30 s.
@@ -225,6 +230,7 @@ The requester's commands are `discover_remote_native_sessions(roomId, targetHost
 | Native executor admission policy, pending executor Review, and renderer-safe Review projection | `src-tauri/src/native_agent/admission.rs` |
 | Adapter seam, opaque capability payload, Codex adapter, and test-only `fake.longjob.v1` adapter | `src-tauri/src/native_agent/capability.rs`, `src-tauri/src/native_agent/capability/codex.rs`, `src-tauri/src/native_agent/capability/fake_longjob.rs` |
 | Read-only native session discovery and inspection (Claude Code, Codex) | `src-tauri/src/native_agent/sessions.rs`, `src-tauri/src/native_agent/sessions/claude.rs`, `src-tauri/src/native_agent/sessions/codex.rs`; Codex history reader and holder scan in `src-tauri/src/native_agent/capability/codex.rs` |
+| Read-only native model configuration (`NativeAgentConfigV1`, native default and session record) | `src-tauri/src/native_agent/agent_config.rs`; readers in `src-tauri/src/native_agent/sessions/codex.rs` and `src-tauri/src/native_agent/sessions/claude.rs`; UI in `src/lib/nativeAgentConfig.ts`, `src/features/workspace/AgentConfigSummary.tsx` |
 | Local Claude Code Conversation (`agent.coding.claude_code_conversation`) | `src-tauri/src/native_agent/capability/claude_code/conversation.rs` |
 | Local Claude Code session continuation (`agent.coding.claude_code`) | `src-tauri/src/native_agent/capability/claude_code.rs` |
 | Remote session reading: permissions, wire types, minimal disclosure, Room Control kinds and requester wait | `src-tauri/src/session_read_access.rs`, `src-tauri/src/native_agent/sessions/remote.rs`, `src-tauri/src/room_control.rs` (`native_agent.session_query` / `session_response`), `src-tauri/src/bridge_lifecycle.rs` (`request_native_sessions`); UI in `src/features/workspace/BridgeWorkspaces.tsx` (Bridge details → Workspaces), `src/features/workspace/NativeSessionsCard.tsx`, `src/features/workspace/SessionReadingSettings.tsx` (Settings overview), `src/lib/workspaceShares.ts`, `src/lib/nativeSessions.ts` |

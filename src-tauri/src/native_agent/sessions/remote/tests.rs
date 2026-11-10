@@ -205,7 +205,11 @@ mod with_claude_store {
                     ]),
                     Some("tool_use"),
                 ),
-                line("assistant", &workspace, "2026-10-18T01:00:09Z", serde_json::json!([{"type": "text", "text": format!("Done. I edited {}/src/lib.rs and all tests pass.", workspace.display())}]), Some("end_turn")),
+                // As Claude Code records a reply: the model that answered
+                // and the request's effort level.
+                format!("{}\n", serde_json::json!({"type": "assistant", "cwd": workspace, "entrypoint": "cli", "timestamp": "2026-10-18T01:00:09Z",
+                    "effort": "high", "message": {"role": "assistant", "model": "claude-opus-5-5", "stop_reason": "end_turn",
+                    "content": [{"type": "text", "text": format!("Done. I edited {}/src/lib.rs and all tests pass.", workspace.display())}]}})),
             ]
             .concat();
             fs::write(dir.join(format!("{id}.jsonl")), body).unwrap();
@@ -336,6 +340,50 @@ mod with_claude_store {
             .providers
             .iter()
             .any(|provider| provider.provider == PROVIDER_CODEX && !provider.history_readable));
+
+        // What each session recorded travels with it, as identifiers only;
+        // the native default of the one shared folder travels with its
+        // provider, kept apart. Claude Code's default is not knowable.
+        let config = session.agent_config.as_ref().unwrap();
+        assert_eq!(
+            (config.scope, config.model.as_deref(), config.reasoning_effort.as_deref()),
+            (AgentConfigScopeV1::Session, Some("claude-opus-5-5"), Some("high"))
+        );
+        let claude_default = discovery
+            .providers
+            .iter()
+            .find(|provider| provider.provider == PROVIDER_CLAUDE_CODE)
+            .and_then(|provider| provider.native_default.as_ref())
+            .unwrap();
+        assert_eq!(
+            (claude_default.scope, claude_default.model.as_deref()),
+            (AgentConfigScopeV1::NativeDefault, None)
+        );
+
+        // A Host's answer with a forged configuration is refused whole: a
+        // path-shaped value, another provider's report, or a default
+        // passed off as a session's.
+        let forge = |change: &dyn Fn(&mut RemoteSessionResponseV1)| {
+            let mut forged = answer.clone();
+            change(&mut forged);
+            validate_response(&forged).is_err()
+        };
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().model = Some("/Users/me/.claude/settings.json".into())));
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().agent = PROVIDER_CODEX.into()));
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().scope = AgentConfigScopeV1::NativeDefault));
+        assert!(forge(&|a| {
+            let provider = a.discovery.as_mut().unwrap().providers.iter_mut().find(|p| p.provider == PROVIDER_CLAUDE_CODE).unwrap();
+            provider.native_default.as_mut().unwrap().scope = AgentConfigScopeV1::Session;
+        }));
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().note = Some("x\u{7}".into())));
+        // An answer from a Host that reports no configuration still reads.
+        let mut older = answer.clone();
+        for session in &mut older.discovery.as_mut().unwrap().sessions {
+            session.agent_config = None;
+        }
+        let wire = serde_json::to_value(&older).unwrap();
+        assert!(wire.pointer("/discovery/sessions/0/agentConfig").is_none());
+        validate_response(&serde_json::from_value(wire).unwrap()).unwrap();
     }
 
     #[test]

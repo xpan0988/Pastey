@@ -858,6 +858,26 @@ pub fn list_native_agent_capabilities(
     Ok(registry.capabilities())
 }
 
+/// What a new task with each native Agent on this Host would start with,
+/// outside any project folder, as the Agent itself reports it (Codex:
+/// `config/read`; Claude Code has no read-only query, so it is unknown).
+/// Read only: no session or task is started and no configuration is
+/// written or overridden. Local only.
+#[tauri::command]
+pub async fn read_native_agent_defaults(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::native_agent::agent_config::NativeAgentConfigV1>, String> {
+    let (_claude, codex) = state.native_agents.lock().session_sources();
+    tokio::task::spawn_blocking(move || {
+        vec![
+            codex.native_default(None),
+            crate::native_agent::sessions::claude::native_default(),
+        ]
+    })
+    .await
+    .map_err(|_| "Reading the native Agent defaults stopped unexpectedly.".to_string())
+}
+
 /// Finds the Claude Code and Codex sessions that already exist on this Host
 /// in the workspaces this Host's user names, with their live state and
 /// evidence. Read only: nothing is started, resumed, changed or stopped.

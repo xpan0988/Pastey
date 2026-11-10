@@ -6009,6 +6009,20 @@ mod tests {
                 verdict: ResumeVerdictV1::Safe,
                 reasons: vec!["no process holds it".into()],
             },
+            // The recorded model configuration crosses Room Control's
+            // field-name check like every other session fact.
+            agent_config: Some(crate::native_agent::agent_config::NativeAgentConfigV1 {
+                agent: PROVIDER_CLAUDE_CODE.into(),
+                scope: crate::native_agent::agent_config::AgentConfigScopeV1::Session,
+                model_provider: None,
+                model: Some("claude-opus-5-5".into()),
+                reasoning_effort: Some("high".into()),
+                model_origin: None,
+                reasoning_effort_origin: None,
+                source: "Claude Code transcript (latest reply)".into(),
+                note: None,
+                observed_at_ms: 3,
+            }),
         };
         RemoteSessionResponseV1 {
             schema_version: NATIVE_SESSION_SCHEMA.into(),

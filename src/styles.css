@@ -525,6 +525,14 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
 .availability { display: flex; align-items: flex-start; gap: 10px; font-size: var(--text-sm); color: var(--text-2); }
 .availability .dot { margin-top: 6px; }
 .availability strong { color: var(--text); font-weight: 600; }
+.agent-config { display: grid; gap: 2px; font-size: var(--text-sm); color: var(--text-2); }
+.agent-config-head { color: var(--text); font-weight: 600; }
+.agent-config-values { display: flex; flex-wrap: wrap; gap: 4px var(--space-4); }
+.agent-config-values strong { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.agent-config-values strong.subtle { color: var(--text-3); font-weight: 500; }
+.agent-config-note { font-size: var(--text-xs); color: var(--text-3); line-height: 1.45; }
+.agent-config-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px var(--space-4); padding: 6px var(--space-6); border-bottom: 1px solid var(--border); background: var(--surface-2); font-size: var(--text-xs); }
+.agent-config-strip .agent-config-head { font-weight: 600; }
 .filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--space-2); }
 
 .agent-response-text { max-height: 360px; overflow: auto; padding: 12px; border-radius: var(--radius-md); background: var(--surface-2); color: var(--text); font-family: var(--font-mono); font-size: var(--text-sm); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -31,6 +31,9 @@ use super::{
     MAX_SESSIONS, MAX_TITLE_CHARS, PROVIDER_CLAUDE_CODE,
 };
 use crate::error::AppResult;
+use crate::native_agent::agent_config::{
+    config_field, config_value, AgentConfigScopeV1, NativeAgentConfigV1,
+};
 
 const LIVE_SOURCE: &str = "claude agents --json";
 const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -231,6 +234,7 @@ impl ClaudeSessionSourceV1 {
                 }
                 LiveRegistryV1::Read { .. } => None,
             },
+            native_default: matches!(workspaces, [_]).then(native_default),
         };
         (sessions, observation)
     }
@@ -388,7 +392,63 @@ fn session_from(
         status,
         status_basis,
         resume,
+        agent_config: Some(transcript_config(transcript)),
     })
+}
+
+const TRANSCRIPT_CONFIG_SOURCE: &str = "Claude Code transcript (latest reply)";
+const CLAUDE_DEFAULT_SOURCE: &str = "Claude Code";
+
+/// What this session's latest reply recorded: the model that answered and
+/// the effort level of that request. Nothing else is taken for it.
+fn transcript_config(transcript: &TranscriptV1) -> NativeAgentConfigV1 {
+    let unknown = |note: &str| {
+        NativeAgentConfigV1::unknown(
+            PROVIDER_CLAUDE_CODE,
+            AgentConfigScopeV1::Session,
+            TRANSCRIPT_CONFIG_SOURCE,
+            note,
+        )
+    };
+    if !transcript.complete {
+        return unknown("The transcript is larger than Pastey reads, so its latest reply's model is not known.");
+    }
+    let Some((model, reasoning_effort)) = transcript.reply_config.clone() else {
+        return unknown("No reply is recorded in this session yet.");
+    };
+    let note = match (&model, &reasoning_effort) {
+        (None, _) => Some("Claude Code recorded no model Pastey can show for the latest reply."),
+        (Some(_), None) => Some("Claude Code recorded no effort level with the latest reply."),
+        _ => None,
+    };
+    NativeAgentConfigV1 {
+        agent: PROVIDER_CLAUDE_CODE.into(),
+        scope: AgentConfigScopeV1::Session,
+        // Not recorded in the transcript (Anthropic, Bedrock, Vertex, …).
+        model_provider: None,
+        model,
+        reasoning_effort,
+        model_origin: None,
+        reasoning_effort_origin: None,
+        source: TRANSCRIPT_CONFIG_SOURCE.into(),
+        note: note.map(str::to_owned),
+        observed_at_ms: now_ms(),
+    }
+}
+
+/// Claude Code's native default for a new conversation. It has no
+/// read-only interface for it: its effective model and effort follow
+/// managed policy, flags, environment variables and several settings
+/// files, and an unset model depends on the account. Pastey neither reads
+/// one settings file as the answer nor starts a session to find out, so it
+/// is unknown until a conversation's first reply records it.
+pub(crate) fn native_default() -> NativeAgentConfigV1 {
+    NativeAgentConfigV1::unknown(
+        PROVIDER_CLAUDE_CODE,
+        AgentConfigScopeV1::NativeDefault,
+        CLAUDE_DEFAULT_SOURCE,
+        "Claude Code has no read-only query for its default model or effort. A conversation shows what it used once Claude Code has replied.",
+    )
 }
 
 /// What one transcript says, bounded.
@@ -405,6 +465,9 @@ struct TranscriptV1 {
     activity: ActivitySummaryV1,
     recent: VecDeque<SnapshotEntryV1>,
     complete: bool,
+    /// The model and effort Claude Code recorded with the latest reply of
+    /// the main conversation, if any reply was recorded.
+    reply_config: Option<(Option<String>, Option<String>)>,
 }
 
 impl TranscriptV1 {
@@ -427,6 +490,7 @@ impl TranscriptV1 {
             activity: ActivitySummaryV1::default(),
             recent: VecDeque::new(),
             complete: true,
+            reply_config: None,
         }
     }
 }
@@ -475,6 +539,18 @@ fn read_transcript(path: &Path) -> Option<TranscriptV1> {
             || entry.get("isSidechain").and_then(Value::as_bool) == Some(true)
         {
             continue;
+        }
+        if kind == "assistant" {
+            // `<synthetic>` marks replies Claude Code wrote itself (errors,
+            // notices), which no model produced.
+            if let Some(model) = entry
+                .pointer("/message/model")
+                .and_then(Value::as_str)
+                .filter(|model| *model != "<synthetic>")
+            {
+                transcript.reply_config =
+                    Some((config_value(model), config_field(entry.get("effort"))));
+            }
         }
         observe_turn_entry(
             &mut transcript,

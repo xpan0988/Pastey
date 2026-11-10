@@ -43,7 +43,9 @@ bounded lifecycle/result, and cancel where that interface supports it. It does
 not broker the Agent provider or authentication, translate native tools into
 effects, control its tool or shell strategy, recreate its sandbox, inspect its
 reasoning/process topology, or require ordinary Host-local tasks to pass through
-Scratch, GST, or ManagedObject.
+Scratch, GST, or ManagedObject. It shows the model and reasoning effort an
+Agent reports through its own interfaces, read only, and never sets them
+([Layer 5](layers/layer-5-agent.md#native-model-configuration-read-only)).
 
 By default a selected Agent works directly in the explicitly selected original
 workspace on its Host. A Host-private native session is associated with Host +

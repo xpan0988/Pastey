@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { readAppearance, saveAppearance, type Appearance } from "../../lib/appearance";
 import { isApplePlatform, readEnterKeyMode, saveEnterKeyMode, type EnterKeyMode } from "../../lib/composerKeys";
@@ -14,6 +14,7 @@ import {
   listAuthorizedSearchFolders,
   listManagedRuntimeOptions,
   listNativeAgentCapabilities,
+  readNativeAgentDefaults,
   listRooms,
   openLogsFolder,
   revealInFolder,
@@ -23,7 +24,8 @@ import {
   updateConfig,
   updateManagedWorkerProvider,
 } from "../../lib/tauri";
-import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot, NativeAgentCapability } from "../../lib/tauri";
+import type { AuthorizedSearchFolder, ManagedRuntimeOption, ManagedWorkerProviderSettings, ManagedWorkerProviderSettingsSnapshot, NativeAgentCapability, NativeAgentConfig } from "../../lib/tauri";
+import { agentConfigLine, presentAgentConfig } from "../../lib/nativeAgentConfig";
 import type { AppConfig, RoomInfo } from "../../lib/types";
 import { DeviceTrustSettings } from "./DeviceTrustSettings";
 import { InternetSettings } from "./InternetSettings";
@@ -200,21 +202,37 @@ function SharedSearchFolders() {
 function AgentSettings() {
   const [capabilities, setCapabilities] = useState<NativeAgentCapability[] | null>(null);
   const [checking, setChecking] = useState(false);
+  // Each Agent's native default, read only. A newer look (or leaving the
+  // screen) makes an older answer irrelevant: it is dropped, never shown.
+  const [defaults, setDefaults] = useState<NativeAgentConfig[] | null>(null);
+  const [defaultsProblem, setDefaultsProblem] = useState<string | null>(null);
+  const look = useRef(0);
+  useEffect(() => () => { look.current += 1; }, []);
   async function check() {
     setChecking(true);
+    const mine = ++look.current;
+    void readNativeAgentDefaults()
+      .then((read) => { if (look.current === mine) { setDefaults(read); setDefaultsProblem(null); } })
+      .catch((error) => { if (look.current === mine) { setDefaults([]); setDefaultsProblem(error instanceof Error ? error.message : String(error)); } });
     try { setCapabilities(await listNativeAgentCapabilities()); } catch { setCapabilities([]); } finally { setChecking(false); }
   }
   useEffect(() => { void check(); }, []);
+  const configRow = (agent: NativeAgentConfig["agent"]) => {
+    if (defaults === null) return <small className="subtle">Reading its model configuration…</small>;
+    const config = defaults.find((candidate) => candidate.agent === agent);
+    const shown = presentAgentConfig(config, defaultsProblem ?? "Not reported.");
+    return <small title={shown.detail}>{agentConfigLine(config)} <span className="subtle">· native default, read only.{shown.complete ? "" : ` ${config?.note ?? defaultsProblem ?? "Not reported."}`}</span></small>;
+  };
   const codex = capabilities?.find((capability) => capability.agentId === "agent.coding.codex");
   const claude = capabilities?.find((capability) => capability.agentId === CLAUDE_CODE_AGENT_ID);
   return <>
     <section className="section" aria-label="Native Agents on this device">
-      <div className="section-head-row"><div className="section-head"><h2>On this device</h2><p>Native Agents keep their own sign-in, tools, sandbox and context. Pastey only starts them, moves files when you approve, and reports what they return.</p></div>
+      <div className="section-head-row"><div className="section-head"><h2>On this device</h2><p>Native Agents keep their own sign-in, model, tools, sandbox and context. Pastey only starts them, moves files when you approve, and reports what they return. The model and reasoning shown are what each Agent itself reports for a new task outside any project folder; change them in the Agent's own settings.</p></div>
         <button type="button" className="btn btn-sm" disabled={checking} onClick={() => void check()}><Icon name="refresh" small />{checking ? "Checking…" : "Check again"}</button></div>
       <div className="card">
-        <div className="setting-row"><span><strong>Codex</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(codex ? { state: codex.state, reason: codex.reason, detail: codex.detail, backend: codex.backend } : { state: "unavailable" }, null, false)}</small></span>
+        <div className="setting-row"><span><strong>Codex</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(codex ? { state: codex.state, reason: codex.reason, detail: codex.detail, backend: codex.backend } : { state: "unavailable" }, null, false)}</small>{configRow("codex")}</span>
           {capabilities === null ? <Dot pulse /> : <Badge tone={codex?.state === "available" ? "ok" : "warn"}>{codex?.state === "available" ? "Available" : codex?.state === "incompatible" ? "Needs update" : "Unavailable"}</Badge>}</div>
-        <div className="setting-row"><span><strong>Claude Code</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(claude ? { state: claude.state, reason: claude.reason, detail: claude.detail } : { state: "unavailable" }, null, false, CLAUDE_CODE_AGENT_ID)} This device only.</small></span>
+        <div className="setting-row"><span><strong>Claude Code</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(claude ? { state: claude.state, reason: claude.reason, detail: claude.detail } : { state: "unavailable" }, null, false, CLAUDE_CODE_AGENT_ID)} This device only.</small>{configRow("claude_code")}</span>
           {capabilities === null ? <Dot pulse /> : <Badge tone={claude?.state === "available" ? "ok" : "warn"}>{claude?.state === "available" ? "Available" : claude?.state === "incompatible" ? "Needs update" : "Unavailable"}</Badge>}</div>
       </div>
     </section>

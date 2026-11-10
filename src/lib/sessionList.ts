@@ -2,7 +2,7 @@
  * it is kept honest: a session is named by its provider and id only (never
  * by its title or time), a read that fails is never taken as a deletion, and
  * an older answer never replaces a newer one. */
-import type { NativeSessionProvider } from "./tauri";
+import type { NativeAgentConfig, NativeSessionProvider } from "./tauri";
 import type { SessionView } from "./nativeSessions";
 
 /** One native session, by what identifies it. */
@@ -24,6 +24,9 @@ export interface ProviderRead {
   provider: NativeSessionProvider;
   historyReadable: boolean;
   note: string | null;
+  /** What a new task in this workspace would start with, as the provider
+   * reported it in this read. */
+  nativeDefault?: NativeAgentConfig | null;
 }
 
 /** One answer from session discovery for one workspace. */
@@ -54,6 +57,10 @@ export interface SessionListState {
   readAt: Partial<Record<NativeSessionProvider, number>>;
   lookedAt: number;
   notes: string[];
+  /** Each provider's native default as the newest read reported it. Never
+   * carried over from an earlier read: a default not reported now is
+   * unknown, not what it was. */
+  defaults: Partial<Record<NativeSessionProvider, NativeAgentConfig>>;
 }
 
 function newestFirst(a: SessionView, b: SessionView): number {
@@ -83,6 +90,7 @@ export function mergeSessionRead(previous: SessionListState | null, scopeKey: st
     readAt,
     lookedAt: read.at,
     notes: [...(read.notes ?? [])],
+    defaults: Object.fromEntries(read.providers.flatMap((provider) => provider.nativeDefault ? [[provider.provider, provider.nativeDefault]] : [])),
   };
 }
 

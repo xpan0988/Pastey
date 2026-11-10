@@ -20,7 +20,10 @@
 //! None of this is needed to find a thread: its history is Codex's saved
 //! record on this Host, read whether or not any Codex client runs.
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde_json::{json, Value};
 
@@ -33,6 +36,9 @@ use super::{
     MAX_SESSIONS, MAX_TITLE_CHARS, PROVIDER_CODEX,
 };
 use crate::error::AppResult;
+use crate::native_agent::agent_config::{
+    config_field, note_text, AgentConfigScopeV1, ConfigOriginV1, NativeAgentConfigV1,
+};
 use crate::native_agent::capability::codex::{
     codex_holder_processes,
     own_holds::OwnThreadHoldV1,
@@ -295,7 +301,27 @@ impl CodexSessionSourceV1 {
             status,
             status_basis,
             resume,
+            agent_config: Some(thread_config(thread)),
         })
+    }
+
+    /// What a new task would start with, as Codex's own `config/read`
+    /// reports it, seen from `workspace` (its project layers included) or,
+    /// without one, from no project. Read only: this reader's app-server
+    /// starts no thread and nothing is written.
+    pub(crate) fn native_default(&self, workspace: Option<&Path>) -> NativeAgentConfigV1 {
+        let cwd = workspace
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir);
+        match CodexHistoryReaderV1::open(&self.executable, &cwd) {
+            Ok(reader) => read_native_default(&reader, workspace),
+            Err(error) => NativeAgentConfigV1::unknown(
+                PROVIDER_CODEX,
+                AgentConfigScopeV1::NativeDefault,
+                CONFIG_SOURCE,
+                note_text(&format!("Codex could not be asked: {}", error.message())),
+            ),
+        }
     }
 
     pub(crate) fn discover(
@@ -310,6 +336,7 @@ impl CodexSessionSourceV1 {
                     history_readable: false,
                     live_source: None,
                     note: Some(note),
+                    native_default: None,
                 },
             )
         };
@@ -317,9 +344,20 @@ impl CodexSessionSourceV1 {
             Ok(reader) => reader,
             Err(reason) => return unavailable(format!("Codex history unavailable: {reason}")),
         };
+        // The default as seen from that one folder; several folders could
+        // each see another one.
+        let native_default = match workspaces {
+            [workspace] => Some(read_native_default(&reader, Some(workspace))),
+            _ => None,
+        };
         let threads = match self.threads(&reader, workspaces) {
             Ok(threads) => threads,
-            Err(reason) => return unavailable(format!("Codex history unavailable: {reason}")),
+            Err(reason) => {
+                let (sessions, mut observation) =
+                    unavailable(format!("Codex history unavailable: {reason}"));
+                observation.native_default = native_default;
+                return (sessions, observation);
+            }
         };
         let sessions = threads
             .iter()
@@ -333,6 +371,7 @@ impl CodexSessionSourceV1 {
                 "History read with the {} Codex. Live state comes from each thread's Codex writer lock where it can be read.",
                 reader.backend().unwrap_or("configured")
             )),
+            native_default,
         };
         (sessions, observation)
     }
@@ -645,5 +684,118 @@ fn read_error(error: HistoryReadErrorV1) -> String {
     match error {
         HistoryReadErrorV1::Oversized => "a history page was too large to read".into(),
         HistoryReadErrorV1::Failed(reason) => reason,
+    }
+}
+
+/// Names the native interface for every Codex configuration report.
+const CONFIG_SOURCE: &str = "Codex config/read";
+const THREAD_CONFIG_SOURCE: &str = "Codex thread record";
+/// `config/read` is a local read: answered quickly or not at all.
+const CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The model configuration Codex records for one thread (`thread/list`):
+/// the configured value when the thread is loaded, else the latest one it
+/// saved. Codex says this is not per-turn telemetry, and so does Pastey.
+fn thread_config(thread: &Value) -> NativeAgentConfigV1 {
+    let model = config_field(thread.get("model"));
+    let reasoning_effort = config_field(thread.get("reasoningEffort"));
+    let note = match (&model, &reasoning_effort) {
+        (None, None) => Some("Codex reported no model or reasoning effort for this thread.".into()),
+        (None, Some(_)) => Some("Codex reported no model for this thread.".into()),
+        (Some(_), None) => Some("Codex reported no reasoning effort for this thread (unset or unavailable).".into()),
+        _ => None,
+    };
+    NativeAgentConfigV1 {
+        agent: PROVIDER_CODEX.into(),
+        scope: AgentConfigScopeV1::Session,
+        model_provider: config_field(thread.get("modelProvider")),
+        model,
+        reasoning_effort,
+        model_origin: None,
+        reasoning_effort_origin: None,
+        source: THREAD_CONFIG_SOURCE.into(),
+        note,
+        observed_at_ms: now_ms(),
+    }
+}
+
+/// The kind of layer `config/read` names for one key. Its file is never
+/// kept.
+fn config_origin(result: &Value, key: &str) -> Option<ConfigOriginV1> {
+    let kind = result
+        .get("origins")?
+        .get(key)?
+        .pointer("/name/type")?
+        .as_str()?;
+    Some(match kind {
+        "user" => ConfigOriginV1::User,
+        "project" => ConfigOriginV1::Project,
+        "system" | "mdm" | "enterpriseManaged" | "legacyManagedConfigTomlFromFile"
+        | "legacyManagedConfigTomlFromMdm" => ConfigOriginV1::Managed,
+        "sessionFlags" => ConfigOriginV1::SessionFlags,
+        "packagedDefaults" => ConfigOriginV1::PackagedDefault,
+        _ => ConfigOriginV1::Other,
+    })
+}
+
+/// Codex's effective configuration through `config/read`. A key Codex
+/// leaves unset is unknown: Codex then picks its own default, which this
+/// interface does not report, and Pastey does not guess it.
+fn read_native_default(
+    reader: &CodexHistoryReaderV1,
+    workspace: Option<&Path>,
+) -> NativeAgentConfigV1 {
+    let mut params = json!({"includeLayers": false});
+    if let Some(workspace) = workspace {
+        params["cwd"] = json!(dunce::simplified(workspace).to_string_lossy());
+    }
+    let result = match reader.request_within("config/read", params, CONFIG_READ_TIMEOUT) {
+        Ok(result) => result,
+        Err(error) => {
+            let reason = match error {
+                HistoryReadErrorV1::Oversized => "its answer was larger than Pastey reads".to_owned(),
+                HistoryReadErrorV1::Failed(reason) => reason,
+            };
+            let unsupported = ["method not found", "unknown variant", "not supported"]
+                .iter()
+                .any(|marker| reason.to_ascii_lowercase().contains(marker));
+            return NativeAgentConfigV1::unknown(
+                PROVIDER_CODEX,
+                AgentConfigScopeV1::NativeDefault,
+                CONFIG_SOURCE,
+                if unsupported {
+                    "This Codex version does not answer config/read.".to_owned()
+                } else {
+                    note_text(&format!(
+                        "Codex did not answer config/read: {}",
+                        super::remote::redact_paths(&reason)
+                    ))
+                },
+            );
+        }
+    };
+    let config = result.get("config").unwrap_or(&Value::Null);
+    let model = config_field(config.get("model"));
+    let reasoning_effort = config_field(config.get("model_reasoning_effort"));
+    let mut notes = Vec::new();
+    if model.is_none() {
+        notes.push("No model is set in Codex's configuration: Codex then uses its own default, which config/read does not report.");
+    }
+    if reasoning_effort.is_none() {
+        notes.push("No reasoning effort is set: the model's own default applies, which config/read does not report.");
+    }
+    NativeAgentConfigV1 {
+        agent: PROVIDER_CODEX.into(),
+        scope: AgentConfigScopeV1::NativeDefault,
+        model_provider: config_field(config.get("model_provider")),
+        model_origin: model.as_ref().and_then(|_| config_origin(&result, "model")),
+        reasoning_effort_origin: reasoning_effort
+            .as_ref()
+            .and_then(|_| config_origin(&result, "model_reasoning_effort")),
+        model,
+        reasoning_effort,
+        source: CONFIG_SOURCE.into(),
+        note: (!notes.is_empty()).then(|| notes.join(" ")),
+        observed_at_ms: now_ms(),
     }
 }

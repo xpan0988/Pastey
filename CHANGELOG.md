@@ -6,6 +6,10 @@ The current development changes belong in `Unreleased`. Each release archives th
 
 ## Unreleased
 
+### Added
+
+- **See which model each Agent uses.** New conversation, a conversation, each session and Settings → Agents show the model and reasoning effort as Codex or Claude Code itself reports them, read only. A new conversation shows the Agent's native default for that folder and device (Codex: its `config/read`); a session shows what it recorded (Codex: its thread record; Claude Code: the model and effort of its latest reply). The two are kept apart. Claude Code offers no read-only query for its default, so that shows Unknown until a conversation has replied; anything else not reported is Unknown too, never guessed. Pastey still sets no model or effort and passes no override. Another device's values come only with the sessions of a folder it shares with Sessions on, without paths.
+
 ### Changed
 
 - **Agent replies read as Markdown.** Codex and Claude Code replies, earlier turns and a session's Agent excerpts render headings, lists, task lists, tables, quotes and code blocks (language label, Copy, highlighting for a named language) instead of showing the syntax. The text stays untrusted: HTML is shown as text, images are never loaded, and links never open in Pastey; a link shows its host and copies its address. Each reply has Copy reply for its exact text. Your own prompts and Share text are shown exactly as written.

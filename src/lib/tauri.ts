@@ -823,6 +823,33 @@ export type NativeSessionLastTurn = "completed" | "interrupted" | "failed" | "in
 export type NativeSessionStatus = "running" | "idle" | "completed" | "interrupted" | "failed" | "unknown";
 export type NativeSessionResumeVerdict = "safe" | "unsafe" | "unknown";
 
+/** A native Agent's model configuration, read only, as the Agent itself
+ * reported it: the native default a new task would start with, or what one
+ * existing session recorded. Pastey keeps no model setting of its own and
+ * never changes this one; an absent value is unknown, never guessed. Values
+ * are identifiers, the origins only the kind of configuration layer. */
+export type NativeAgentConfigScope = "native_default" | "session";
+export type NativeAgentConfigOrigin = "user" | "project" | "managed" | "session_flags" | "packaged_default" | "other";
+export interface NativeAgentConfig {
+  agent: NativeSessionProvider;
+  scope: NativeAgentConfigScope;
+  modelProvider?: string | null;
+  model?: string | null;
+  reasoningEffort?: string | null;
+  modelOrigin?: NativeAgentConfigOrigin | null;
+  reasoningEffortOrigin?: NativeAgentConfigOrigin | null;
+  /** Which native interface reported it. */
+  source: string;
+  note?: string | null;
+  observedAtMs: number;
+}
+
+/** What a new task with each native Agent on this device would start with,
+ * outside any project folder. Read only and local: nothing starts. */
+export function readNativeAgentDefaults(): Promise<NativeAgentConfig[]> {
+  return invoke("read_native_agent_defaults");
+}
+
 /** One session as a peer Host describes it: no folder paths, a workspace
  * only by its folder name and an opaque scope reference. */
 export interface RemoteNativeSession {
@@ -842,6 +869,18 @@ export interface RemoteNativeSession {
   status: NativeSessionStatus;
   statusBasis: EvidenceBasis;
   resume: { verdict: NativeSessionResumeVerdict; reasons: string[] };
+  /** What this session recorded (absent from a Host that reports none). */
+  agentConfig?: NativeAgentConfig | null;
+}
+
+/** One provider's part of a discovery. `nativeDefault`: what a new task in
+ * the one folder asked about would start with, as that provider reports it. */
+export interface NativeSessionProviderObservation {
+  provider: NativeSessionProvider;
+  historyReadable: boolean;
+  liveSource: string | null;
+  note: string | null;
+  nativeDefault?: NativeAgentConfig | null;
 }
 
 export interface RemoteNativeSessionSnapshot {
@@ -864,7 +903,7 @@ export interface RemoteNativeSessionResponse {
   scopes: SharedWorkspace[];
   discovery?: {
     observedAtMs: number;
-    providers: Array<{ provider: NativeSessionProvider; historyReadable: boolean; liveSource: string | null; note: string | null }>;
+    providers: NativeSessionProviderObservation[];
     sessions: RemoteNativeSession[];
     truncated: boolean;
     resolution: "unique" | "ambiguous" | "none";
@@ -928,7 +967,7 @@ export interface LocalNativeSession extends Omit<RemoteNativeSession, "scopeRef"
 
 export interface LocalNativeSessionDiscovery {
   observedAtMs: number;
-  providers: Array<{ provider: NativeSessionProvider; historyReadable: boolean; liveSource: string | null; note: string | null }>;
+  providers: NativeSessionProviderObservation[];
   sessions: LocalNativeSession[];
   resolution: "unique" | "ambiguous" | "none";
   sessionId: string | null;
