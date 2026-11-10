@@ -105,14 +105,23 @@ The internet carrier's contract ([Connectivity](layers/layer-4-connectivity.md))
 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey connectivity::
 ```
 
-They do not exercise NAT traversal, relays, real networks or Windows; part W of the [physical acceptance](platform/mac-windows-acceptance.md) does.
+These automated checks do not exercise NAT traversal, relays, real networks or Windows. For a physical regression check, pair the devices on the LAN, enable Across the internet on both, then put them on separate networks. Check the reported path, reconnect, run Codex remotely and verify the outcome after an outage without resending the turn. Use [net-probe](../tools/net-probe/README.md) to isolate the raw path from the Bridge.
+
+The pairing and authenticated transfer regression suites also use loopback sockets:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- bridge_auth join_authentication discovery:: bridge_lifecycle:: storage::tests::a_pairing_code storage::tests::a_pinned_peer commands::tests::a_code_pairs
+```
 
 ## Automated, local, and physical evidence
 
 - Rust and TypeScript tests cover deterministic composition, alias resolution, immutable correlation, whole-Plan readiness, replay, Worker/provider streaming, effect enforcement, Core results, exact Transfer receipt, cancellation/revocation races, restart, and Burn.
 - A local dual-instance run covers desktop wiring, current-session Room Control, ordinary Transfer, and protocol interaction on one machine. It does not prove independent physical Hosts, LAN failure behavior, native Windows, or a verified managed process world on another platform.
 - Source-level Native Agent reliability and deterministic two-Host state validation are complete. The test-only pair harness uses two independent durable Host states; it does not exercise physical machines.
-- Physical Native Agent proof requires packaged builds on a Mac and a Windows Host and recorded acceptance evidence. The deterministic pair harness does not replace it. For 2.0.0, remote invocation, identity, Full Access and recovery were run physically; movement and Return were not ([recorded results](platform/mac-windows-acceptance.md#recorded-results-for-200)).
+- **2.0.0 release evidence.** The release owner reported packaged Mac ↔ Windows runs covering a Bridge across separate networks (home Wi-Fi and phone hotspot), remote Windows Codex from the Mac, Host identity and the secure session, unattended Full Access, connection and Agent recovery, and Developer Mode recovery. The per-step records are not in the repository. A separate Mac → Windows run found and inspected a Codex Desktop thread, refused to continue it while held, and continued it in place once the Codex clients were closed.
+- **Subsequent physical acceptance.** The maintainer confirmed end-to-end Native Workspace Movement, result Return and Apply, and Full Access while Windows is locked. There is no per-case record here to establish specific builds, directions, timings or failure-matrix results for those runs. Relay-only operation, sleep/wake and the full Generic Managed multi-Host path are outside these recorded results.
+- **Local Claude Code Conversation.** On macOS, signed-in Claude Code 2.1.317 passed new and follow-up turns, Stop, and cleanup after Pastey was killed, through the production start method and the built lifeline. The tests did not drive the packaged UI or IPC. A separate headless probe exercised interruption and cleanup with a real tool call. On Windows 11 with 2.1.319, signed-in adapter runs covered a new conversation and its follow-up, Stop with a real tool process, and process cleanup after Pastey was killed. A debug app run also exercised the local flow and untrusted-workspace refusal through the real WebView and IPC; the folder picker and interactive trust prompt were not driven there. A paired Mac's view of a Windows Host with Claude Code enabled was not run in that record; local-only advertisement and admission are covered by the automated checks and Core's no-peer-protocol rule.
+- **Windows Codex Stop.** Merged in `8b7288e`. The Windows fixture suite passed, and a signed-in adapter test with Codex 0.163.0 confirmed the sandboxed command was gone when Stop was reported and the next turn resumed the conversation. That record does not cover the packaged app, the bundled desktop Codex or the restricted-token sandbox.
 
 ## Native Agent focused validation
 
@@ -150,29 +159,19 @@ Full Access has unit tests (`full_access`, `session_read_access`, the `full_acce
 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey full_access
 ```
 
-It does not exercise a packaged app, Windows, or an unattended session there; part U of the [Mac ↔ Windows acceptance](platform/mac-windows-acceptance.md) does.
+The automated pair uses neither a packaged app nor a native Windows session. For physical use and regression setup, see [Unattended Windows readiness](reference.md#unattended-windows-readiness).
 
-### Known timing-sensitive tests
+### Timing-sensitive tests
 
-Classified on 2026-10-26 on an Apple Silicon Mac, comparing `232e231` (before Full Access) with the Full Access branch. Each side ran the full suite twice (`cargo test --bin pastey`, outside the sandbox so PTYs work) and each test below five times alone (`--exact`):
+If the Room Control burst test fails on its query/answer counts, rerun it alone on an idle machine. Its shared projection can unblock callers before the final answer reaches the requester, so a count mismatch at that instant does not by itself prove loss or replay.
 
-| Test | Baseline | Full Access | Class |
-| --- | --- | --- | --- |
-| `room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers` | full: 1 of 2 runs failed; alone: 5/5 pass (failed alone once in an earlier check) | full: 1 of 2 failed; alone: 4/5 | Flaky before Full Access. Under the burst, Room Control can drop the Mac's current Windows session ("Current remote Host session is unavailable") |
-| `native_agent::tests::a_reviewed_task_with_a_proven_requester_takes_its_decisions` | pass | pass, after the fix | Was a regression in the test's assumption (a folder-scoped grant not covering another folder); fixed by revoking Full Access in the test |
-| `a_new_conversation_replaces_the_live_one_without_touching_other_owners`, `an_unknown_turn_at_restart_blocks_follow_ups_and_is_never_rerun`, `an_unavailable_conversation_is_never_replaced_by_a_new_one`, `another_owner_or_workspace_never_inherits_a_conversation`, `concurrent_follow_ups_are_exclusive_and_each_runs_once`, `thread_continuation::tests::pastey_s_own_idle_session_is_closed_only_after_the_folder_check`, `a_workspace_sent_by_a_device_with_full_access_starts_when_it_lands` | pass in both full runs and 5/5 alone (the last is new) | pass in both full runs and 5/5 alone | Failed only once, in one full run made while other builds competed for the CPU; their waits on the fixture Codex are bounded to a few seconds |
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- --exact room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers
+```
 
-Rechecked on 2026-10-28 after the WAN fixes, comparing `5e3e38d` with `6163348`:
+### Claude Code live validation
 
-- Alone, the burst test passes 5/5 on both commits.
-- On `5e3e38d` it also passes 10/10 with every core kept busy.
-- In one full run on `6163348` it failed at the answer count (`runtime_pair_tests.rs:816`: Mac 32 accepted `capability_answer`, Windows 33 accepted `capability_query`) instead of with "Current remote Host session is unavailable". The resolver now survives the lost liveness probe that ended such a run earlier, so a run under contention gets as far as this count.
-
-The count is read the moment the last check returns. That can come before Windows's last answer has reached the Mac, for three reasons: Windows counts a query when it admits it, it sends the answer in the background, and all the checks wait on one shared projection slot. This is a race in the test's own observation, in code unchanged since `5e3e38d`. It is not a lost or repeated delivery.
-
-To repeat a classification, run the full suite on an otherwise idle machine, then the test alone, for example `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- --exact room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers`.
-
-Claude Code session continuation has a live check. It uses the installed, signed-in Claude Code and a little of its quota. In `src-tauri/target/claude-s2-live` it creates a fresh session, continues it through Pastey's Native Agent lifecycle, and then shows that a session a foreground run holds is refused without anything being sent:
+The separate Claude Code background-session continuation has a live check on macOS. It uses the installed, signed-in Claude Code and a little of its quota. In `src-tauri/target/claude-s2-live` it creates a fresh session, continues it through Pastey's Native Agent lifecycle, and then shows that a session a foreground run holds is refused without anything being sent:
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_continues_an_unheld_session_and_refuses_a_held_one -- --ignored --nocapture
@@ -188,12 +187,12 @@ Run them one at a time, from a clean environment: a shell inside a Claude Code s
 env -i HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="$TMPDIR" LANG=en_US.UTF-8 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_ -- --ignored --nocapture --test-threads=1
 ```
 
-The same command also runs the Claude Code conversation checks. They go through Pastey's own entry point (`start_claude_code_conversation_task`, what the app's `start_native_claude_code_task` command calls) and the real lifeline, which is the built `pastey` executable, so build it first:
+That filter also selects the Claude Code Conversation checks. Before running it, build the real lifeline with `cargo build --manifest-path src-tauri/Cargo.toml --bin pastey`. The Conversation checks exercise:
 - a conversation and a follow-up that remembers it;
 - Stop during a turn;
 - a Pastey process killed with SIGKILL during a turn: Claude Code must end without anyone stopping it, and the restored task must never read failed.
 
-They run in folders under `src-tauri/target/`, which Claude Code must trust as part of this repository.
+They use disposable folders under `src-tauri/target/`. Open the checkout in Claude Code and grant its own workspace trust before running tests that write project settings.
 
 On Windows, the Claude Code conversation adapter has its own suites. They run real Windows processes in the product's Job Object (a fixture `claude.cmd` with PowerShell `-p` runs, `ping`, `conhost`), and no Claude Code:
 
@@ -201,29 +200,30 @@ On Windows, the Claude Code conversation adapter has its own suites. They run re
 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- claude_code::job:: conversation::windows_tests --test-threads=4
 ```
 
-Their live checks, and the steps that open the capability on Windows, are in the [Windows Claude Code acceptance](platform/windows-claude-code-acceptance.md). Until it passes, the capability reports `native_agent_platform_unverified` on Windows.
+For the Windows live checks, use a fresh PowerShell outside any Claude Code session. Install the standalone CLI (2.1.319 or later), sign in, and check `claude --version` and `claude auth status`. Run from a disposable checkout trusted by Claude Code. The live checks use the account's model quota. The Stop and crash tests grant only `Bash(ping:*)` in their disposable folders' own Claude Code settings so they can observe a real tool process.
 
-```bash
-cargo build --manifest-path src-tauri/Cargo.toml
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_conversation_ -- --ignored --nocapture --test-threads=1
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey windows_stop_tests
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_codex_stop_ends_the_command_the_turn_ran -- --ignored --nocapture
 ```
 
-The test-only `native_agent::tests::pair_harness` scenarios use Requester Host A and Executor Host B with separate `AppPaths`, SQLite databases, and `NativeAgentServiceV1` instances, each independently restarted from durable state. Two compositions share it. The Codex workspace-movement pair uses a deterministic fake Codex app-server that writes app-server launches and native turns to external ledgers. The capability pair registers only the test-only `fake.longjob.v1` adapter, with Codex absent, to prove the lifecycle is capability-neutral. Executor admission scenarios in both show that a direct remote invocation or a landed workspace waits for executor Review without any adapter `prepare`/`start` or app-server launch. The fixture controls delivery and fault timing while exercising production state, movement, regular-file-set package/materialization, task, reconciliation, Return, apply, cancellation, and Burn code; it does not implement another Native Agent state machine. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey native_agent::tests::pair_harness`. It gives deterministic evidence for authority, task ownership, executor admission and Review, movement, restart, reconciliation, exact Return and retry, conflict retention, apply idempotence, cancellation, Burn, late completion/observer behavior, and Agent-at-most-once. It does not prove APFS ↔ NTFS behavior, real macOS/Windows process lifecycle, installed and authenticated Codex, real app-server behavior, LAN/socket interruption and reconnect, sleep/wake, firewall/platform behavior, or packaged release UX. Those boundaries still require physical Mac ↔ Windows acceptance.
+The last two commands check Windows Codex Stop. The ignored Codex test requires a signed-in Codex installation with its Windows sandbox set up. For isolated diagnosis use the [Codex Stop probe](../tools/codex-stop-probe/README.md).
 
-The remaining Phase 2 gate is a Native Agent physical multi-device procedure and recorded Mac ↔ Windows evidence before claiming movement reliability across actual devices. It must exercise a connected remote Host, explicit requester movement review, the executing Host's Accept and Deny, encrypted outbound and return transfer, stale/replaced-session rejection, interruption and restart behavior, cancellation races, replay rejection, source-change conflict retention, and recovery presentation. Keep recorded evidence non-secret: never include provider credentials, native session identifiers, Host paths, grants, ObjectRefs, or raw Agent/terminal content.
+### Native Workspace Movement regression checks
 
-## Mac ↔ Windows physical acceptance
+The test-only `native_agent::tests::pair_harness` scenarios use Requester Host A and Executor Host B with separate `AppPaths`, SQLite databases, and `NativeAgentServiceV1` instances, each independently restarted from durable state. Two compositions share it. The Codex workspace-movement pair uses a deterministic fake Codex app-server that writes app-server launches and native turns to external ledgers. The capability pair registers only the test-only `fake.longjob.v1` adapter, with Codex absent, to prove the lifecycle is capability-neutral. Executor admission scenarios in both show that a direct remote invocation or a landed workspace waits for executor Review without any adapter `prepare`/`start` or app-server launch. The fixture controls delivery and fault timing while exercising production state, movement, regular-file-set package/materialization, task, reconciliation, Return, apply, cancellation, and Burn code; it does not implement another Native Agent state machine. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey native_agent::tests::pair_harness`. It gives deterministic evidence for authority, task ownership, executor admission and Review, movement, restart, reconciliation, exact Return and retry, conflict retention, apply idempotence, cancellation, Burn, late completion/observer behavior, and Agent-at-most-once. It does not prove APFS ↔ NTFS behavior, real macOS/Windows process lifecycle, installed and authenticated Codex, real app-server behavior, LAN/socket interruption and reconnect, sleep/wake, firewall/platform behavior, or packaged release UX. Use physical hosts to exercise those boundaries.
 
-The consolidated physical procedure is [Mac ↔ Windows acceptance](platform/mac-windows-acceptance.md). It replaces the earlier manual two-device smoke and covers:
-- secure pairing;
-- LAN Bridge operation;
-- reconnection;
-- representative Agent and file workflows;
-- overlay reach;
-- Bridges across the internet through the carrier (part W);
-- Burn;
-- raw path measurements with the isolated `tools/net-probe`.
+For a packaged regression run on two devices, use disposable folders. Verify secure pairing and reconnect, requester movement approval, executor Accept and Deny, encrypted outbound transfer, one Codex turn, exact result Return and Apply, and conflict retention when the source changes. Exercise a network drop or restart and verify recovery does not run a second turn. Verify that Burn cuts off Bridge authority. To check Full Access while locked, grant it on Windows, lock with Win+L while Pastey is running, and from the Mac start Codex and open a Developer Terminal without an Accept on Windows. Verify revocation prevents later requests from starting without Accept. Record only non-secret evidence; omit credentials, native session ids, private paths, grants, and raw Agent or terminal content.
 
-Each step stays untested until it is recorded on real devices.
+## Windows crash diagnosis
+
+Check the Application event log for `pastey.exe` (Application Error 1000 or Windows Error Reporting 1001), and note the faulting module and exception code. For WebView crashes look for `msedgewebview2.exe`. The app log records bounded panic details, unclean exit on next launch and Native Agent steps by task id. Do not share WER dumps.
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000,1001; StartTime=(Get-Date).AddDays(-7)} | Where-Object { $_.Message -match 'pastey|msedgewebview2' }
+Get-Content "$env:LOCALAPPDATA\pastey\logs\pastey.log" -Tail 300
+```
 
 ## Developer Terminal physical checks
 
@@ -249,7 +249,7 @@ Pushing the tag triggers GitHub Actions installer builds for macOS Apple Silicon
 
 Release history of the pipeline: beta.1 uploaded only its macOS DMG; beta.2 uploaded the DMG and the Windows NSIS installer. The Linux job has failed in its Rust check or test step on every release run since 1.9.1, so no Linux package has been published since then. 2.0.0 is the first release to build the Windows MSI with the Codex sandbox sidecars. Before pushing that tag, push the release commit alone (`git push origin main`), run `npm run build:checked:windows` from it on Windows to see both installers build, and only then push the tag (`git push origin v2.0.0`).
 
-A release claims only what was verified for it. For 2.0.0 the physical Mac ↔ Windows results are summarized in [Recorded results for 2.0.0](platform/mac-windows-acceptance.md#recorded-results-for-200); native workspace movement and Return were not accepted physically end to end. A release pass must also run the full validation stack and packaged physical smoke appropriate to its actual claim.
+Run the validation stack and packaged physical smoke appropriate to the release claim. Report the checks actually run for that release separately from earlier results.
 
 ## Repository hygiene
 

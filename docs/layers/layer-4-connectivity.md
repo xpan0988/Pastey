@@ -6,11 +6,11 @@ How a Bridge's two devices reach each other. [Layer 4](layer-4-bridge.md) owns t
 
 | Path | State | Evidence |
 | --- | --- | --- |
-| LAN (UDP discovery, TCP room servers) | Shipped, unchanged by the carrier | Automated suites; physical LAN acceptance in [Mac ↔ Windows acceptance](../platform/mac-windows-acceptance.md) parts B–D |
-| Overlay address (Tailscale/WireGuard) | Shipped, unchanged | Automated; physical part G |
-| Internet carrier (iroh: direct P2P, relay fallback) | **Shipped in 2.0, off by default** | Automated: deterministic two-Host tests over an in-memory carrier, and real iroh QUIC on loopback. Physical: a Mac and a Windows PC on separate networks (home Wi-Fi and a phone hotspot) kept and recovered a Bridge and ran remote Codex across them ([acceptance](../platform/mac-windows-acceptance.md#recorded-results-for-200)) |
+| LAN (UDP discovery, TCP room servers) | Shipped, unchanged by the carrier | Automated suites and physical Mac ↔ Windows pairing and reconnect |
+| Overlay address (Tailscale/WireGuard) | Shipped, unchanged | Automated; use two devices on an overlay for physical checks |
+| Internet carrier (iroh: direct P2P, relay fallback) | **Shipped in 2.0, off by default** | Automated: deterministic two-Host tests over an in-memory carrier, and real iroh QUIC on loopback. Physical: a Mac and a Windows PC on separate networks (home Wi-Fi and a phone hotspot) kept and recovered a Bridge and ran remote Codex across them ([validation evidence](../development.md#automated-local-and-physical-evidence)) |
 
-This is evidence from one pair of devices and networks, not a claim of WAN reliability in general. NAT traversal success, relay throughput and network-change recovery depend on the networks and are measured only by part W (and, for raw path behaviour, the isolated `tools/net-probe`, part F). Throughput over the internet carrier is low in the tests so far: Test connection measured about 0.2–0.4 MB/s over a phone hotspot, and the cause (the hotspot uplink, the path, or Pastey) is not yet established.
+This is evidence from one pair of devices and networks, not a claim of WAN reliability in general. NAT traversal success, relay throughput and network-change recovery depend on the networks. Use the isolated [net-probe](../../tools/net-probe/README.md) for raw path measurements. Throughput over the internet carrier is low in the tests so far: Test connection measured about 0.2–0.4 MB/s over a phone hotspot, and the cause (the hotspot uplink, the path, or Pastey) is not yet established.
 
 ## Transport–Session contract
 
@@ -50,10 +50,8 @@ Unchanged from before the carrier. Joining by code may name the creator's addres
 
 ## Decisions
 
-Each records what was chosen, against which alternative, and why. The [NAT traversal research](../research/native-nat-traversal.md) is the earlier analysis; where this differs, this page is current.
-
-- **iroh 1.x behind a `Carrier` trait.** Pastey depends on its own `Carrier`/`CarrierLink`/`InboundSink` traits; iroh is one implementation (`iroh_carrier.rs`) and tests use an in-memory one with the same contract. Replacing iroh, or adding a second carrier, means a new implementation and a new carrier name in cards; nothing above `connectivity` changes. Chosen over STUN+own punching, WebRTC/ICE and libp2p for the reasons in the research report.
-- **Relay fallback carries Bridge traffic.** The research proposed a direct-only gate. Pastey's goal for this phase is that a paired Bridge works across networks, with direct P2P where possible and relay fallback when necessary. Relayed bytes are QUIC-encrypted end to end and Bridge-encrypted again; the relay sees volume and timing. Measured on n0's free relays from one network, relay throughput was about 1.1 MiB/s at about 350 ms RTT (`tools/net-probe/RESULTS.md`): usable for control, Agent requests and small items, slow for large files. The UI says which path is in use.
+- **iroh 1.x behind a `Carrier` trait.** Pastey depends on its own `Carrier`/`CarrierLink`/`InboundSink` traits; iroh is one implementation (`iroh_carrier.rs`) and tests use an in-memory one with the same contract. Replacing iroh, or adding a second carrier, means a new implementation and a new carrier name in cards; nothing above `connectivity` changes. iroh supplies QUIC, direct connection establishment and relay fallback behind that interface.
+- **Relay fallback carries Bridge traffic.** When no direct path works, the relay can still carry the paired Bridge’s traffic. Relayed bytes are QUIC-encrypted end to end and Bridge-encrypted again; the relay sees volume and timing. Measured on n0's free relays from one network, relay throughput was about 1.1 MiB/s at about 350 ms RTT in the isolated probe. This is raw path evidence, separate from Pastey transfer throughput. The UI says which path is in use.
 - **The card is trusted because of the session it arrives in, not a separate signature.** Room Control events are encrypted to the current session's transport keys, which the pinned device key established (SPAKE2 at pairing binds them; reconnect signs them). An extra device signature over the card would prove the same thing. The receiver binds the pin to the authenticated session's HostRef and requires the Bridge's own pin to name it.
 - **Loopback forwarder, not HTTP over QUIC.** Each TCP connection to a local forwarder becomes one QUIC stream, so the room server, its HTTP clients, Transfer and Room Control are unchanged, and LAN behaviour is untouched. The cost is one loopback hop and the join-source registry. HTTP directly on QUIC streams remains possible later.
 - **Address lookup only with n0's relays.** With the default relays the endpoint publishes its home relay as a record signed by its key on n0's DNS, so a peer whose relay changed while the session was down is still found. With the user's own relay nothing is published to n0. The card exchanged over the Bridge is always the primary source.
@@ -78,6 +76,6 @@ Each records what was chosen, against which alternative, and why. The [NAT trave
 - Large transfers over a relay are slow and are not resumable; an interrupted transfer fails as on a LAN.
 - Both sides symmetric NAT, or UDP blocked on one side: relay only. If the relay is unreachable too, the Bridge is not reachable across the internet.
 - Liveness checks run one after another: a stalled tunnel probe delays the other Bridges' checks by up to 5 s per round.
-- Windows Defender Firewall may ask about network access on first start of the carrier; the answer and the network profile matter (part W).
+- Windows Defender Firewall may ask about network access on first start of the carrier; the answer and the network profile matter.
 - iroh must stay current for n0's public relays, which support only the latest stable release.
 - Mobile devices, push wake-up and offline delivery are out of scope.

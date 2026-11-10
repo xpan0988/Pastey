@@ -1885,7 +1885,7 @@ pub async fn start_remote_native_capability_task(
 /// itself, as one ordinary remote invocation: the Host resolves the folder
 /// from this device's own Session reading permission, waits for its user's
 /// Accept, and Codex refuses a second writer. Only Codex threads: remote
-/// Claude Code continuation stays off (`remote-continuation.md`).
+/// Claude Code execution is local only (see `docs/layers/layer-5-agent.md`).
 #[tauri::command]
 pub async fn continue_remote_native_session(
     room_id: String,

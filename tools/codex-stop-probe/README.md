@@ -8,4 +8,4 @@ python -I probe.py --after=shutdown        # then close the app-server's stdin
 python -I probe.py --job --after=terminate # app-server in a Job Object; then terminate the job
 ```
 
-`--job` starts the app-server suspended inside a kill-on-close Job Object that permits no breakaway, as Pastey does, and reports whether each of the command's processes is in it. `--codex=PATH` picks another launcher. Each run uses the signed-in Codex and its quota (one short turn). Results for Codex 0.163.0 are in `docs/research/claude-code-adapter-validation.md`, section H11.
+`--job` starts the app-server suspended inside a kill-on-close Job Object that permits no breakaway, as Pastey does, and reports whether each of the command's processes is in it. `--codex=PATH` picks another launcher. Each run uses the signed-in Codex and its quota (one short turn). See [development](../../docs/development.md#automated-local-and-physical-evidence) for Windows Stop evidence.

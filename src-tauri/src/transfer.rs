@@ -6603,8 +6603,7 @@ mod tests {
 }
 
 /// Regression tests for the Bridge join and room-request boundary (see
-/// docs/layers/layer-4-join-audit.md). The attacks the audit demonstrated
-/// against the unauthenticated join are each shown to be refused.
+/// docs/layers/layer-4-bridge.md).
 #[cfg(test)]
 mod join_authentication {
     use super::*;

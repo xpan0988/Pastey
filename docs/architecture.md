@@ -2,7 +2,7 @@
 
 Pastey is cross-device infrastructure for general-capability Agents. A Host is a device and execution locality; a capability is an ability that Host exposes; and an Agent is an intelligence or execution participant that makes or proposes task decisions over capabilities and resources. A general-capability Agent is not architecturally confined to one Host, tool, provider, model, capability family, or local execution environment. Hosts expose capabilities and resources, Agents reason over them, and Pastey makes authorized decisions executable across devices.
 
-This is the product and architecture direction, not a claim of AGI or universal Agent integration. The current 2.0 implementation has a capability-neutral native capability path, with Codex as its only shipped adapter, and a distinct Generic Managed Worker path over a current-session Bridge that runs on the LAN, an overlay address, or an optional internet carrier (direct P2P with relay fallback). Source code, validators, and tests are authoritative. For 2.0.0, physical Mac ↔ Windows runs covered cross-network Bridges, remote Codex execution, Host identity and the secure session, Full Access, recovery and Developer Mode; native workspace movement and Return have not completed physical end-to-end acceptance ([recorded results](platform/mac-windows-acceptance.md#recorded-results-for-200)).
+Pastey 2.0 has a capability-neutral Native Agent path for Codex and local Claude Code conversations, and a distinct Generic Managed Worker path. Bridge traffic can use the LAN, an overlay address or the optional internet carrier (direct P2P with relay fallback). Source code, validators and tests are authoritative. See [development](development.md#automated-local-and-physical-evidence) for physical acceptance and its limits.
 
 ## Agent execution across Hosts
 
@@ -22,10 +22,9 @@ Dependencies point downward. Layer 5 decides semantic eligibility before Layer 3
 
 ## Native Host capabilities
 
-A mature runtime—Codex today, another Agent, a vendor runtime, or a device
-runtime—is a Host capability, not a Pastey Worker harness and not a special
-control architecture. Codex is the current production adapter. The boundary is
-deliberately small:
+A mature runtime is a Host capability. Codex and Claude Code use the Native
+Agent lifecycle; the Generic Managed Worker uses a separate execution path.
+The boundary is deliberately small:
 
 ```text
 The native capability owns HOW: its provider or runtime, native session,
@@ -296,6 +295,7 @@ Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown,
 | Capability | macOS | Linux | Windows |
 | --- | --- | --- | --- |
 | Search/Transfer safe identity and encrypted transfer | Implemented | Implemented where the desktop product is supported | Implemented; cross-compiled checks do not replace native proof |
+| Claude Code Conversation (local only) | 2.1.317 or later, under a lifeline | Unix lifeline implemented; outside the supported release scope | 2.1.319 or later, in a Job Object |
 | Managed Resource effects | Implemented | Implemented | Implemented |
 | Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | [Codex-derived managed execution](platform/windows-managed-execution.md), gated by Host-owned setup and native conformance. Windows v1 Managed Execute acceptance exists; failure is fail-closed with no unsandboxed fallback. |
 | Worker task Network effects | Not exposed | Not exposed | Not exposed |
@@ -305,26 +305,17 @@ The Host-owned network broker exists as an independent Phase 5 authority domain,
 
 ## Current product boundary
 
-The primary product path is Native mature Agents. Pastey implements a capability-neutral native lifecycle with Codex as its production adapter: capability discovery and invocation, Host-private persistent native sessions, local original-workspace operation, authenticated direct remote invocation when that workspace already exists on the target Host, and explicit reviewed workspace movement when it does not. Both remote paths start only after the executing Host's own Accept. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
+The primary product path is Native mature Agents. Codex supports local execution, authenticated direct invocation in an existing workspace on the other Host, and reviewed workspace movement when the workspace must cross Hosts. The executing Host admits a remote run through its own Accept or an active Full Access grant. [Claude Code conversations](layers/layer-5-agent.md#claude-code-conversations) use the same task lifecycle with local execution only; they expose no Bridge protocol. The movement path uses encrypted outbound and return Transfer, captures and revalidates the source baseline, preserves a returned result for durable conflict recovery instead of overwriting a changed source, and treats cancellation, stale or replaced sessions, malformed messages, and ambiguous outcomes as non-completion.
 
-The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, requester movement review and approval, the executing Host's Agent-request Accept/Deny banner, Full Access (given and revoked only on the controlled Host, after a consent dialog), bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun. Phase 1 is complete. Phase 2 source-level reliability and deterministic two-Host state validation are complete. Physical Mac ↔ Windows validation covers remote invocation, identity, Full Access and recovery; physical movement, Return and their failure matrix remain open.
+The associated product presentation exposes native-Agent capability state, task lifecycle, remote invocation, requester movement review and approval, the executing Host's Agent-request Accept/Deny banner, Full Access (given and revoked only on the controlled Host, after a consent dialog), bounded movement status, and Bridge-scoped reopening of unresolved durable work with Reconcile, Stop, conflict, and result-Return repair actions. Receipt-ambiguous outbound movement retains source ownership and never triggers automatic workspace resend or Agent rerun.
 
 The Generic Managed Worker / Transform / Execute path remains implemented and distinct. It includes the Host/identity/object substrate, native Plan and protocol v2, Resource/Process/Network enforcement, Core result finalization, the bounded Worker Harness and model-visible Worker Context Contract, provider configuration, exact managed runtime binding, managed Host coordination, native-v2 orchestration, Natural-v2 lowering, and capability observation/confirmation. V1 remains isolated and unchanged: it executes Search/Transfer and rejects Transform/Execute. The Generic Managed path retains its own evidence limits: Bridge Device Check is a bounded Managed E2E self-check, and Windows Managed Execute acceptance does not establish an external-provider or physical multi-Host PASS.
 
 The General Semantic Transform foundation is complete for bounded regular-file representations: GST-1 implements same-Host lifecycle and Core-owned canonical file-set sealing; GST-2 preserves the same logical object and revision through exact authored cross-Host file-set Transfer; and GST-3 consumes an exact RegularFileSet through the existing read-only ExecutionWorld mount and exact process binding, yielding only the existing Execute result digest. The Host canonically revalidates the entire tree both before leasing and after releasing the world; Execute never registers N+1. The transport package remains Host-private and is not a managed object; scalar Transfer and scalar Execute remain unchanged.
 
-## Roadmap
+## Native Agent reliability
 
-```text
-Phase 1 — Native Agent Core
-CLOSED
-
-Phase 2 — Multi-Device Reliability Closure
-SOURCE AND DETERMINISTIC VALIDATION COMPLETE; PHYSICAL VALIDATION OF REMOTE INVOCATION,
-IDENTITY, FULL ACCESS AND RECOVERY RECORDED FOR 2.0.0; PHYSICAL MOVEMENT/RETURN OPEN
-```
-
-Phase 2's source-level reliability closure covers disconnect/reconnect behavior, rejection of stale or replaced Bridge sessions, restart-visible interrupted-movement recovery, monotonic status/reconciliation, receipt-ambiguous outbound movement, durable conflict/Return recovery, cancellation races, replay protection, and Bridge Burn authority cutoff. The deterministic two-Host harness validates state and consequence paths with independent durable Hosts and an external Agent-turn ledger. Transient session loss invalidates Bridge transport authority but preserves Host-local Codex sessions and live observers; a still-observed turn continues locally. An unproved native turn remains reconciliation-required and source-owning. A completed native turn remains `Completed` through result capture, Return, conflict-retention, apply, or abandonment failures; only its consequence state changes. An exact durable snapshot may retry Return without another Agent turn. The apply journal claims completion only for a proven original or exact-result workspace and leaves unexpected state untouched. Burn removes Bridge authority even when safe filesystem repair is unprovable; uncertain trees may remain as orphan residue without blocking startup. The deterministic harness does not establish physical behavior. Physical Mac ↔ Windows movement, Return and their failure matrix remain Phase 2 work.
+Transient session loss invalidates Bridge transport authority but preserves Host-local Codex sessions and live observers; a still-observed turn continues locally. An unproved native turn remains reconciliation-required and source-owning. A completed native turn remains `Completed` through result capture, Return, conflict-retention, apply, or abandonment failures; only its consequence state changes. An exact durable snapshot may retry Return without another Agent turn. The apply journal claims completion only for a proven original or exact-result workspace and leaves unexpected state untouched. Burn removes Bridge authority even when safe filesystem repair is unprovable; uncertain trees may remain as orphan residue without blocking startup. Physical acceptance covers Native Workspace Movement, Return and Apply, and Full Access while Windows is locked. The [validation evidence](development.md#automated-local-and-physical-evidence) lists the boundaries of those results.
 
 The Generic Managed Worker / Transform / Execute subsystem remains a separate maintained architecture. Its Worker Context Contract, provider configuration, Managed E2E self-check, and Windows Managed Execute backend are factual implementation material, not the primary mature-Agent roadmap.
 

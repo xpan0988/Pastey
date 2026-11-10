@@ -1,4 +1,4 @@
-# net-probe — Stage 2 cross-NAT probe (research only)
+# net-probe: raw network path diagnostics
 
 `net-probe` measures whether two of your devices on different networks can reach each other with iroh 1.3, and how. It is a standalone crate with its own `[workspace]`. It is not a dependency of the Pastey app, not in its bundle, and it never touches a Pastey Bridge, key or database.
 

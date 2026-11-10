@@ -33,7 +33,7 @@ The earlier Agents page put the device, its access, a single tracked task, a New
 - **Device** ("Agents on [device]"): who runs and reads everything below, and decides what this device may do there. Its connection and Codex readiness are one line; Access (each authority separately, with the steps there) and Device details are one click away.
 - **Workspace**: a folder that device shares with this Bridge, listed by name with what it allows, *Sessions* and *Agents*, as that device's own switches. It is the unit of authority, so it is the unit of navigation: sessions are listed per workspace, and a new conversation runs in one. "Other places" keeps the two places that are not shared workspaces: a folder by path on that device, and a folder from this device (reviewed movement). Neither has sessions. On this device, the workspaces are folders the user adds here.
 - **Conversation**: everything in the main pane is one conversation, in one of two kinds that never stand in for each other:
-  - a **new conversation**: the first message always begins a new Codex conversation in that workspace; it never continues another thread there. Later messages in the same view continue *this* conversation (and only after a turn of it ran; a folder sent from this device never continues). It is listed in its workspace as "your new conversation, from this device";
+  - a **new conversation**: the first message opens a fresh session in that workspace. Choose Codex or Claude Code on this device; only Codex is offered for remote execution. Later messages in the same view continue *this* session once it exists. A run on a folder sent from this device cannot be continued from that view;
   - an **existing session**, named by provider and id: its history (as much as the Host allows), then this device's turns in it, then a composer that continues *that* session.
 - **Turn**: a message and what came back. The task behind it (waiting for the device's Accept, running, an approval it asks for, its reply, a failure and its fix, Reconcile, Stop, Abandon, Retry Return, a movement review) is the Agent's side of the turn, inside the conversation. Its ids, state code and folder are under Task details, in the turn.
 
@@ -53,15 +53,16 @@ In a conversation:
 | Capability | Status |
 |---|---|
 | Run Codex on this or another device; continue Pastey's own conversation in a folder | Implemented |
-| Workspace movement to another device and result return | Implemented; not yet accepted end to end on physical devices. A second movement or Return while one is sending is refused |
-| Share a folder with one Bridge, from inside it, with Sessions and Agent requests chosen per folder | Implemented (Mac ↔ Windows acceptance N) |
+| Claude Code Conversation on this device | Available on macOS and Windows with a compatible signed-in CLI and Claude Code workspace trust |
+| Workspace movement, result Return and Apply | Physically accepted; a second movement or Return while one is sending is refused |
+| Share a folder with one Bridge, from inside it, with Sessions and Agent requests chosen per folder | Implemented |
 | Run Codex in a folder another device shares, chosen by name | Implemented: that device resolves its own path; same Review, or Full Access |
-| Use another device unattended (Full Access) | Implemented: runs, continuations, received workspaces and terminals start without Accept; folders added by path; revoked by Revoke, Forget, re-pairing or Burn. Physically verified Mac → Windows for 2.0.0 (acceptance part U); the locked-screen result is not recorded |
+| Use another device unattended (Full Access) | Implemented: runs, continuations, received workspaces and terminals start without Accept; folders added by path; revoked by Revoke, Forget, re-pairing or Burn. Physically accepted Mac → Windows, including with Windows locked |
 | Read-only discovery and inspection of Claude Code and Codex sessions, here or on another device that shares the folder with Sessions on | Implemented |
 | Continue an idle Codex thread on this device, in the thread itself | Implemented: Codex's writer lock excludes other writers; checked against the turn you saw (real, macOS). A thread only Pastey's own idle conversation holds is continued after Pastey closes that session |
-| Continue a Codex thread on another device | Implemented: needs a share with Sessions and Agent requests there, and that device's Accept per run (real Mac → Windows: refused while the Codex app had it open, continued once every Codex client was closed) |
-| Continue an idle Claude Code session on this device | Implemented: `claude --bg --resume`, copy-on-held, checked against the entry you saw |
-| Continue a Claude Code session from another device | Not enabled: a background session can outlive Pastey there (remote-continuation.md) |
+| Continue a Codex thread on another device | Implemented: needs a share with Sessions and Agent requests there, and that device's Accept per run or Full Access (real Mac → Windows: refused while the Codex app had it open, continued once every Codex client was closed) |
+| Continue a discovered idle Claude Code session on macOS | `claude --bg --resume`, checked against the entry you saw; unavailable on Windows |
+| Run or continue Claude Code from another device | Unavailable; Claude Code execution has no Bridge protocol. Read-only session sharing remains separate |
 | Observe or steer a turn the Codex app is running | Not possible through supported interfaces: its app-server is private; the writer lock only shows that it has the thread open |
 
 Continuation is Execution, started from Observation: a session's conversation continues an existing Codex thread or Claude Code session, named by provider and id. It runs in the session itself, only while the session still ends with the entry you saw, and is followed in that conversation. A New conversation never continues another thread: Pastey's own conversations in a folder are listed as sessions ("by Pastey") and are continued from there like any other. Each conversation says why when it cannot send (open in another client, a Pastey task running in it, changed, unreadable, or a Claude Code session on another device), and says "You can try" when Pastey cannot see whether a client has it open and Codex decides at the start. A continuation on another device also needs that folder shared with Sessions and Agent requests on, and that device's Accept, whose banner there names the shared folder it is for.
@@ -118,52 +119,9 @@ Removed from view because the Host never reads it: "Burn defaults" (`auto_burn_a
 
 Measurements are shown only after they are taken, with what they exercised and when. "Test connection" measures Pastey's pipeline over the Bridge in memory for about a second; the local speed test never touches the network. Pastey keeps no history of real transfer throughput, so it shows none.
 
-## Feature preservation audit
-
-| Original feature | Previous location | New location | Status |
-|---|---|---|---|
-| Device name, platform, power | Legacy Settings → General and Troubleshooting (before 2.0) | Settings → This device → Device | Restored |
-| Capability probe (runtimes) | Legacy Settings → Diagnostics logging | Settings → This device → Runtimes | Restored (quick and full) |
-| Local speed test (loopback, two modes, three durations, last result) | Legacy Settings → Troubleshooting; 2.0 kept a disabled "Run local test" | Settings → This device → Local speed test | Restored |
-| Peer link throughput | 2.0 Devices → Check (inside the managed self-check) | Device Details → Performance → Test connection (read-only), and Advanced | Kept, now also without the managed E2E |
-| Device diagnostics (identity, session, control, data path) | 2.0 Devices → Check | Device Details → Performance and Advanced | Kept |
-| Managed readiness and E2E self-check | 2.0 Devices → Check | Device Details → Advanced | Kept |
-| Bridge member list and liveness | 2.0 Devices page, right context panel | Bridge details → Devices | Kept |
-| Pairing, new code, pair with code | 2.0 network panel | Bridge details → Connection | Kept |
-| Private-network address | 2.0 network panel | Bridge details → Reach it on another network | Kept |
-| Internet path of one Bridge (direct, through a relay, ready, off) | New | Bridge details → Reach it on another network; Device Details → Connection | Added |
-| Show this device | 2.0 network panel | Bridge details, Agents → Access, Device Details hint | Kept |
-| Change receiving folder | Legacy Settings → Receiving | Settings → General → Receiving | Restored |
-| Open receiving folder | Legacy and 2.0 Settings | Settings → General; Inbox → Open folder | Kept |
-| Save received files / images | Legacy and 2.0 Settings | Settings → General → Receiving | Restored (briefly removed in error) |
-| Transfer grouping and window | Legacy Settings → Transfer diagnostics (editable); 2.0 read only | Settings → Advanced | Restored as editable |
-| Developer tools | Settings | Settings → Advanced | Kept |
-| Logs folder, copy last error, check for updates | Legacy Settings → Troubleshooting; 2.0 "Unavailable" | Settings → Advanced and About | Kept |
-| Activity (in-flight and recent transfers) | 2.0 Activity page | Share thread with live progress; Inbox for received items | Merged |
-| Burn defaults | Legacy and 2.0 Settings | — | Removed: the Host never reads it |
-| Find file | 2.0 composer mode | Share → + → Get a file from <device>… | Moved |
-| Agent sessions | 2.0 Task mode card; then Sessions tab; then Agents → Sessions on <device>; then Continue a session | Agents → a workspace's sessions, each a conversation | Merged |
-| Run with Codex | 2.0 Task mode card; then Agent tab; then Agents → Run a task; then New task | Agents → a workspace → New conversation (and Other places) | Merged |
-| "Start a new conversation" checkbox (default: continue Pastey's conversation in the folder) | Agents → New task | Removed: a new conversation is always new; Pastey's earlier conversations are sessions, continued from the list | Replaced |
-| Session report: Live state, Last turn, Facts / Inferred / Not known, ids | Agents → a session's report, always open | A session's view → Evidence and how Pastey knows | Kept, on request |
-| The followed task (approvals, reply, movement, Reconcile, Stop, Abandon, Retry Return) | Agents → Run a task, above the form | Agents, above the choice; inside the session it continues while that is open | Kept, shown once |
-
-Security information stays visible: every permission names the device, folder, Bridge and expiry; Revoke sits next to it in Settings and in that Bridge's details; Trust, Forget, Replace key and Burn each need a confirmation that says what happens.
-
 ## Find file
 
-It was a top-level composer mode beside Send and Task, a leftover from when Pastey was a file-transfer tool. Its real job is the mirror of sending: get one file *from* the other device. Its use is occasional and always starts in a Bridge, next to sending. It is now **+ → Get a file from <device>…** in the Share composer (and in the empty Share view), opening a dialog. The Bridge Plan flow, its review, the shared-folder scope and Inbox delivery are unchanged.
-
-## Run with Codex: what was wrong
-
-The button was disabled when `busy`, an unresolved workspace movement, Codex not `available` on the target, the target missing a HostRef, or an empty **workspace** or **task** field. Session reading was never an input. In the reported case (Codex available on DESKTOP-DMI2L9P, a folder chosen on Windows) the folder chosen on Windows was a Session reading or Unattended access grant. Those never fill the Mac's free-text "Original workspace path…" field, which for a remote run must hold the folder's full path on Windows. Nothing said so.
-
-Now:
-- `src/lib/nativeAgentReadiness.ts` derives the action (run here, run there, review movement), the ordered requirements, the first blocker and what happens next. The card shows the checklist and blocker, and the button uses only that.
-- "Where is the folder?" separates **Already on <device>** (type its path; no files move) from **On this device** (folder picker; reviewed movement).
-- The target is kept by HostRef, so a reconnect shows "not connected" instead of falling back to this device.
-- The remote capability is observed again every 15 s and on window focus, keeping the last answer visible.
-- The started remote task stays bound to its device, so Stop and native decisions route there.
+Use **+ → Get a file from <device>…** in the Share composer or the empty Share view. The Bridge Plan reviews the request, searches the folders that device shared, and delivers the selected file to the Inbox.
 
 ## Design system
 

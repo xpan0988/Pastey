@@ -109,7 +109,7 @@ impl FixtureV1 {
         fs::create_dir(&fixture.config).unwrap();
         fs::create_dir(root.join("live")).unwrap();
         fs::write(root.join("mode"), mode).unwrap();
-        fs::write(root.join("version"), "2.1.317 (Claude Code)\n").unwrap();
+        fs::write(root.join("version"), "2.1.319 (Claude Code)\n").unwrap();
         fs::write(
             root.join("auth"),
             r#"{"loggedIn":true,"authMethod":"claude.ai"}"#,
@@ -276,67 +276,32 @@ fn run(fixture: &FixtureV1, mode: &str, new_conversation: bool) -> NativeAgentTa
     wait_terminal(&service, &started.task_id)
 }
 
-// Detection and gating.
-
 #[test]
-fn windows_stays_unavailable_until_its_acceptance_passes() {
+fn availability_requires_windows_minimum_version_and_sign_in() {
     let fixture = FixtureV1::new("complete");
-    let adapter = fixture.adapter();
     assert_eq!(
-        adapter.availability_report().state,
+        fixture.adapter().availability_report().state,
         NativeAgentCapabilityStateV1::Available
     );
 
-    // The product's own gate, whatever is installed.
-    adapter.accept_windows_for_tests(WINDOWS_ACCEPTED_VERSION);
-    let gated = adapter.availability_report();
-    if WINDOWS_ACCEPTED_VERSION.is_none() {
-        assert_eq!(gated.state, NativeAgentCapabilityStateV1::Unavailable);
-        assert_eq!(gated.reason, Some("native_agent_platform_unverified"));
-        assert!(gated.detail.as_deref().unwrap().contains("2.1.317"));
-        let mut service =
-            NativeAgentServiceV1::with_paths_and_adapters(fixture.paths(), vec![adapter.clone()])
-                .unwrap();
-        assert!(service
-            .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
-            .is_err());
-        assert!(fixture.runs().is_empty(), "nothing ran");
-    }
-    if let Some(accepted) = WINDOWS_ACCEPTED_VERSION {
-        // The version the Windows acceptance measured, and only it or later.
-        assert_eq!(accepted, (2, 1, 319));
-        let shown = format!("{}.{}.{}", accepted.0, accepted.1, accepted.2);
-        assert_eq!(gated.state, NativeAgentCapabilityStateV1::Incompatible);
-        assert!(gated.detail.as_deref().unwrap().contains(&shown));
-        fs::write(
-            fixture.root.join("version"),
-            format!("{shown} (Claude Code)\n"),
-        )
-        .unwrap();
-        adapter.accept_windows_for_tests(WINDOWS_ACCEPTED_VERSION);
-        assert_eq!(
-            adapter.availability_report().state,
-            NativeAgentCapabilityStateV1::Available
-        );
-        fs::write(fixture.root.join("version"), "2.1.317 (Claude Code)\n").unwrap();
-    }
-
-    // A version older than the one accepted on Windows.
+    fs::write(fixture.root.join("version"), "2.1.318 (Claude Code)\n").unwrap();
     let adapter = fixture.adapter();
-    adapter.accept_windows_for_tests(Some((2, 1, 330)));
     let old = adapter.availability_report();
     assert_eq!(old.state, NativeAgentCapabilityStateV1::Incompatible);
-    assert!(old.detail.unwrap().contains("2.1.330"));
-}
+    assert_eq!(old.reason, Some("native_agent_incompatible"));
+    assert!(old.detail.unwrap().contains("2.1.319"));
+    let mut service =
+        NativeAgentServiceV1::with_paths_and_adapters(fixture.paths(), vec![adapter]).unwrap();
+    assert!(service
+        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .is_err());
+    assert!(fixture.runs().is_empty(), "nothing ran");
 
-#[test]
-fn availability_requires_a_measured_version_and_a_signed_in_claude_code() {
-    let fixture = FixtureV1::new("complete");
-    fs::write(fixture.root.join("version"), "2.1.309 (Claude Code)\n").unwrap();
-    let old = fixture.adapter().availability_report();
-    assert_eq!(old.state, NativeAgentCapabilityStateV1::Incompatible);
-    assert!(old.detail.unwrap().contains("2.1.317"));
     fs::write(fixture.root.join("version"), "2.1.320 (Claude Code)\n").unwrap();
+    assert_eq!(
+        fixture.adapter().availability_report().state,
+        NativeAgentCapabilityStateV1::Available
+    );
     fs::write(
         fixture.root.join("auth"),
         r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#,
@@ -361,15 +326,11 @@ fn no_bridge_peer_learns_of_it_or_can_invoke_it() {
     assert!(fixture.adapter().supported_protocols().is_empty());
 }
 
-/// With the Windows gate open and Claude Code available here, a peer is
-/// still told of Codex only: what this Host describes, and what a peer's
-/// view makes of it.
+/// Even when Claude Code is available here, a peer is told of Codex only.
 #[test]
-fn with_the_gate_open_a_peer_still_sees_codex_only() {
+fn a_peer_sees_codex_only_when_claude_code_is_available_locally() {
     let fixture = FixtureV1::new("complete");
-    fs::write(fixture.root.join("version"), "2.1.319 (Claude Code)\n").unwrap();
     let claude = fixture.adapter();
-    claude.accept_windows_for_tests(Some((2, 1, 319)));
     assert_eq!(
         claude.availability_report().state,
         NativeAgentCapabilityStateV1::Available
@@ -1167,9 +1128,8 @@ fn a_repository_s_configuration_and_trust_count_for_its_subfolders() {
 }
 
 // Live checks: the installed, signed-in Claude Code on this Windows Host,
-// through Pastey's own entry point and the real Job Object, past the
-// acceptance gate they exist to open. Run from a clean environment
-// (docs/platform/windows-claude-code-acceptance.md).
+// through Pastey's own entry point and the real Job Object. Run from a
+// clean environment (docs/development.md).
 
 fn live_workspace(name: &str) -> PathBuf {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1229,7 +1189,6 @@ fn live_service(root: &Path) -> NativeAgentServiceV1 {
     paths.ensure_directories().unwrap();
     crate::storage::init_database(&paths).unwrap();
     let adapter = Arc::new(ClaudeCodeConversationAdapterV1::default());
-    adapter.accept_windows_for_tests(Some(MINIMUM_VERSION));
     let report = adapter.availability_report();
     eprintln!(
         "availability: {:?} {:?} {:?}",

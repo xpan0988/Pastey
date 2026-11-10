@@ -4,8 +4,7 @@
 //! settings and tools. Pastey passes the prompt and the session, nothing
 //! else: no model, permission mode, settings, tool list or `--bare`.
 //!
-//! Evidence (Claude Code 2.1.317, macOS; see
-//! `docs/research/claude-code-adapter-validation.md`, F9):
+//! Headless behavior measured on macOS with Claude Code 2.1.317:
 //! - The session is Pastey's choice (`--session-id`) and is continued
 //!   exactly (`--resume`); an unknown id is refused before anything runs.
 //! - The prompt carries Pastey's own `uuid`, which Claude Code echoes back
@@ -35,9 +34,8 @@
 //! outcome is decided only once its job holds no process. Measured on
 //! Windows with Claude Code 2.1.309, signed out: the session id is honoured
 //! and a duplicate refused, an unknown `--resume` is refused, and the
-//! interrupt is acknowledged. Signed in, 2.1.319 passed the physical
-//! acceptance; Windows runs only that version or later
-//! (`WINDOWS_ACCEPTED_VERSION`).
+//! interrupt is acknowledged. Signed-in local execution was verified on
+//! Windows with 2.1.319; see `docs/development.md` for evidence and checks.
 //!
 //! Local only: no peer protocol.
 
@@ -79,15 +77,12 @@ pub(in crate::native_agent) const CLAUDE_CODE_CONVERSATION_ID: &str =
     "agent.coding.claude_code_conversation";
 /// No peer protocol: a Bridge peer cannot invoke it.
 const NO_PEER_PROTOCOLS: [&str; 0] = [];
-/// The oldest Claude Code whose headless behaviour, as relied on above, was
-/// measured. Claude Code updates itself; older ones are refused.
+/// The oldest Claude Code whose signed-in headless behavior was verified
+/// on each platform. Older versions are refused.
+#[cfg(not(windows))]
 const MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 317);
-/// The oldest Claude Code whose Windows behaviour passed the signed-in
-/// physical acceptance (docs/platform/windows-claude-code-acceptance.md):
-/// 2.1.319, on Windows 11, 2026-11-09. `None` would make Windows
-/// unavailable, whatever is installed.
 #[cfg(windows)]
-const WINDOWS_ACCEPTED_VERSION: Option<(u64, u64, u64)> = Some((2, 1, 319));
+const MINIMUM_VERSION: (u64, u64, u64) = (2, 1, 319);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const AVAILABILITY_REUSE: Duration = Duration::from_secs(30);
 /// Bound for one stream-json line; a longer line is skipped.
@@ -297,9 +292,6 @@ pub(in crate::native_agent) struct ClaudeCodeConversationAdapterV1 {
     /// Observes a run again after a restart, from the same transcript and
     /// registry the session continuation adapter watches.
     reobserver: ClaudeCodeNativeAdapterV1,
-    /// `WINDOWS_ACCEPTED_VERSION`, which tests may stand in for.
-    #[cfg(windows)]
-    windows_accepted: Mutex<Option<(u64, u64, u64)>>,
 }
 
 impl Default for ClaudeCodeConversationAdapterV1 {
@@ -312,8 +304,6 @@ impl Default for ClaudeCodeConversationAdapterV1 {
             runs: Arc::default(),
             observed: Mutex::new(None),
             reobserver: ClaudeCodeNativeAdapterV1::default(),
-            #[cfg(windows)]
-            windows_accepted: Mutex::new(WINDOWS_ACCEPTED_VERSION),
         }
     }
 }
@@ -354,7 +344,7 @@ impl ClaudeCodeConversationAdapterV1 {
 
     /// Tests: a fixture `claude`, store and global configuration, started
     /// without the lifeline helper (on Windows, in its Job Object as in the
-    /// product, and past the acceptance gate).
+    /// product).
     #[cfg(test)]
     pub(in crate::native_agent) fn use_fixture(&self, cli: &Path, config_dir: &Path) {
         *self.cli.lock().unwrap() = Some(cli.to_path_buf());
@@ -364,8 +354,6 @@ impl ClaudeCodeConversationAdapterV1 {
         {
             *self.launcher.lock().unwrap() = Some(LauncherV1::Direct);
         }
-        #[cfg(windows)]
-        self.accept_windows_for_tests(Some(MINIMUM_VERSION));
         *self.observed.lock().unwrap() = None;
         self.reobserver.use_fixture(cli, config_dir);
     }
@@ -375,17 +363,6 @@ impl ClaudeCodeConversationAdapterV1 {
     #[cfg(all(test, unix))]
     pub(in crate::native_agent) fn use_lifeline_helper(&self, helper: &Path) {
         *self.launcher.lock().unwrap() = Some(LauncherV1::Lifeline(helper.to_path_buf()));
-    }
-
-    /// Tests: stands in for `WINDOWS_ACCEPTED_VERSION` (the live acceptance
-    /// runs past the gate it is meant to open).
-    #[cfg(all(test, windows))]
-    pub(in crate::native_agent) fn accept_windows_for_tests(
-        &self,
-        accepted: Option<(u64, u64, u64)>,
-    ) {
-        *self.windows_accepted.lock().unwrap() = accepted;
-        *self.observed.lock().unwrap() = None;
     }
 
     /// Tests: every live run stops observing silently, as if Pastey's
@@ -438,36 +415,11 @@ impl ClaudeCodeConversationAdapterV1 {
                 state: NativeAgentCapabilityStateV1::Incompatible,
                 reason: Some("native_agent_incompatible"),
                 detail: Some(format!(
-                    "Claude Code {shown} is older than {}.{}.{}, the oldest version Pastey has measured. Update Claude Code.",
+                    "Claude Code {shown} is older than {}.{}.{}, the minimum version Pastey requires on this platform. Update Claude Code.",
                     MINIMUM_VERSION.0, MINIMUM_VERSION.1, MINIMUM_VERSION.2
                 )),
                 backend: None,
             };
-        }
-        #[cfg(windows)]
-        {
-            let accepted = self
-                .windows_accepted
-                .lock()
-                .ok()
-                .and_then(|accepted| *accepted);
-            let Some(accepted) = accepted else {
-                return unavailable(
-                    "native_agent_platform_unverified",
-                    format!("Claude Code {shown} is installed, but Pastey runs Claude Code conversations on Windows only once their physical acceptance has passed."),
-                );
-            };
-            if version < accepted {
-                return CapabilityAvailabilityV1 {
-                    state: NativeAgentCapabilityStateV1::Incompatible,
-                    reason: Some("native_agent_incompatible"),
-                    detail: Some(format!(
-                        "Claude Code {shown} is older than {}.{}.{}, the oldest version Pastey has accepted on Windows. Update Claude Code.",
-                        accepted.0, accepted.1, accepted.2
-                    )),
-                    backend: None,
-                };
-            }
         }
         if signed_out(&cli) {
             return unavailable(
