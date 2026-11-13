@@ -2011,23 +2011,34 @@ pub async fn receive_room_control_event_handler(
                 // device has Full Access.
                 let mut request = request;
                 let mut share_requirement = None;
+                // The capability's own adapter says how a peer names such a
+                // folder and which switches it needs; taken out of the
+                // service so the shares are read without its lock.
+                let contract = ctx
+                    .state
+                    .native_agents
+                    .lock()
+                    .peer_folder_contract(&request.agent_capability);
                 match crate::session_read_access::resolve_agent_request(
                     &ctx.state.paths,
                     verified_device.as_ref(),
                     &binding,
-                    &request.agent_capability,
+                    contract.as_ref(),
                     &request.input,
                     storage::now_ts(),
                 ) {
                     Ok(Some(input)) => {
-                        share_requirement = verified_device.as_ref().and_then(|device| {
-                            crate::session_read_access::ShareRequirementV1::of_resolved(
-                                device,
-                                &binding,
-                                &request.agent_capability,
-                                &input,
-                            )
-                        });
+                        share_requirement = verified_device
+                            .as_ref()
+                            .zip(contract.as_ref())
+                            .and_then(|(device, contract)| {
+                                crate::session_read_access::ShareRequirementV1::of_resolved(
+                                    device,
+                                    &binding,
+                                    contract.folder_use(),
+                                    &input,
+                                )
+                            });
                         request.input = input;
                     }
                     Ok(None) => {}

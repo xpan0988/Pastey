@@ -10,7 +10,7 @@ This document owns concrete identifiers, bounds, configuration facts, and source
 | Capability | A bounded ability observed or exposed by a Host. Observation and compatibility do not select a Host or grant execution authority. |
 | Agent | An intelligence/execution participant that can make or propose task decisions over capabilities and resources. Pastey does not currently integrate arbitrary Agents. |
 | Native Agent | Pastey's product and protocol family (`native_agent.*`) for invoking native Host capabilities through one capability-neutral lifecycle. |
-| Native capability | A Host-owned mature runtime behind that lifecycle, reached through a `NativeCapabilityAdapterV1` adapter; it owns HOW. Codex (`agent.coding.codex`) supports Bridge execution; Claude Code Conversation (`agent.coding.claude_code_conversation`) is local only. |
+| Native capability | A Host-owned mature runtime behind that lifecycle, reached through a `NativeCapabilityAdapterV1` adapter; it owns HOW. Codex (`agent.coding.codex`, `agent.coding.codex_thread`) and Claude Code (`agent.coding.claude_code_conversation`, `agent.coding.claude_code`) support Bridge execution through the same admission. |
 | Native executor admission / executor Review | The executing Host's start-time authority gate for a native invocation: Local is admitted at once; remote waits for its user's Accept. |
 | Requester movement approval | The requesting Host's approval to move its workspace and request the remote operation. It is not execution authority. |
 | Managed Host admission | The managed Plan path's attempt-bound admission (`host-admission:v2-attempt-bound:*`). It is unrelated to native executor admission. |
@@ -143,9 +143,11 @@ Native sessions are Host-private. The Codex adapter keeps its app-server session
 
 ### Claude Code Conversation facts
 
-- `start_native_claude_code_task` starts or follows up on a local conversation under `agent.coding.claude_code_conversation`. The adapter uses `claude -p` with stream JSON; it exposes no peer protocol, including under Full Access.
+- `start_native_claude_code_task` starts or follows up on a local conversation under `agent.coding.claude_code_conversation`; `start_remote_native_claude_code_task` does the same on another Host, in a folder it shares, as invoke-v2 input `{scopeRef, task, resume}`. The adapter uses `claude -p` with stream JSON and advertises `pastey-native-agent-control-v1` + `pastey-native-agent-invoke-v2`; its peer folder use is `Run`.
 - The minimum is 2.1.317 on macOS and 2.1.319 on Windows. An older or unreadable version is `native_agent_incompatible`; a CLI that reports signed out is `native_agent_signed_out`. Availability also requires a launch supervisor (a Unix lifeline or a Windows Job Object).
-- The separate `agent.coding.claude_code` adapter for a discovered session uses `claude --bg --resume`. It still returns `native_agent_platform_unverified` on Windows; the Conversation checks do not establish compatibility for that path. See [Layer 5](layers/layer-5-agent.md#claude-code-conversations) for trust, session ownership and Stop semantics.
+- `agent.coding.claude_code` continues a discovered session (`continue_native_session`, `continue_remote_native_session`; peer input `{scopeRef, sessionId, prompt, expectedMarker, options}`, peer folder use `ContinueSession`). macOS/Linux without options: `claude --bg --resume <id> -- <prompt>`. Windows, or any options: the contained headless `claude -p --resume <id> [--model m] [--effort e]`, which needs the Conversation adapter's minimum version and supervisor. On Windows its availability is that headless availability plus a readable `claude agents --json`.
+- Continuation codes: a held session, a changed marker, another folder, or a second registry holder after launch is `native_agent_start_failed` (nothing sent); a completed headless turn whose prompt does not follow the marker is `native_agent_outcome_unknown`.
+- `NativeSessionOptionsV1`: `model` 1–96 characters of `[A-Za-z0-9._:/@+[]-]`, not starting with `-`, `/`, `.` or `~`, no `//`, no drive prefix; `effort` 1–16 lowercase letters. Codex refuses any options. See [Layer 5](layers/layer-5-agent.md#claude-code-conversations) for trust, session ownership and Stop semantics.
 
 ### Native session discovery facts
 

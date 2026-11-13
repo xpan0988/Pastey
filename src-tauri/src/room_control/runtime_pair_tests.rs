@@ -614,6 +614,162 @@ async fn a_shared_thread_is_continued_once_and_the_mac_learns_the_outcome() {
     );
 }
 
+/// Claude Code on Windows, driven from the Mac over the real channel with
+/// the same product model as Codex: Windows shares a folder; the Mac starts
+/// a new Claude Code conversation there and continues an existing session
+/// with an effort its user chose. Every run waits for Windows's Accept, runs
+/// once, in Windows's own folder and session, and the Mac learns each
+/// outcome from Windows's status. A denied request and a session another
+/// Claude Code process holds run nothing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_claude_code_runs_and_continues_for_the_mac_only_after_accept() {
+    use crate::native_agent::NativeAgentTaskStateV1;
+    let pair = RuntimePairV1::new().await;
+    let codex = install_windows_codex(&pair);
+    let claude = crate::native_agent::PairClaudeFixtureV1::install(
+        &mut pair.windows.runtime.native_agents.lock(),
+        &codex.workspace,
+    );
+    let transcript = claude.existing_session();
+    pair.windows_shares(&codex, true, true).await;
+    let scope = pair.mac_lists_shares().await.unwrap().scopes[0]
+        .scope_ref
+        .clone();
+    let invoke = |capability: &'static str, input| {
+        crate::commands::invoke_remote_native_capability(
+            pair.mac.runtime.clone(),
+            ROOM.into(),
+            pair.windows.route_ref(),
+            pair.windows.host_ref().as_str().into(),
+            capability.into(),
+            input,
+        )
+    };
+
+    // A new conversation in the shared folder.
+    let queued = invoke(
+        crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY,
+        crate::native_agent::claude_code_conversation_peer_input(&scope, "Say hi", true).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(queued.state, NativeAgentTaskStateV1::Queued);
+    pair.windows_review_appears(&queued.task_id).await;
+    assert!(claude.runs().is_empty(), "nothing runs before Accept");
+    pair.windows_accepts(&queued.task_id).unwrap();
+    let ended = pair.mac_task_ends(&queued.task_id).await;
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Completed, "{ended:?}");
+    assert_eq!(claude.runs().len(), 1);
+    assert!(claude.runs()[0].contains("--session-id"), "a new session");
+
+    // The existing session, continued in place with the chosen effort.
+    let options = crate::native_agent::NativeSessionOptionsV1 {
+        model: None,
+        effort: Some("low".into()),
+    };
+    let continue_input = || {
+        crate::native_agent::claude_code_session_peer_input(
+            &scope,
+            crate::native_agent::PAIR_EXISTING_SESSION,
+            "What word?",
+            Some("a-1"),
+            &options,
+        )
+        .unwrap()
+    };
+    let queued = invoke(
+        crate::native_agent::CLAUDE_CODE_SESSION_CAPABILITY,
+        continue_input(),
+    )
+    .await
+    .unwrap();
+    pair.windows_review_appears(&queued.task_id).await;
+    pair.windows_accepts(&queued.task_id).unwrap();
+    let ended = pair.mac_task_ends(&queued.task_id).await;
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Completed, "{ended:?}");
+    let runs = claude.runs();
+    assert_eq!(runs.len(), 2);
+    assert!(
+        runs[1].contains(&format!(
+            "--resume {}",
+            crate::native_agent::PAIR_EXISTING_SESSION
+        )) && runs[1].contains("--effort low"),
+        "{runs:?}"
+    );
+    assert!(std::fs::read_to_string(&transcript)
+        .unwrap()
+        .contains("What word?"));
+
+    // Denied: nothing runs, and the Mac learns it.
+    let queued = invoke(
+        crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY,
+        crate::native_agent::claude_code_conversation_peer_input(&scope, "Again", true).unwrap(),
+    )
+    .await
+    .unwrap();
+    pair.windows_review_appears(&queued.task_id).await;
+    pair.windows
+        .runtime
+        .native_agents
+        .lock()
+        .deny_invocation_review(&queued.task_id, storage::now_ts())
+        .unwrap();
+    let ended = pair.mac_task_ends(&queued.task_id).await;
+    assert_eq!(
+        ended.code.as_deref(),
+        Some("native_agent_admission_denied"),
+        "{ended:?}"
+    );
+    assert_eq!(claude.runs().len(), 2);
+
+    // Held by another Claude Code process: accepted, but nothing is sent.
+    // The session has moved on since (the marker is now the last reply).
+    claude.hold_existing();
+    let marker = crate::native_agent::sessions::claude_transcript_marker(&transcript).unwrap();
+    let queued = invoke(
+        crate::native_agent::CLAUDE_CODE_SESSION_CAPABILITY,
+        crate::native_agent::claude_code_session_peer_input(
+            &scope,
+            crate::native_agent::PAIR_EXISTING_SESSION,
+            "Once more",
+            Some(&marker),
+            &options,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    pair.windows_review_appears(&queued.task_id).await;
+    pair.windows_accepts(&queued.task_id).unwrap();
+    let ended = pair.mac_task_ends(&queued.task_id).await;
+    assert_eq!(
+        ended.code.as_deref(),
+        Some("native_agent_start_failed"),
+        "{ended:?}"
+    );
+    assert_eq!(claude.runs().len(), 2, "nothing was sent");
+    claude.release_existing();
+
+    // A peer that names a path, or a folder not shared with it, is refused
+    // before anything is queued on Windows.
+    let refused = invoke(
+        crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY,
+        crate::native_agent::claude_code_conversation_peer_input(
+            "scope:ffffffffffffffff",
+            "x",
+            true,
+        )
+        .unwrap(),
+    )
+    .await;
+    if let Ok(status) = refused {
+        assert_eq!(status.state, NativeAgentTaskStateV1::Failed, "{status:?}");
+    }
+    assert!(pair.windows_reviews().is_empty());
+    assert_eq!(claude.runs().len(), 2);
+}
+
 /// The Mac records a continuation as queued, then finds the Windows session
 /// gone before it can send it: nothing was sent, so the task ends as not
 /// delivered, which the Mac shows and keeps; it is never left queued with

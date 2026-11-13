@@ -121,6 +121,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- bridge_auth join
 - **2.0.0 release evidence.** The release owner reported packaged Mac ↔ Windows runs covering a Bridge across separate networks (home Wi-Fi and phone hotspot), remote Windows Codex from the Mac, Host identity and the secure session, unattended Full Access, connection and Agent recovery, and Developer Mode recovery. The per-step records are not in the repository. A separate Mac → Windows run found and inspected a Codex Desktop thread, refused to continue it while held, and continued it in place once the Codex clients were closed.
 - **Subsequent physical acceptance.** The maintainer confirmed end-to-end Native Workspace Movement, result Return and Apply, and Full Access while Windows is locked. There is no per-case record here to establish specific builds, directions, timings or failure-matrix results for those runs. Relay-only operation, sleep/wake and the full Generic Managed multi-Host path are outside these recorded results.
 - **Local Claude Code Conversation.** On macOS, signed-in Claude Code 2.1.317 passed new and follow-up turns, Stop, and cleanup after Pastey was killed, through the production start method and the built lifeline. The tests did not drive the packaged UI or IPC. A separate headless probe exercised interruption and cleanup with a real tool call. On Windows 11 with 2.1.319, signed-in adapter runs covered a new conversation and its follow-up, Stop with a real tool process, and process cleanup after Pastey was killed. A debug app run also exercised the local flow and untrusted-workspace refusal through the real WebView and IPC; the folder picker and interactive trust prompt were not driven there. A paired Mac's view of a Windows Host with Claude Code enabled was not run in that record; local-only advertisement and admission are covered by the automated checks and Core's no-peer-protocol rule.
+- **Remote Claude Code (Mac → Windows).** Automated: the two-Host Room Control pair test (`windows_claude_code_runs_and_continues_for_the_mac_only_after_accept`, real room router on loopback, fixture Claude Code on the "Windows" Host) covers a new conversation and an existing-session continuation in a shared folder, each only after Accept and run once, Deny, a held session refused with nothing sent, and an unshared reference refused before Review; unit tests cover Full Access admission, share switches, marker, held/rival/concurrent-writer cases and option validation. Live on macOS with signed-in Claude Code 2.1.318 through the production lifecycle and lifeline: an existing session Pastey did not create was continued in place with `--model haiku --effort low` (same session file, earlier context recalled, discovery then read `claude-haiku-5-5` / `low` where it read `claude-opus-5-5` / `medium` before), and a session held idle by another headless run was refused naming the holder with nothing written. Not yet run: any of this on Windows, signed in, and the packaged Mac ↔ Windows flow (see [Remote Claude Code physical acceptance](#remote-claude-code-physical-acceptance)).
 - **Windows Codex Stop.** Merged in `8b7288e`. The Windows fixture suite passed, and a signed-in adapter test with Codex 0.163.0 confirmed the sandboxed command was gone when Stop was reported and the next turn resumed the conversation. That record does not cover the packaged app, the bundled desktop Codex or the restricted-token sandbox.
 
 ## Native Agent focused validation
@@ -187,7 +188,7 @@ Run them one at a time, from a clean environment: a shell inside a Claude Code s
 env -i HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="$TMPDIR" LANG=en_US.UTF-8 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_ -- --ignored --nocapture --test-threads=1
 ```
 
-That filter also selects the Claude Code Conversation checks. Before running it, build the real lifeline with `cargo build --manifest-path src-tauri/Cargo.toml --bin pastey`. The Conversation checks exercise:
+That filter also selects the Claude Code Conversation checks and the headless existing-session check (an existing session continued in place with a chosen model and effort, then a held session refused). Before running it, build the real lifeline with `cargo build --manifest-path src-tauri/Cargo.toml --bin pastey`. The Conversation checks exercise:
 - a conversation and a follow-up that remembers it;
 - Stop during a turn;
 - a Pastey process killed with SIGKILL during a turn: Claude Code must end without anyone stopping it, and the restored task must never read failed.
@@ -209,6 +210,27 @@ cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_codex_sto
 ```
 
 The last two commands check Windows Codex Stop. The ignored Codex test requires a signed-in Codex installation with its Windows sandbox set up. For isolated diagnosis use the [Codex Stop probe](../tools/codex-stop-probe/README.md).
+
+### Remote Claude Code physical acceptance
+
+Not yet recorded. Run on the Windows Host first, in a fresh PowerShell outside any Claude Code session, signed in with 2.1.319 or later, from a checkout Claude Code trusts:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- claude_code::job:: conversation::windows_tests --test-threads=4
+cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_conversation_ -- --ignored --nocapture --test-threads=1
+```
+
+The headless existing-session check (`installed_claude_code_continues_an_existing_session_in_place_with_a_chosen_model`) uses the Unix lifeline and runs on macOS; on Windows the same path is exercised by the packaged flow below. Then, packaged, Mac (no Claude Code installed) and Windows paired:
+
+1. Windows: Bridge details → Workspaces → share a disposable, Claude-trusted folder with Sessions and Agent requests on.
+2. Mac: Agents → Windows → that folder → New conversation → Claude Code; send a prompt. Windows: Accept. Expect one run, the reply on the Mac, and the session listed under that folder.
+3. Mac: open an existing session there (one made with `claude` on Windows, then closed); expand "Model and effort", choose a model alias and `low`; send. Windows: Accept. Expect the same session id afterwards (Details → Ids), its context used, and the session strip showing the chosen model and `low`.
+4. Open that session in the Claude desktop app or `claude --resume` on Windows, leave it idle; continue it from the Mac. Expect "An interactive Claude Code session … has this session open", nothing written.
+5. Deny one request; grant Full Access and repeat step 2 without Accept; revoke and check the next request waits again.
+6. Stop a long turn from the Mac (expect "Stopped" only once the Job Object is empty); disconnect the network during a turn and reconnect (expect Reconcile, no second turn); Burn the Bridge during a turn.
+7. Kill Pastey on Windows during a turn and restart it: expect "outcome unknown", then the observed end; nothing re-sent.
+
+Record versions, steps and outcomes only; omit session ids, paths and transcript content.
 
 ### Native Workspace Movement regression checks
 

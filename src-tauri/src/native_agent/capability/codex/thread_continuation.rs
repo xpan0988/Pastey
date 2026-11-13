@@ -278,6 +278,18 @@ impl NativeCapabilityAdapterV1 for CodexThreadAdapterV1 {
         &GENERIC_NATIVE_INVOKE_PROTOCOLS
     }
 
+    fn peer_folder_use(&self) -> Option<crate::native_agent::capability::PeerFolderUseV1> {
+        Some(crate::native_agent::capability::PeerFolderUseV1::ContinueSession)
+    }
+
+    fn resolve_peer_input(
+        &self,
+        input: &OpaqueCapabilityPayloadV1,
+        shared: &[(String, PathBuf)],
+    ) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+        resolve_peer_input(input, shared).map(Some)
+    }
+
     fn require_available(&self) -> AppResult<()> {
         let report = self.availability_report();
         match report.state {

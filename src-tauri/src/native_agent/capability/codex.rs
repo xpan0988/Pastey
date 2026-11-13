@@ -667,6 +667,20 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
         &WORKSPACE_MOVEMENT_PROTOCOLS
     }
 
+    /// A peer may name a folder this Host shares by its reference, or (as
+    /// before shares existed) a path, which stays as it is.
+    fn peer_folder_use(&self) -> Option<super::PeerFolderUseV1> {
+        Some(super::PeerFolderUseV1::Run)
+    }
+
+    fn resolve_peer_input(
+        &self,
+        input: &OpaqueCapabilityPayloadV1,
+        shared: &[(String, PathBuf)],
+    ) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+        resolve_peer_workspace_ref(input, shared)
+    }
+
     fn require_available(&self) -> AppResult<()> {
         let report = self.availability_report();
         match report.state {

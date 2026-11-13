@@ -510,7 +510,7 @@ impl ShareRequirementV1 {
     pub(crate) fn of_resolved(
         device: &VerifiedPeerDevice,
         binding: &HostSessionBinding,
-        capability: &str,
+        folder_use: crate::native_agent::PeerFolderUseV1,
         input: &crate::native_agent::OpaqueCapabilityPayloadV1,
     ) -> Option<Self> {
         let workspace = serde_json::to_value(input)
@@ -528,7 +528,7 @@ impl ShareRequirementV1 {
             peer_host_ref: binding.peer_host_ref.as_str().to_owned(),
             local_host_ref: binding.local_host_ref.as_str().to_owned(),
             workspace,
-            continuing: capability == crate::native_agent::CODEX_THREAD_CAPABILITY,
+            continuing: folder_use == crate::native_agent::PeerFolderUseV1::ContinueSession,
         })
     }
 }
@@ -563,34 +563,30 @@ pub(crate) fn share_requirement_holds(
 }
 
 /// What the executing Host does with a peer's native invocation before it
-/// is admitted (and, without Full Access, held for Review): a Codex
-/// run naming a folder by its share reference, or any thread continuation
-/// (which names its folder only that way), is turned into this Host's own
-/// folder among the shares of the device proven in exactly `binding` now.
-/// Running needs the share to allow agent requests; continuing also needs
-/// it to allow reading sessions. Anything else is refused. `None`: the
-/// request names no shared folder and stays as it is.
+/// is admitted (and, without Full Access, held for Review): a capability
+/// whose adapter says how a peer names a folder this Host shares
+/// (`contract`) has that reference turned into this Host's own folder among
+/// the shares of the device proven in exactly `binding` now. Running needs
+/// the share to allow agent requests; continuing a session also needs it to
+/// allow reading sessions. A reference it may not use is refused. `None`:
+/// the request names no shared folder and stays as it is.
 pub(crate) fn resolve_agent_request(
     paths: &AppPaths,
     device: Option<&VerifiedPeerDevice>,
     binding: &HostSessionBinding,
-    capability: &str,
+    contract: Option<&crate::native_agent::PeerFolderContractV1>,
     input: &crate::native_agent::OpaqueCapabilityPayloadV1,
     now: i64,
 ) -> AppResult<Option<crate::native_agent::OpaqueCapabilityPayloadV1>> {
-    let continuing = capability == crate::native_agent::CODEX_THREAD_CAPABILITY;
-    if !continuing && capability != crate::native_agent::CODEX_CAPABILITY_ID {
+    let Some(contract) = contract else {
         return Ok(None);
-    }
+    };
+    let continuing = contract.folder_use() == crate::native_agent::PeerFolderUseV1::ContinueSession;
     let shared = match device {
         Some(device) => agent_request_scopes(paths, device, binding, now, continuing)?,
         None => Vec::new(),
     };
-    if continuing {
-        crate::native_agent::resolve_codex_thread_peer_input(input, &shared).map(Some)
-    } else {
-        crate::native_agent::resolve_codex_workspace_ref(input, &shared)
-    }
+    contract.resolve(input, &shared)
 }
 
 #[cfg(test)]

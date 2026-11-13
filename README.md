@@ -35,7 +35,7 @@ Native task completion is separate from result capture, Return, and apply. Paste
 ## Current status on main
 
 - Physical Mac ↔ Windows acceptance is complete for Native Workspace Movement, result Return and Apply, and Full Access while Windows is locked. See [validation evidence](docs/development.md#automated-local-and-physical-evidence) for the scope of these results.
-- Claude Code conversations run on this device on macOS and Windows. Codex is the Native Agent available for Bridge execution; the Windows Codex Stop fix is merged.
+- Claude Code conversations and session continuation run on macOS and Windows, on this device or, through the same Review or Full Access as Codex, from another device in a folder it shares. The Windows Codex Stop fix is merged.
 - A second workspace movement or Return that starts while one is still sending is refused, not queued.
 - Workspace movement carries at most 1,024 regular files. Symlinks, special files, empty folders, executable modes, names that collide when case is ignored, and names that are not portable between macOS and Windows are refused before review.
 - macOS (Apple Silicon) and Windows 11 x64 are the supported desktop platforms. Linux is outside the supported release scope.
@@ -59,7 +59,7 @@ To run Agents across devices:
 - To reach a device on another network, turn on Settings → General → Across the internet on both devices. It uses n0's public relays (for development and hobby use) unless you set your own.
 - For unattended use of a Windows PC, see [Unattended Windows readiness](docs/reference.md#unattended-windows-readiness): Pastey has no background service and must be started at sign-in.
 
-To use Claude Code, install and sign in to the standalone Claude Code CLI (2.1.317 or later on macOS, 2.1.319 or later on Windows). In **Agents → This device → New conversation**, select Claude Code. If the workspace has Claude Code project settings, open the folder in Claude Code and accept its trust prompt first. Bridge peers cannot start Claude Code conversations.
+To use Claude Code, install and sign in to the standalone Claude Code CLI (2.1.317 or later on macOS, 2.1.319 or later on Windows). In **Agents → This device → New conversation**, select Claude Code. If the workspace has Claude Code project settings, open the folder in Claude Code and accept its trust prompt first. Another device can run or continue Claude Code here only in a folder you share with it (Bridge details → Workspaces) and only after your Accept or under its Full Access; it uses this device's own Claude Code sign-in and settings.
 
 **Upgrading from 1.x or a 2.0 beta:** install over the existing app with the same kind of installer (on Windows, do not mix the `.exe` and the `.msi`). Update both devices: earlier versions cannot pair with or reconnect to 2.0.0. A Bridge from an earlier version stays disconnected, with its content kept, until the two devices pair it again from its network panel. Unattended Codex permissions from earlier builds are removed; give Full Access on the controlled device instead.
 

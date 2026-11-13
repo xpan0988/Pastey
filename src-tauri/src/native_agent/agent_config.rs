@@ -148,7 +148,9 @@ pub(crate) fn config_value(raw: &str) -> Option<String> {
 
 /// A JSON string field as a configuration identifier.
 pub(crate) fn config_field(value: Option<&serde_json::Value>) -> Option<String> {
-    value.and_then(serde_json::Value::as_str).and_then(config_value)
+    value
+        .and_then(serde_json::Value::as_str)
+        .and_then(config_value)
 }
 
 /// Bounded single-line text for a source or note.
@@ -166,9 +168,8 @@ pub(crate) fn config_text(text: &str, limit: usize) -> String {
 /// The report as it may leave this Host: values are already identifiers;
 /// the source and note lose anything path-like.
 pub(crate) fn remote_projection(config: &NativeAgentConfigV1) -> NativeAgentConfigV1 {
-    let redact = |text: &str, limit| {
-        config_text(&super::sessions::remote::redact_paths(text), limit)
-    };
+    let redact =
+        |text: &str, limit| config_text(&super::sessions::remote::redact_paths(text), limit);
     NativeAgentConfigV1 {
         agent: config.agent.clone(),
         scope: config.scope,
@@ -178,7 +179,10 @@ pub(crate) fn remote_projection(config: &NativeAgentConfigV1) -> NativeAgentConf
         model_origin: config.model_origin,
         reasoning_effort_origin: config.reasoning_effort_origin,
         source: redact(&config.source, MAX_SOURCE_CHARS),
-        note: config.note.as_deref().map(|note| redact(note, MAX_NOTE_CHARS)),
+        note: config
+            .note
+            .as_deref()
+            .map(|note| redact(note, MAX_NOTE_CHARS)),
         observed_at_ms: config.observed_at_ms,
     }
 }
@@ -239,7 +243,10 @@ mod tests {
         let remote = remote_projection(&local);
         assert!(remote.is_valid());
         let wire = serde_json::to_string(&remote).unwrap();
-        assert!(!wire.contains("/Users") && !wire.contains("C:\\\\"), "{wire}");
+        assert!(
+            !wire.contains("/Users") && !wire.contains("C:\\\\"),
+            "{wire}"
+        );
         assert_eq!(remote.model.as_deref(), Some("gpt-6.1-sol"));
         assert_eq!(remote.model_origin, Some(ConfigOriginV1::Project));
 

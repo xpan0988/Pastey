@@ -297,7 +297,10 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
             &windows_paths,
             Some(&device),
             &at_windows,
-            &request.agent_capability,
+            crate::native_agent::PeerFolderContractV1::of_product_capability(
+                &request.agent_capability,
+            )
+            .as_ref(),
             &request.input,
             storage::now_ts(),
         )

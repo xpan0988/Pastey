@@ -64,6 +64,38 @@ pub(crate) fn run_claude_code_lifeline_if_requested() -> bool {
 pub(crate) const CODEX_THREAD_CAPABILITY: &str =
     capability::codex::thread_continuation::CODEX_THREAD_CAPABILITY_ID;
 
+/// Claude Code conversations Pastey begins and continues in a folder
+/// (`capability::claude_code::conversation`).
+pub(crate) const CLAUDE_CODE_CONVERSATION_CAPABILITY: &str =
+    capability::claude_code::conversation::CLAUDE_CODE_CONVERSATION_ID;
+/// Continuing an existing Claude Code session (`capability::claude_code`).
+pub(crate) const CLAUDE_CODE_SESSION_CAPABILITY: &str =
+    capability::claude_code::CLAUDE_CODE_CAPABILITY_ID;
+
+/// A requesting device's Claude Code conversation input: the folder only as
+/// the scope reference of a folder that Host shares with it.
+pub(crate) fn claude_code_conversation_peer_input(
+    scope_ref: &str,
+    task: &str,
+    resume: bool,
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    capability::claude_code::conversation::peer_input(scope_ref, task, resume)
+}
+
+/// A requesting device's input continuing one existing Claude Code session:
+/// the folder only as the scope reference its Session reading showed it.
+/// `model` and `effort` are Claude Code's own per-session options, sent only
+/// when its user chose them for this continuation.
+pub(crate) fn claude_code_session_peer_input(
+    scope_ref: &str,
+    session_id: &str,
+    prompt: &str,
+    expected_marker: Option<&str>,
+    options: &NativeSessionOptionsV1,
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    capability::claude_code::peer_input(scope_ref, session_id, prompt, expected_marker, options)
+}
+
 /// A requesting device's continuation input: the folder only as the scope
 /// reference its Session reading permission showed it.
 pub(crate) fn codex_thread_peer_input(
@@ -80,23 +112,61 @@ pub(crate) fn codex_thread_peer_input(
     )
 }
 
-/// The executing Host resolves a peer's continuation input among the
-/// folders that exact device may read now, `(scope_ref, workspace)`.
-pub(crate) fn resolve_codex_thread_peer_input(
-    input: &OpaqueCapabilityPayloadV1,
-    readable: &[(String, PathBuf)],
-) -> AppResult<OpaqueCapabilityPayloadV1> {
-    capability::codex::thread_continuation::resolve_peer_input(input, readable)
+#[cfg(all(test, unix))]
+pub(crate) use capability::claude_code::conversation::tests::{
+    PairClaudeFixtureV1, PAIR_EXISTING_SESSION,
+};
+pub(crate) use capability::PeerFolderUseV1;
+
+/// How one capability's peer invocations name a folder this Host shares
+/// (its adapter's `peer_folder_use` and `resolve_peer_input`), taken out of
+/// the service so share resolution never holds the service lock.
+#[derive(Clone)]
+pub(crate) struct PeerFolderContractV1 {
+    folder_use: PeerFolderUseV1,
+    adapter: Arc<dyn NativeCapabilityAdapterV1>,
 }
 
-/// The executing Host resolves a peer's Codex run naming a shared folder by
-/// its reference (`scope:`) among the folders that exact device may ask to
-/// run agents in now. `None`: the input names a path, unchanged.
-pub(crate) fn resolve_codex_workspace_ref(
-    input: &OpaqueCapabilityPayloadV1,
-    shared: &[(String, PathBuf)],
-) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
-    capability::codex::resolve_peer_workspace_ref(input, shared)
+impl PeerFolderContractV1 {
+    fn of(adapter: Arc<dyn NativeCapabilityAdapterV1>) -> Option<Self> {
+        Some(Self {
+            folder_use: adapter.peer_folder_use()?,
+            adapter,
+        })
+    }
+
+    pub(crate) fn folder_use(&self) -> PeerFolderUseV1 {
+        self.folder_use
+    }
+
+    /// The adapter's own input for a peer's, given the folders
+    /// `(scope_ref, folder)` the requesting device may use this way now.
+    pub(crate) fn resolve(
+        &self,
+        input: &OpaqueCapabilityPayloadV1,
+        shared: &[(String, PathBuf)],
+    ) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+        self.adapter.resolve_peer_input(input, shared)
+    }
+
+    /// Tests: the contract of a product capability, from a fresh adapter.
+    #[cfg(test)]
+    pub(crate) fn of_product_capability(capability_id: &str) -> Option<Self> {
+        let adapter: Arc<dyn NativeCapabilityAdapterV1> = match capability_id {
+            CODEX_CAPABILITY_ID => Arc::new(CodexNativeAdapterV1::default()),
+            CODEX_THREAD_CAPABILITY => {
+                Arc::new(capability::codex::thread_continuation::CodexThreadAdapterV1::default())
+            }
+            CLAUDE_CODE_CONVERSATION_CAPABILITY => Arc::new(
+                capability::claude_code::conversation::ClaudeCodeConversationAdapterV1::default(),
+            ),
+            CLAUDE_CODE_SESSION_CAPABILITY => {
+                Arc::new(capability::claude_code::ClaudeCodeNativeAdapterV1::default())
+            }
+            _ => return None,
+        };
+        Self::of(adapter)
+    }
 }
 
 /// One local lifecycle line per Native Agent transition, so a crash or a
@@ -141,6 +211,46 @@ pub(crate) const WORKSPACE_MOVEMENT_PROTOCOLS: [&str; 3] = [
 pub(crate) const NATIVE_AGENT_INVOKE_V2_SCHEMA: &str = "pastey-native-agent-invoke-v2";
 pub(crate) const GENERIC_NATIVE_INVOKE_PROTOCOLS: [&str; 2] =
     [NATIVE_AGENT_PROTOCOL_SCHEMA, NATIVE_AGENT_INVOKE_V2_SCHEMA];
+/// A native Agent's own per-session options that its user explicitly chose
+/// for one continuation: the model, and the reasoning effort. Pastey keeps
+/// no default of either and never chooses one; absent means the Agent's own
+/// configuration decides. Each is an identifier the Agent itself validates
+/// (an unknown model is the Agent's own failure). Only capabilities whose
+/// native interface was measured to apply them to the same session accept
+/// them; every other refuses rather than ignore them.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NativeSessionOptionsV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<String>,
+}
+
+impl NativeSessionOptionsV1 {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.model.is_none() && self.effort.is_none()
+    }
+
+    /// Identifiers only: never something a command line could read as an
+    /// option, a path or several words.
+    pub(crate) fn validate(&self) -> AppResult<()> {
+        let model_ok = self.model.as_deref().is_none_or(|model| {
+            agent_config::config_value(model).as_deref() == Some(model) && !model.starts_with('-')
+        });
+        let effort_ok = self.effort.as_deref().is_none_or(|effort| {
+            !effort.is_empty()
+                && effort.len() <= 16
+                && effort.chars().all(|c| c.is_ascii_lowercase())
+        });
+        if model_ok && effort_ok {
+            Ok(())
+        } else {
+            invalid("The chosen model or reasoning effort is not a valid identifier.")
+        }
+    }
+}
+
 /// A running task whose native capability waits for its own client to
 /// answer a request (an approval, a question) that Pastey does not answer.
 pub(crate) const AWAITING_NATIVE_DECISION_CODE: &str = "native_agent_awaiting_native_decision";
@@ -1346,6 +1456,12 @@ impl NativeAgentServiceV1 {
         self.adapters.push(Arc::new(adapter));
     }
 
+    /// Tests: registers one more adapter, as the product registers its own.
+    #[cfg(test)]
+    pub(crate) fn add_adapter_for_test(&mut self, adapter: Arc<dyn NativeCapabilityAdapterV1>) {
+        self.adapters.push(adapter);
+    }
+
     /// Tests: the task occupying a canonical Codex workspace, if any.
     #[cfg(test)]
     fn workspace_occupant(&self, workspace: &Path) -> Option<String> {
@@ -1990,6 +2106,16 @@ impl NativeAgentServiceV1 {
 
     pub(crate) fn require_capability(&self, capability_id: &str) -> AppResult<()> {
         self.adapter(capability_id)?.require_available()
+    }
+
+    /// How a peer's invocation of `capability_id` names a folder this Host
+    /// shares, when it does. Only capabilities a peer may invoke have one.
+    pub(crate) fn peer_folder_contract(&self, capability_id: &str) -> Option<PeerFolderContractV1> {
+        let adapter = self.adapter(capability_id).ok()?;
+        if adapter.supported_protocols().is_empty() {
+            return None;
+        }
+        PeerFolderContractV1::of(adapter)
     }
 
     /// Workspace movement is offered only by the Codex capability.
@@ -4128,15 +4254,25 @@ impl NativeAgentServiceV1 {
     }
 
     /// Continues one existing Claude Code session that this Host's user
-    /// chose, in its canonical workspace, with `prompt`. Local only; the
-    /// adapter refuses while any process holds the session.
+    /// chose, in its canonical workspace, with `prompt` (and Claude Code's
+    /// own options, when the user chose them for this turn). The adapter
+    /// refuses while any process holds the session, or once it no longer
+    /// ends with `expected_marker`.
     pub(crate) fn start_claude_session_task(
         &mut self,
         workspace: &Path,
         session_id: &str,
         prompt: &str,
+        expected_marker: Option<&str>,
+        options: &NativeSessionOptionsV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        let input = capability::claude_code::continue_input(session_id, workspace, prompt)?;
+        let input = capability::claude_code::continue_input(
+            session_id,
+            workspace,
+            prompt,
+            expected_marker,
+            options,
+        )?;
         self.start_local_invocation(
             capability::claude_code::CLAUDE_CODE_CAPABILITY_ID,
             &format!("native-agent:{}", Uuid::new_v4()),

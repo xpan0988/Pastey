@@ -11,6 +11,7 @@ export type ProcessRights = "standard" | "administrator" | "unknown";
 export function fullAccessAllows(controller: string): string[] {
   return [
     `Run Codex in any folder on this device, and continue Codex sessions here.`,
+    `Run Claude Code, with this device's own Claude Code sign-in, settings and permission rules, in folders shared with ${controller} or opened by ${controller}, and continue the Claude Code sessions in them (only while no other Claude Code process here has a session open).`,
     `Read the Claude Code and Codex sessions in folders shared with ${controller}, and open more folders here by their path.`,
     `Open a terminal on this device (PowerShell on Windows, your shell on macOS) with exactly the rights Pastey has here. Anything Pastey's user account can do, ${controller} can do: read, change or delete your files, reach any folder, and run programs. Pastey's folder rules decide only which folders are offered for sessions; they do not limit the terminal or Codex.`,
     `Send a folder here and run Codex on it.`,
@@ -22,9 +23,9 @@ export function fullAccessLimits(controller: string): string[] {
   return [
     `It does not let this device control ${controller}. That is only ${controller}'s own choice, made there.`,
     `Pastey never answers Codex's own questions. Whether Codex asks before a command or file change follows Codex's own settings on this device; when it asks, the question goes to the person using ${controller}.`,
+    "Pastey never answers Claude Code's own permission prompts either: run from Pastey, Claude Code refuses whatever its own settings here would ask about, and goes on.",
     "It never raises its rights: a Windows UAC prompt, an administrator password, or a macOS privacy prompt for something Pastey has not been allowed appears on this device, where nobody may be there to answer. What Pastey has already been allowed, it has too.",
     "Nothing runs while this device is asleep, signed out, or Pastey is quit.",
-    "Claude Code sessions here can still be continued only on this device.",
   ];
 }
 
@@ -33,7 +34,7 @@ export function fullAccessLimits(controller: string): string[] {
 export function processRightsWarning(rights: ProcessRights): string | null {
   switch (rights) {
     case "administrator":
-      return "Pastey is running as administrator on this device, so its terminal and Codex runs would have administrator rights too, with no UAC prompt. Unless you mean that, quit Pastey and start it normally (not \"Run as administrator\") before giving Full Access.";
+      return "Pastey is running as administrator on this device, so its terminal, Codex and Claude Code runs would have administrator rights too, with no UAC prompt. Unless you mean that, quit Pastey and start it normally (not \"Run as administrator\") before giving Full Access.";
     case "unknown":
       return "Pastey could not tell whether it runs as administrator here. Whatever rights it has, the other device gets.";
     case "standard":

@@ -346,8 +346,16 @@ mod with_claude_store {
         // provider, kept apart. Claude Code's default is not knowable.
         let config = session.agent_config.as_ref().unwrap();
         assert_eq!(
-            (config.scope, config.model.as_deref(), config.reasoning_effort.as_deref()),
-            (AgentConfigScopeV1::Session, Some("claude-opus-5-5"), Some("high"))
+            (
+                config.scope,
+                config.model.as_deref(),
+                config.reasoning_effort.as_deref()
+            ),
+            (
+                AgentConfigScopeV1::Session,
+                Some("claude-opus-5-5"),
+                Some("high")
+            )
         );
         let claude_default = discovery
             .providers
@@ -368,14 +376,38 @@ mod with_claude_store {
             change(&mut forged);
             validate_response(&forged).is_err()
         };
-        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().model = Some("/Users/me/.claude/settings.json".into())));
-        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().agent = PROVIDER_CODEX.into()));
-        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().scope = AgentConfigScopeV1::NativeDefault));
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0]
+            .agent_config
+            .as_mut()
+            .unwrap()
+            .model =
+            Some("/Users/me/.claude/settings.json".into())));
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0]
+            .agent_config
+            .as_mut()
+            .unwrap()
+            .agent = PROVIDER_CODEX.into()));
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0]
+            .agent_config
+            .as_mut()
+            .unwrap()
+            .scope = AgentConfigScopeV1::NativeDefault));
         assert!(forge(&|a| {
-            let provider = a.discovery.as_mut().unwrap().providers.iter_mut().find(|p| p.provider == PROVIDER_CLAUDE_CODE).unwrap();
+            let provider = a
+                .discovery
+                .as_mut()
+                .unwrap()
+                .providers
+                .iter_mut()
+                .find(|p| p.provider == PROVIDER_CLAUDE_CODE)
+                .unwrap();
             provider.native_default.as_mut().unwrap().scope = AgentConfigScopeV1::Session;
         }));
-        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0].agent_config.as_mut().unwrap().note = Some("x\u{7}".into())));
+        assert!(forge(&|a| a.discovery.as_mut().unwrap().sessions[0]
+            .agent_config
+            .as_mut()
+            .unwrap()
+            .note = Some("x\u{7}".into())));
         // An answer from a Host that reports no configuration still reads.
         let mut older = answer.clone();
         for session in &mut older.discovery.as_mut().unwrap().sessions {

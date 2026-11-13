@@ -69,10 +69,10 @@ export function remoteAccessGuidance(facts: RemoteAccessFacts): AccessLine[] {
   const runnable = shared.filter((share) => allows(share, "run")).map((share) => share.label);
   lines.push({
     id: "run",
-    label: "Run Codex",
+    label: "Run Codex or Claude Code",
     state: fullAccess ? "ok" : "decided_there",
     detail: (fullAccess
-      ? `Runs start on ${where} at once, in its shared folders or any folder you name by path.`
+      ? `Runs start on ${where} at once: Codex in its shared folders or any folder you name by path, Claude Code in its shared folders.`
       : facts.lastRunWaitedForAccept === true
         ? `Your last run waited for someone on ${where} to click Accept: ${where} has not given this device Full Access.`
         : `Each run waits for someone on ${where} to click Accept, unless ${where}'s user gives this device Full Access.`)
@@ -84,7 +84,7 @@ export function remoteAccessGuidance(facts: RemoteAccessFacts): AccessLine[] {
     id: "decisions",
     label: "Codex's own approval prompts",
     state: facts.connected ? "ok" : "unknown",
-    detail: `Answered here, by you. Pastey proves this device's identity to ${where} before each run; this needs no trust or permission.`,
+    detail: `Answered here, by you. Pastey proves this device's identity to ${where} before each run; this needs no trust or permission. Claude Code asks nothing: run from Pastey, it refuses what its own settings on ${where} would ask about.`,
     steps: [],
   });
 
@@ -107,7 +107,7 @@ export function remoteAccessGuidance(facts: RemoteAccessFacts): AccessLine[] {
       id: "continue",
       label: "Continue its sessions",
       state: fullAccess ? "ok" : "decided_there",
-      detail: `Codex threads in ${continuable.length ? continuable.join(", ") : `folders ${where} shares for sessions and agent requests`}: ${fullAccess ? "each continuation starts at once" : `each continuation waits for someone on ${where} to click Accept`}. Claude Code sessions are continued only on ${where} itself.`,
+      detail: `Codex threads and Claude Code sessions in ${continuable.length ? continuable.join(", ") : `folders ${where} shares for sessions and agent requests`}: ${fullAccess ? "each continuation starts at once" : `each continuation waits for someone on ${where} to click Accept`}. Each is refused while another client there has it open.`,
       steps: [],
     });
   return lines;

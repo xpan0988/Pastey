@@ -56,7 +56,7 @@ impl FixtureV1 {
         fs::write(
             &transcript,
             format!(
-                "{{\"type\":\"user\",\"cwd\":\"{ws}\",\"timestamp\":\"2026-10-17T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"Earlier work\"}}}}\n{{\"type\":\"assistant\",\"cwd\":\"{ws}\",\"timestamp\":\"2026-10-17T00:00:01Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Done before\"}}],\"stop_reason\":\"end_turn\"}}}}\n",
+                "{{\"type\":\"user\",\"cwd\":\"{ws}\",\"uuid\":\"u-1\",\"timestamp\":\"2026-10-17T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"Earlier work\"}}}}\n{{\"type\":\"assistant\",\"cwd\":\"{ws}\",\"uuid\":\"a-1\",\"timestamp\":\"2026-10-17T00:00:01Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Done before\"}}],\"stop_reason\":\"end_turn\"}}}}\n",
                 ws = workspace.display()
             ),
         )
@@ -225,7 +225,13 @@ fn an_unheld_session_is_continued_once_under_its_own_id_and_then_released() {
     let fixture = FixtureV1::new("continue");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let status = wait_terminal(&service, &started.task_id);
     assert_eq!(
@@ -254,7 +260,13 @@ fn a_session_listed_without_a_status_is_starting_not_waiting_on_an_approval() {
     let fixture = FixtureV1::new("starting");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let mut seen_waiting = false;
     let terminal = loop {
@@ -276,7 +288,13 @@ fn a_session_any_process_holds_is_refused_before_anything_is_sent() {
         fixture.hold(status);
         let (mut service, _) = fixture.service();
         let started = service
-            .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+            .start_claude_session_task(
+                &fixture.workspace,
+                SESSION,
+                PROMPT,
+                None,
+                &crate::native_agent::NativeSessionOptionsV1::default(),
+            )
             .unwrap();
         let terminal = wait_terminal(&service, &started.task_id);
         assert_eq!(terminal.state, NativeAgentTaskStateV1::Failed);
@@ -294,7 +312,13 @@ fn a_copy_claude_code_started_is_stopped_and_the_outcome_stays_unknown() {
     let fixture = FixtureV1::new("copy");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let terminal = wait_terminal(&service, &started.task_id);
     assert_eq!(
@@ -311,7 +335,13 @@ fn a_refusal_or_an_unclear_answer_is_never_retried() {
     let fixture = FixtureV1::new("untrusted");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let terminal = wait_terminal(&service, &started.task_id);
     assert_eq!(terminal.code.as_deref(), Some("native_agent_start_failed"));
@@ -321,7 +351,13 @@ fn a_refusal_or_an_unclear_answer_is_never_retried() {
     let fixture = FixtureV1::new("garbled");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let terminal = wait_terminal(&service, &started.task_id);
     assert_eq!(
@@ -336,7 +372,13 @@ fn a_session_waiting_on_its_own_client_is_shown_waiting_and_can_be_stopped() {
     let fixture = FixtureV1::new("awaiting");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     for _ in 0..500 {
         if service
@@ -383,7 +425,13 @@ fn a_running_continuation_holds_its_folder_against_every_workspace_capability() 
     let fixture = FixtureV1::new("awaiting");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     for _ in 0..500 {
         if service
@@ -422,7 +470,13 @@ fn a_session_recorded_in_another_workspace_is_not_continued() {
     .unwrap();
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let terminal = wait_terminal(&service, &started.task_id);
     assert_eq!(terminal.code.as_deref(), Some("native_agent_start_failed"));
@@ -430,13 +484,79 @@ fn a_session_recorded_in_another_workspace_is_not_continued() {
 }
 
 #[test]
-fn no_bridge_peer_can_invoke_it_or_learn_of_it() {
+fn a_background_continuation_refuses_a_session_that_changed_since_it_was_seen() {
     let fixture = FixtureV1::new("continue");
     let (mut service, _) = fixture.service();
-    assert!(
-        service.native_capability_facts().is_empty(),
-        "local-only capabilities are not described to peers"
+    let started = service
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            Some("u-1"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+    let terminal = wait_terminal(&service, &started.task_id);
+    assert_eq!(terminal.code.as_deref(), Some("native_agent_start_failed"));
+    assert_eq!(fixture.launches(), 0);
+    let started = service
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            Some("a-1"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+    let terminal = wait_terminal(&service, &started.task_id);
+    assert_eq!(
+        terminal.state,
+        NativeAgentTaskStateV1::Completed,
+        "{terminal:?}"
     );
+    assert_eq!(fixture.launches(), 1);
+}
+
+#[test]
+fn a_bridge_peer_may_ask_and_waits_for_review_unless_it_holds_full_access() {
+    let fixture = FixtureV1::new("continue");
+    let (mut service, adapter) = fixture.service();
+    assert_eq!(
+        service.native_capability_facts().len(),
+        1,
+        "described to peers with the generic invocation"
+    );
+    assert_eq!(
+        adapter.peer_folder_use(),
+        Some(crate::native_agent::PeerFolderUseV1::ContinueSession)
+    );
+    // A peer names the folder only by a share reference.
+    let shared = vec![(
+        "scope:0123456789abcdef".to_string(),
+        fixture.workspace.clone(),
+    )];
+    let asked = peer_input(
+        "scope:0123456789abcdef",
+        SESSION,
+        PROMPT,
+        Some("a-1"),
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
+    let resolved = adapter
+        .resolve_peer_input(&asked, &shared)
+        .unwrap()
+        .unwrap();
+    assert!(adapter.resolve_peer_input(&asked, &[]).is_err());
+    let host_form = continue_input(
+        SESSION,
+        &fixture.workspace,
+        PROMPT,
+        None,
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
+    assert!(adapter.resolve_peer_input(&host_form, &shared).is_err());
     let binding = crate::host_identity::HostSessionBinding::new(
         "room-claude",
         crate::host_identity::HostRef::from_device_id("claude-executor").unwrap(),
@@ -451,11 +571,14 @@ fn no_bridge_peer_can_invoke_it_or_learn_of_it() {
         task_id: "remote-claude".into(),
         target_host_ref: "claude-executor".into(),
         agent_capability: CLAUDE_CODE_CAPABILITY_ID.into(),
-        input: continue_input(SESSION, &fixture.workspace, PROMPT).unwrap(),
+        input: resolved,
     };
-    let refused =
-        service.receive_bridge_invocation(&binding, &request, crate::storage::now_ts(), None);
-    assert!(refused.is_err_and(|error| error.message().contains("local to its Host")));
+    let held = service
+        .receive_bridge_invocation(&binding, &request, crate::storage::now_ts(), None)
+        .unwrap();
+    assert_eq!(held.state, NativeAgentTaskStateV1::Queued);
+    assert_eq!(held.code.as_deref(), Some("native_agent_review_required"));
+    assert_eq!(fixture.launches(), 0, "nothing runs before Accept");
     // Not even a device this Host gave Full Access, proven in this session.
     let paths =
         crate::storage::AppPaths::new(fixture.root.join("app-data"), fixture.root.join("logs"));
@@ -515,14 +638,26 @@ fn no_bridge_peer_can_invoke_it_or_learn_of_it() {
         &binding,
         crate::storage::now_ts()
     ));
-    let refused = service.receive_bridge_invocation(
-        &binding,
-        &request,
-        crate::storage::now_ts(),
-        Some(&device),
+    // Full Access stands in for the Accept: the same start, as that peer.
+    let request = crate::native_agent::NativeInvocationRequestV1 {
+        task_id: "remote-claude-full-access".into(),
+        ..request
+    };
+    let admitted = service
+        .receive_bridge_invocation(&binding, &request, crate::storage::now_ts(), Some(&device))
+        .unwrap();
+    assert_ne!(
+        admitted.state,
+        NativeAgentTaskStateV1::Queued,
+        "{admitted:?}"
     );
-    assert!(refused.is_err_and(|error| error.message().contains("local to its Host")));
-    assert_eq!(fixture.launches(), 0);
+    let terminal = wait_terminal(&service, "remote-claude-full-access");
+    assert_eq!(
+        terminal.state,
+        NativeAgentTaskStateV1::Completed,
+        "{terminal:?}"
+    );
+    assert_eq!(fixture.launches(), 1, "sent once");
 }
 
 /// S2 live: through Pastey's Native Agent lifecycle and the installed Claude
@@ -563,7 +698,13 @@ fn installed_claude_code_continues_an_unheld_session_and_refuses_a_held_one() {
     let mut service = NativeAgentServiceV1::with_paths_and_adapters(paths, vec![adapter]).unwrap();
 
     let started = service
-        .start_claude_session_task(&workspace, &session, "Reply with exactly: pastey-continued")
+        .start_claude_session_task(
+            &workspace,
+            &session,
+            "Reply with exactly: pastey-continued",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let mut terminal = None;
     for _ in 0..1200 {
@@ -616,7 +757,13 @@ fn installed_claude_code_continues_an_unheld_session_and_refuses_a_held_one() {
     }
     assert!(held, "the foreground run never appeared in the registry");
     let refused = service
-        .start_claude_session_task(&workspace, &session, "Reply with exactly: must-not-run")
+        .start_claude_session_task(
+            &workspace,
+            &session,
+            "Reply with exactly: must-not-run",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let mut refusal = None;
     for _ in 0..300 {
@@ -657,14 +804,26 @@ fn a_second_pastey_continuation_of_a_running_session_is_refused() {
     let fixture = FixtureV1::new("manual");
     let (mut service, _) = fixture.service();
     let first = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the first turn launched");
     // Refused by Core before the adapter sees it: one Pastey task per
     // session. Against other Claude Code clients only the adapter's
     // registry check and `--bg`'s copy-on-held apply (tests above).
     assert!(service
-        .start_claude_session_task(&fixture.workspace, SESSION, "another turn")
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            "another turn",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
         .is_err());
     assert_eq!(fixture.launches(), 1);
     fixture.finish("Done");
@@ -679,7 +838,13 @@ fn a_launch_failure_after_the_session_showed_activity_is_unknown_not_a_non_start
     let fixture = FixtureV1::new("fail-after-start");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let terminal = wait_terminal(&service, &started.task_id);
     assert_eq!(
@@ -704,7 +869,13 @@ fn a_stop_claude_code_does_not_confirm_stays_a_request_and_keeps_the_folder_held
     let fixture = FixtureV1::new("manual");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the turn launched");
     fixture.ignore_stop();
@@ -746,7 +917,13 @@ fn a_stop_claude_code_does_not_confirm_stays_a_request_and_keeps_the_folder_held
 fn crashed_while_running(fixture: &FixtureV1) -> String {
     let (mut before, adapter) = fixture.service();
     let started = before
-        .start_claude_session_task(&fixture.workspace, SESSION, PROMPT)
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the turn launched");
     adapter.abandon_runs();
@@ -771,7 +948,13 @@ fn a_restart_while_the_session_runs_keeps_the_outcome_unknown_then_observes_its_
         .workspace_has_authoritative_owner(&fixture.workspace, None, None)
         .unwrap());
     assert!(after
-        .start_claude_session_task(&fixture.workspace, SESSION, "go on")
+        .start_claude_session_task(
+            &fixture.workspace,
+            SESSION,
+            "go on",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
         .is_err());
 
     fixture.finish("Finished after the restart");
@@ -956,7 +1139,13 @@ fn installed_claude_code_crash_child() {
     )
     .unwrap();
     let started = service
-        .start_claude_session_task(Path::new(&workspace), &session, LONG_PROMPT)
+        .start_claude_session_task(
+            Path::new(&workspace),
+            &session,
+            LONG_PROMPT,
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     println!("PASTEY_LIVE_CRASH_TASK={}", started.task_id);
     loop {
@@ -1002,7 +1191,13 @@ fn installed_claude_code_turn_outlives_a_killed_pastey_and_is_observed_to_its_en
         .workspace_has_authoritative_owner(&workspace, None, None)
         .unwrap());
     assert!(after
-        .start_claude_session_task(&workspace, &session, "Reply with exactly: must-not-run")
+        .start_claude_session_task(
+            &workspace,
+            &session,
+            "Reply with exactly: must-not-run",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
         .is_err());
 
     let mut terminal = None;

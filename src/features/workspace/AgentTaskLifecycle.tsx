@@ -19,6 +19,7 @@ import {
   reconcileRemoteNativeAgentTask,
   retryNativeAgentWorkspaceResultReturn,
   startNativeClaudeCodeTask,
+  startRemoteNativeClaudeCodeTask,
   startNativeCodexTask,
   startRemoteNativeCodexTask,
   stopBridgeNativeAgentTask,
@@ -171,8 +172,10 @@ export function nativeAgentConversationUnavailable(status: NativeAgentTaskStatus
 
 export const CODEX_AGENT_ID = "agent.coding.codex";
 export const CLAUDE_CODE_AGENT_ID = "agent.coding.claude_code_conversation";
-/** The Agents a new conversation runs with on this device. Another device
- * runs Codex only: Claude Code is not offered to Bridge peers. */
+/** The Agents a new conversation can run with. On another device each is
+ * offered only when that device advertises it, and Claude Code only in a
+ * folder it shares (named by reference): a typed path and a folder sent from
+ * this device run Codex. */
 export const LOCAL_CONVERSATION_AGENTS = [CODEX_AGENT_ID, CLAUDE_CODE_AGENT_ID] as const;
 export type ConversationAgentId = typeof LOCAL_CONVERSATION_AGENTS[number];
 
@@ -799,19 +802,27 @@ export function useNativeAgentTask(roomId: string) {
   }, [beginTurn, busy, origin, taskText, workspace]);
 
   /** A shared place names a folder that Host shares with this device by its
-   * reference, which that Host resolves itself; otherwise the typed path.
-   * A new conversation unless `followUp`. */
-  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false) => {
+   * reference, which that Host resolves itself; otherwise the typed path
+   * (Codex only). A new conversation unless `followUp`, which continues the
+   * shown conversation with its own Agent. */
+  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID) => {
     const shared = place.kind === "shared" ? { scopeRef: place.scopeRef, label: place.label } : null;
     const target = shared ? shared.scopeRef : workspace.trim();
     const sent = taskText.trim();
+    const agentId = followUp && origin?.kind === "new" ? conversationAgent(origin) : chosen;
     if (!roomId || !peerSessionId || !hostRef || !target || !sent || busy) return;
+    if (agentId === CLAUDE_CODE_AGENT_ID && !shared) {
+      setMessage("Claude Code runs on another device only in a folder that device shares with this one.");
+      return;
+    }
     setBusy(true); setMessage(null);
     try {
-      const started = await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, target, sent, followUp, shared?.label ?? null);
+      const started = agentId === CLAUDE_CODE_AGENT_ID && shared
+        ? await startRemoteNativeClaudeCodeTask(roomId, peerSessionId, hostRef, shared.scopeRef, sent, followUp)
+        : await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, target, sent, followUp, shared?.label ?? null);
       rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
       setTaskHostRef(hostRef);
-      beginTurn(started.taskId, hostRef, place, followUp, sent);
+      beginTurn(started.taskId, hostRef, place, followUp, sent, null, agentId);
       try {
         const projection = await loadRecoveryProjection();
         // A drained projection clears the shown task; the task just started
@@ -823,9 +834,9 @@ export function useNativeAgentTask(roomId: string) {
         setMessage(error instanceof Error ? error.message : "Pastey could not load the remote task correlation.");
       }
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not start remote Codex."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)} there.`); }
     finally { setBusy(false); }
-  }, [beginTurn, busy, loadRecoveryProjection, restoreOrigin, taskText, workspace]);
+  }, [beginTurn, busy, loadRecoveryProjection, origin, restoreOrigin, taskText, workspace]);
 
   /** Sending a folder from this device is always its own new conversation. */
   const proposeRemoteMovement = useCallback(async (roomId: string, hostRef: string, place: ConversationPlace) => {

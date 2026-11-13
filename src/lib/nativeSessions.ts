@@ -205,9 +205,6 @@ export function continuationAvailability(
    * last listed it (`null`: no longer listed; omitted: not known). */
   share?: Pick<SharedWorkspace, "label" | "readSessions" | "agentRequests"> | null,
 ): { allowed: boolean; reason: string } {
-  if (!onThisDevice && session.provider !== "codex") {
-    return { allowed: false, reason: `Continuing a Claude Code session on another device is not available: a background Claude Code session can outlive Pastey on ${hostName}, and its outcome could be lost. Continue it on ${hostName}.` };
-  }
   if (session.resume.verdict === "unsafe") {
     return {
       allowed: false,
@@ -215,21 +212,59 @@ export function continuationAvailability(
         ? liveSourceKind(session.live?.source ?? "") === "pastey"
           ? "A Pastey task is running a turn in this thread now. Wait for it to finish, then look again."
           : `This Codex thread is open in another Codex client on ${hostName} (the Codex app or a terminal). Close it there, then look again.`
-        : "A Claude Code process holds this session (the desktop app, a terminal or a background session). Let it finish or close it, then look again.",
+        : `A Claude Code process on ${hostName} holds this session (the desktop app, a terminal or a background session). Let it finish or close it, then look again.`,
     };
   }
+  // On another device, either Agent needs the folder shared for both
+  // reading and agent requests, and a turn marker to check against.
+  const remoteProblem = onThisDevice ? null
+    : share === null ? `${hostName} no longer shares this folder with this Bridge. Look for sessions again.`
+      : share && !(share.readSessions && share.agentRequests) ? `${hostName} shares ${share.label} for its sessions, but not for agent requests, so a continuation would be refused. ${shareLocation(hostName)} → ${share.label}, and turn on “Agent requests”.`
+        : !session.lastTurn.marker ? `${hostName} did not say which ${session.provider === "codex" ? "turn this thread" : "message this session"} ends with, so Pastey cannot check that it is unchanged. Update Pastey on ${hostName}.`
+          : null;
   if (session.provider === "codex") {
     if (session.lastTurn.outcome === "unreadable") return { allowed: false, reason: "This thread's history cannot be read, so it cannot be continued safely." };
+    if (remoteProblem) return { allowed: false, reason: remoteProblem };
     if (!onThisDevice) {
-      if (share === null) return { allowed: false, reason: `${hostName} no longer shares this folder with this Bridge. Look for sessions again.` };
-      if (share && !(share.readSessions && share.agentRequests)) return { allowed: false, reason: `${hostName} shares ${share.label} for its sessions, but not for agent requests, so a continuation would be refused. ${shareLocation(hostName)} → ${share.label}, and turn on “Agent requests”.` };
-      if (!session.lastTurn.marker) return { allowed: false, reason: `${hostName} did not say which turn this thread ends with, so Pastey cannot check that it is unchanged. Update Pastey on ${hostName}.` };
-      return { allowed: true, reason: `Someone on ${hostName} must Accept. Then Codex there reopens this thread, refusing if the Codex app or a terminal has it open, and Pastey checks that it still ends with the turn you see here.` };
+      return { allowed: true, reason: `Someone on ${hostName} must Accept (unless this device has Full Access there). Then Codex there reopens this thread, refusing if the Codex app or a terminal has it open, and Pastey checks that it still ends with the turn you see here.` };
     }
     return { allowed: true, reason: "Codex reopens this thread, refusing if the Codex app or a terminal has it open, and Pastey checks that it still ends with the turn you see here." };
   }
   if (session.resume.verdict === "unknown") {
     return { allowed: false, reason: `Pastey cannot show that nothing holds this session: ${session.resume.reasons.join("; ") || "no live source"}.` };
   }
-  return { allowed: true, reason: "Claude Code continues it under its own id only if nothing holds it at launch; otherwise Pastey stops the copy it starts and reports the outcome as unknown." };
+  if (remoteProblem) return { allowed: false, reason: remoteProblem };
+  const inPlace = "Claude Code continues this same session in its own folder, only while no other Claude Code process has it open, and Pastey checks that it still ends with the message you see here. If another process takes it as the turn starts, nothing is sent, or the outcome is reported as unknown; it is never silently copied.";
+  return onThisDevice
+    ? { allowed: true, reason: inPlace }
+    : { allowed: true, reason: `Someone on ${hostName} must Accept (unless this device has Full Access there). Then ${inPlace.charAt(0).toLowerCase()}${inPlace.slice(1)}` };
+}
+
+/** Claude Code's own effort levels, as its CLI lists them (`--effort`). */
+export const CLAUDE_CODE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/** Whether `provider`'s own model and effort can be chosen for one
+ * continuation from Pastey. Claude Code: its native `--model` / `--effort`
+ * were measured to apply to the same session (the model stays the session's
+ * for later turns, the effort applies to the turn). Codex: not yet. */
+export function sessionOptionsSupported(provider: NativeSessionProvider): boolean {
+  return provider === "claude_code";
+}
+
+/** A model the user typed, if it is an identifier the Host would accept
+ * (the Host checks again; the Agent itself decides whether it exists). */
+export function validModelChoice(model: string): boolean {
+  const value = model.trim();
+  return /^[A-Za-z0-9._:/@+[\]-]{1,96}$/.test(value)
+    && !/^[-/.~]/.test(value)
+    && !value.includes("//")
+    && !(value.length > 1 && value[1] === ":");
+}
+
+/** The options a continuation sends: only what the user chose. */
+export function chosenSessionOptions(model: string, effort: string): { model?: string; effort?: string } | null {
+  const options: { model?: string; effort?: string } = {};
+  if (model.trim()) options.model = model.trim();
+  if (effort) options.effort = effort;
+  return Object.keys(options).length ? options : null;
 }

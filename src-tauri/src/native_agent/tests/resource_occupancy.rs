@@ -75,7 +75,13 @@ fn codex_on_one_host_and_claude_code_on_another_run_at_once() {
     let mut host_b = host_with_codex_and_claude(&claude);
     start_blocked_codex(&mut host_a, &agent, "codex-on-a", &workspace);
     let on_b = host_b
-        .start_claude_session_task(&workspace, SESSION, "go on")
+        .start_claude_session_task(
+            &workspace,
+            SESSION,
+            "go on",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| claude.busy(), "Claude Code ran on Host B");
     assert!(running(&host_a, "codex-on-a"));
@@ -97,7 +103,13 @@ fn codex_and_claude_code_on_one_host_run_at_once_in_separate_folders() {
     let mut host = host_with_codex_and_claude(&claude);
     start_blocked_codex(&mut host, &agent, "codex-task", &workspace);
     let claude_task = host
-        .start_claude_session_task(&sibling, SESSION, "go on")
+        .start_claude_session_task(
+            &sibling,
+            SESSION,
+            "go on",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| claude.busy(), "Claude Code ran beside Codex");
     assert!(running(&host, "codex-task"));
@@ -130,8 +142,14 @@ fn claude_code_is_refused_a_folder_codex_holds_by_any_name_or_nesting() {
     }
     for name in &names {
         assert!(
-            host.start_claude_session_task(name, SESSION, "go on")
-                .is_err(),
+            host.start_claude_session_task(
+                name,
+                SESSION,
+                "go on",
+                None,
+                &crate::native_agent::NativeSessionOptionsV1::default()
+            )
+            .is_err(),
             "{} is the folder Codex holds",
             name.display()
         );
@@ -144,7 +162,13 @@ fn claude_code_is_refused_a_folder_codex_holds_by_any_name_or_nesting() {
 
     release_codex(&host, "codex-task", &workspace);
     let after = host
-        .start_claude_session_task(&workspace, SESSION, "go on")
+        .start_claude_session_task(
+            &workspace,
+            SESSION,
+            "go on",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| claude.busy(), "Claude Code ran once Codex was done");
     finish_claude(&host, &claude, &after.task_id);
@@ -160,7 +184,13 @@ fn codex_is_refused_a_folder_claude_code_holds() {
     let claude = FixtureV1::in_workspace("manual", &workspace);
     let mut host = host_with_codex_and_claude(&claude);
     let claude_task = host
-        .start_claude_session_task(&workspace, SESSION, "go on")
+        .start_claude_session_task(
+            &workspace,
+            SESSION,
+            "go on",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| claude.busy(), "Claude Code ran");
     for folder in [&workspace, &nested] {
@@ -188,7 +218,13 @@ fn workspace_movement_respects_a_folder_claude_code_holds_and_holds_its_own_sour
     let claude = FixtureV1::in_workspace("manual", &source.join("module"));
     let mut host = host_with_codex_and_claude(&claude);
     let claude_task = host
-        .start_claude_session_task(&source.join("module"), SESSION, "go on")
+        .start_claude_session_task(
+            &source.join("module"),
+            SESSION,
+            "go on",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| claude.busy(), "Claude Code ran in the source");
     host.propose_bridge_workspace_movement(
@@ -216,7 +252,13 @@ fn workspace_movement_respects_a_folder_claude_code_holds_and_holds_its_own_sour
         .approve_workspace_movement("movement-1", "room-1", "host:source", &root)
         .unwrap();
     assert!(host
-        .start_claude_session_task(&source.join("module"), SESSION, "again")
+        .start_claude_session_task(
+            &source.join("module"),
+            SESSION,
+            "again",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
         .is_err());
     assert_eq!(claude.launches(), 1);
     crate::regular_file_set_transfer::cleanup_package(&package);

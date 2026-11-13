@@ -44,7 +44,7 @@ import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } 
 import { bridgeInternetLine, internetSettingLine, relayUrlProblem } from "../src/lib/internetStatus";
 import { controlLine, expiryLabel, FULL_ACCESS_ENDS, fullAccessAllows, fullAccessLimits, processRightsWarning, remoteStartLine } from "../src/lib/fullAccess";
 import { nativeDecisionPresentation, nativeDecisionsAwaitUser, nativeFileChangeLabel } from "../src/lib/nativeDecisions";
-import { continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionStatusPresentation, type SessionView } from "../src/lib/nativeSessions";
+import { chosenSessionOptions, continuationAvailability, continuationChip, evidenceGroups, localSessionView, remoteOutcomeMessage, resumeLabel, sessionFilters, sessionHoldLine, sessionPersistenceLine, sessionOptionsSupported, sessionStatusPresentation, validModelChoice, type SessionView } from "../src/lib/nativeSessions";
 import { taskOutcome, taskStages } from "../src/lib/nativeTaskOutcome";
 import { conversationTitle, createLookGate, mergeSessionRead, nativeSessionKey, reconcileWithCurrent, sameNativeSession, type SessionListState } from "../src/lib/sessionList";
 import { agentConfigLine, conversationConfig, effortLabel, presentAgentConfig } from "../src/lib/nativeAgentConfig";
@@ -627,9 +627,13 @@ test("A selected remote Host shows its own advertised Codex availability", () =>
   // state, even while it is disconnected (it is chosen by HostRef).
   // On this device, the Agent the view runs with decides (Codex or Claude
   // Code); another device runs Codex only.
-  assert.match(card, /const availability: NativeAgentTargetAvailability = targetHostRef\s*\? nativeAgentTargetAvailability\(CODEX_AGENT_ID, remoteCapabilities\.observation\)\s*: localAvailability\(agent\.capabilities\.find\(\(capability\) => capability\.agentId === viewAgent\)\);/);
-  assert.match(card, /const viewAgent: ConversationAgentId = targetHostRef \? CODEX_AGENT_ID/);
-  assert.match(card, /onChooseAgent=\{targetHostRef \|\| shownView\?\.kind === "current" \? undefined : chooseLocalAgent\}/);
+  assert.match(card, /const availability: NativeAgentTargetAvailability = targetHostRef\s*\? nativeAgentTargetAvailability\(viewAgent, remoteCapabilities\.observation\)\s*: localAvailability\(agent\.capabilities\.find\(\(capability\) => capability\.agentId === viewAgent\)\);/);
+  // Another device's Agents are what it advertises; Claude Code is offered
+  // there only in a folder it shares, and a typed path or a sent folder
+  // runs Codex.
+  assert.match(card, /const agentChoosable = !targetHostRef \|\| choice\?\.kind === "shared";/);
+  assert.match(card, /agentChoosable \? localAgent : CODEX_AGENT_ID/);
+  assert.match(card, /onChooseAgent=\{!agentChoosable \|\| shownView\?\.kind === "current" \? undefined : chooseLocalAgent\}/);
   assert.match(composer, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
   assert.match(lifecycle, /listRemoteNativeAgentCapabilities\(roomId, hostRef\)/);
   assert.match(bindings, /invoke\("list_remote_native_agent_capabilities", \{ roomId, targetHostRef \}\)/);
@@ -674,7 +678,7 @@ test("Continued and new Agent conversations are shown only once confirmed, and a
   assert.match(card, /const conversationRan = current && agent\.origin\?\.kind === "new"/);
   assert.match(card, /const followUp = conversationRan && kind !== "send";/);
   assert.match(card, /agent\.start\(place, followUp, agentId\)/);
-  assert.match(card, /agent\.startRemote\(roomId, remote\.peerSessionId, targetHostRef, place, followUp\)/);
+  assert.match(card, /agent\.startRemote\(roomId, remote\.peerSessionId, targetHostRef, place, followUp, agentId\)/);
   assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), sent, !followUp\)/);
   assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, sent, followUp, shared\?\.label \?\? null\)/);
   assert.match(lifecycle, /const start = useCallback\(async \(place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID\)/);
@@ -682,7 +686,7 @@ test("Continued and new Agent conversations are shown only once confirmed, and a
   assert.match(lifecycle, /const agentId = followUp && origin\?\.kind === "new" \? conversationAgent\(origin\) : chosen;/);
   assert.match(lifecycle, /startNativeClaudeCodeTask\(workspace\.trim\(\), sent, !followUp\)/);
   assert.match(bindings, /invoke\("start_native_claude_code_task", \{ workspace, task, newConversation \}\)/);
-  assert.match(lifecycle, /const startRemote = useCallback\(async \(roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false\)/);
+  assert.match(lifecycle, /const startRemote = useCallback\(async \(roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID\)/);
   // A follow-up stays in the conversation its view began; anything else
   // begins a new one, with its own id.
   // …and with the same Agent: a follow-up never crosses into another Agent's conversation.
@@ -837,7 +841,9 @@ test("Full Access is one informed, directional decision made only on the control
   assert.equal(processRightsWarning("standard"), null);
   assert.match(processRightsWarning("administrator") ?? "", /running as administrator[\s\S]*administrator rights too, with no UAC prompt/);
   assert.match(processRightsWarning("unknown") ?? "", /Whatever rights it has, the other device gets/);
-  assert.match(limits, /Claude Code sessions here can still be continued only on this device/);
+  assert.match(allows, /Run Claude Code, with this device's own Claude Code sign-in, settings and permission rules, in folders shared with School Mac or opened by School Mac/);
+  assert.match(limits, /Pastey never answers Claude Code's own permission prompts either/);
+  assert.doesNotMatch(limits, /Claude Code sessions here can still be continued only on this device/);
   assert.match(FULL_ACCESS_ENDS.join(" "), /Revoke Full Access[\s\S]*Forget or revoke the device[\s\S]*Burn this Bridge, or pair it with another device/);
   assert.match(controlLine("Home PC", true), /start there without anyone accepting them/);
   assert.match(controlLine("Home PC", false), /waits for someone at Home PC to click Accept[\s\S]*turns on Full Access for this device in that Bridge's details on Home PC/);
@@ -1066,15 +1072,17 @@ test("the sessions card continues only this device's own sessions and never gran
   // permission showed, never a path.
   assert.equal(card.match(/continueNativeSession\(/g)?.length, 1);
   assert.equal(card.match(/continueRemoteNativeSession\(/g)?.length, 1);
-  assert.match(card, /continueNativeSession\(\{ workspaces: \[folder\], provider: view\.provider, sessionId: view\.sessionId, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null \}\)/);
-  assert.match(card, /continueRemoteNativeSession\(\{ roomId: route\.roomId, peerSessionId: route\.peerSessionId, targetHostRef: route\.hostRef, provider: view\.provider, sessionId: view\.sessionId, scopeRef: view\.scopeRef, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null \}\)/);
+  assert.match(card, /continueNativeSession\(\{ workspaces: \[folder\], provider: view\.provider, sessionId: view\.sessionId, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null, \.\.\.\(options \? \{ options \} : \{\}\) \}\)/);
+  // The Agent's own model and effort only as chosen here, only for Claude Code.
+  assert.match(card, /const options = optionsSupported \? chosenSessionOptions\(model, effort\) : null;/);
+  assert.match(card, /continueRemoteNativeSession\(\{ roomId: route\.roomId, peerSessionId: route\.peerSessionId, targetHostRef: route\.hostRef, provider: view\.provider, sessionId: view\.sessionId, scopeRef: view\.scopeRef, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null, options \}\)/);
   assert.match(card, /continuationAvailability\(view, !route, hostName, share\)/);
   assert.match(card, /agent\.adoptTask\(started, route\?\.hostRef \?\? null, continued, text\)/);
   // The continued session is named by provider and id, kept here only.
   assert.match(card, /const continued: ContinuedSession = \{ provider: view\.provider, sessionId: view\.sessionId, title: view\.title, workspaceLabel: view\.workspaceLabel, scopeRef: view\.scopeRef \};/);
   // Nothing is sent twice from here: not while sending, not while a turn of
   // this session or another task runs, and not when it cannot be continued.
-  assert.match(card, /if \(!view \|\| !availability\?\.allowed \|\| !prompt\.trim\(\) \|\| sending \|\| active \|\| otherActive \|\| !snapshot\) return;/);
+  assert.match(card, /if \(!view \|\| !availability\?\.allowed \|\| !prompt\.trim\(\) \|\| sending \|\| active \|\| otherActive \|\| !snapshot \|\| modelInvalid\) return;/);
   assert.match(card, /its own account, not verified/);
   assert.match(settings, /Trusting a device does not let it read anything/);
   // Settings gathers every share and can end it; creating one happens in its Bridge.
@@ -1356,7 +1364,7 @@ test("Bridge access guidance keeps each authority separate and says where it is 
   assert.match(allowed.detail, /PasteySessionTest/);
   const both = remoteAccessGuidance(accessFacts({ sharing: { state: "known", workspaces: [sharedFolder({ readSessions: true, agentRequests: true })] } })).find((line) => line.id === "continue")!;
   assert.equal(both.state, "decided_there");
-  assert.match(both.detail, /Codex threads in PasteySessionTest: each continuation waits for someone on DESKTOP-DMI2L9P to click Accept/);
+  assert.match(both.detail, /Codex threads and Claude Code sessions in PasteySessionTest: each continuation waits for someone on DESKTOP-DMI2L9P to click Accept/);
   // A run that waited in Review is reported, not guessed beforehand.
   assert.match(remoteAccessGuidance(accessFacts({ lastRunWaitedForAccept: true })).find((line) => line.id === "run")!.detail, /has not given this device Full Access/);
   // Full Access is reported as that device said, and then nothing waits.
@@ -1498,15 +1506,34 @@ test("Sessions follow the Agents device and mark the ones Pastey started", () =>
 test("A session is offered for continuation only where the Host would accept it", () => {
   const base = sessionView({ provider: "codex", resume: { verdict: "safe", reasons: [] } });
   assert.equal(continuationAvailability(base, true).allowed, true);
-  // Another device: a Codex thread only with the marker to check against,
-  // and only after that device's Accept; Claude Code never.
+  // Another device: either Agent's session only with the marker to check
+  // against, and only after that device's Accept (or under Full Access).
   const remoteCodex = continuationAvailability({ ...base, lastTurn: { ...base.lastTurn, marker: "turn-9" } }, false, "DESKTOP");
   assert.equal(remoteCodex.allowed, true);
   assert.match(remoteCodex.reason, /Someone on DESKTOP must Accept/);
   assert.equal(continuationAvailability({ ...base, lastTurn: { ...base.lastTurn, marker: null } }, false, "DESKTOP").allowed, false);
-  const remoteClaude = continuationAvailability(sessionView({ provider: "claude_code" }), false, "DESKTOP");
-  assert.equal(remoteClaude.allowed, false);
-  assert.match(remoteClaude.reason, /outlive Pastey on DESKTOP/);
+  const remoteClaude = sessionView({ provider: "claude_code", resume: { verdict: "safe", reasons: [] } });
+  const unmarked = continuationAvailability({ ...remoteClaude, lastTurn: { ...remoteClaude.lastTurn, marker: null } }, false, "DESKTOP");
+  assert.equal(unmarked.allowed, false);
+  assert.match(unmarked.reason, /did not say which message this session ends with/);
+  const marked = continuationAvailability({ ...remoteClaude, lastTurn: { ...remoteClaude.lastTurn, marker: "a-1" } }, false, "DESKTOP");
+  assert.equal(marked.allowed, true);
+  assert.match(marked.reason, /Someone on DESKTOP must Accept[\s\S]*only while no other Claude Code process has it open[\s\S]*never silently copied/);
+  const notShared = continuationAvailability({ ...remoteClaude, lastTurn: { ...remoteClaude.lastTurn, marker: "a-1" } }, false, "DESKTOP", { label: "app", readSessions: true, agentRequests: false });
+  assert.equal(notShared.allowed, false);
+  assert.match(notShared.reason, /not for agent requests/);
+  const heldThere = continuationAvailability({ ...remoteClaude, resume: { verdict: "unsafe", reasons: [] } }, false, "DESKTOP");
+  assert.equal(heldThere.allowed, false);
+  assert.match(heldThere.reason, /A Claude Code process on DESKTOP holds this session/);
+  // Model and effort: only Claude Code's, only identifiers, only as chosen.
+  assert.equal(sessionOptionsSupported("claude_code"), true);
+  assert.equal(sessionOptionsSupported("codex"), false);
+  assert.equal(validModelChoice("claude-haiku-5-5"), true);
+  assert.equal(validModelChoice("sonnet"), true);
+  for (const bad of ["--dangerously-skip-permissions", "two words", "/etc/model", "C:model", "a//b"]) assert.equal(validModelChoice(bad), false, bad);
+  assert.equal(chosenSessionOptions("", ""), null);
+  assert.deepEqual(chosenSessionOptions(" haiku ", "low"), { model: "haiku", effort: "low" });
+  assert.deepEqual(chosenSessionOptions("", "max"), { effort: "max" });
   // Held by the Codex app or a terminal.
   const held = continuationAvailability({ ...base, resume: { verdict: "unsafe", reasons: [] } }, true);
   assert.equal(held.allowed, false);

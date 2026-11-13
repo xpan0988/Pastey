@@ -332,7 +332,7 @@ fn resolve(
         &h.paths,
         device,
         binding,
-        capability,
+        crate::native_agent::PeerFolderContractV1::of_product_capability(capability).as_ref(),
         input,
         storage::now_ts(),
     )
@@ -584,18 +584,81 @@ fn a_peer_never_chooses_the_path_and_a_path_stays_a_path() {
         &with_path
     )
     .is_err());
-    // Other capabilities are untouched.
+    // A capability whose adapter names no shared folder is untouched.
     assert_eq!(
         resolve(
             &h,
             Some(&device),
             &binding,
-            "agent.coding.claude_code",
+            "fake.longjob.v1",
             &codex_run(&reference)
         )
         .unwrap(),
         None
     );
+}
+
+#[test]
+fn claude_code_peers_need_the_same_switches_as_codex_peers() {
+    let h = FixtureV1::new();
+    let (binding, device) = h.proven(BRIDGE, "s1");
+    let now = storage::now_ts();
+    h.trust(&device);
+    let view = h.grant(&device, false);
+    let reference = shared_workspaces(&h.paths, &device, &binding, now).unwrap()[0]
+        .scope_ref
+        .clone();
+    let options = crate::native_agent::NativeSessionOptionsV1::default();
+    let session = "66666666-6666-4666-8666-666666666666";
+    let run = crate::native_agent::claude_code_conversation_peer_input(&reference, "fix it", true)
+        .unwrap();
+    let continue_there = crate::native_agent::claude_code_session_peer_input(
+        &reference,
+        session,
+        "go on",
+        Some("a-1"),
+        &options,
+    )
+    .unwrap();
+    let conversation = crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY;
+    let continuation = crate::native_agent::CLAUDE_CODE_SESSION_CAPABILITY;
+    let update = |read, run| UpdateWorkspaceShareV1 {
+        grant_id: view.grant_id.clone(),
+        read_sessions: read,
+        share_excerpts: false,
+        agent_requests: run,
+        duration_hours: None,
+    };
+    // Sessions only: neither runs nor continues.
+    update_share(&h.paths, &update(true, false), now).unwrap();
+    assert!(resolve(&h, Some(&device), &binding, conversation, &run).is_err());
+    assert!(resolve(&h, Some(&device), &binding, continuation, &continue_there).is_err());
+    // Agent requests only: runs, but continuing needs reading too.
+    update_share(&h.paths, &update(false, true), now).unwrap();
+    let resolved = resolve(&h, Some(&device), &binding, conversation, &run)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&resolved).unwrap()["workspace"],
+        h.workspace.to_string_lossy().as_ref()
+    );
+    assert!(resolve(&h, Some(&device), &binding, continuation, &continue_there).is_err());
+    // Both: continuing resolves to this Host's own folder.
+    update_share(&h.paths, &update(true, true), now).unwrap();
+    let continued = serde_json::to_value(
+        resolve(&h, Some(&device), &binding, continuation, &continue_there)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        continued["workspace"],
+        h.workspace.to_string_lossy().as_ref()
+    );
+    assert_eq!(continued["sessionId"], session);
+    assert_eq!(continued["expectedMarker"], "a-1");
+    // No proven device: nothing is shared with it.
+    assert!(resolve(&h, None, &binding, continuation, &continue_there).is_err());
 }
 
 #[test]

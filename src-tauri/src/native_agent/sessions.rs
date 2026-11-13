@@ -14,6 +14,13 @@
 //! reported as a claim, not as proof.
 
 pub(crate) mod claude;
+
+/// Tests: a Claude Code transcript's last main-chain entry, as discovery
+/// reports it (two-Host tests, Unix only).
+#[cfg(all(test, unix))]
+pub(crate) fn claude_transcript_marker(path: &Path) -> Option<String> {
+    claude::transcript_end(path)?.1
+}
 mod codex;
 pub(crate) mod remote;
 
@@ -263,6 +270,10 @@ pub(crate) struct NativeSessionContinueV1 {
     /// session no longer ends with it.
     #[serde(default)]
     pub(crate) expected_marker: Option<String>,
+    /// The Agent's own model or effort, only as the user chose them for this
+    /// turn. Refused by a provider that cannot apply them to the session.
+    #[serde(default)]
+    pub(crate) options: crate::native_agent::NativeSessionOptionsV1,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

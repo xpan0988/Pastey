@@ -1,29 +1,43 @@
-//! Claude Code: continuing one existing session that this Host's user chose
-//! (native session continuation, S2).
+//! Claude Code: continuing one existing session that this Host's user, or
+//! a Bridge peer allowed to read and run in its folder, chose (native
+//! session continuation, S2). The session continues under its own id, in
+//! its own folder, with its own history; it is never copied or replaced.
 //!
-//! The only mechanism used is Claude Code's own `claude --bg --resume <id>`.
-//! It continues the session under the same id only when no Claude Code
-//! process holds it; when one does, it starts a copy instead and says so. A
-//! headless `claude -p --resume` gives no such guarantee: two of them write
-//! one session at once. Pastey additionally checks `claude agents --json`
-//! right before launching, and refuses while any process holds the session.
+//! Two of Claude Code's own mechanisms, one per run:
+//! - **Background** (macOS and Linux, no options): `claude --bg --resume
+//!   <id> -- <prompt>`. It continues the session under the same id only when
+//!   no Claude Code process holds it; when one does, it starts a copy and
+//!   says so. Given any option it also starts a copy, so it carries none.
+//!   The background session runs under Claude Code's own supervisor and
+//!   outlives Pastey (measured): after a restart the turn is observed again
+//!   from the registry and the transcript, never launched again. When the
+//!   turn ends Pastey stops it (`claude stop`, which keeps the conversation).
+//! - **Headless** (Windows, where `--bg` and its supervisor were never
+//!   measured; and everywhere when the user chose Claude Code's own model or
+//!   effort for this turn): the contained `claude -p --resume <id>` run the
+//!   conversation adapter uses (`conversation::HeadlessContinuationV1`). It
+//!   ends with Pastey's process (lifeline, or a Job Object on Windows). A
+//!   headless run does not refuse a held session by itself (measured: two
+//!   write one session at once), so nothing is sent until Claude Code's
+//!   registry lists the run Pastey started as the session's only holder,
+//!   and a completed turn whose prompt does not follow the entry its user
+//!   saw is never reported as done. `--model` and `--effort` were measured
+//!   (2.1.318) to apply to the same session: the model stays the session's
+//!   for later turns, the effort applies to the turn.
 //!
-//! Pastey passes only the prompt, no other option: Claude Code starts a copy
-//! when a background session is resumed with options other than its own.
-//! The session keeps its own permission settings, and its approvals belong
-//! to Claude Code's own clients (`claude attach`); Pastey never answers one.
-//! When the turn ends, Pastey stops the background session (`claude stop`,
-//! which keeps the conversation) so the session is free again.
+//! Before either, right before launching: the transcript is this folder's,
+//! still ends with the entry its user saw, and `claude agents --json` lists
+//! no process holding the session. Otherwise nothing is sent. Claude Code
+//! keeps no writer lock: a client that opens the session afterwards is not
+//! prevented by Claude Code.
 //!
-//! A background session runs under Claude Code's own supervisor, not under
-//! Pastey, and outlives Pastey's process (measured). So after a restart the
-//! turn's outcome is unknown: the adapter observes the same session again
-//! from what its start recorded, never launching anything, until the
-//! registry and the transcript show how it ended.
+//! Pastey passes only the prompt (and options its user chose). The session
+//! keeps its own permission settings; its approvals belong to Claude Code's
+//! own clients, and Pastey never answers one.
 //!
-//! This adapter advertises no peer protocol: a Bridge peer cannot invoke it.
-//! It is unavailable on Windows: `--bg`, `claude stop` and Claude Code's
-//! supervisor have not been measured there.
+//! A Bridge peer names the folder only by its share reference
+//! (`resolve_peer_input`); continuing needs that share's Sessions and Agent
+//! requests, and Core's admission (Review or Full Access).
 
 use std::{
     collections::HashMap,
@@ -48,11 +62,14 @@ use super::{
 };
 use crate::error::{AppError, AppResult};
 use crate::native_agent::sessions::claude::{
-    claude_config_dir, find_cli, live_status, project_dir, transcript_cwd, turn_after_prompt,
-    valid_session_id,
+    claude_config_dir, find_cli, live_status, project_dir, transcript_cwd, transcript_end,
+    turn_after_prompt, valid_session_id,
 };
 use crate::native_agent::sessions::{in_workspaces, now_ms, LastTurnV1};
-use crate::native_agent::{NativeAgentCapabilityStateV1, NativeTurnOutcomeV1, MAX_TASK_BYTES};
+use crate::native_agent::{
+    NativeAgentCapabilityStateV1, NativeSessionOptionsV1, NativeTurnOutcomeV1,
+    GENERIC_NATIVE_INVOKE_PROTOCOLS, MAX_TASK_BYTES,
+};
 
 pub(in crate::native_agent) mod conversation;
 #[cfg(windows)]
@@ -61,8 +78,6 @@ pub(in crate::native_agent) mod job;
 pub(in crate::native_agent) mod lifeline;
 
 pub(in crate::native_agent) const CLAUDE_CODE_CAPABILITY_ID: &str = "agent.coding.claude_code";
-/// No peer protocol: continuation is local to this Host's user.
-const NO_PEER_PROTOCOLS: [&str; 0] = [];
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_POLL: Duration = Duration::from_secs(1);
@@ -80,6 +95,47 @@ struct ContinueInputV1 {
     session_id: String,
     workspace: String,
     prompt: String,
+    /// The session's last main-chain entry when its user looked at it.
+    #[serde(default)]
+    expected_marker: Option<String>,
+    #[serde(default)]
+    options: NativeSessionOptionsV1,
+}
+
+/// What a Bridge peer sends: the folder only as the reference of a folder
+/// this Host shares with it, never a path.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeerContinueInputV1 {
+    scope_ref: String,
+    session_id: String,
+    prompt: String,
+    expected_marker: Option<String>,
+    #[serde(default)]
+    options: NativeSessionOptionsV1,
+}
+
+/// Which of Claude Code's mechanisms continues a session (see the module).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MechanismV1 {
+    Background,
+    Headless,
+}
+
+fn mechanism(options: &NativeSessionOptionsV1) -> MechanismV1 {
+    if cfg!(windows) || !options.is_empty() {
+        MechanismV1::Headless
+    } else {
+        MechanismV1::Background
+    }
+}
+
+fn valid_marker(marker: &str) -> bool {
+    !marker.is_empty()
+        && marker.len() <= 64
+        && marker
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 fn parse(input: &OpaqueCapabilityPayloadV1) -> AppResult<ContinueInputV1> {
@@ -95,6 +151,16 @@ fn parse(input: &OpaqueCapabilityPayloadV1) -> AppResult<ContinueInputV1> {
             "Claude Code prompt is empty or exceeds its bound.".into(),
         ));
     }
+    if parsed
+        .expected_marker
+        .as_deref()
+        .is_some_and(|marker| !valid_marker(marker))
+    {
+        return Err(AppError::InvalidInput(
+            "Claude Code continuation names an invalid entry.".into(),
+        ));
+    }
+    parsed.options.validate()?;
     if !Path::new(&parsed.workspace).is_dir() {
         return Err(AppError::InvalidInput(
             "Claude Code workspace is unavailable.".into(),
@@ -120,15 +186,76 @@ pub(in crate::native_agent) fn continue_input(
     session_id: &str,
     workspace: &Path,
     prompt: &str,
+    expected_marker: Option<&str>,
+    options: &NativeSessionOptionsV1,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
     let input = OpaqueCapabilityPayloadV1::new(json!({
         "sessionId": session_id,
         "workspace": workspace.to_string_lossy(),
         "prompt": prompt,
+        "expectedMarker": expected_marker,
+        "options": options,
     }));
     input.validate()?;
     parse(&input)?;
     Ok(input)
+}
+
+/// The input a requesting device sends to continue `session_id` in a folder
+/// another Host shares with it, named by `scope_ref`.
+pub(in crate::native_agent) fn peer_input(
+    scope_ref: &str,
+    session_id: &str,
+    prompt: &str,
+    expected_marker: Option<&str>,
+    options: &NativeSessionOptionsV1,
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    if !valid_session_id(session_id) {
+        return Err(AppError::InvalidInput(
+            "Claude Code session id is invalid.".into(),
+        ));
+    }
+    if prompt.trim().is_empty() || prompt.len() > MAX_TASK_BYTES {
+        return Err(AppError::InvalidInput(
+            "Claude Code prompt is empty or exceeds its bound.".into(),
+        ));
+    }
+    options.validate()?;
+    let input = OpaqueCapabilityPayloadV1::new(json!({
+        "scopeRef": scope_ref,
+        "sessionId": session_id,
+        "prompt": prompt,
+        "expectedMarker": expected_marker,
+        "options": options,
+    }));
+    input.validate()?;
+    Ok(input)
+}
+
+/// The executing Host's own input for a peer's: its shared folder for the
+/// reference. A path from a peer is refused (unknown field), and so is a
+/// reference it may not use for continuing.
+fn resolve_peer_input(
+    input: &OpaqueCapabilityPayloadV1,
+    shared: &[(String, PathBuf)],
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    let peer: PeerContinueInputV1 = serde_json::from_value(input.value().clone())
+        .map_err(|_| AppError::InvalidInput("Claude Code continuation input is invalid.".into()))?;
+    let Some((_, workspace)) = shared
+        .iter()
+        .find(|(scope_ref, _)| *scope_ref == peer.scope_ref)
+    else {
+        return Err(AppError::InvalidInput(
+            "This device may not read sessions in that folder, so it may not continue them.".into(),
+        ));
+    };
+    continue_input(
+        &peer.session_id,
+        workspace,
+        &peer.prompt,
+        peer.expected_marker.as_deref(),
+        &peer.options,
+    )
 }
 
 /// What one task's run shares with `cancel` and `release`.
@@ -147,6 +274,8 @@ pub(in crate::native_agent) struct ClaudeCodeNativeAdapterV1 {
     poll: Mutex<Duration>,
     runs: Arc<Mutex<HashMap<String, Arc<RunControlV1>>>>,
     observed: Mutex<Option<(Instant, CapabilityAvailabilityV1)>>,
+    /// The contained headless runs (see the module).
+    headless: conversation::HeadlessContinuationV1,
 }
 
 impl Default for ClaudeCodeNativeAdapterV1 {
@@ -157,6 +286,7 @@ impl Default for ClaudeCodeNativeAdapterV1 {
             poll: Mutex::new(DEFAULT_POLL),
             runs: Arc::default(),
             observed: Mutex::new(None),
+            headless: conversation::HeadlessContinuationV1::default(),
         }
     }
 }
@@ -185,6 +315,14 @@ impl ClaudeCodeNativeAdapterV1 {
         *self.config_dir.lock().unwrap() = Some(config_dir.to_path_buf());
         *self.poll.lock().unwrap() = Duration::from_millis(20);
         *self.observed.lock().unwrap() = None;
+        self.headless.use_fixture(config_dir);
+    }
+
+    /// Tests: the installed `claude`, its headless runs under a real
+    /// lifeline helper (the built `pastey` executable).
+    #[cfg(all(test, unix))]
+    pub(in crate::native_agent) fn use_lifeline_helper(&self, helper: &Path) {
+        self.headless.use_lifeline_helper(helper);
     }
 
     /// Tests: every run of this adapter stops observing silently, as if its
@@ -194,6 +332,7 @@ impl ClaudeCodeNativeAdapterV1 {
         for control in self.runs.lock().unwrap().values() {
             control.abandoned.store(true, Ordering::Release);
         }
+        self.headless.abandon_runs();
     }
 
     fn run_for(
@@ -202,6 +341,7 @@ impl ClaudeCodeNativeAdapterV1 {
         cli: PathBuf,
         recovery: RecoveryV1,
         reobserving: bool,
+        expected_marker: Option<String>,
     ) -> Option<ClaudeSessionRunV1> {
         let config_dir = self.config_dir()?;
         let control = Arc::new(RunControlV1::default());
@@ -219,6 +359,7 @@ impl ClaudeCodeNativeAdapterV1 {
             prompt: recovery.prompt,
             since_ms: recovery.since_ms,
             reobserving,
+            expected_marker,
             poll: self.poll(),
             control,
             runs: self.runs.clone(),
@@ -269,11 +410,21 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
             }
         }
         let report = match self.cli() {
-            _ if cfg!(windows) => CapabilityAvailabilityV1 {
-                state: NativeAgentCapabilityStateV1::Unavailable,
-                reason: Some("native_agent_platform_unverified"),
-                detail: Some("Pastey continues Claude Code background sessions only on macOS and Linux until they are validated on Windows.".into()),
-                backend: None,
+            // Windows continues every session with the contained headless
+            // run, which also needs the registry below.
+            Some(cli) if cfg!(windows) => match self.headless.availability(Some(cli.clone())) {
+                report if report.state != NativeAgentCapabilityStateV1::Available => report,
+                report => match live_status(&cli, "") {
+                    Ok(_) => report,
+                    Err(why) => CapabilityAvailabilityV1 {
+                        state: NativeAgentCapabilityStateV1::Incompatible,
+                        reason: Some("native_agent_incompatible"),
+                        detail: Some(format!(
+                            "Claude Code cannot report its active sessions: {why}."
+                        )),
+                        backend: None,
+                    },
+                },
             },
             None => CapabilityAvailabilityV1 {
                 state: NativeAgentCapabilityStateV1::Unavailable,
@@ -304,8 +455,23 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
         report
     }
 
+    /// A peer that may read the folder's sessions and ask to run agents
+    /// there may ask; each request waits for this Host's Review unless the
+    /// peer holds Full Access.
     fn supported_protocols(&self) -> &'static [&'static str] {
-        &NO_PEER_PROTOCOLS
+        &GENERIC_NATIVE_INVOKE_PROTOCOLS
+    }
+
+    fn peer_folder_use(&self) -> Option<super::PeerFolderUseV1> {
+        Some(super::PeerFolderUseV1::ContinueSession)
+    }
+
+    fn resolve_peer_input(
+        &self,
+        input: &OpaqueCapabilityPayloadV1,
+        shared: &[(String, PathBuf)],
+    ) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+        resolve_peer_input(input, shared).map(Some)
     }
 
     fn prepare(&self, input: &OpaqueCapabilityPayloadV1) -> AppResult<PreparedInvocationV1> {
@@ -341,30 +507,66 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
             .cli()
             .ok_or_else(|| AppError::InvalidInput("Claude Code is not installed.".into()))?;
         let host_workspace = Path::new(&parsed.workspace).canonicalize().ok();
+        let mechanism = mechanism(&parsed.options);
+        if mechanism == MechanismV1::Headless {
+            let report = self.headless.availability(Some(cli.clone()));
+            if report.state != NativeAgentCapabilityStateV1::Available {
+                return Err(AppError::InvalidInput(report.detail.unwrap_or_else(|| {
+                    "Claude Code cannot apply these options to the session here.".into()
+                })));
+            }
+        }
+        // Whichever mechanism runs, the turn is observed again after a
+        // restart from the same record: the registry and the transcript.
         let recovery = RecoveryV1 {
-            session_id: parsed.session_id,
-            workspace: parsed.workspace,
-            prompt: parsed.prompt,
+            session_id: parsed.session_id.clone(),
+            workspace: parsed.workspace.clone(),
+            prompt: parsed.prompt.clone(),
             since_ms: now_ms(),
         };
         let recovery_payload = OpaqueCapabilityPayloadV1::new(
             serde_json::to_value(&recovery).map_err(AppError::from)?,
         );
         recovery_payload.validate()?;
-        let run = self
-            .run_for(task_id, cli, recovery, false)
-            .ok_or_else(|| AppError::InvalidInput("Claude Code's store is unavailable.".into()))?;
+        let run: Box<dyn NativeInvocationRunV1> = match mechanism {
+            MechanismV1::Background => Box::new(
+                self.run_for(task_id, cli, recovery, false, parsed.expected_marker)
+                    .ok_or_else(|| {
+                        AppError::InvalidInput("Claude Code's store is unavailable.".into())
+                    })?,
+            ),
+            MechanismV1::Headless => {
+                let config_dir = self.config_dir().ok_or_else(|| {
+                    AppError::InvalidInput("Claude Code's store is unavailable.".into())
+                })?;
+                let workspace = host_workspace.clone().ok_or_else(|| {
+                    AppError::InvalidInput("Claude Code workspace is unavailable.".into())
+                })?;
+                self.headless.start(
+                    task_id,
+                    conversation::HeadlessSessionTurnV1 {
+                        cli,
+                        config_dir: &config_dir,
+                        workspace,
+                        session_id: parsed.session_id,
+                        prompt: parsed.prompt,
+                        expected_marker: parsed.expected_marker,
+                        options: parsed.options,
+                    },
+                )?
+            }
+        };
         Ok(StartedInvocationV1 {
             session_reused: true,
             conversation: None,
             host_workspace,
             recovery: Some(recovery_payload),
-            run: Box::new(run),
+            run,
         })
     }
 
     fn cancel(&self, task_id: &str) -> AppResult<()> {
-        if self.request_stop(task_id, false) {
+        if self.headless.cancel(task_id) || self.request_stop(task_id, false) {
             Ok(())
         } else {
             Err(AppError::InvalidInput(
@@ -374,6 +576,7 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
     }
 
     fn release(&self, task_id: &str) {
+        self.headless.release(task_id);
         self.request_stop(task_id, true);
     }
 
@@ -383,9 +586,11 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
                 control.stop.store(true, Ordering::Release);
             }
         }
+        self.headless.shutdown();
     }
 
-    /// No: a background session belongs to Claude Code's supervisor.
+    /// No: a background session belongs to Claude Code's supervisor, and a
+    /// headless run's end is observed, not assumed, after a restart.
     fn native_execution_ends_with_pastey(&self) -> bool {
         false
     }
@@ -400,7 +605,7 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
             return None;
         }
         let cli = self.cli()?;
-        let run = self.run_for(task_id, cli, recovery, true)?;
+        let run = self.run_for(task_id, cli, recovery, true, None)?;
         Some(Box::new(run))
     }
 }
@@ -416,6 +621,8 @@ struct ClaudeSessionRunV1 {
     since_ms: u64,
     /// Observing again after a restart: nothing is launched.
     reobserving: bool,
+    /// The session's last main-chain entry when its user looked at it.
+    expected_marker: Option<String>,
     poll: Duration,
     control: Arc<RunControlV1>,
     runs: Arc<Mutex<HashMap<String, Arc<RunControlV1>>>>,
@@ -585,6 +792,12 @@ impl ClaudeSessionRunV1 {
             .ok_or("The session's transcript is not in this workspace.")?;
         in_workspaces(&cwd, std::slice::from_ref(&self.workspace))
             .ok_or("The session ran in another workspace.")?;
+        if let Some(expected) = self.expected_marker.as_deref() {
+            let marker = transcript_end(&self.transcript).and_then(|(_, marker)| marker);
+            if marker.as_deref() != Some(expected) {
+                return Err("This session changed since it was looked at, so nothing was sent. Look at it again before continuing.".into());
+            }
+        }
         match live_status(&self.cli, &self.session_id) {
             Ok(None) => Ok(()),
             Ok(Some(status)) => Err(format!("Another Claude Code process holds the session ({status}); nothing was sent.")),

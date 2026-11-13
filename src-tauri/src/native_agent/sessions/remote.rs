@@ -319,9 +319,8 @@ fn valid_config(
     provider: &str,
     scope: AgentConfigScopeV1,
 ) -> bool {
-    config.is_none_or(|config| {
-        config.is_valid() && config.agent == provider && config.scope == scope
-    })
+    config
+        .is_none_or(|config| config.is_valid() && config.agent == provider && config.scope == scope)
 }
 
 fn valid_provider(provider: &str) -> bool {

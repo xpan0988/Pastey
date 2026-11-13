@@ -152,7 +152,7 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
     if (place.kind !== "shared") rememberWorkspace(memoryKey, agent.workspace.trim());
     if (!remote || !targetHostRef) return agent.start(place, followUp, agentId);
     if (readiness.action === "review_movement") return agent.proposeRemoteMovement(roomId, targetHostRef, place);
-    return agent.startRemote(roomId, remote.peerSessionId, targetHostRef, place, followUp);
+    return agent.startRemote(roomId, remote.peerSessionId, targetHostRef, place, followUp, agentId);
   }
 
   const showTurns = current && (agent.origin?.kind === "new" || (!agent.origin && (agent.status || agent.movement)));
@@ -255,23 +255,25 @@ export function codexUnavailableCopy(reason: string | null | undefined, where: s
   }
 }
 
-/** What to tell the user about an unusable Claude Code on this device. */
-export function claudeCodeUnavailableCopy(reason: string | null | undefined): string {
+/** What to tell the user about an unusable Claude Code on `where` (this
+ * device, or another one, which only says why by its reason code). */
+export function claudeCodeUnavailableCopy(reason: string | null | undefined, where = "this device"): string {
+  const on = where === "this device" ? "" : ` on ${where}`;
   switch (reason) {
     case "native_agent_not_installed":
-      return "Claude Code is not installed on this device, or Pastey cannot find the claude command. Check that “claude --version” works in a new terminal; if Claude Code was installed after Pastey started, quit Pastey and open it again.";
+      return `Claude Code is not installed on ${where}, or Pastey there cannot find the claude command. Check that “claude --version” works in a new terminal${on}; if Claude Code was installed after Pastey started, quit Pastey and open it again.`;
     case "native_agent_signed_out":
-      return "Claude Code is installed but not signed in. Run “claude” in a terminal and sign in, then check again.";
+      return `Claude Code is installed on ${where} but not signed in. Run “claude” in a terminal${on} and sign in, then check again.`;
     case "native_agent_probe_failed":
-      return "Claude Code exits with an error when Pastey checks it (“claude --version”). Run that in a new terminal to see why.";
+      return `Claude Code${on} exits with an error when Pastey checks it (“claude --version”). Run that in a new terminal${on} to see why.`;
     case "native_agent_incompatible":
-      return "Claude Code on this device needs an update before Pastey can use it. Update Claude Code, then check again.";
+      return `Claude Code on ${where} needs an update before Pastey can use it. Update Claude Code, then check again.`;
     case "native_agent_platform_unverified":
       return "Pastey runs Claude Code conversations only on macOS, Linux and Windows.";
     case "native_agent_launch_failed":
-      return "Pastey cannot start Claude Code under its own supervision on this device.";
+      return `Pastey cannot start Claude Code under its own supervision on ${where}.`;
     default:
-      return "Claude Code is unavailable on this device.";
+      return `Claude Code is unavailable on ${where}.`;
   }
 }
 
@@ -279,11 +281,13 @@ export function availabilityCopy(availability: NativeAgentTargetAvailability, re
   const where = remoteName ?? "this device";
   if (agentId === CLAUDE_CODE_AGENT_ID) {
     switch (availability.state) {
-      case "checking": return "Checking Claude Code on this device…";
-      case "unknown": return `Pastey could not check Claude Code: ${availability.message}`;
-      case "available": return "Claude Code is ready. It runs in your folder with its own sign-in, model and settings.";
+      case "checking": return `Checking Claude Code on ${where}…`;
+      case "unknown": return `Pastey could not check Claude Code on ${where}: ${availability.message}`;
+      case "available": return remoteName
+        ? `Claude Code is available on ${where}. It runs in a folder ${where} shares, with its own sign-in, model and settings there, after ${where} accepts; no files move.`
+        : "Claude Code is ready. It runs in your folder with its own sign-in, model and settings.";
       default: {
-        const copy = claudeCodeUnavailableCopy(availability.reason ?? (availability.state === "incompatible" ? "native_agent_incompatible" : null));
+        const copy = claudeCodeUnavailableCopy(availability.reason ?? (availability.state === "incompatible" ? "native_agent_incompatible" : null), where);
         return availability.detail ? `${copy} (${availability.detail})` : copy;
       }
     }

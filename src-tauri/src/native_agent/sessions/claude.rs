@@ -411,7 +411,9 @@ fn transcript_config(transcript: &TranscriptV1) -> NativeAgentConfigV1 {
         )
     };
     if !transcript.complete {
-        return unknown("The transcript is larger than Pastey reads, so its latest reply's model is not known.");
+        return unknown(
+            "The transcript is larger than Pastey reads, so its latest reply's model is not known.",
+        );
     }
     let Some((model, reasoning_effort)) = transcript.reply_config.clone() else {
         return unknown("No reply is recorded in this session yet.");
@@ -825,12 +827,99 @@ fn entry_text(entry: &Value) -> String {
     }
 }
 
-/// A session's status in Claude Code's live registry: `Ok(None)` when no
-/// process holds it, `Err` when the registry cannot be read.
-pub(in crate::native_agent) fn live_status(
+/// Where a transcript's session ran and its last main-chain entry (the
+/// marker discovery reports), as read now. `None`: unreadable or larger
+/// than Pastey reads.
+pub(in crate::native_agent) fn transcript_end(
+    path: &Path,
+) -> Option<(Option<String>, Option<String>)> {
+    let transcript = read_transcript(path)?;
+    transcript
+        .complete
+        .then(|| (transcript.cwd, transcript.last_turn.marker))
+}
+
+/// Whether the user entry `prompt_uuid` follows `marker` in the session's
+/// main chain: walking back from its parent through entries that are not
+/// conversation turns (attachments, system entries), the first user or
+/// assistant entry reached is `marker`. `None`: the transcript or the prompt
+/// entry could not be read.
+pub(in crate::native_agent) fn prompt_follows(
+    path: &Path,
+    prompt_uuid: &str,
+    marker: &str,
+) -> Option<bool> {
+    let file = fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_TRANSCRIPT_BYTES {
+        return None;
+    }
+    let mut parents: HashMap<String, (Option<String>, bool)> = HashMap::new();
+    let mut prompt_parent = None;
+    for line in BufReader::new(file).split(b'\n') {
+        let Ok(line) = line else { return None };
+        let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let Some(uuid) = entry.get("uuid").and_then(Value::as_str) else {
+            continue;
+        };
+        let parent = entry
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
+        if uuid == prompt_uuid && kind == "user" {
+            prompt_parent = Some(parent.clone());
+        }
+        parents.insert(
+            uuid.to_owned(),
+            (parent, matches!(kind, "user" | "assistant")),
+        );
+    }
+    let mut cursor = prompt_parent?;
+    for _ in 0..parents.len() + 1 {
+        let Some(id) = cursor else {
+            return Some(false);
+        };
+        let (parent, turn) = parents.get(&id)?;
+        if *turn {
+            return Some(id == marker);
+        }
+        cursor = parent.clone();
+    }
+    Some(false)
+}
+
+/// One process Claude Code's live registry lists as holding a session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native_agent) struct LiveHolderV1 {
+    pub(in crate::native_agent) pid: Option<u32>,
+    /// `interactive` (the Claude app, a terminal, or a headless run) or
+    /// `background`.
+    pub(in crate::native_agent) kind: String,
+    pub(in crate::native_agent) status: String,
+    pub(in crate::native_agent) started_at_ms: Option<u64>,
+}
+
+impl LiveHolderV1 {
+    /// Who holds it, in words the registry supports.
+    pub(in crate::native_agent) fn described(&self) -> &'static str {
+        match self.kind.as_str() {
+            "interactive" => "An interactive Claude Code session (the Claude app, a terminal or another headless run)",
+            "background" => "A background Claude Code session",
+            _ => "Another Claude Code process",
+        }
+    }
+}
+
+/// Every process Claude Code's live registry lists for `session_id`. `Err`
+/// when the registry cannot be read. An empty registry is what Claude Code
+/// reports; it is only as good as its own view of its processes (measured:
+/// inside a macOS sandbox that hides other processes it reads empty).
+pub(in crate::native_agent) fn live_holders(
     cli: &Path,
     session_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Vec<LiveHolderV1>, String> {
     let mut command = Command::new(cli);
     command.args(["agents", "--json"]);
     let output = super::bounded_output(command, LIVE_TIMEOUT)
@@ -842,16 +931,39 @@ pub(in crate::native_agent) fn live_status(
     };
     Ok(entries
         .iter()
-        .find(|entry| entry.get("sessionId").and_then(Value::as_str) == Some(session_id))
-        .map(|entry| {
+        .filter(|entry| entry.get("sessionId").and_then(Value::as_str) == Some(session_id))
+        .map(|entry| LiveHolderV1 {
+            pid: entry
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|pid| u32::try_from(pid).ok()),
+            kind: entry
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
             // A session that is still starting is listed briefly without a
             // status.
-            entry
+            status: entry
                 .get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("starting")
-                .to_owned()
-        }))
+                .to_owned(),
+            started_at_ms: entry.get("startedAt").and_then(Value::as_u64),
+        })
+        .collect())
+}
+
+/// A session's status in Claude Code's live registry: `Ok(None)` when no
+/// process holds it, `Err` when the registry cannot be read.
+pub(in crate::native_agent) fn live_status(
+    cli: &Path,
+    session_id: &str,
+) -> Result<Option<String>, String> {
+    Ok(live_holders(cli, session_id)?
+        .into_iter()
+        .next()
+        .map(|holder| holder.status))
 }
 
 /// A Claude Code session id: a UUID.

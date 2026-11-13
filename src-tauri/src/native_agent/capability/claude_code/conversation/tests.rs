@@ -7,6 +7,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use super::*;
+use crate::native_agent::sessions::claude::project_dir;
 use crate::native_agent::{NativeAgentServiceV1, NativeAgentTaskStateV1, NativeAgentTaskStatusV1};
 
 /// A fake `claude`. `--version`, `auth status` and `agents --json` answer
@@ -44,17 +45,28 @@ case "$mode" in
   missing) echo "No conversation found with session ID: $sid" >&2
     printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"%s"}\n' "$sid"; exit 1 ;;
 esac
+case "$mode" in
+  rival) printf '[{"sessionId":"%s","kind":"interactive","status":"idle","pid":1,"startedAt":1000},{"sessionId":"%s","kind":"interactive","pid":%s}]' "$sid" "$sid" "$$" > "$ROOT/registry.json" ;;
+  listed) printf '[{"sessionId":"%s","kind":"interactive","pid":%s,"startedAt":%s000}]' "$sid" "$$" "$(date +%s)" > "$ROOT/registry.json" ;;
+esac
 IFS= read -r line
 uuid=$(printf '%s' "$line" | sed -n 's/.*"uuid":"\([^"]*\)".*/\1/p')
+if [ "$mode" = interloper ]; then
+  last=$(grep -o '"uuid":"[^"]*"' "$T" 2>/dev/null | tail -1 | sed 's/.*:"\(.*\)"/\1/')
+  printf '{"type":"user","cwd":"%s","uuid":"interloper","parentUuid":"%s","timestamp":"%s","sessionId":"%s","message":{"role":"user","content":"written elsewhere"}}\n' "$WS" "$last" "$(now)" "$sid" >> "$T"
+fi
+parent=$(grep -o '"uuid":"[^"]*"' "$T" 2>/dev/null | tail -1 | sed 's/.*:"\(.*\)"/\1/')
 prompt=$(printf '%s' "$line" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p')
 printf '[{"sessionId":"%s","kind":"interactive","status":"busy"}]' "$sid" > "$ROOT/registry.json"
 init_sid="$sid"
 [ "$mode" = wrong-session ] && init_sid="00000000-0000-4000-8000-000000000000"
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$init_sid"
-printf '{"type":"user","cwd":"%s","uuid":"%s","timestamp":"%s","sessionId":"%s","message":{"role":"user","content":"%s"}}\n' "$WS" "$uuid" "$(now)" "$sid" "$prompt" >> "$T"
+printf '{"type":"user","cwd":"%s","uuid":"%s","parentUuid":"%s","timestamp":"%s","sessionId":"%s","message":{"role":"user","content":"%s"}}\n' "$WS" "$uuid" "$parent" "$(now)" "$sid" "$prompt" >> "$T"
 [ "$mode" = unaccepted ] || printf '%s\n' "$line" | sed 's/^{/{"isReplay":true,/'
+n=0
 reply() {
-  printf '{"type":"assistant","cwd":"%s","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"}}\n' "$WS" "$(now)" "$1" >> "$T"
+  n=$((n+1))
+  printf '{"type":"assistant","cwd":"%s","uuid":"reply-%s-%s","parentUuid":"%s","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"%s"}],"stop_reason":"end_turn"}}\n' "$WS" "$$" "$n" "$uuid" "$(now)" "$1" >> "$T"
   printf '{"type":"assistant","message":{"content":[{"type":"text","text":"%s"}]}}\n' "$1"
 }
 result() {
@@ -63,7 +75,7 @@ result() {
 drain() { while IFS= read -r _; do :; done; }
 finish() { printf '[]' > "$ROOT/registry.json"; exit "${1:-0}"; }
 case "$mode" in
-  complete) reply "Reply for Pastey"; result success false 1 "Reply for Pastey"; drain; finish ;;
+  complete|listed|interloper) reply "Reply for Pastey"; result success false 1 "Reply for Pastey"; drain; finish ;;
   denied) reply "Done anyway"; result success false 2 "Done anyway" '[{"tool_name":"Write"}]'; drain; finish ;;
   error) result success true 1 "Failed to authenticate"; drain; finish 1 ;;
   no-turn) result success false 0 ""; drain; finish ;;
@@ -165,6 +177,46 @@ impl FixtureV1 {
         .unwrap();
     }
 }
+
+/// A fake Claude Code installed on one Host of a two-Host test, working in
+/// that Host's shared folder: both Claude Code adapters run it.
+pub(crate) struct PairClaudeFixtureV1(FixtureV1);
+
+impl PairClaudeFixtureV1 {
+    pub(crate) fn install(service: &mut NativeAgentServiceV1, workspace: &Path) -> Self {
+        let mut fixture = FixtureV1::new("complete");
+        fixture.workspace = workspace.canonicalize().unwrap();
+        // That Host's user trusted the folder's repository in Claude Code.
+        fixture.trust(&repository_root(&fixture.workspace).unwrap_or(fixture.workspace.clone()));
+        let conversation = fixture.adapter();
+        let session = Arc::new(super::super::ClaudeCodeNativeAdapterV1::default());
+        session.use_fixture(&fixture.cli, &fixture.config);
+        service.add_adapter_for_test(conversation);
+        service.add_adapter_for_test(session);
+        Self(fixture)
+    }
+
+    /// The `-p` runs started on that Host, in order.
+    pub(crate) fn runs(&self) -> Vec<String> {
+        self.0.runs()
+    }
+
+    /// An existing session in the folder that its user saw ending with
+    /// `a-1`; its transcript.
+    pub(crate) fn existing_session(&self) -> PathBuf {
+        self.0.existing_session()
+    }
+
+    pub(crate) fn hold_existing(&self) {
+        self.0.hold_existing("interactive", "busy");
+    }
+
+    pub(crate) fn release_existing(&self) {
+        fs::write(self.0.root.join("registry.json"), "[]").unwrap();
+    }
+}
+
+pub(crate) const PAIR_EXISTING_SESSION: &str = EXISTING;
 
 impl Drop for FixtureV1 {
     fn drop(&mut self) {
@@ -588,12 +640,302 @@ fn availability_requires_a_measured_version_and_a_signed_in_claude_code() {
     assert_eq!(signed_out.reason, Some("native_agent_signed_out"));
 }
 
+/// A Bridge binding of this fixture's Host as executor.
+fn executor_binding() -> crate::host_identity::HostSessionBinding {
+    crate::host_identity::HostSessionBinding::new(
+        "room-claude",
+        crate::host_identity::HostRef::from_device_id("claude-executor").unwrap(),
+        crate::host_identity::HostRef::from_device_id("claude-requester").unwrap(),
+        "executor-session",
+        "requester-session",
+        "requester-route",
+        crate::storage::now_ts() + 600,
+    )
+    .unwrap()
+}
+
 #[test]
-fn no_bridge_peer_learns_of_it_or_can_invoke_it() {
+fn bridge_peers_see_it_and_name_its_folder_only_by_a_share_reference() {
     let fixture = FixtureV1::new("complete");
-    let (service, _) = fixture.service();
-    assert!(service.native_capability_facts().is_empty());
-    assert!(fixture.adapter().supported_protocols().is_empty());
+    let (mut service, adapter) = fixture.service();
+    let facts = service.native_capability_facts();
+    assert_eq!(facts.len(), 1, "described to peers");
+    assert_eq!(
+        adapter.supported_protocols(),
+        &crate::native_agent::GENERIC_NATIVE_INVOKE_PROTOCOLS
+    );
+    assert_eq!(
+        adapter.peer_folder_use(),
+        Some(crate::native_agent::PeerFolderUseV1::Run)
+    );
+    let shared = vec![(
+        "scope:0123456789abcdef".to_string(),
+        fixture.workspace.clone(),
+    )];
+    let asked = peer_input("scope:0123456789abcdef", "fix the test", true).unwrap();
+    let resolved = adapter
+        .resolve_peer_input(&asked, &shared)
+        .unwrap()
+        .expect("a reference is resolved");
+    assert_eq!(
+        resolved.value()["workspace"],
+        fixture.workspace.to_string_lossy().as_ref()
+    );
+    assert_eq!(resolved.value()["resume"], true);
+    // Another reference, no shares, or a path: refused.
+    let other = peer_input("scope:ffffffffffffffff", "x", false).unwrap();
+    assert!(adapter.resolve_peer_input(&other, &shared).is_err());
+    assert!(adapter.resolve_peer_input(&asked, &[]).is_err());
+    let with_path = OpaqueCapabilityPayloadV1::new(json!({
+        "scopeRef": "scope:0123456789abcdef", "task": "x", "resume": false, "workspace": "/etc"
+    }));
+    assert!(adapter.resolve_peer_input(&with_path, &shared).is_err());
+    // Host form from a peer is refused too: only a reference is accepted.
+    let host_form = conversation_input(&fixture.workspace, "x", false).unwrap();
+    assert!(adapter.resolve_peer_input(&host_form, &shared).is_err());
+
+    // A peer's invocation waits for this Host's Review: nothing runs.
+    let request = crate::native_agent::NativeInvocationRequestV1 {
+        task_id: "remote-claude-conversation".into(),
+        target_host_ref: "claude-executor".into(),
+        agent_capability: CLAUDE_CODE_CONVERSATION_ID.into(),
+        input: resolved,
+    };
+    let held = service
+        .receive_bridge_invocation(
+            &executor_binding(),
+            &request,
+            crate::storage::now_ts(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(held.state, NativeAgentTaskStateV1::Queued);
+    assert_eq!(held.code.as_deref(), Some("native_agent_review_required"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(fixture.runs().is_empty(), "nothing ran before Accept");
+}
+
+// Continuing an existing session with the contained headless run (the
+// session continuation adapter's Headless mechanism), driven through the
+// Native Agent lifecycle with this fixture.
+
+const EXISTING: &str = "77777777-7777-4777-8777-777777777777";
+
+impl FixtureV1 {
+    /// An existing session in the workspace, ending with entry `a-1`.
+    fn existing_session(&self) -> PathBuf {
+        let transcript =
+            project_dir(&self.config, &self.workspace).join(format!("{EXISTING}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        let ws = self.workspace.display();
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{ws}\",\"uuid\":\"u-1\",\"parentUuid\":null,\"timestamp\":\"2026-10-17T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"Remember PELICAN\"}}}}\n{{\"type\":\"assistant\",\"cwd\":\"{ws}\",\"uuid\":\"a-1\",\"parentUuid\":\"u-1\",\"timestamp\":\"2026-10-17T00:00:01Z\",\"message\":{{\"role\":\"assistant\",\"model\":\"claude-sonnet-5-5\",\"content\":[{{\"type\":\"text\",\"text\":\"OK\"}}],\"stop_reason\":\"end_turn\"}}}}\n{{\"type\":\"attachment\",\"uuid\":\"att-1\",\"parentUuid\":\"a-1\"}}\n"
+            ),
+        )
+        .unwrap();
+        transcript
+    }
+
+    fn session_service(
+        &self,
+    ) -> (
+        NativeAgentServiceV1,
+        Arc<super::super::ClaudeCodeNativeAdapterV1>,
+    ) {
+        let adapter = Arc::new(super::super::ClaudeCodeNativeAdapterV1::default());
+        adapter.use_fixture(&self.cli, &self.config);
+        let service =
+            NativeAgentServiceV1::with_paths_and_adapters(self.paths(), vec![adapter.clone()])
+                .unwrap();
+        (service, adapter)
+    }
+
+    fn hold_existing(&self, kind: &str, status: &str) {
+        fs::write(
+            self.root.join("registry.json"),
+            format!(
+                r#"[{{"sessionId":"{EXISTING}","kind":"{kind}","status":"{status}","pid":4242}}]"#
+            ),
+        )
+        .unwrap();
+    }
+}
+
+fn options(model: Option<&str>, effort: Option<&str>) -> NativeSessionOptionsV1 {
+    NativeSessionOptionsV1 {
+        model: model.map(str::to_owned),
+        effort: effort.map(str::to_owned),
+    }
+}
+
+fn continue_existing(
+    service: &mut NativeAgentServiceV1,
+    fixture: &FixtureV1,
+    marker: Option<&str>,
+    options: &NativeSessionOptionsV1,
+) -> NativeAgentTaskStatusV1 {
+    let started = service
+        .start_claude_session_task(&fixture.workspace, EXISTING, "What word?", marker, options)
+        .unwrap();
+    wait_terminal(service, &started.task_id)
+}
+
+#[test]
+fn an_existing_session_continues_in_place_with_the_model_and_effort_its_user_chose() {
+    let fixture = FixtureV1::new("complete");
+    let transcript = fixture.existing_session();
+    let (mut service, _) = fixture.session_service();
+    let terminal = continue_existing(
+        &mut service,
+        &fixture,
+        Some("a-1"),
+        &options(Some("haiku"), Some("low")),
+    );
+    assert_eq!(
+        terminal.state,
+        NativeAgentTaskStateV1::Completed,
+        "{terminal:?}"
+    );
+    assert_eq!(text(&terminal).as_deref(), Some("Reply for Pastey"));
+    let runs = fixture.runs();
+    assert_eq!(runs.len(), 1, "sent once");
+    assert!(
+        runs[0].contains(&format!("--resume {EXISTING}"))
+            && runs[0].contains("--model haiku --effort low"),
+        "{runs:?}"
+    );
+    assert!(!runs[0].contains("--fork-session") && !runs[0].contains("--session-id"));
+    // The same session's transcript, never a copy.
+    let entries = fs::read_to_string(&transcript).unwrap();
+    assert!(entries.contains("What word?"));
+    assert_eq!(
+        fs::read_dir(transcript.parent().unwrap()).unwrap().count(),
+        1,
+        "no other session was created"
+    );
+}
+
+#[test]
+fn a_session_that_changed_since_its_user_looked_is_not_continued() {
+    let fixture = FixtureV1::new("complete");
+    fixture.existing_session();
+    let (mut service, _) = fixture.session_service();
+    let terminal = continue_existing(
+        &mut service,
+        &fixture,
+        Some("u-1"),
+        &options(None, Some("low")),
+    );
+    assert_eq!(
+        terminal.code.as_deref(),
+        Some("native_agent_start_failed"),
+        "{terminal:?}"
+    );
+    assert!(fixture.runs().is_empty(), "nothing was launched");
+}
+
+#[test]
+fn a_session_held_by_another_process_is_refused_with_who_holds_it() {
+    let fixture = FixtureV1::new("complete");
+    fixture.existing_session();
+    fixture.hold_existing("interactive", "busy");
+    let (mut service, _) = fixture.session_service();
+    let started = service
+        .start_claude_session_task(
+            &fixture.workspace,
+            EXISTING,
+            "go on",
+            Some("a-1"),
+            &options(None, Some("low")),
+        )
+        .unwrap();
+    let terminal = wait_terminal(&service, &started.task_id);
+    assert_eq!(terminal.code.as_deref(), Some("native_agent_start_failed"));
+    assert!(fixture.runs().is_empty());
+}
+
+#[test]
+fn a_holder_that_appears_as_the_run_starts_stops_it_before_anything_is_sent() {
+    let fixture = FixtureV1::new("rival");
+    let transcript = fixture.existing_session();
+    let before = fs::read_to_string(&transcript).unwrap();
+    let (mut service, _) = fixture.session_service();
+    let terminal = continue_existing(
+        &mut service,
+        &fixture,
+        Some("a-1"),
+        &options(None, Some("low")),
+    );
+    assert_eq!(
+        terminal.state,
+        NativeAgentTaskStateV1::Failed,
+        "{terminal:?}"
+    );
+    assert_eq!(terminal.code.as_deref(), Some("native_agent_start_failed"));
+    assert_eq!(fixture.runs().len(), 1, "launched, then stopped unsent");
+    assert_eq!(
+        fs::read_to_string(&transcript).unwrap(),
+        before,
+        "nothing was sent"
+    );
+}
+
+#[test]
+fn the_run_listed_as_the_sessions_only_holder_is_sent_the_prompt() {
+    let fixture = FixtureV1::new("listed");
+    fixture.existing_session();
+    let (mut service, _) = fixture.session_service();
+    let terminal = continue_existing(
+        &mut service,
+        &fixture,
+        Some("a-1"),
+        &options(Some("opus"), None),
+    );
+    assert_eq!(
+        terminal.state,
+        NativeAgentTaskStateV1::Completed,
+        "{terminal:?}"
+    );
+}
+
+#[test]
+fn a_turn_another_client_wrote_into_at_the_same_time_is_never_reported_done() {
+    let fixture = FixtureV1::new("interloper");
+    fixture.existing_session();
+    let (mut service, _) = fixture.session_service();
+    let terminal = continue_existing(
+        &mut service,
+        &fixture,
+        Some("a-1"),
+        &options(None, Some("low")),
+    );
+    assert_eq!(
+        terminal.code.as_deref(),
+        Some("native_agent_outcome_unknown"),
+        "{terminal:?}"
+    );
+    assert_ne!(terminal.state, NativeAgentTaskStateV1::Completed);
+}
+
+#[test]
+fn options_that_are_not_identifiers_are_refused_before_anything_runs() {
+    let fixture = FixtureV1::new("complete");
+    fixture.existing_session();
+    let (mut service, _) = fixture.session_service();
+    for bad in [
+        options(Some("--dangerously-skip-permissions"), None),
+        options(Some("two words"), None),
+        options(Some("/etc/model"), None),
+        options(None, Some("High")),
+        options(None, Some("low; rm")),
+    ] {
+        assert!(service
+            .start_claude_session_task(&fixture.workspace, EXISTING, "x", Some("a-1"), &bad)
+            .is_err());
+    }
+    assert!(fixture.runs().is_empty());
 }
 
 // Live checks: the installed, signed-in Claude Code, through Pastey's own
@@ -618,6 +960,21 @@ fn live_workspace(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).unwrap();
     workspace.canonicalize().unwrap()
+}
+
+/// The session transcripts Claude Code keeps for `workspace` now. Earlier
+/// runs of a live check leave theirs in the same folder; a check counts only
+/// the ones it created.
+fn live_transcripts(workspace: &Path) -> std::collections::HashSet<PathBuf> {
+    fs::read_dir(project_dir(&claude_config_dir().unwrap(), workspace))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn live_service(root: &Path) -> NativeAgentServiceV1 {
@@ -747,6 +1104,171 @@ fn installed_claude_code_conversation_runs_and_continues_through_pastey() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Live: an existing session Pastey did not create is continued in place
+/// through Pastey's lifecycle, with a model and effort its user chose, then
+/// read back through session discovery (the native configuration Pastey
+/// shows); and a session another headless run holds, idle, is refused
+/// without anything being sent. Uses the installed, signed-in Claude Code.
+#[test]
+#[ignore = "uses the installed, signed-in Claude Code and its quota"]
+fn installed_claude_code_continues_an_existing_session_in_place_with_a_chosen_model() {
+    use std::io::Write as _;
+    let workspace = live_workspace("claude-existing-live");
+    let earlier = live_transcripts(&workspace);
+    let cli = find_cli().expect("an installed claude");
+    let session = Uuid::new_v4().to_string();
+    let created = std::process::Command::new(&cli)
+        .args([
+            "-p",
+            "Remember the word PELICAN. Reply only OK.",
+            "--session-id",
+            &session,
+        ])
+        .current_dir(&workspace)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(created.status.success(), "{created:?}");
+    let source = crate::native_agent::sessions::ClaudeSessionSourceV1::installed();
+    let find = |source: &crate::native_agent::sessions::ClaudeSessionSourceV1| {
+        source
+            .discover(std::slice::from_ref(&workspace))
+            .0
+            .into_iter()
+            .find(|found| found.session_id == session)
+            .expect("discovered")
+    };
+    let before = find(&source);
+    let marker = before.last_turn.marker.clone().expect("a marker");
+    eprintln!(
+        "before: model {:?} effort {:?}",
+        before.agent_config.as_ref().and_then(|c| c.model.clone()),
+        before
+            .agent_config
+            .as_ref()
+            .and_then(|c| c.reasoning_effort.clone())
+    );
+
+    let root = std::env::temp_dir().join(format!("pastey-claude-existing-{}", Uuid::new_v4()));
+    let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
+    paths.ensure_directories().unwrap();
+    crate::storage::init_database(&paths).unwrap();
+    let adapter = Arc::new(super::super::ClaudeCodeNativeAdapterV1::default());
+    adapter.use_lifeline_helper(&built_pastey());
+    let mut service = NativeAgentServiceV1::with_paths_and_adapters(paths, vec![adapter]).unwrap();
+    let chosen = NativeSessionOptionsV1 {
+        model: Some("haiku".into()),
+        effort: Some("low".into()),
+    };
+    let started = service
+        .start_claude_session_task(
+            &workspace,
+            &session,
+            "What word did I ask you to remember? Reply with that one word.",
+            Some(&marker),
+            &chosen,
+        )
+        .unwrap();
+    let terminal = live_terminal(&service, &started.task_id);
+    eprintln!(
+        "continued: {:?} {:?} {:?} {:?}",
+        terminal.state,
+        terminal.code,
+        terminal.result,
+        text(&terminal)
+    );
+    assert_eq!(terminal.state, NativeAgentTaskStateV1::Completed);
+    assert!(text(&terminal).unwrap().to_uppercase().contains("PELICAN"));
+    wait_released(&service, &workspace);
+    let after = find(&source);
+    let config = after.agent_config.clone().expect("the session's record");
+    eprintln!(
+        "after: model {:?} effort {:?} source {}",
+        config.model, config.reasoning_effort, config.source
+    );
+    assert!(config.model.unwrap().contains("haiku"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+    let created: Vec<_> = live_transcripts(&workspace)
+        .difference(&earlier)
+        .cloned()
+        .collect();
+    assert_eq!(
+        created.len(),
+        1,
+        "the same session, never a copy: {created:?}"
+    );
+    assert!(created[0].ends_with(format!("{session}.jsonl")));
+
+    // Held idle by another headless run: refused, nothing sent.
+    let mut holder = std::process::Command::new(&cli)
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--resume",
+            &session,
+        ])
+        .current_dir(&workspace)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..100 {
+        if claude_runs_in(&workspace) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(claude_runs_in(&workspace), "the holder is listed");
+    let held_marker = find(&source).last_turn.marker.clone().unwrap();
+    let transcript =
+        project_dir(&claude_config_dir().unwrap(), &workspace).join(format!("{session}.jsonl"));
+    let main_entries = |path: &Path| {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\"")
+            })
+            .count()
+    };
+    let entries_before = main_entries(&transcript);
+    let refused = service
+        .start_claude_session_task(
+            &workspace,
+            &session,
+            "Reply with exactly: must-not-run",
+            Some(&held_marker),
+            &NativeSessionOptionsV1 {
+                model: None,
+                effort: Some("low".into()),
+            },
+        )
+        .unwrap();
+    let refused = live_terminal(&service, &refused.task_id);
+    eprintln!(
+        "held: {:?} {:?} {:?}",
+        refused.state, refused.code, refused.result
+    );
+    assert_eq!(refused.code.as_deref(), Some("native_agent_start_failed"));
+    assert!(refused
+        .result
+        .unwrap()
+        .contains("interactive Claude Code session"));
+    assert_eq!(
+        main_entries(&transcript),
+        entries_before,
+        "nothing was sent"
+    );
+    let _ = holder.stdin.take().map(|mut stdin| stdin.flush());
+    let _ = holder.wait();
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 #[ignore = "uses the installed, signed-in Claude Code and its quota"]
 fn installed_claude_code_conversation_stops_on_stop() {
@@ -808,6 +1330,7 @@ fn installed_claude_code_conversation_crash_child() {
 #[ignore = "uses the installed, signed-in Claude Code and its quota"]
 fn installed_claude_code_conversation_ends_when_pastey_is_killed() {
     let workspace = live_workspace("claude-conversation-crash-live");
+    let earlier = live_transcripts(&workspace);
     let root = std::env::temp_dir().join(format!("pastey-claude-live-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -888,12 +1411,10 @@ fn installed_claude_code_conversation_ends_when_pastey_is_killed() {
         Some("native_agent_interrupted_on_restart")
     );
     assert_ne!(terminal.state, NativeAgentTaskStateV1::Failed);
-    let transcripts = project_dir(&claude_config_dir().unwrap(), &workspace);
-    let prompts: usize = fs::read_dir(&transcripts)
-        .unwrap()
-        .flatten()
-        .map(|entry| {
-            fs::read_to_string(entry.path())
+    let prompts: usize = live_transcripts(&workspace)
+        .difference(&earlier)
+        .map(|path| {
+            fs::read_to_string(path)
                 .unwrap_or_default()
                 .lines()
                 .filter(|line| line.contains("\"type\":\"user\"") && line.contains("from 1 to 600"))

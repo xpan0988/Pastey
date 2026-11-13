@@ -963,9 +963,18 @@ pub async fn continue_native_session(
     ) {
         return Err(problem);
     }
+    request
+        .options
+        .validate()
+        .map_err(|error| error.message())?;
     let workspace = std::path::PathBuf::from(&snapshot.session.workspace);
     let mut native_agents = state.native_agents.lock();
     match provider {
+        // Codex's own per-turn options are not applied by Pastey yet: it
+        // refuses them rather than ignore them.
+        PROVIDER_CODEX if !request.options.is_empty() => Err(crate::error::AppError::InvalidInput(
+            "Choosing Codex's model or reasoning effort from Pastey is not supported yet.".into(),
+        )),
         PROVIDER_CODEX => native_agents.start_codex_thread_task(
             &workspace,
             &request.session_id,
@@ -976,6 +985,8 @@ pub async fn continue_native_session(
             &workspace,
             &request.session_id,
             &request.prompt,
+            request.expected_marker.as_deref(),
+            &request.options,
         ),
     }
     .map_err(|error| error.message())
@@ -1904,8 +1915,10 @@ pub async fn start_remote_native_capability_task(
 /// Continues one session of another current Bridge Host, in the session
 /// itself, as one ordinary remote invocation: the Host resolves the folder
 /// from this device's own Session reading permission, waits for its user's
-/// Accept, and Codex refuses a second writer. Only Codex threads: remote
-/// Claude Code execution is local only (see `docs/layers/layer-5-agent.md`).
+/// Accept (or admits it under Full Access), and its adapter refuses a
+/// session another client holds (Codex's writer lock; Claude Code's
+/// registry, checked again once Pastey's own run is listed).
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn continue_remote_native_session(
     room_id: String,
@@ -1916,24 +1929,73 @@ pub async fn continue_remote_native_session(
     scope_ref: String,
     prompt: String,
     expected_marker: Option<String>,
+    options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
-    if provider != crate::native_agent::sessions::PROVIDER_CODEX {
-        return Err("Continuing a Claude Code session on another device is not available: a background Claude Code session can outlive Pastey there, and its outcome could be lost.".into());
-    }
-    let input = crate::native_agent::codex_thread_peer_input(
-        &scope_ref,
-        &session_id,
-        &prompt,
-        expected_marker.as_deref(),
-    )
-    .map_err(|error| error.message())?;
+    let options = options.unwrap_or_default();
+    let (capability, input) = match provider.as_str() {
+        crate::native_agent::sessions::PROVIDER_CODEX if !options.is_empty() => {
+            return Err(
+                "Choosing Codex's model or reasoning effort from Pastey is not supported yet."
+                    .into(),
+            )
+        }
+        crate::native_agent::sessions::PROVIDER_CODEX => (
+            crate::native_agent::CODEX_THREAD_CAPABILITY,
+            crate::native_agent::codex_thread_peer_input(
+                &scope_ref,
+                &session_id,
+                &prompt,
+                expected_marker.as_deref(),
+            ),
+        ),
+        crate::native_agent::sessions::PROVIDER_CLAUDE_CODE => (
+            crate::native_agent::CLAUDE_CODE_SESSION_CAPABILITY,
+            crate::native_agent::claude_code_session_peer_input(
+                &scope_ref,
+                &session_id,
+                &prompt,
+                expected_marker.as_deref(),
+                &options,
+            ),
+        ),
+        _ => return Err("Unknown native Agent provider.".into()),
+    };
+    let input = input.map_err(|error| error.message())?;
     invoke_remote_native_capability(
         state.inner().clone(),
         room_id,
         peer_session_id,
         target_host_ref,
-        crate::native_agent::CODEX_THREAD_CAPABILITY.into(),
+        capability.into(),
+        input,
+    )
+    .await
+}
+
+/// Runs Claude Code in a folder another current Bridge Host shares with this
+/// device, named by its reference: continuing this device's Claude Code
+/// conversation there, or beginning one. The Host resolves the folder from
+/// its own share, waits for its user's Accept (or admits it under Full
+/// Access), and runs its own Claude Code with its own sign-in and settings.
+#[tauri::command]
+pub async fn start_remote_native_claude_code_task(
+    room_id: String,
+    peer_session_id: String,
+    target_host_ref: String,
+    scope_ref: String,
+    task: String,
+    resume: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let input = crate::native_agent::claude_code_conversation_peer_input(&scope_ref, &task, resume)
+        .map_err(|error| error.message())?;
+    invoke_remote_native_capability(
+        state.inner().clone(),
+        room_id,
+        peer_session_id,
+        target_host_ref,
+        crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY.into(),
         input,
     )
     .await

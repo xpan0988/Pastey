@@ -635,7 +635,11 @@ fn scripted_history_codex(root: &Path, workspace: &Path, outside: &Path) -> Path
     let thread = |id: &str, cwd: &Path, originator: &str, updated: u64| {
         // As Codex 0.163 lists them: the model configuration it records
         // for the thread (t-live from a version that recorded none).
-        let (model, effort) = if id == "t-live" { (serde_json::Value::Null, serde_json::Value::Null) } else { (json!("gpt-6-sol"), json!("xhigh")) };
+        let (model, effort) = if id == "t-live" {
+            (serde_json::Value::Null, serde_json::Value::Null)
+        } else {
+            (json!("gpt-6-sol"), json!("xhigh"))
+        };
         json!({"id": id, "cwd": cwd, "name": format!("thread {id}"), "originator": originator,
                "createdAt": 1_792_000_000u64, "updatedAt": updated, "gitInfo": {"branch": "main"}, "status": {"type": "notLoaded"},
                "model": model, "modelProvider": "openai", "reasoningEffort": effort})
@@ -1028,10 +1032,17 @@ fn codex_reports_its_default_and_each_threads_configuration_apart() {
     assert_eq!(sessions.len(), 2);
     let default = observation.native_default.clone().unwrap();
     assert_eq!(
-        (default.scope, default.model.as_deref(), default.reasoning_effort.as_deref()),
+        (
+            default.scope,
+            default.model.as_deref(),
+            default.reasoning_effort.as_deref()
+        ),
         (AgentConfigScopeV1::NativeDefault, None, None)
     );
-    assert!(default.note.unwrap().contains("does not answer config/read"));
+    assert!(default
+        .note
+        .unwrap()
+        .contains("does not answer config/read"));
     let thread_config = |sessions: &[NativeSessionV1], id: &str| {
         sessions
             .iter()
@@ -1057,7 +1068,10 @@ fn codex_reports_its_default_and_each_threads_configuration_apart() {
         )
     );
     let unrecorded = thread_config(&sessions, "t-live");
-    assert_eq!((unrecorded.model, unrecorded.reasoning_effort), (None, None));
+    assert_eq!(
+        (unrecorded.model, unrecorded.reasoning_effort),
+        (None, None)
+    );
     assert!(unrecorded.note.unwrap().contains("no model"));
 
     // Codex answers: the folder's project layer sets the model, the user's
@@ -1069,7 +1083,11 @@ fn codex_reports_its_default_and_each_threads_configuration_apart() {
         .to_string()
     };
     fs::write(&project, answer("gpt-6.1-sol", "project", json!("high"))).unwrap();
-    fs::write(&general, answer("gpt-6-sol", "user", serde_json::Value::Null)).unwrap();
+    fs::write(
+        &general,
+        answer("gpt-6-sol", "user", serde_json::Value::Null),
+    )
+    .unwrap();
     let (sessions, observation) = source.discover(&[workspace.clone()]);
     let default = observation.native_default.clone().unwrap();
     assert_eq!(
@@ -1090,10 +1108,14 @@ fn codex_reports_its_default_and_each_threads_configuration_apart() {
             None
         )
     );
-    assert!(!serde_json::to_string(&observation).unwrap().contains("config.toml"));
+    assert!(!serde_json::to_string(&observation)
+        .unwrap()
+        .contains("config.toml"));
     // The thread keeps what it recorded: not the default, and not merged.
     assert_eq!(
-        thread_config(&sessions, "t-done").reasoning_effort.as_deref(),
+        thread_config(&sessions, "t-done")
+            .reasoning_effort
+            .as_deref(),
         Some("xhigh")
     );
 
@@ -1115,7 +1137,11 @@ fn codex_reports_its_default_and_each_threads_configuration_apart() {
     fs::write(&project, answer("gpt-6.1-sol", "project", json!("medium"))).unwrap();
     let (_, observation) = source.discover(&[workspace.clone()]);
     assert_eq!(
-        observation.native_default.unwrap().reasoning_effort.as_deref(),
+        observation
+            .native_default
+            .unwrap()
+            .reasoning_effort
+            .as_deref(),
         Some("medium")
     );
     // Several folders could each see another default: none is reported.
@@ -1124,11 +1150,22 @@ fn codex_reports_its_default_and_each_threads_configuration_apart() {
 
     // The reader can only read: starting a thread or turn, or writing
     // configuration, is refused before anything is sent.
-    let reader = crate::native_agent::capability::codex::CodexHistoryReaderV1::open(&agent, &workspace).unwrap();
-    for method in ["thread/start", "turn/start", "thread/resume", "config/value/write", "config/batchWrite"] {
+    let reader =
+        crate::native_agent::capability::codex::CodexHistoryReaderV1::open(&agent, &workspace)
+            .unwrap();
+    for method in [
+        "thread/start",
+        "turn/start",
+        "thread/resume",
+        "config/value/write",
+        "config/batchWrite",
+    ] {
         match reader.request(method, json!({})) {
             Err(crate::native_agent::capability::codex::HistoryReadErrorV1::Failed(reason)) => {
-                assert!(reason.contains("is not a history read"), "{method}: {reason}")
+                assert!(
+                    reason.contains("is not a history read"),
+                    "{method}: {reason}"
+                )
             }
             _ => panic!("{method} must be refused"),
         }
@@ -1155,9 +1192,18 @@ fn claude_code_sessions_report_their_latest_reply_and_the_default_stays_unknown(
     fs::create_dir_all(&other).unwrap();
     // A settings file that names another model: never taken as the answer.
     fs::create_dir_all(&config).unwrap();
-    fs::write(config.join("settings.json"), r#"{"model": "claude-haiku-5-5", "effortLevel": "low"}"#).unwrap();
+    fs::write(
+        config.join("settings.json"),
+        r#"{"model": "claude-haiku-5-5", "effortLevel": "low"}"#,
+    )
+    .unwrap();
     let reply = |at: &str, model: &str, effort: Option<&str>| {
-        let mut entry = assistant(&workspace, at, json!([{"type": "text", "text": "ok"}]), "end_turn");
+        let mut entry = assistant(
+            &workspace,
+            at,
+            json!([{"type": "text", "text": "ok"}]),
+            "end_turn",
+        );
         entry["message"]["model"] = json!(model);
         if let Some(effort) = effort {
             entry["effort"] = json!(effort);
@@ -1214,13 +1260,25 @@ fn claude_code_sessions_report_their_latest_reply_and_the_default_stays_unknown(
             switched.model_provider.as_deref(),
             switched.note.as_deref()
         ),
-        (AgentConfigScopeV1::Session, Some("claude-opus-5-5"), Some("high"), None, None)
+        (
+            AgentConfigScopeV1::Session,
+            Some("claude-opus-5-5"),
+            Some("high"),
+            None,
+            None
+        )
     );
     let older = config_of(NO_EFFORT);
-    assert_eq!((older.model.as_deref(), older.reasoning_effort.as_deref()), (Some("claude-opus-5-5"), None));
+    assert_eq!(
+        (older.model.as_deref(), older.reasoning_effort.as_deref()),
+        (Some("claude-opus-5-5"), None)
+    );
     assert!(older.note.unwrap().contains("no effort level"));
     let unanswered = config_of(NO_REPLY);
-    assert_eq!((unanswered.model, unanswered.reasoning_effort), (None, None));
+    assert_eq!(
+        (unanswered.model, unanswered.reasoning_effort),
+        (None, None)
+    );
     assert!(unanswered.note.unwrap().contains("No reply"));
 
     let default = observation.native_default.unwrap();
@@ -1232,7 +1290,10 @@ fn claude_code_sessions_report_their_latest_reply_and_the_default_stays_unknown(
     let (_, several) = source.discover(&[workspace.clone(), other.clone()]);
     assert!(several.native_default.is_none());
 
-    let snapshot = source.inspect(&[workspace.clone()], SWITCHED).unwrap().unwrap();
+    let snapshot = source
+        .inspect(&[workspace.clone()], SWITCHED)
+        .unwrap()
+        .unwrap();
     let inspected = snapshot.session.agent_config.unwrap();
     assert_eq!(
         (inspected.model, inspected.reasoning_effort),

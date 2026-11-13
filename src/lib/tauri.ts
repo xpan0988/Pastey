@@ -310,6 +310,27 @@ export function startNativeClaudeCodeTask(workspace: string, task: string, newCo
   return invoke("start_native_claude_code_task", { workspace, task, newConversation });
 }
 
+/** Runs Claude Code in a folder another Bridge Host shares with this
+ * device, named by its reference (`SharedWorkspace.scopeRef`): continuing
+ * this device's Claude Code conversation there (`resume`), or beginning one.
+ * That Host resolves the folder itself, waits for its user's Accept unless
+ * this device has Full Access there, and runs its own Claude Code. */
+export function startRemoteNativeClaudeCodeTask(
+  roomId: string, peerSessionId: string, targetHostRef: string, scopeRef: string, task: string, resume: boolean,
+): Promise<NativeAgentTaskStatus> {
+  return invoke("start_remote_native_claude_code_task", { roomId, peerSessionId, targetHostRef, scopeRef, task, resume });
+}
+
+/** A native Agent's own model and reasoning effort, chosen explicitly by the
+ * user for one continuation of a session. Pastey keeps no default of either;
+ * absent means the Agent's own configuration decides. Only Agents whose
+ * native interface applies them to the same session accept them (Claude
+ * Code); the others refuse rather than ignore them. */
+export interface NativeSessionOptions {
+  model?: string;
+  effort?: string;
+}
+
 /** The native session (as session discovery names it) a conversation task
  * this device's user started runs in, once its Agent confirmed it; null
  * otherwise. This device only: it never travels over a Bridge. */
@@ -989,14 +1010,16 @@ export function inspectNativeSession(workspaces: string[], provider: NativeSessi
 /** Continues one of this device's own sessions in the session itself, with
  * a new prompt, only while it still ends with `expectedMarker`. The task then
  * follows the ordinary Native Agent status, Stop and recovery commands. */
-export function continueNativeSession(request: { workspaces: string[]; provider: NativeSessionProvider; sessionId: string; prompt: string; expectedMarker: string | null }): Promise<NativeAgentTaskStatus> {
+export function continueNativeSession(request: { workspaces: string[]; provider: NativeSessionProvider; sessionId: string; prompt: string; expectedMarker: string | null; options?: NativeSessionOptions }): Promise<NativeAgentTaskStatus> {
   return invoke("continue_native_session", { request });
 }
 
-/** Asks another current Bridge Host to continue one of its Codex threads,
- * named by the scope its Session reading permission showed this device. The
- * Host waits for its user's Accept; Codex there refuses a second writer. */
-export function continueRemoteNativeSession(request: { roomId: string; peerSessionId: string; targetHostRef: string; provider: NativeSessionProvider; sessionId: string; scopeRef: string; prompt: string; expectedMarker: string | null }): Promise<NativeAgentTaskStatus> {
+/** Asks another current Bridge Host to continue one of its Codex threads or
+ * Claude Code sessions, named by the scope its Session reading permission
+ * showed this device. The Host waits for its user's Accept (unless this
+ * device has Full Access there); Codex refuses a second writer, and Claude
+ * Code's session is refused while any other process holds it. */
+export function continueRemoteNativeSession(request: { roomId: string; peerSessionId: string; targetHostRef: string; provider: NativeSessionProvider; sessionId: string; scopeRef: string; prompt: string; expectedMarker: string | null; options?: NativeSessionOptions | null }): Promise<NativeAgentTaskStatus> {
   return invoke("continue_remote_native_session", request);
 }
 

@@ -237,6 +237,20 @@ impl CapabilityAvailabilityV1 {
     }
 }
 
+/// What a Bridge peer's invocation of a capability does in a folder this Host
+/// shares with that peer, and so which of the share's switches it needs. A
+/// peer names such a folder only by its share reference, which the executing
+/// Host resolves among its own shares before admission; the adapter turns the
+/// resolved folder into its own input (`resolve_peer_input`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PeerFolderUseV1 {
+    /// Runs the capability in the folder: needs Agent requests.
+    Run,
+    /// Continues a native session the peer found by reading the folder's
+    /// sessions: needs Agent requests and Sessions.
+    ContinueSession,
+}
+
 pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     fn capability_id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
@@ -244,6 +258,26 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     /// Exact protocols this Host supports for the capability, advertised in
     /// its existing capability fact.
     fn supported_protocols(&self) -> &'static [&'static str];
+
+    /// How a peer's invocation uses a folder this Host shares. `None`: it
+    /// names no shared folder, and its input reaches admission unchanged.
+    fn peer_folder_use(&self) -> Option<PeerFolderUseV1> {
+        None
+    }
+
+    /// Turns a peer's input, which names its folder by share reference, into
+    /// this adapter's own input, given the folders `(scope_ref, folder)` the
+    /// exact requesting device may use that way now. `Ok(None)`: the input
+    /// names no share and stays as it is (only for adapters that accept a
+    /// peer's path). A reference among none of `shared`, or a path where only
+    /// a reference is accepted, is refused. Pure: nothing runs.
+    fn resolve_peer_input(
+        &self,
+        _input: &OpaqueCapabilityPayloadV1,
+        _shared: &[(String, PathBuf)],
+    ) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+        Ok(None)
+    }
 
     fn require_available(&self) -> AppResult<()> {
         match self.availability() {

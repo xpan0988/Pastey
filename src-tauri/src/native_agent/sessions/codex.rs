@@ -702,7 +702,9 @@ fn thread_config(thread: &Value) -> NativeAgentConfigV1 {
     let note = match (&model, &reasoning_effort) {
         (None, None) => Some("Codex reported no model or reasoning effort for this thread.".into()),
         (None, Some(_)) => Some("Codex reported no model for this thread.".into()),
-        (Some(_), None) => Some("Codex reported no reasoning effort for this thread (unset or unavailable).".into()),
+        (Some(_), None) => Some(
+            "Codex reported no reasoning effort for this thread (unset or unavailable).".into(),
+        ),
         _ => None,
     };
     NativeAgentConfigV1 {
@@ -730,7 +732,10 @@ fn config_origin(result: &Value, key: &str) -> Option<ConfigOriginV1> {
     Some(match kind {
         "user" => ConfigOriginV1::User,
         "project" => ConfigOriginV1::Project,
-        "system" | "mdm" | "enterpriseManaged" | "legacyManagedConfigTomlFromFile"
+        "system"
+        | "mdm"
+        | "enterpriseManaged"
+        | "legacyManagedConfigTomlFromFile"
         | "legacyManagedConfigTomlFromMdm" => ConfigOriginV1::Managed,
         "sessionFlags" => ConfigOriginV1::SessionFlags,
         "packagedDefaults" => ConfigOriginV1::PackagedDefault,
@@ -753,7 +758,9 @@ fn read_native_default(
         Ok(result) => result,
         Err(error) => {
             let reason = match error {
-                HistoryReadErrorV1::Oversized => "its answer was larger than Pastey reads".to_owned(),
+                HistoryReadErrorV1::Oversized => {
+                    "its answer was larger than Pastey reads".to_owned()
+                }
                 HistoryReadErrorV1::Failed(reason) => reason,
             };
             let unsupported = ["method not found", "unknown variant", "not supported"]

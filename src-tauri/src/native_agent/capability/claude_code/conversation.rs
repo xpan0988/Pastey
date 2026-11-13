@@ -37,7 +37,18 @@
 //! interrupt is acknowledged. Signed-in local execution was verified on
 //! Windows with 2.1.319; see `docs/development.md` for evidence and checks.
 //!
-//! Local only: no peer protocol.
+//! A Bridge peer may invoke it with the generic invocation protocol, naming
+//! the folder only by the reference of a folder this Host shares with it
+//! (`resolve_peer_input`). Core's admission (Review or Full Access), task
+//! ownership and conversation ownership apply as to any capability: a
+//! peer's conversation in a folder is its own, never this Host's user's.
+//!
+//! The same headless run continues an existing session this Host's user or
+//! a peer chose (`HeadlessContinuationV1`, used by the session continuation
+//! adapter): only while nothing else holds the session, only while it still
+//! ends with the entry its user saw, and only once Claude Code's registry
+//! shows that the run Pastey started is the session's one holder. Nothing is
+//! sent before that; see `confirm_sole_holder`.
 
 use std::{
     collections::HashMap,
@@ -67,16 +78,16 @@ use crate::error::{AppError, AppResult};
 use crate::native_agent::sessions::claude::{
     claude_config_dir, find_cli, live_status, project_dir,
 };
+use crate::native_agent::sessions::claude::{live_holders, prompt_follows, transcript_end};
+use crate::native_agent::sessions::in_workspaces;
 use crate::native_agent::sessions::{now_ms, PROVIDER_CLAUDE_CODE};
 use crate::native_agent::{
-    NativeAgentCapabilityStateV1, NativeConversationContinuityV1, NativeTurnOutcomeV1,
-    MAX_TASK_BYTES,
+    NativeAgentCapabilityStateV1, NativeConversationContinuityV1, NativeSessionOptionsV1,
+    NativeTurnOutcomeV1, GENERIC_NATIVE_INVOKE_PROTOCOLS, MAX_TASK_BYTES,
 };
 
 pub(in crate::native_agent) const CLAUDE_CODE_CONVERSATION_ID: &str =
     "agent.coding.claude_code_conversation";
-/// No peer protocol: a Bridge peer cannot invoke it.
-const NO_PEER_PROTOCOLS: [&str; 0] = [];
 /// The oldest Claude Code whose signed-in headless behavior was verified
 /// on each platform. Older versions are refused.
 #[cfg(not(windows))]
@@ -102,6 +113,16 @@ const STOP_TERMINATE_GRACE: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const LEFTOVER_GRACE: Duration = Duration::from_secs(5);
 const EVENT_POLL: Duration = Duration::from_millis(100);
+/// After `claude` starts to continue a session, how long Pastey waits for
+/// it to appear in Claude Code's registry (measured at about 0.2 s on
+/// macOS) before reading who holds the session. No prompt is sent before.
+#[cfg(not(test))]
+const HOLDER_SETTLE: Duration = Duration::from_millis(1500);
+#[cfg(test)]
+const HOLDER_SETTLE: Duration = Duration::from_millis(150);
+/// A holder the registry says started this long before Pastey's launch is
+/// another process, whatever else is known about it.
+const HOLDER_CLOCK_SKEW_MS: u64 = 2000;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -111,6 +132,57 @@ struct ConversationInputV1 {
     /// Continue this owner's conversation in the folder, or begin one when
     /// none exists; `false` always begins a new one.
     resume: bool,
+}
+
+/// What a Bridge peer sends: the folder only as the reference of a folder
+/// this Host shares with it, never a path.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PeerConversationInputV1 {
+    scope_ref: String,
+    task: String,
+    resume: bool,
+}
+
+/// The input a requesting device sends to run `task` in a folder another
+/// Host shares with it, named by `scope_ref`.
+pub(in crate::native_agent) fn peer_input(
+    scope_ref: &str,
+    task: &str,
+    resume: bool,
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
+        return Err(AppError::InvalidInput(
+            "Claude Code task is empty or exceeds its bound.".into(),
+        ));
+    }
+    let input = OpaqueCapabilityPayloadV1::new(json!({
+        "scopeRef": scope_ref,
+        "task": task,
+        "resume": resume,
+    }));
+    input.validate()?;
+    Ok(input)
+}
+
+/// The executing Host's own input for a peer's: its shared folder for the
+/// reference. A path from a peer is refused (unknown field), and so is a
+/// reference it may not use.
+fn resolve_peer_input(
+    input: &OpaqueCapabilityPayloadV1,
+    shared: &[(String, PathBuf)],
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    let peer: PeerConversationInputV1 = serde_json::from_value(input.value().clone())
+        .map_err(|_| AppError::InvalidInput("Claude Code input is invalid.".into()))?;
+    let Some((_, workspace)) = shared
+        .iter()
+        .find(|(scope_ref, _)| *scope_ref == peer.scope_ref)
+    else {
+        return Err(AppError::InvalidInput(
+            "This device may not ask to run agents in that folder.".into(),
+        ));
+    };
+    conversation_input(workspace, &peer.task, peer.resume)
 }
 
 /// What continuing a conversation takes: its Claude Code session.
@@ -375,77 +447,90 @@ impl ClaudeCodeConversationAdapterV1 {
     }
 
     fn probe(&self) -> CapabilityAvailabilityV1 {
-        let unavailable = |reason: &'static str, detail: String| CapabilityAvailabilityV1 {
-            state: NativeAgentCapabilityStateV1::Unavailable,
-            reason: Some(reason),
-            detail: Some(detail),
+        headless_availability(self.cli(), self.launcher().is_some())
+    }
+}
+
+/// Whether Claude Code's headless interface can run here, contained: a
+/// version verified on this platform, signed in, and Pastey's containment
+/// (the lifeline helper, or on Windows a Job Object) available.
+pub(in crate::native_agent) fn headless_availability(
+    cli: Option<PathBuf>,
+    launcher_available: bool,
+) -> CapabilityAvailabilityV1 {
+    let unavailable = |reason: &'static str, detail: String| CapabilityAvailabilityV1 {
+        state: NativeAgentCapabilityStateV1::Unavailable,
+        reason: Some(reason),
+        detail: Some(detail),
+        backend: None,
+    };
+    if cfg!(not(any(unix, windows))) {
+        return unavailable(
+            "native_agent_platform_unverified",
+            "Pastey runs Claude Code conversations only on macOS, Linux and Windows.".into(),
+        );
+    }
+    let Some(cli) = cli else {
+        return unavailable(
+            "native_agent_not_installed",
+            "No `claude` executable was found.".into(),
+        );
+    };
+    let mut command = claude_command(&cli);
+    command.arg("--version").current_dir(std::env::temp_dir());
+    let Some((true, text)) = run_probe(command, PROBE_TIMEOUT) else {
+        return unavailable(
+            "native_agent_probe_failed",
+            format!("`{} --version` did not answer.", cli.display()),
+        );
+    };
+    let Some(version) = parse_version(&text) else {
+        return CapabilityAvailabilityV1 {
+            state: NativeAgentCapabilityStateV1::Incompatible,
+            reason: Some("native_agent_incompatible"),
+            detail: Some("Claude Code did not report a version Pastey understands.".into()),
             backend: None,
         };
-        if cfg!(not(any(unix, windows))) {
-            return unavailable(
-                "native_agent_platform_unverified",
-                "Pastey runs Claude Code conversations only on macOS, Linux and Windows.".into(),
-            );
-        }
-        let Some(cli) = self.cli() else {
-            return unavailable(
-                "native_agent_not_installed",
-                "No `claude` executable was found.".into(),
-            );
-        };
-        let mut command = claude_command(&cli);
-        command.arg("--version").current_dir(std::env::temp_dir());
-        let Some((true, text)) = run_probe(command, PROBE_TIMEOUT) else {
-            return unavailable(
-                "native_agent_probe_failed",
-                format!("`{} --version` did not answer.", cli.display()),
-            );
-        };
-        let Some(version) = parse_version(&text) else {
-            return CapabilityAvailabilityV1 {
-                state: NativeAgentCapabilityStateV1::Incompatible,
-                reason: Some("native_agent_incompatible"),
-                detail: Some("Claude Code did not report a version Pastey understands.".into()),
-                backend: None,
-            };
-        };
-        let shown = format!("{}.{}.{}", version.0, version.1, version.2);
-        if version < MINIMUM_VERSION {
-            return CapabilityAvailabilityV1 {
-                state: NativeAgentCapabilityStateV1::Incompatible,
-                reason: Some("native_agent_incompatible"),
-                detail: Some(format!(
-                    "Claude Code {shown} is older than {}.{}.{}, the minimum version Pastey requires on this platform. Update Claude Code.",
-                    MINIMUM_VERSION.0, MINIMUM_VERSION.1, MINIMUM_VERSION.2
-                )),
-                backend: None,
-            };
-        }
-        if signed_out(&cli) {
-            return unavailable(
-                "native_agent_signed_out",
-                "Claude Code is installed but not signed in. Run `claude` in a terminal and sign in.".into(),
-            );
-        }
-        if self.launcher().is_none() {
-            return unavailable(
-                "native_agent_launch_failed",
-                "Pastey cannot find its own executable to keep Claude Code on its lifeline.".into(),
-            );
-        }
-        #[cfg(windows)]
-        if let Err(error) = super::job::ContainedJobV1::create() {
-            return unavailable(
-                "native_agent_launch_failed",
-                format!("Pastey cannot create the Job Object that keeps Claude Code contained: {error}."),
-            );
-        }
-        CapabilityAvailabilityV1 {
-            state: NativeAgentCapabilityStateV1::Available,
-            reason: None,
-            detail: Some(format!("Claude Code {shown} at {}", cli.display())),
+    };
+    let shown = format!("{}.{}.{}", version.0, version.1, version.2);
+    if version < MINIMUM_VERSION {
+        return CapabilityAvailabilityV1 {
+            state: NativeAgentCapabilityStateV1::Incompatible,
+            reason: Some("native_agent_incompatible"),
+            detail: Some(format!(
+                "Claude Code {shown} is older than {}.{}.{}, the minimum version Pastey requires on this platform. Update Claude Code.",
+                MINIMUM_VERSION.0, MINIMUM_VERSION.1, MINIMUM_VERSION.2
+            )),
             backend: None,
-        }
+        };
+    }
+    if signed_out(&cli) {
+        return unavailable(
+            "native_agent_signed_out",
+            "Claude Code is installed but not signed in. Run `claude` in a terminal and sign in."
+                .into(),
+        );
+    }
+    if !launcher_available {
+        return unavailable(
+            "native_agent_launch_failed",
+            "Pastey cannot find its own executable to keep Claude Code on its lifeline.".into(),
+        );
+    }
+    #[cfg(windows)]
+    if let Err(error) = super::job::ContainedJobV1::create() {
+        return unavailable(
+            "native_agent_launch_failed",
+            format!(
+                "Pastey cannot create the Job Object that keeps Claude Code contained: {error}."
+            ),
+        );
+    }
+    CapabilityAvailabilityV1 {
+        state: NativeAgentCapabilityStateV1::Available,
+        reason: None,
+        detail: Some(format!("Claude Code {shown} at {}", cli.display())),
+        backend: None,
     }
 }
 
@@ -619,8 +704,22 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
         report
     }
 
+    /// A peer may ask, naming a folder this Host shares with it; each run
+    /// waits for this Host's Review unless the peer holds Full Access.
     fn supported_protocols(&self) -> &'static [&'static str] {
-        &NO_PEER_PROTOCOLS
+        &GENERIC_NATIVE_INVOKE_PROTOCOLS
+    }
+
+    fn peer_folder_use(&self) -> Option<super::super::PeerFolderUseV1> {
+        Some(super::super::PeerFolderUseV1::Run)
+    }
+
+    fn resolve_peer_input(
+        &self,
+        input: &OpaqueCapabilityPayloadV1,
+        shared: &[(String, PathBuf)],
+    ) -> AppResult<Option<OpaqueCapabilityPayloadV1>> {
+        resolve_peer_input(input, shared).map(Some)
     }
 
     fn prepare(&self, input: &OpaqueCapabilityPayloadV1) -> AppResult<PreparedInvocationV1> {
@@ -715,6 +814,8 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
                 prompt_uuid: Uuid::new_v4().to_string(),
                 control,
                 runs: self.runs.clone(),
+                options: NativeSessionOptionsV1::default(),
+                existing: None,
             }),
         })
     }
@@ -779,6 +880,165 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
     }
 }
 
+/// Continuing an existing session with the same contained headless run a
+/// conversation uses, for the session continuation adapter: this module
+/// owns how `claude` is started, contained, stopped and judged, and that
+/// adapter only says which session, folder, prompt and options.
+pub(in crate::native_agent) struct HeadlessContinuationV1 {
+    global_config: Mutex<Option<PathBuf>>,
+    launcher: Mutex<Option<LauncherV1>>,
+    runs: Arc<Mutex<HashMap<String, Arc<ConversationControlV1>>>>,
+    observed: Mutex<Option<(Instant, CapabilityAvailabilityV1)>>,
+}
+
+impl Default for HeadlessContinuationV1 {
+    fn default() -> Self {
+        Self {
+            global_config: Mutex::new(None),
+            launcher: Mutex::new(LauncherV1::product()),
+            runs: Arc::default(),
+            observed: Mutex::new(None),
+        }
+    }
+}
+
+/// One continuation of an existing session, as its user chose it.
+pub(in crate::native_agent) struct HeadlessSessionTurnV1<'a> {
+    pub(in crate::native_agent) cli: PathBuf,
+    pub(in crate::native_agent) config_dir: &'a Path,
+    /// Canonical.
+    pub(in crate::native_agent) workspace: PathBuf,
+    pub(in crate::native_agent) session_id: String,
+    pub(in crate::native_agent) prompt: String,
+    pub(in crate::native_agent) expected_marker: Option<String>,
+    pub(in crate::native_agent) options: NativeSessionOptionsV1,
+}
+
+impl HeadlessContinuationV1 {
+    fn launcher(&self) -> Option<LauncherV1> {
+        self.launcher.lock().ok()?.clone()
+    }
+
+    /// Whether the contained headless run is available here (cached as the
+    /// conversation adapter's availability is).
+    pub(in crate::native_agent) fn availability(
+        &self,
+        cli: Option<PathBuf>,
+    ) -> CapabilityAvailabilityV1 {
+        if let Some((at, report)) = self
+            .observed
+            .lock()
+            .ok()
+            .and_then(|observed| observed.clone())
+        {
+            if at.elapsed() < AVAILABILITY_REUSE {
+                return report;
+            }
+        }
+        let report = headless_availability(cli, self.launcher().is_some());
+        if let Ok(mut observed) = self.observed.lock() {
+            *observed = Some((Instant::now(), report.clone()));
+        }
+        report
+    }
+
+    /// The run continuing `turn.session_id`; observed by Core like any run.
+    pub(in crate::native_agent) fn start(
+        &self,
+        task_id: &str,
+        turn: HeadlessSessionTurnV1<'_>,
+    ) -> AppResult<Box<dyn NativeInvocationRunV1>> {
+        let launcher = self.launcher().ok_or_else(|| {
+            AppError::InvalidInput("Claude Code cannot be kept on its lifeline.".into())
+        })?;
+        let control = Arc::new(ConversationControlV1::default());
+        self.runs
+            .lock()
+            .map_err(|_| AppError::InvalidInput("Claude Code runs are unavailable.".into()))?
+            .insert(task_id.to_owned(), control.clone());
+        let global_config = self
+            .global_config
+            .lock()
+            .ok()
+            .and_then(|config| config.clone())
+            .or_else(default_global_config);
+        Ok(Box::new(ConversationRunV1 {
+            task_id: task_id.to_owned(),
+            cli: turn.cli,
+            launcher,
+            transcript: project_dir(turn.config_dir, &turn.workspace)
+                .join(format!("{}.jsonl", turn.session_id)),
+            global_config,
+            workspace: turn.workspace,
+            session_id: turn.session_id,
+            continuity: NativeConversationContinuityV1::Continued,
+            prompt: turn.prompt,
+            prompt_uuid: Uuid::new_v4().to_string(),
+            control,
+            runs: self.runs.clone(),
+            options: turn.options,
+            existing: Some(ExistingSessionV1 {
+                expected_marker: turn.expected_marker,
+            }),
+        }))
+    }
+
+    /// Stop for a task this runner started. `false`: it has none.
+    pub(in crate::native_agent) fn cancel(&self, task_id: &str) -> bool {
+        let control = self
+            .runs
+            .lock()
+            .ok()
+            .and_then(|runs| runs.get(task_id).cloned());
+        control.map(|control| control.request_stop()).is_some()
+    }
+
+    pub(in crate::native_agent) fn release(&self, task_id: &str) {
+        let control = self
+            .runs
+            .lock()
+            .ok()
+            .and_then(|mut runs| runs.remove(task_id));
+        if let Some(control) = control {
+            control.request_stop();
+        }
+    }
+
+    pub(in crate::native_agent) fn shutdown(&self) {
+        if let Ok(runs) = self.runs.lock() {
+            for control in runs.values() {
+                control.request_stop();
+            }
+        }
+    }
+
+    /// Tests: the fixture's global configuration, started without the
+    /// lifeline helper (on Windows, in its Job Object as in the product).
+    #[cfg(test)]
+    pub(in crate::native_agent) fn use_fixture(&self, config_dir: &Path) {
+        *self.global_config.lock().unwrap() = Some(config_dir.join(".claude.json"));
+        #[cfg(unix)]
+        {
+            *self.launcher.lock().unwrap() = Some(LauncherV1::Direct);
+        }
+        *self.observed.lock().unwrap() = None;
+    }
+
+    /// Tests: every live run stops observing silently.
+    #[cfg(test)]
+    pub(in crate::native_agent) fn abandon_runs(&self) {
+        for control in self.runs.lock().unwrap().values() {
+            control.abandoned.store(true, Ordering::Release);
+        }
+    }
+
+    /// Tests: the installed `claude` under a real lifeline helper.
+    #[cfg(all(test, unix))]
+    pub(in crate::native_agent) fn use_lifeline_helper(&self, helper: &Path) {
+        *self.launcher.lock().unwrap() = Some(LauncherV1::Lifeline(helper.to_path_buf()));
+    }
+}
+
 /// The last `result` Claude Code reported.
 struct ResultV1 {
     subtype: String,
@@ -804,6 +1064,18 @@ struct ConversationRunV1 {
     prompt_uuid: String,
     control: Arc<ConversationControlV1>,
     runs: Arc<Mutex<HashMap<String, Arc<ConversationControlV1>>>>,
+    /// Claude Code's own per-session options, only as its user chose them.
+    options: NativeSessionOptionsV1,
+    /// Set when the run continues an existing session its user chose (not a
+    /// conversation Pastey began): what that user saw of it.
+    existing: Option<ExistingSessionV1>,
+}
+
+/// An existing session a run continues, as its user chose it.
+struct ExistingSessionV1 {
+    /// The session's last main-chain entry when its user looked at it. The
+    /// session must still end with it, and Pastey's prompt must follow it.
+    expected_marker: Option<String>,
 }
 
 /// What a run saw on Claude Code's stream.
@@ -822,7 +1094,7 @@ impl ConversationRunV1 {
             NativeConversationContinuityV1::New => "--session-id",
             NativeConversationContinuityV1::Continued => "--resume",
         };
-        let args = [
+        let mut args = vec![
             "-p",
             "--input-format",
             "stream-json",
@@ -833,6 +1105,14 @@ impl ConversationRunV1 {
             session_flag,
             &self.session_id,
         ];
+        // Claude Code's own options for the session, as its user chose them
+        // (validated identifiers, each its own argument).
+        if let Some(model) = self.options.model.as_deref() {
+            args.extend(["--model", model]);
+        }
+        if let Some(effort) = self.options.effort.as_deref() {
+            args.extend(["--effort", effort]);
+        }
         match &self.launcher {
             #[cfg(unix)]
             LauncherV1::Lifeline(helper) => {
@@ -856,7 +1136,7 @@ impl ConversationRunV1 {
                 helper_command
                     .arg(super::lifeline::LIFELINE_ARG)
                     .arg(program)
-                    .args(args);
+                    .args(&args);
                 let (reader, writer) = std::io::pipe()?;
                 let read_fd = reader.as_raw_fd();
                 // SAFETY: only async-signal-safe calls between fork and exec.
@@ -886,7 +1166,7 @@ impl ConversationRunV1 {
             LauncherV1::Job => {
                 let job = super::job::ContainedJobV1::create()?;
                 let mut command = claude_command(&self.cli);
-                command.args(args);
+                command.args(&args);
                 self.prepare(&mut command);
                 let child = job.spawn(&mut command)?;
                 Ok(ClaudeProcessV1 { child, job })
@@ -895,7 +1175,7 @@ impl ConversationRunV1 {
             LauncherV1::Direct => {
                 use std::os::unix::process::CommandExt;
                 let mut command = claude_command(&self.cli);
-                command.args(args);
+                command.args(&args);
                 // SAFETY: only an async-signal-safe call before exec.
                 unsafe {
                     command.pre_exec(|| {
@@ -1213,18 +1493,11 @@ impl ConversationRunV1 {
             return outcome(NativeTurnOutcomeV1::NotStarted, problem);
         }
         if self.continuity == NativeConversationContinuityV1::Continued {
-            match live_status(&self.cli, &self.session_id) {
-                Ok(None) => {}
-                Ok(Some(status)) => return outcome(
-                    NativeTurnOutcomeV1::NotStarted,
-                    format!("Another Claude Code process has this conversation's session open ({status}); nothing was sent."),
-                ),
-                Err(why) => return outcome(
-                    NativeTurnOutcomeV1::NotStarted,
-                    format!("Whether another process has the session open cannot be shown ({why}); nothing was sent."),
-                ),
+            if let Some(problem) = self.continuation_problem() {
+                return outcome(NativeTurnOutcomeV1::NotStarted, problem);
             }
         }
+        let launched_ms = now_ms();
         let mut process = match self.launch() {
             Ok(process) => process,
             Err(error) => {
@@ -1261,6 +1534,14 @@ impl ConversationRunV1 {
                 }
             });
         }
+        // Continuing a session: nothing is sent until Claude Code's registry
+        // shows the run Pastey started as the session's only holder.
+        if self.continuity == NativeConversationContinuityV1::Continued {
+            if let Err(problem) = self.confirm_sole_holder(launched_ms) {
+                drop(stdin);
+                return self.abandon_unsent(problem);
+            }
+        }
         let mut stdin = stdin;
         // Windows: a Stop already asked for is sent through stdin, and the
         // prompt is never sent after it.
@@ -1291,7 +1572,147 @@ impl ConversationRunV1 {
             .lock()
             .map(|text| text.clone())
             .unwrap_or_default();
-        self.classify(observed, status, &stderr, left)
+        let result = self.classify(observed, status, &stderr, left);
+        self.verify_lineage(result)
+    }
+
+    /// Why a continuation must not start, checked right before launching:
+    /// for a session its user chose, that it is this folder's and still ends
+    /// with the entry its user saw; for any continuation, that no process
+    /// holds it. `None`: it may start.
+    fn continuation_problem(&self) -> Option<String> {
+        if let Some(existing) = &self.existing {
+            let Some((cwd, marker)) = transcript_end(&self.transcript) else {
+                return Some(
+                    "The session's history could not be read in this folder, so nothing was sent."
+                        .into(),
+                );
+            };
+            if cwd
+                .as_deref()
+                .and_then(|cwd| in_workspaces(cwd, std::slice::from_ref(&self.workspace)))
+                .is_none()
+            {
+                return Some("The session ran in another folder, so nothing was sent.".into());
+            }
+            if let Some(expected) = existing.expected_marker.as_deref() {
+                if marker.as_deref() != Some(expected) {
+                    return Some("This session changed since it was looked at, so nothing was sent. Look at it again before continuing.".into());
+                }
+            }
+        }
+        match live_holders(&self.cli, &self.session_id) {
+            Ok(holders) if holders.is_empty() => None,
+            Ok(holders) => Some(format!(
+                "{} has this session open ({}), so nothing was sent. Let it finish or close it there, then continue.",
+                holders[0].described(),
+                holders[0].status
+            )),
+            Err(why) => Some(format!(
+                "Whether another process has the session open cannot be shown ({why}); nothing was sent."
+            )),
+        }
+    }
+
+    /// After launching, before anything is sent: Claude Code's registry
+    /// lists at most one holder of the session, and it is the run Pastey
+    /// started. Claude Code keeps no writer lock, so this closes the moment
+    /// between the check before launching and Pastey's own run appearing
+    /// there (measured: a headless run is listed, as `interactive`, before
+    /// its first prompt). On Windows the holder's process must be in the
+    /// run's Job Object; elsewhere it must have started with the launch, and
+    /// two holders always refuse. A registry that does not list the run at
+    /// all is no evidence against it.
+    fn confirm_sole_holder(&self, launched_ms: u64) -> Result<(), String> {
+        let deadline = Instant::now() + HOLDER_SETTLE;
+        while Instant::now() < deadline {
+            let exited = self
+                .with_process(|process| !matches!(process.child.try_wait(), Ok(None)))
+                .unwrap_or(true);
+            if exited {
+                // What it said decides; nothing will be sent to it.
+                return Ok(());
+            }
+            thread::sleep(EVENT_POLL);
+        }
+        #[cfg(windows)]
+        let own = self.with_process(|process| process.job.process_ids());
+        #[cfg(not(windows))]
+        let own: Option<Vec<u32>> = None;
+        let holders = live_holders(&self.cli, &self.session_id).map_err(|why| {
+            format!("Whether another process opened the session cannot be shown ({why}); nothing was sent.")
+        })?;
+        let foreign = holders.iter().find(|holder| {
+            holder
+                .started_at_ms
+                .is_some_and(|started| started + HOLDER_CLOCK_SKEW_MS < launched_ms)
+                || matches!((&own, holder.pid), (Some(own), Some(pid)) if !own.contains(&pid))
+        });
+        if let Some(holder) = foreign.or_else(|| (holders.len() > 1).then(|| &holders[0])) {
+            return Err(format!(
+                "{} opened this session as Pastey started ({}), so nothing was sent. Let it finish or close it there, then continue.",
+                holder.described(),
+                holder.status
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ends a run Pastey started but sent nothing to: a definite non-start.
+    fn abandon_unsent(&self, problem: String) -> NativeInvocationOutcomeV1 {
+        self.with_process(|process| process.request(KILL));
+        let deadline = Instant::now() + STOP_TERMINATE_GRACE;
+        while Instant::now() < deadline {
+            let exited = self
+                .with_process(|process| !matches!(process.child.try_wait(), Ok(None)))
+                .unwrap_or(true);
+            if exited {
+                break;
+            }
+            thread::sleep(EVENT_POLL);
+        }
+        #[cfg(windows)]
+        let left = self
+            .with_process(|process| process.job.end_remaining(LEFTOVER_GRACE))
+            .unwrap_or_else(|| Err("the run's Job Object is gone".into()));
+        #[cfg(not(windows))]
+        let left: Result<u32, String> = Ok(0);
+        if let Err(why) = left {
+            // Nothing was sent, but the process cannot be shown gone.
+            return outcome(
+                NativeTurnOutcomeV1::Unknown,
+                format!("{problem} The process Pastey started could not be shown to have ended ({why})."),
+            );
+        }
+        outcome(NativeTurnOutcomeV1::NotStarted, problem)
+    }
+
+    /// A completed continuation of a session its user chose stays complete
+    /// only if Pastey's prompt follows the entry that user saw: otherwise
+    /// another client wrote to the session at the same time and its history
+    /// may have branched, which is never reported as done.
+    fn verify_lineage(&self, result: NativeInvocationOutcomeV1) -> NativeInvocationOutcomeV1 {
+        let Some(expected) = self
+            .existing
+            .as_ref()
+            .and_then(|existing| existing.expected_marker.as_deref())
+        else {
+            return result;
+        };
+        if result.kind != NativeTurnOutcomeV1::Completed {
+            return result;
+        }
+        match prompt_follows(&self.transcript, &self.prompt_uuid, expected) {
+            Some(true) => result,
+            Some(false) => outcome(
+                NativeTurnOutcomeV1::Unknown,
+                "Claude Code finished the turn, but another client wrote to this session at the same time, so its history may have branched. Look at the session before continuing it.",
+            ),
+            None => outcome(
+                NativeTurnOutcomeV1::Unknown,
+                "Claude Code finished the turn, but its history could not show that the prompt followed the entry you saw; the outcome is unknown.",
+            ),
+        }
     }
 }
 
@@ -1351,6 +1772,6 @@ impl NativeInvocationRunV1 for ConversationRunV1 {
 }
 
 #[cfg(all(test, unix))]
-mod tests;
+pub(in crate::native_agent) mod tests;
 #[cfg(all(test, windows))]
 mod windows_tests;

@@ -297,7 +297,8 @@ Close/exit, disconnect, explicit departure, session replacement, Burn, shutdown,
 | Capability | macOS | Linux | Windows |
 | --- | --- | --- | --- |
 | Search/Transfer safe identity and encrypted transfer | Implemented | Implemented where the desktop product is supported | Implemented; cross-compiled checks do not replace native proof |
-| Claude Code Conversation (local only) | 2.1.317 or later, under a lifeline | Unix lifeline implemented; outside the supported release scope | 2.1.319 or later, in a Job Object |
+| Claude Code Conversation (local, or from a Bridge peer in a shared folder) | 2.1.317 or later, under a lifeline | Unix lifeline implemented; outside the supported release scope | 2.1.319 or later, in a Job Object |
+| Claude Code session continuation | `claude --bg --resume`; contained headless `-p --resume` when a model or effort is chosen | As macOS; outside the supported release scope | Contained headless `-p --resume` only (`--bg` not measured there); signed-in Windows run of this path not yet recorded |
 | Managed Resource effects | Implemented | Implemented | Implemented |
 | Managed contained Process execution | Available only after the local `sandbox-exec` confinement probe succeeds | Unavailable; fails closed | [Codex-derived managed execution](platform/windows-managed-execution.md), gated by Host-owned setup and native conformance. Windows v1 Managed Execute acceptance exists; failure is fail-closed with no unsandboxed fallback. |
 | Worker task Network effects | Not exposed | Not exposed | Not exposed |
