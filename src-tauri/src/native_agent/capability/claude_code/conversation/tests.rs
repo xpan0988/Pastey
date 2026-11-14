@@ -269,7 +269,12 @@ fn run(fixture: &FixtureV1, mode: &str, new_conversation: bool) -> NativeAgentTa
     fixture.mode(mode);
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", new_conversation)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            new_conversation,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_terminal(&service, &started.task_id)
 }
@@ -298,6 +303,146 @@ fn a_new_conversation_runs_once_in_a_session_pastey_chose_and_completes_with_the
     assert!(Uuid::parse_str(session).is_ok(), "{session}");
 }
 
+/// The session id a `-p` run named, after `flag`.
+fn session_after(run: &str, flag: &str) -> String {
+    run.split(flag)
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("{flag} in {run}"))
+        .to_owned()
+}
+
+#[test]
+fn a_conversation_carries_its_users_model_and_effort_into_the_same_session() {
+    let fixture = FixtureV1::new("complete");
+    let (mut service, _) = fixture.service();
+    let mut turn = |new_conversation, chosen: NativeSessionOptionsV1| {
+        let started = service
+            .start_claude_code_conversation_task(
+                &fixture.workspace,
+                "Do the task",
+                new_conversation,
+                &chosen,
+            )
+            .unwrap();
+        let status = wait_terminal(&service, &started.task_id);
+        wait_released(&service, &fixture.workspace);
+        let session = service.local_task_native_session(&started.task_id);
+        (status, session)
+    };
+    // First turn: a new session, begun with the chosen model.
+    let (first, first_session) = turn(true, options(Some("haiku"), None));
+    assert_eq!(first.state, NativeAgentTaskStateV1::Completed, "{first:?}");
+    // A follow-up with only an effort: the same session, resumed.
+    let (second, second_session) = turn(false, options(None, Some("low")));
+    assert_eq!(
+        second.state,
+        NativeAgentTaskStateV1::Completed,
+        "{second:?}"
+    );
+    assert_eq!(
+        second.conversation,
+        Some(NativeConversationContinuityV1::Continued)
+    );
+    // And one with nothing chosen: Claude Code's own configuration again.
+    let (third, _) = turn(false, NativeSessionOptionsV1::default());
+    assert_eq!(third.state, NativeAgentTaskStateV1::Completed, "{third:?}");
+    let runs = fixture.runs();
+    assert_eq!(runs.len(), 3, "each turn sent once: {runs:?}");
+    let session = session_after(&runs[0], "--session-id ");
+    assert!(runs[0].ends_with("--model haiku"), "{}", runs[0]);
+    assert!(!runs[0].contains("--effort"));
+    assert_eq!(
+        session_after(&runs[1], "--resume "),
+        session,
+        "never another session"
+    );
+    assert!(
+        runs[1].ends_with("--effort low") && !runs[1].contains("--model"),
+        "{}",
+        runs[1]
+    );
+    assert_eq!(session_after(&runs[2], "--resume "), session);
+    assert!(
+        !runs[2].contains("--model") && !runs[2].contains("--effort"),
+        "{}",
+        runs[2]
+    );
+    assert!(runs.iter().all(|run| !run.contains("--fork-session")));
+    assert_eq!(
+        first_session, second_session,
+        "one conversation, one session"
+    );
+}
+
+#[test]
+fn a_conversation_input_names_options_only_when_its_user_chose_some() {
+    let fixture = FixtureV1::new("complete");
+    let plain = conversation_input(
+        &fixture.workspace,
+        "x",
+        true,
+        &NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
+    assert!(
+        plain.value().get("options").is_none(),
+        "unchanged for older Hosts"
+    );
+    let chosen = conversation_input(
+        &fixture.workspace,
+        "x",
+        true,
+        &options(Some("opus"), Some("high")),
+    )
+    .unwrap();
+    assert_eq!(
+        chosen.value()["options"],
+        json!({"model": "opus", "effort": "high"})
+    );
+    // A peer's choice survives the Host's resolution of its folder.
+    let shared = vec![(
+        "scope:0123456789abcdef".to_string(),
+        fixture.workspace.clone(),
+    )];
+    let asked = peer_input(
+        "scope:0123456789abcdef",
+        "x",
+        true,
+        &options(None, Some("max")),
+    )
+    .unwrap();
+    let resolved = resolve_peer_input(&asked, &shared).unwrap();
+    assert_eq!(resolved.value()["options"], json!({"effort": "max"}));
+    assert!(peer_input(
+        "scope:0123456789abcdef",
+        "x",
+        true,
+        &NativeSessionOptionsV1::default()
+    )
+    .unwrap()
+    .value()
+    .get("options")
+    .is_none());
+}
+
+#[test]
+fn a_conversation_refuses_options_that_are_not_identifiers_before_anything_runs() {
+    let fixture = FixtureV1::new("complete");
+    let (mut service, _) = fixture.service();
+    for bad in [
+        options(Some("--permission-mode"), None),
+        options(Some("a b"), None),
+        options(None, Some("LOW")),
+    ] {
+        assert!(service
+            .start_claude_code_conversation_task(&fixture.workspace, "x", true, &bad)
+            .is_err());
+        assert!(peer_input("scope:0123456789abcdef", "x", true, &bad).is_err());
+    }
+    assert!(fixture.runs().is_empty());
+}
+
 #[test]
 fn a_follow_up_continues_exactly_that_session_and_a_new_conversation_begins_another() {
     let fixture = FixtureV1::new("complete");
@@ -311,6 +456,7 @@ fn a_follow_up_continues_exactly_that_session_and_a_new_conversation_begins_anot
                 &fixture.workspace,
                 "Do the task",
                 new_conversation,
+                &crate::native_agent::NativeSessionOptionsV1::default(),
             )
             .unwrap();
         let status = wait_terminal(&service, &started.task_id);
@@ -428,7 +574,12 @@ fn a_conversation_whose_session_is_gone_is_unavailable_and_never_replaced() {
     let fixture = FixtureV1::new("complete");
     let (mut service, _) = fixture.service();
     let first = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     assert_eq!(
         wait_terminal(&service, &first.task_id).state,
@@ -437,7 +588,12 @@ fn a_conversation_whose_session_is_gone_is_unavailable_and_never_replaced() {
     wait_released(&service, &fixture.workspace);
     fixture.mode("missing");
     let continued = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", false)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            false,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let status = wait_terminal(&service, &continued.task_id);
     assert_eq!(status.state, NativeAgentTaskStateV1::Failed);
@@ -455,7 +611,12 @@ fn a_session_another_process_holds_is_not_continued() {
     let fixture = FixtureV1::new("complete");
     let (mut service, _) = fixture.service();
     let first = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_terminal(&service, &first.task_id);
     wait_released(&service, &fixture.workspace);
@@ -466,7 +627,12 @@ fn a_session_another_process_holds_is_not_continued() {
     )
     .unwrap();
     let continued = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", false)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            false,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let status = wait_terminal(&service, &continued.task_id);
     assert_eq!(status.code.as_deref(), Some("native_agent_start_failed"));
@@ -518,7 +684,12 @@ fn a_repository_s_configuration_and_trust_count_for_its_subfolders() {
     let start = |fixture: &FixtureV1| {
         let (mut service, _) = fixture.service();
         let started = service
-            .start_claude_code_conversation_task(&inner, "Do the task", true)
+            .start_claude_code_conversation_task(
+                &inner,
+                "Do the task",
+                true,
+                &crate::native_agent::NativeSessionOptionsV1::default(),
+            )
             .unwrap();
         wait_terminal(&service, &started.task_id)
     };
@@ -535,7 +706,12 @@ fn stop_interrupts_the_run_and_releases_the_folder_once_it_ends() {
     let fixture = FixtureV1::new("hang");
     let (mut service, _) = fixture.service();
     let started = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the run started");
     assert!(service
@@ -577,7 +753,12 @@ fn a_restart_during_a_run_keeps_the_outcome_unknown_then_observes_its_end() {
         (service, adapter)
     };
     let started = before
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the run started");
     adapter.abandon_runs();
@@ -595,7 +776,12 @@ fn a_restart_during_a_run_keeps_the_outcome_unknown_then_observes_its_end() {
         .workspace_has_authoritative_owner(&fixture.workspace, None, None)
         .unwrap());
     assert!(after
-        .start_claude_code_conversation_task(&fixture.workspace, "Again", false)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Again",
+            false,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
         .is_err());
 
     fs::write(fixture.root.join("finish"), b"").unwrap();
@@ -660,9 +846,10 @@ fn bridge_peers_see_it_and_name_its_folder_only_by_a_share_reference() {
     let (mut service, adapter) = fixture.service();
     let facts = service.native_capability_facts();
     assert_eq!(facts.len(), 1, "described to peers");
+    // Generic invocation, and it applies a model or effort its user chose.
     assert_eq!(
         adapter.supported_protocols(),
-        &crate::native_agent::GENERIC_NATIVE_INVOKE_PROTOCOLS
+        &crate::native_agent::OPTIONS_INVOKE_PROTOCOLS
     );
     assert_eq!(
         adapter.peer_folder_use(),
@@ -672,7 +859,13 @@ fn bridge_peers_see_it_and_name_its_folder_only_by_a_share_reference() {
         "scope:0123456789abcdef".to_string(),
         fixture.workspace.clone(),
     )];
-    let asked = peer_input("scope:0123456789abcdef", "fix the test", true).unwrap();
+    let asked = peer_input(
+        "scope:0123456789abcdef",
+        "fix the test",
+        true,
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
     let resolved = adapter
         .resolve_peer_input(&asked, &shared)
         .unwrap()
@@ -683,7 +876,13 @@ fn bridge_peers_see_it_and_name_its_folder_only_by_a_share_reference() {
     );
     assert_eq!(resolved.value()["resume"], true);
     // Another reference, no shares, or a path: refused.
-    let other = peer_input("scope:ffffffffffffffff", "x", false).unwrap();
+    let other = peer_input(
+        "scope:ffffffffffffffff",
+        "x",
+        false,
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
     assert!(adapter.resolve_peer_input(&other, &shared).is_err());
     assert!(adapter.resolve_peer_input(&asked, &[]).is_err());
     let with_path = OpaqueCapabilityPayloadV1::new(json!({
@@ -691,7 +890,13 @@ fn bridge_peers_see_it_and_name_its_folder_only_by_a_share_reference() {
     }));
     assert!(adapter.resolve_peer_input(&with_path, &shared).is_err());
     // Host form from a peer is refused too: only a reference is accepted.
-    let host_form = conversation_input(&fixture.workspace, "x", false).unwrap();
+    let host_form = conversation_input(
+        &fixture.workspace,
+        "x",
+        false,
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
     assert!(adapter.resolve_peer_input(&host_form, &shared).is_err());
 
     // A peer's invocation waits for this Host's Review: nothing runs.
@@ -1027,6 +1232,7 @@ fn installed_claude_code_conversation_runs_and_continues_through_pastey() {
             &workspace,
             "Reply with exactly: pastey-claude-one",
             true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
     let first = live_terminal(&service, &first.task_id);
@@ -1050,6 +1256,7 @@ fn installed_claude_code_conversation_runs_and_continues_through_pastey() {
             &workspace,
             "What exact text did you reply with last time? Reply with exactly that text.",
             false,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
     let follow_up = live_terminal(&service, &follow_up.task_id);
@@ -1269,6 +1476,182 @@ fn installed_claude_code_continues_an_existing_session_in_place_with_a_chosen_mo
     let _ = fs::remove_dir_all(root);
 }
 
+/// Live: an ordinary conversation, begun with a model its user chose and
+/// continued with an effort they chose, stays one native session with its
+/// context; discovery then reads back what the session actually ran with.
+#[test]
+#[ignore = "uses the installed, signed-in Claude Code and its quota"]
+fn installed_claude_code_conversation_applies_a_chosen_model_and_effort_in_one_session() {
+    let workspace = live_workspace("claude-conversation-options-live");
+    let root = std::env::temp_dir().join(format!("pastey-claude-options-{}", Uuid::new_v4()));
+    let mut service = live_service(&root);
+    let first = service
+        .start_claude_code_conversation_task(
+            &workspace,
+            "Remember the word HERON. Reply only OK.",
+            true,
+            &options(Some("haiku"), None),
+        )
+        .unwrap();
+    let first = live_terminal(&service, &first.task_id);
+    eprintln!(
+        "first: {:?} {:?} {:?}",
+        first.state,
+        first.code,
+        text(&first)
+    );
+    assert_eq!(first.state, NativeAgentTaskStateV1::Completed);
+    wait_released(&service, &workspace);
+    let session = service
+        .local_task_native_session(&first.task_id)
+        .expect("the first turn names its session");
+    let read = || {
+        crate::native_agent::sessions::ClaudeSessionSourceV1::installed()
+            .discover(&[workspace.clone()])
+            .0
+            .into_iter()
+            .find(|found| found.session_id == session.session_id)
+            .and_then(|found| found.agent_config)
+            .expect("the session's record")
+    };
+    let after_first = read();
+    eprintln!(
+        "after first: {:?} {:?}",
+        after_first.model, after_first.reasoning_effort
+    );
+    assert!(after_first.model.unwrap().contains("haiku"));
+
+    let second = service
+        .start_claude_code_conversation_task(
+            &workspace,
+            "What word did I ask you to remember? Reply with that one word.",
+            false,
+            &options(None, Some("low")),
+        )
+        .unwrap();
+    let second = live_terminal(&service, &second.task_id);
+    eprintln!(
+        "second: {:?} {:?} {:?}",
+        second.state,
+        second.code,
+        text(&second)
+    );
+    assert_eq!(second.state, NativeAgentTaskStateV1::Completed);
+    assert_eq!(
+        second.conversation,
+        Some(NativeConversationContinuityV1::Continued)
+    );
+    assert!(text(&second).unwrap().to_uppercase().contains("HERON"));
+    wait_released(&service, &workspace);
+    assert_eq!(
+        service.local_task_native_session(&second.task_id).as_ref(),
+        Some(&session),
+        "the same session"
+    );
+    let after_second = read();
+    eprintln!(
+        "after second: {:?} {:?}",
+        after_second.model, after_second.reasoning_effort
+    );
+    assert!(
+        after_second.model.unwrap().contains("haiku"),
+        "the model stays the session's"
+    );
+    assert_eq!(after_second.reasoning_effort.as_deref(), Some("low"));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Live: the installed Claude Code lists its models through the
+/// `initialize` control request alone (no prompt, no session written),
+/// and an entry picked from that list runs as `--model` in a conversation,
+/// which then records the model the entry stands for.
+#[test]
+#[ignore = "uses the installed, signed-in Claude Code and its quota"]
+fn installed_claude_code_lists_its_models_and_a_listed_one_runs() {
+    use crate::native_agent::model_catalog::ModelCatalogStateV1;
+    let config = crate::native_agent::sessions::claude::claude_config_dir().expect("a config dir");
+    let neutral = project_dir(&config, &std::env::temp_dir());
+    let sessions_before = fs::read_dir(&neutral).map(|dir| dir.count()).unwrap_or(0);
+    let catalog = crate::native_agent::sessions::ClaudeSessionSourceV1::installed().model_catalog();
+    eprintln!(
+        "catalog: {}",
+        serde_json::to_string_pretty(&catalog).unwrap()
+    );
+    assert_eq!(
+        catalog.state,
+        ModelCatalogStateV1::Reported,
+        "{:?}",
+        catalog.note
+    );
+    assert!(catalog.is_valid());
+    assert!(!catalog.models.is_empty());
+    assert_eq!(
+        fs::read_dir(&neutral).map(|dir| dir.count()).unwrap_or(0),
+        sessions_before,
+        "listing models writes no session"
+    );
+
+    // A listed entry, as the picker would send it: the cheapest one listed
+    // with what it stands for.
+    let entry = catalog
+        .models
+        .iter()
+        .filter(|entry| entry.resolves_to.is_some())
+        .find(|entry| entry.id.contains("haiku"))
+        .or_else(|| {
+            catalog
+                .models
+                .iter()
+                .find(|entry| entry.resolves_to.is_some())
+        })
+        .expect("an entry that names its model")
+        .clone();
+    let effort = entry
+        .efforts
+        .as_ref()
+        .and_then(|efforts| efforts.first())
+        .map(|effort| effort.id.clone());
+    let workspace = live_workspace("claude-catalog-live");
+    let root = std::env::temp_dir().join(format!("pastey-claude-catalog-{}", Uuid::new_v4()));
+    let mut service = live_service(&root);
+    let started = service
+        .start_claude_code_conversation_task(
+            &workspace,
+            "Reply only OK.",
+            true,
+            &options(Some(&entry.id), effort.as_deref()),
+        )
+        .unwrap();
+    let done = live_terminal(&service, &started.task_id);
+    eprintln!(
+        "{} / {:?}: {:?} {:?} {:?}",
+        entry.id,
+        effort,
+        done.state,
+        done.code,
+        text(&done)
+    );
+    assert_eq!(done.state, NativeAgentTaskStateV1::Completed);
+    wait_released(&service, &workspace);
+    let session = service
+        .local_task_native_session(&started.task_id)
+        .expect("its session");
+    let recorded = crate::native_agent::sessions::ClaudeSessionSourceV1::installed()
+        .discover(&[workspace.clone()])
+        .0
+        .into_iter()
+        .find(|found| found.session_id == session.session_id)
+        .and_then(|found| found.agent_config)
+        .expect("the session's record");
+    eprintln!(
+        "recorded: {:?} {:?}",
+        recorded.model, recorded.reasoning_effort
+    );
+    assert_eq!(recorded.model, entry.resolves_to);
+    assert_eq!(recorded.reasoning_effort, effort);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 #[ignore = "uses the installed, signed-in Claude Code and its quota"]
 fn installed_claude_code_conversation_stops_on_stop() {
@@ -1276,7 +1659,12 @@ fn installed_claude_code_conversation_stops_on_stop() {
     let root = std::env::temp_dir().join(format!("pastey-claude-live-{}", Uuid::new_v4()));
     let mut service = live_service(&root);
     let started = service
-        .start_claude_code_conversation_task(&workspace, LIVE_LONG_PROMPT, true)
+        .start_claude_code_conversation_task(
+            &workspace,
+            LIVE_LONG_PROMPT,
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     for _ in 0..300 {
         if claude_runs_in(&workspace) {
@@ -1315,7 +1703,12 @@ fn installed_claude_code_conversation_crash_child() {
     };
     let mut service = live_service(Path::new(&root));
     let started = service
-        .start_claude_code_conversation_task(Path::new(&workspace), LIVE_LONG_PROMPT, true)
+        .start_claude_code_conversation_task(
+            Path::new(&workspace),
+            LIVE_LONG_PROMPT,
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     println!("PASTEY_LIVE_CONVERSATION_TASK={}", started.task_id);
     loop {

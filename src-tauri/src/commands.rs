@@ -878,6 +878,68 @@ pub async fn read_native_agent_defaults(
     .map_err(|_| "Reading the native Agent defaults stopped unexpectedly.".to_string())
 }
 
+/// The models and reasoning efforts this device's native Agents list for
+/// choosing one per turn (`agent` only, when named), each as the Agent
+/// itself reports it. Read only: no prompt, task or session; nothing set.
+#[tauri::command]
+pub async fn read_native_model_catalogs(
+    agent: Option<String>,
+    refresh: Option<bool>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::native_agent::model_catalog::NativeModelCatalogV1>, String> {
+    use crate::native_agent::sessions::{PROVIDER_CLAUDE_CODE, PROVIDER_CODEX};
+    if agent
+        .as_deref()
+        .is_some_and(|agent| agent != PROVIDER_CODEX && agent != PROVIDER_CLAUDE_CODE)
+    {
+        return Err("Unknown native Agent provider.".into());
+    }
+    let (claude, codex) = state.native_agents.lock().session_sources();
+    tokio::task::spawn_blocking(move || {
+        crate::native_agent::model_catalog::read(
+            &claude,
+            &codex,
+            agent.as_deref(),
+            refresh.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|_| "Reading the native models stopped unexpectedly.".to_string())
+}
+
+/// What the native Agents of one exact current Bridge Host list, asked of
+/// that Host itself. It answers only a device that may ask to run agents
+/// there.
+#[tauri::command]
+pub async fn read_remote_native_model_catalogs(
+    room_id: String,
+    target_host_ref: String,
+    agent: Option<String>,
+    refresh: Option<bool>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::sessions::remote::RemoteSessionResponseV1, String> {
+    use crate::native_agent::sessions::remote::{RemoteSessionOperationV1, RemoteSessionQueryV1};
+    remote_native_session_query(
+        &room_id,
+        &target_host_ref,
+        RemoteSessionQueryV1 {
+            schema_version: String::new(),
+            request_id: String::new(),
+            target_host_ref: String::new(),
+            operation: RemoteSessionOperationV1::Models,
+            provider: agent,
+            text: None,
+            active_within_secs: None,
+            scope_ref: None,
+            session_id: None,
+            folder: None,
+            refresh: refresh.filter(|refresh| *refresh),
+        },
+        &state,
+    )
+    .await
+}
+
 /// Finds the Claude Code and Codex sessions that already exist on this Host
 /// in the workspaces this Host's user names, with their live state and
 /// evidence. Read only: nothing is started, resumed, changed or stopped.
@@ -970,16 +1032,12 @@ pub async fn continue_native_session(
     let workspace = std::path::PathBuf::from(&snapshot.session.workspace);
     let mut native_agents = state.native_agents.lock();
     match provider {
-        // Codex's own per-turn options are not applied by Pastey yet: it
-        // refuses them rather than ignore them.
-        PROVIDER_CODEX if !request.options.is_empty() => Err(crate::error::AppError::InvalidInput(
-            "Choosing Codex's model or reasoning effort from Pastey is not supported yet.".into(),
-        )),
         PROVIDER_CODEX => native_agents.start_codex_thread_task(
             &workspace,
             &request.session_id,
             &request.prompt,
             request.expected_marker.as_deref(),
+            &request.options,
         ),
         _ => native_agents.start_claude_session_task(
             &workspace,
@@ -1020,6 +1078,7 @@ pub async fn discover_remote_native_sessions(
             scope_ref,
             session_id: None,
             folder: None,
+            refresh: None,
         },
         &state,
     )
@@ -1050,6 +1109,7 @@ pub async fn inspect_remote_native_session(
             active_within_secs: None,
             scope_ref: None,
             session_id: Some(session_id),
+            refresh: None,
             folder: None,
         },
         &state,
@@ -1103,6 +1163,7 @@ pub async fn list_remote_shared_workspaces(
             text: None,
             active_within_secs: None,
             scope_ref: None,
+            refresh: None,
             session_id: None,
             folder: None,
         },
@@ -1135,6 +1196,7 @@ pub async fn open_remote_folder(
             provider: None,
             text: None,
             active_within_secs: None,
+            refresh: None,
             scope_ref: None,
             session_id: None,
             folder: Some(folder.trim().to_owned()),
@@ -1230,6 +1292,7 @@ pub fn start_native_codex_task(
     workspace: String,
     task: String,
     new_conversation: Option<bool>,
+    options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     state
@@ -1239,6 +1302,7 @@ pub fn start_native_codex_task(
             std::path::Path::new(&workspace),
             &task,
             new_conversation.unwrap_or(false),
+            &options.unwrap_or_default(),
         )
         .map_err(|error| error.message())
 }
@@ -1252,6 +1316,7 @@ pub fn start_native_claude_code_task(
     workspace: String,
     task: String,
     new_conversation: Option<bool>,
+    options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     state
@@ -1261,6 +1326,7 @@ pub fn start_native_claude_code_task(
             std::path::Path::new(&workspace),
             &task,
             new_conversation.unwrap_or(false),
+            &options.unwrap_or_default(),
         )
         .map_err(|error| error.message())
 }
@@ -1283,6 +1349,15 @@ pub fn get_native_agent_task_session(
 /// Observes one native capability through the existing Layer 4
 /// current-session resolver. Compatibility is only a bounded Host fact: it
 /// does not select the Host or grant invocation, Transfer, or Review authority.
+/// A remote Host's refusal, said plainly when the reason may be that it
+/// cannot apply the model or effort chosen for the turn.
+fn options_refusal(options: &crate::native_agent::NativeSessionOptionsV1, error: String) -> String {
+    if options.is_empty() || error != "Remote native Agent protocol is incompatible." {
+        return error;
+    }
+    "That device's Pastey cannot apply a chosen model or reasoning effort, so nothing was sent. Update Pastey there, or choose \u{201c}Use native configuration\u{201d}.".into()
+}
+
 async fn require_remote_native_capability(
     state: Arc<AppState>,
     room_id: &str,
@@ -1836,19 +1911,28 @@ pub async fn start_remote_native_codex_task(
     task: String,
     resume: bool,
     workspace_label: Option<String>,
+    options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     let target =
         crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
             .map_err(|error| error.message())?;
+    let options = options.unwrap_or_default();
+    options.validate().map_err(|error| error.message())?;
+    // A choice goes only to a Host whose Codex applies it.
+    let mut protocols = crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS.to_vec();
+    if !options.is_empty() {
+        protocols.push(crate::native_agent::NATIVE_SESSION_OPTIONS_PROTOCOL);
+    }
     let session = require_remote_native_capability(
         state.inner().clone(),
         &room_id,
         &target,
         crate::native_agent::CODEX_CAPABILITY_ID,
-        &crate::native_agent::DIRECT_NATIVE_INVOKE_PROTOCOLS,
+        &protocols,
     )
-    .await?;
+    .await
+    .map_err(|error| options_refusal(&options, error))?;
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before native invocation.".into());
     }
@@ -1864,6 +1948,7 @@ pub async fn start_remote_native_codex_task(
         workspace: workspace.clone(),
         task: task.clone(),
         resume,
+        options,
     };
     crate::native_agent::validate_invoke(&request).map_err(|error| error.message())?;
     let queued = state
@@ -1934,12 +2019,6 @@ pub async fn continue_remote_native_session(
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     let options = options.unwrap_or_default();
     let (capability, input) = match provider.as_str() {
-        crate::native_agent::sessions::PROVIDER_CODEX if !options.is_empty() => {
-            return Err(
-                "Choosing Codex's model or reasoning effort from Pastey is not supported yet."
-                    .into(),
-            )
-        }
         crate::native_agent::sessions::PROVIDER_CODEX => (
             crate::native_agent::CODEX_THREAD_CAPABILITY,
             crate::native_agent::codex_thread_peer_input(
@@ -1947,6 +2026,7 @@ pub async fn continue_remote_native_session(
                 &session_id,
                 &prompt,
                 expected_marker.as_deref(),
+                &options,
             ),
         ),
         crate::native_agent::sessions::PROVIDER_CLAUDE_CODE => (
@@ -1986,10 +2066,16 @@ pub async fn start_remote_native_claude_code_task(
     scope_ref: String,
     task: String,
     resume: bool,
+    options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
-    let input = crate::native_agent::claude_code_conversation_peer_input(&scope_ref, &task, resume)
-        .map_err(|error| error.message())?;
+    let input = crate::native_agent::claude_code_conversation_peer_input(
+        &scope_ref,
+        &task,
+        resume,
+        &options.unwrap_or_default(),
+    )
+    .map_err(|error| error.message())?;
     invoke_remote_native_capability(
         state.inner().clone(),
         room_id,
@@ -2012,14 +2098,24 @@ pub(crate) async fn invoke_remote_native_capability(
     let target =
         crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
             .map_err(|error| error.message())?;
+    // An input carrying a model or effort choice goes only to a Host whose
+    // capability applies it, never to one that might not.
+    let chosen = crate::native_agent::chosen_options(&input);
+    let protocols: &[&str] = if chosen.is_some() {
+        &crate::native_agent::OPTIONS_INVOKE_PROTOCOLS
+    } else {
+        &crate::native_agent::GENERIC_NATIVE_INVOKE_PROTOCOLS
+    };
+    let chosen = chosen.unwrap_or_default();
     let session = require_remote_native_capability(
         state.clone(),
         &room_id,
         &target,
         &agent_capability,
-        &crate::native_agent::GENERIC_NATIVE_INVOKE_PROTOCOLS,
+        protocols,
     )
-    .await?;
+    .await
+    .map_err(|error| options_refusal(&chosen, error))?;
     if session.binding().peer_route_ref != peer_session_id {
         return Err("The selected Host session changed before native invocation.".into());
     }

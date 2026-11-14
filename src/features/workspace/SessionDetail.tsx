@@ -8,8 +8,6 @@ import {
   type SharedWorkspace,
 } from "../../lib/tauri";
 import {
-  CLAUDE_CODE_EFFORT_LEVELS,
-  chosenSessionOptions,
   continuationAvailability,
   evidenceGroups,
   localSessionView,
@@ -23,10 +21,10 @@ import {
   sessionStatusPresentation,
   snapshotActivityLine,
   sessionOptionsSupported,
-  validModelChoice,
 } from "../../lib/nativeSessions";
 import { agentConfigLine, presentAgentConfig } from "../../lib/nativeAgentConfig";
 import { AgentConfigSummary } from "./AgentConfigSummary";
+import { AgentTurnOptionsChoice, catalogEntry, useAgentTurnOptions, useModelCatalog } from "./AgentTurnOptions";
 import { continuedSessionKey, type ContinuedSession } from "./AgentTaskLifecycle";
 import { AgentMarkdown, CopyButton } from "./AgentMarkdown";
 import { PastTurnView, TaskTurn } from "./AgentTaskTracker";
@@ -79,10 +77,10 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [details, setDetails] = useState(false);
-  // Claude Code's own model and effort for the next turn, only as the user
+  // The Agent's own model and effort for the next turn, only as the user
   // chooses them here; empty is the Agent's own configuration. Never kept.
-  const [model, setModel] = useState("");
-  const [effort, setEffort] = useState("");
+  const turnOptions = useAgentTurnOptions();
+  const catalog = useModelCatalog(session.provider, route ? { kind: "remote", roomId: route.roomId, hostRef: route.hostRef, hostName } : { kind: "local" }, target === "local" || !!route);
 
   async function read() {
     setBusy(true); setMessage(null);
@@ -128,8 +126,11 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
   const certain = view?.resume.verdict === "safe";
 
   const optionsSupported = !!view && sessionOptionsSupported(view.provider);
-  const modelInvalid = !!model.trim() && !validModelChoice(model);
-  const options = optionsSupported ? chosenSessionOptions(model, effort) : null;
+  // Codex runs only a model it lists (it would keep any other in the
+  // thread); its Host refuses one before sending, and so does this view.
+  const modelInvalid = optionsSupported && (turnOptions.invalid
+    || (view?.provider === "codex" && !!turnOptions.model && !catalogEntry(catalog.catalog, turnOptions.model)));
+  const options = optionsSupported ? turnOptions.options : null;
 
   async function send() {
     if (!view || !availability?.allowed || !prompt.trim() || sending || active || otherActive || !snapshot || modelInvalid) return;
@@ -143,7 +144,7 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
       if (!ours || !base) setBase(snapshot);
       agent.adoptTask(started, route?.hostRef ?? null, continued, text);
       setPrompt("");
-      setModel(""); setEffort("");
+      turnOptions.clear();
     } catch (error) {
       setSendError(error instanceof Error ? error.message : String(error));
     } finally { setSending(false); }
@@ -180,7 +181,7 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
       onChange={setPrompt}
       onSend={send}
       canSend={!blocked && !!prompt.trim() && !sending && !modelInvalid}
-      above={optionsSupported && availability?.allowed ? <SessionOptionsChoice provider={providerLabel(session.provider)} hostName={hostName} model={model} effort={effort} invalid={modelInvalid} disabled={sending || active} onModel={setModel} onEffort={setEffort} /> : null}
+      above={optionsSupported && availability?.allowed && view ? <AgentTurnOptionsChoice agent={view.provider} provider={providerLabel(view.provider)} hostName={hostName} choice={turnOptions} catalog={catalog} confirmed={view.agentConfig} current={view.agentConfig?.model ?? null} disabled={sending || active} target="session" /> : null}
       disabled={!!availability && !availability.allowed}
       sending={sending}
       autoFocus
@@ -190,35 +191,6 @@ export function SessionConversation({ roomId, agent, peers, members, target, ses
       hintTone={sendError ? "bad" : blocked ? "warn" : undefined}
     />
   </section>;
-}
-
-/** The Agent's own model and effort for the next turn, chosen explicitly
- * here or left to the Agent. What the session actually ran with is the
- * session's record above, read again after the turn. */
-function SessionOptionsChoice({ provider, hostName, model, effort, invalid, disabled, onModel, onEffort }: {
-  provider: string;
-  hostName: string;
-  model: string;
-  effort: string;
-  invalid: boolean;
-  disabled: boolean;
-  onModel: (model: string) => void;
-  onEffort: (effort: string) => void;
-}) {
-  const chosen = !!model.trim() || !!effort;
-  return <details className="disclosure session-options" open={chosen || undefined}>
-    <summary><Icon name="chevron" small />{chosen ? `Next turn: ${[model.trim() && `model ${model.trim()}`, effort && `effort ${effort}`].filter(Boolean).join(", ")}` : `Model and effort: ${provider}'s own`}</summary>
-    <div className="row disclosure-body">
-      <input className="input input-mono" value={model} disabled={disabled} onChange={(event) => onModel(event.target.value)} placeholder={`${provider}'s own model`} aria-label={`${provider} model for the next turn`} spellCheck={false} autoComplete="off" />
-      <select className="select" value={effort} disabled={disabled} onChange={(event) => onEffort(event.target.value)} aria-label={`${provider} reasoning effort for the next turn`}>
-        <option value="">{provider}'s own effort</option>
-        {CLAUDE_CODE_EFFORT_LEVELS.map((level) => <option key={level} value={level}>{level}</option>)}
-      </select>
-    </div>
-    <p className="xsmall subtle">{invalid
-      ? "Type a model name or alias as Claude Code knows it (for example sonnet, opus, or a full model name)."
-      : `Applied by ${provider} on ${hostName} to this same session: a model you choose stays the session's for later turns, an effort applies to this turn. Pastey keeps neither and changes no settings; ${provider} itself refuses a model it does not know.`}</p>
-  </details>;
 }
 
 /** What the session holds, as a conversation, with how much of it is here. */

@@ -305,6 +305,57 @@ impl CodexSessionSourceV1 {
         })
     }
 
+    /// The models this Codex lists for its picker, through its own
+    /// `model/list` on a Pastey-private app-server outside any project.
+    /// Read only: no thread is started and nothing is written.
+    pub(crate) fn model_catalog(&self) -> crate::native_agent::model_catalog::NativeModelCatalogV1 {
+        use crate::native_agent::model_catalog::{
+            codex_catalog, NativeModelCatalogV1, CODEX_CATALOG_SOURCE, MAX_MODELS,
+        };
+        let unavailable = |reason: &str| {
+            NativeModelCatalogV1::unavailable(
+                PROVIDER_CODEX,
+                CODEX_CATALOG_SOURCE,
+                &format!("Codex did not list its models: {reason}"),
+            )
+        };
+        let reader = match CodexHistoryReaderV1::open(&self.executable, &std::env::temp_dir()) {
+            Ok(reader) => reader,
+            Err(error) => return unavailable(&error.message()),
+        };
+        let mut entries: Vec<Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..4 {
+            let mut params = json!({});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            let page = match reader.request("model/list", params) {
+                Ok(page) => page,
+                Err(HistoryReadErrorV1::Oversized) => {
+                    return unavailable("its answer was larger than Pastey reads")
+                }
+                Err(HistoryReadErrorV1::Failed(reason)) => return unavailable(&reason),
+            };
+            entries.extend(
+                page.get("data")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+            cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty())
+                .map(str::to_owned);
+            if cursor.is_none() || entries.len() >= MAX_MODELS {
+                break;
+            }
+        }
+        codex_catalog(&entries, false)
+    }
+
     /// What a new task would start with, as Codex's own `config/read`
     /// reports it, seen from `workspace` (its project layers included) or,
     /// without one, from no project. Read only: this reader's app-server

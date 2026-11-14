@@ -299,15 +299,18 @@ export function listRemoteNativeAgentCapabilities(roomId: string, targetHostRef:
 }
 
 /** Continues this device's Codex conversation in the workspace (or begins
- * one); `newConversation` explicitly begins a new one instead. */
-export function startNativeCodexTask(workspace: string, task: string, newConversation = false): Promise<NativeAgentTaskStatus> {
-  return invoke("start_native_codex_task", { workspace, task, newConversation });
+ * one); `newConversation` explicitly begins a new one instead. `options`
+ * are Codex's own model and effort for this turn, only as the user chose
+ * them; this device's Codex must list them. */
+export function startNativeCodexTask(workspace: string, task: string, newConversation = false, options: NativeSessionOptions | null = null): Promise<NativeAgentTaskStatus> {
+  return invoke("start_native_codex_task", { workspace, task, newConversation, options });
 }
 
 /** Runs Claude Code in a folder of this device: continuing this device's
- * Claude Code conversation there, or beginning one. This device only. */
-export function startNativeClaudeCodeTask(workspace: string, task: string, newConversation = false): Promise<NativeAgentTaskStatus> {
-  return invoke("start_native_claude_code_task", { workspace, task, newConversation });
+ * Claude Code conversation there, or beginning one. `options` are Claude
+ * Code's own model and effort for this turn, only as the user chose them. */
+export function startNativeClaudeCodeTask(workspace: string, task: string, newConversation = false, options: NativeSessionOptions | null = null): Promise<NativeAgentTaskStatus> {
+  return invoke("start_native_claude_code_task", { workspace, task, newConversation, options });
 }
 
 /** Runs Claude Code in a folder another Bridge Host shares with this
@@ -316,16 +319,16 @@ export function startNativeClaudeCodeTask(workspace: string, task: string, newCo
  * That Host resolves the folder itself, waits for its user's Accept unless
  * this device has Full Access there, and runs its own Claude Code. */
 export function startRemoteNativeClaudeCodeTask(
-  roomId: string, peerSessionId: string, targetHostRef: string, scopeRef: string, task: string, resume: boolean,
+  roomId: string, peerSessionId: string, targetHostRef: string, scopeRef: string, task: string, resume: boolean, options: NativeSessionOptions | null = null,
 ): Promise<NativeAgentTaskStatus> {
-  return invoke("start_remote_native_claude_code_task", { roomId, peerSessionId, targetHostRef, scopeRef, task, resume });
+  return invoke("start_remote_native_claude_code_task", { roomId, peerSessionId, targetHostRef, scopeRef, task, resume, options });
 }
 
 /** A native Agent's own model and reasoning effort, chosen explicitly by the
- * user for one continuation of a session. Pastey keeps no default of either;
- * absent means the Agent's own configuration decides. Only Agents whose
- * native interface applies them to the same session accept them (Claude
- * Code); the others refuse rather than ignore them. */
+ * user for one turn (of a conversation or a continued session). Pastey
+ * keeps no default of either; absent means the Agent's own configuration
+ * decides. The Agent applies them to the same session; a Host that cannot
+ * apply them refuses rather than ignore them. */
 export interface NativeSessionOptions {
   model?: string;
   effort?: string;
@@ -374,9 +377,9 @@ export function denyNativeInvocationReview(taskId: string): Promise<NativeAgentT
  * shares with this device (`SharedWorkspace.scopeRef`), which that Host
  * resolves itself; `workspaceLabel` names such a folder until it answers. */
 export function startRemoteNativeCodexTask(
-  roomId: string, peerSessionId: string, targetHostRef: string, workspace: string, task: string, resume: boolean, workspaceLabel: string | null = null,
+  roomId: string, peerSessionId: string, targetHostRef: string, workspace: string, task: string, resume: boolean, workspaceLabel: string | null = null, options: NativeSessionOptions | null = null,
 ): Promise<NativeAgentTaskStatus> {
-  return invoke("start_remote_native_codex_task", { roomId, peerSessionId, targetHostRef, workspace, task, resume, workspaceLabel });
+  return invoke("start_remote_native_codex_task", { roomId, peerSessionId, targetHostRef, workspace, task, resume, workspaceLabel, options });
 }
 
 export function proposeRemoteNativeCodexWorkspaceMovement(
@@ -865,6 +868,49 @@ export interface NativeAgentConfig {
   observedAtMs: number;
 }
 
+/** The models a native Agent lists for choosing one per turn, as the Agent
+ * on the executing device itself reports them (Codex: `model/list`;
+ * Claude Code: what its `initialize` answer lists, or, labelled
+ * `fallback`, its documented aliases). Listed is not a promise that the
+ * user's account may use a model. Never stored by Pastey. */
+export type NativeModelCatalogState = "reported" | "fallback" | "unavailable";
+export interface NativeEffortOption { id: string; description?: string | null }
+export interface NativeModelOption {
+  /** What a turn passes to choose it. */
+  id: string;
+  displayName: string;
+  description?: string | null;
+  /** The model the id stands for, when the Agent says. */
+  resolvesTo?: string | null;
+  isDefault: boolean;
+  /** Supported efforts; absent: not reported for this model. */
+  efforts?: NativeEffortOption[] | null;
+  defaultEffort?: string | null;
+}
+export interface NativeModelCatalog {
+  agent: NativeSessionProvider;
+  state: NativeModelCatalogState;
+  models: NativeModelOption[];
+  /** The Host accepts a model id the Agent did not list. */
+  customModels: boolean;
+  /** Efforts to offer for a model whose own are not reported. */
+  efforts: string[];
+  source: string;
+  note?: string | null;
+  observedAtMs: number;
+}
+
+/** This device's native model lists (one Agent's, when named). */
+export function readNativeModelCatalogs(agent: NativeSessionProvider | null = null, refresh = false): Promise<NativeModelCatalog[]> {
+  return invoke("read_native_model_catalogs", { agent, refresh });
+}
+
+/** Another current Bridge Host's native model lists, asked of that Host;
+ * it answers only a device that may ask to run agents there. */
+export function readRemoteNativeModelCatalogs(roomId: string, targetHostRef: string, agent: NativeSessionProvider | null = null, refresh = false): Promise<RemoteNativeSessionResponse> {
+  return invoke("read_remote_native_model_catalogs", { roomId, targetHostRef, agent, refresh });
+}
+
 /** What a new task with each native Agent on this device would start with,
  * outside any project folder. Read only and local: nothing starts. */
 export function readNativeAgentDefaults(): Promise<NativeAgentConfig[]> {
@@ -936,6 +982,8 @@ export interface RemoteNativeSessionResponse {
   fullAccess?: boolean;
   /** Why it would not open a folder (`folder_refused`). */
   detail?: string | null;
+  /** What that Host's native Agents list (a model query only). */
+  models?: NativeModelCatalog[] | null;
 }
 
 /** A folder another Bridge Host shares with this device, as that Host

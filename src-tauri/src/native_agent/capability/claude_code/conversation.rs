@@ -83,7 +83,7 @@ use crate::native_agent::sessions::in_workspaces;
 use crate::native_agent::sessions::{now_ms, PROVIDER_CLAUDE_CODE};
 use crate::native_agent::{
     NativeAgentCapabilityStateV1, NativeConversationContinuityV1, NativeSessionOptionsV1,
-    NativeTurnOutcomeV1, GENERIC_NATIVE_INVOKE_PROTOCOLS, MAX_TASK_BYTES,
+    NativeTurnOutcomeV1, MAX_TASK_BYTES, OPTIONS_INVOKE_PROTOCOLS,
 };
 
 pub(in crate::native_agent) const CLAUDE_CODE_CONVERSATION_ID: &str =
@@ -132,6 +132,10 @@ struct ConversationInputV1 {
     /// Continue this owner's conversation in the folder, or begin one when
     /// none exists; `false` always begins a new one.
     resume: bool,
+    /// Claude Code's own model and effort for this turn, only as its user
+    /// chose them. Absent: Claude Code's own configuration decides.
+    #[serde(default)]
+    options: NativeSessionOptionsV1,
 }
 
 /// What a Bridge peer sends: the folder only as the reference of a folder
@@ -142,6 +146,20 @@ struct PeerConversationInputV1 {
     scope_ref: String,
     task: String,
     resume: bool,
+    #[serde(default)]
+    options: NativeSessionOptionsV1,
+}
+
+/// `input` with `options` added only when its user chose any: without a
+/// choice the input is exactly what it was before options existed, so a Host
+/// that predates them still accepts it, and one given a choice it cannot
+/// apply refuses it (unknown field) rather than ignore it.
+fn with_options(mut input: Value, options: &NativeSessionOptionsV1) -> AppResult<Value> {
+    options.validate()?;
+    if !options.is_empty() {
+        input["options"] = serde_json::to_value(options).map_err(AppError::from)?;
+    }
+    Ok(input)
 }
 
 /// The input a requesting device sends to run `task` in a folder another
@@ -150,17 +168,21 @@ pub(in crate::native_agent) fn peer_input(
     scope_ref: &str,
     task: &str,
     resume: bool,
+    options: &NativeSessionOptionsV1,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
     if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
         return Err(AppError::InvalidInput(
             "Claude Code task is empty or exceeds its bound.".into(),
         ));
     }
-    let input = OpaqueCapabilityPayloadV1::new(json!({
-        "scopeRef": scope_ref,
-        "task": task,
-        "resume": resume,
-    }));
+    let input = OpaqueCapabilityPayloadV1::new(with_options(
+        json!({
+            "scopeRef": scope_ref,
+            "task": task,
+            "resume": resume,
+        }),
+        options,
+    )?);
     input.validate()?;
     Ok(input)
 }
@@ -182,7 +204,7 @@ fn resolve_peer_input(
             "This device may not ask to run agents in that folder.".into(),
         ));
     };
-    conversation_input(workspace, &peer.task, peer.resume)
+    conversation_input(workspace, &peer.task, peer.resume, &peer.options)
 }
 
 /// What continuing a conversation takes: its Claude Code session.
@@ -200,6 +222,7 @@ fn parse(input: &OpaqueCapabilityPayloadV1) -> AppResult<(ConversationInputV1, P
             "Claude Code task is empty or exceeds its bound.".into(),
         ));
     }
+    parsed.options.validate()?;
     let workspace = Path::new(&parsed.workspace)
         .canonicalize()
         .ok()
@@ -213,12 +236,16 @@ pub(in crate::native_agent) fn conversation_input(
     workspace: &Path,
     task: &str,
     resume: bool,
+    options: &NativeSessionOptionsV1,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
-    let input = OpaqueCapabilityPayloadV1::new(json!({
-        "workspace": workspace.to_string_lossy(),
-        "task": task,
-        "resume": resume,
-    }));
+    let input = OpaqueCapabilityPayloadV1::new(with_options(
+        json!({
+            "workspace": workspace.to_string_lossy(),
+            "task": task,
+            "resume": resume,
+        }),
+        options,
+    )?);
     input.validate()?;
     parse(&input)?;
     Ok(input)
@@ -707,7 +734,7 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
     /// A peer may ask, naming a folder this Host shares with it; each run
     /// waits for this Host's Review unless the peer holds Full Access.
     fn supported_protocols(&self) -> &'static [&'static str] {
-        &GENERIC_NATIVE_INVOKE_PROTOCOLS
+        &OPTIONS_INVOKE_PROTOCOLS
     }
 
     fn peer_folder_use(&self) -> Option<super::super::PeerFolderUseV1> {
@@ -814,7 +841,10 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
                 prompt_uuid: Uuid::new_v4().to_string(),
                 control,
                 runs: self.runs.clone(),
-                options: NativeSessionOptionsV1::default(),
+                // Applied to the session this turn runs in, new or resumed:
+                // Claude Code keeps a chosen model for the session's later
+                // turns; an effort is this turn's.
+                options: parsed.options,
                 existing: None,
             }),
         })

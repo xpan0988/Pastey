@@ -469,9 +469,14 @@ fn a_shared_folder_allows_only_what_its_owner_turned_on() {
             .len(),
         1
     );
-    let thread =
-        crate::native_agent::codex_thread_peer_input(&reference, "thread-1", "go on", None)
-            .unwrap();
+    let thread = crate::native_agent::codex_thread_peer_input(
+        &reference,
+        "thread-1",
+        "go on",
+        None,
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
     assert!(resolve(
         &h,
         Some(&device),
@@ -610,8 +615,13 @@ fn claude_code_peers_need_the_same_switches_as_codex_peers() {
         .clone();
     let options = crate::native_agent::NativeSessionOptionsV1::default();
     let session = "66666666-6666-4666-8666-666666666666";
-    let run = crate::native_agent::claude_code_conversation_peer_input(&reference, "fix it", true)
-        .unwrap();
+    let run = crate::native_agent::claude_code_conversation_peer_input(
+        &reference,
+        "fix it",
+        true,
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
     let continue_there = crate::native_agent::claude_code_session_peer_input(
         &reference,
         session,
@@ -872,9 +882,14 @@ fn full_access_allows_everything_in_shared_folders_and_ends_with_it() {
     let reference = shared_workspaces(&h.paths, &device, &binding, now).unwrap()[0]
         .scope_ref
         .clone();
-    let continue_there =
-        crate::native_agent::codex_thread_peer_input(&reference, "thread-1", "go on", None)
-            .unwrap();
+    let continue_there = crate::native_agent::codex_thread_peer_input(
+        &reference,
+        "thread-1",
+        "go on",
+        None,
+        &crate::native_agent::NativeSessionOptionsV1::default(),
+    )
+    .unwrap();
     // Sessions only: no agent requests, no continuation.
     assert!(resolve(&h, Some(&device), &binding, codex, &codex_run(&reference)).is_err());
     assert!(resolve(&h, Some(&device), &binding, thread, &continue_there).is_err());

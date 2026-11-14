@@ -5332,6 +5332,7 @@ mod tests {
             workspace: "/existing/workspace".into(),
             task: "work".into(),
             resume: true,
+            options: Default::default(),
         })
         .unwrap();
         let event = native_agent_event("native_agent.invoke", payload, &context).unwrap();
@@ -5755,6 +5756,7 @@ mod tests {
                 workspace: "/workspace".into(),
                 task: "edit".into(),
                 resume: true,
+                options: Default::default(),
             })
             .unwrap(),
         );
@@ -6081,6 +6083,7 @@ mod tests {
             }),
             full_access: false,
             detail: None,
+            models: None,
         }
     }
 
@@ -6098,6 +6101,7 @@ mod tests {
             scope_ref: None,
             session_id: Some("77777777-7777-4777-8777-777777777777".into()),
             folder: None,
+            refresh: None,
         };
         let validated = validate_native(native_event(
             "native_agent.session_query",

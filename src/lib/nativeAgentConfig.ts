@@ -12,6 +12,7 @@ const EFFORTS: Record<string, string> = {
   high: "High",
   xhigh: "Extra high",
   max: "Max",
+  ultra: "Ultra",
 };
 
 const ORIGINS: Record<NativeAgentConfigOrigin, string> = {

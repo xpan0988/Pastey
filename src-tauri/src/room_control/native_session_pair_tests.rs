@@ -139,6 +139,7 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
             scope_ref: None,
             session_id: None,
             folder: None,
+            refresh: None,
         };
         pending.register(&query.request_id, "room-pair", windows_host.as_str());
         native_event(
@@ -265,6 +266,7 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
                 workspace: scope_ref.clone(),
                 task: "Run the tests".into(),
                 resume: true,
+                options: Default::default(),
             })
             .unwrap(),
         );
@@ -284,6 +286,7 @@ fn a_remote_session_query_is_answered_only_under_the_hosts_own_permission() {
                     "019a0000-0000-7000-8000-000000000001",
                     "Continue",
                     Some("turn-9"),
+                    &crate::native_agent::NativeSessionOptionsV1::default(),
                 )
                 .unwrap(),
             })

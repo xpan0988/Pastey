@@ -30,6 +30,7 @@ import {
   startNativeV2PlanAttempt,
   type NativeV2PlanStatus,
   type NativeV2ProductState,
+  type NativeSessionOptions,
 } from "../../lib/tauri";
 import { ownAsyncDisposer } from "../../lib/subscriptionLifecycle";
 import { sameNativeSession, type NativeSessionIdentity } from "../../lib/sessionList";
@@ -784,20 +785,22 @@ export function useNativeAgentTask(roomId: string) {
 
   /** Starts an Agent on this device: `chosen` for a new conversation, or,
    * with `followUp`, the Agent of the conversation the shown task belongs
-   * to, which it continues. */
-  const start = useCallback(async (place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID) => {
+   * to, which it continues. `options` are the Agent's own model and effort
+   * for this turn. Resolves whether the turn started. */
+  const start = useCallback(async (place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID, options: NativeSessionOptions | null = null): Promise<boolean> => {
     const sent = taskText.trim();
-    if (!workspace.trim() || !sent || busy) return;
+    if (!workspace.trim() || !sent || busy) return false;
     const agentId = followUp && origin?.kind === "new" ? conversationAgent(origin) : chosen;
     setBusy(true); setMessage(null);
     try {
       const started = agentId === CLAUDE_CODE_AGENT_ID
-        ? await startNativeClaudeCodeTask(workspace.trim(), sent, !followUp)
-        : await startNativeCodexTask(workspace.trim(), sent, !followUp);
+        ? await startNativeClaudeCodeTask(workspace.trim(), sent, !followUp, options)
+        : await startNativeCodexTask(workspace.trim(), sent, !followUp, options);
       setStatus(started); setTaskHostRef(null);
       beginTurn(started.taskId, null, place, followUp, sent, null, agentId);
+      return true;
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)}.`); }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)}.`); return false; }
     finally { setBusy(false); }
   }, [beginTurn, busy, origin, taskText, workspace]);
 
@@ -805,21 +808,21 @@ export function useNativeAgentTask(roomId: string) {
    * reference, which that Host resolves itself; otherwise the typed path
    * (Codex only). A new conversation unless `followUp`, which continues the
    * shown conversation with its own Agent. */
-  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID) => {
+  const startRemote = useCallback(async (roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID, options: NativeSessionOptions | null = null): Promise<boolean> => {
     const shared = place.kind === "shared" ? { scopeRef: place.scopeRef, label: place.label } : null;
     const target = shared ? shared.scopeRef : workspace.trim();
     const sent = taskText.trim();
     const agentId = followUp && origin?.kind === "new" ? conversationAgent(origin) : chosen;
-    if (!roomId || !peerSessionId || !hostRef || !target || !sent || busy) return;
+    if (!roomId || !peerSessionId || !hostRef || !target || !sent || busy) return false;
     if (agentId === CLAUDE_CODE_AGENT_ID && !shared) {
       setMessage("Claude Code runs on another device only in a folder that device shares with this one.");
-      return;
+      return false;
     }
     setBusy(true); setMessage(null);
     try {
       const started = agentId === CLAUDE_CODE_AGENT_ID && shared
-        ? await startRemoteNativeClaudeCodeTask(roomId, peerSessionId, hostRef, shared.scopeRef, sent, followUp)
-        : await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, target, sent, followUp, shared?.label ?? null);
+        ? await startRemoteNativeClaudeCodeTask(roomId, peerSessionId, hostRef, shared.scopeRef, sent, followUp, options)
+        : await startRemoteNativeCodexTask(roomId, peerSessionId, hostRef, target, sent, followUp, shared?.label ?? null, options);
       rememberStartedNativeTask(roomId, { taskId: started.taskId, hostRef });
       setTaskHostRef(hostRef);
       beginTurn(started.taskId, hostRef, place, followUp, sent, null, agentId);
@@ -833,8 +836,9 @@ export function useNativeAgentTask(roomId: string) {
         setTaskHostRef(hostRef);
         setMessage(error instanceof Error ? error.message : "Pastey could not load the remote task correlation.");
       }
+      return true;
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)} there.`); }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)} there.`); return false; }
     finally { setBusy(false); }
   }, [beginTurn, busy, loadRecoveryProjection, origin, restoreOrigin, taskText, workspace]);
 

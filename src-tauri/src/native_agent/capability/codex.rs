@@ -45,14 +45,24 @@ use super::{
 };
 use crate::error::{AppError, AppResult};
 use crate::native_agent::sessions::PROVIDER_CODEX as PROVIDER_CODEX_SESSIONS;
+use crate::native_agent::NativeSessionOptionsV1;
 use crate::native_agent::{
     invalid, native_decision_content_digest, NativeAgentCapabilityStateV1, NativeAgentServiceV1,
     NativeConversationContinuityV1, NativeDecisionContentV1, NativeDecisionKindV1,
     NativeDecisionReviewV1, NativeDecisionStateV1, NativeDecisionV1, NativeFileChangeV1,
     NativeTurnOutcomeV1, CODEX_CAPABILITY_ID, MAX_LINE_BYTES, MAX_NATIVE_DECISION_CONTENT_BYTES,
     MAX_TASK_BYTES, NATIVE_AGENT_RPC_TIMEOUT, NATIVE_DECISION_REVIEW_TTL_SECONDS,
-    WORKSPACE_MOVEMENT_PROTOCOLS,
+    NATIVE_SESSION_OPTIONS_PROTOCOL, WORKSPACE_MOVEMENT_PROTOCOLS,
 };
+
+/// Codex's direct and movement protocols, and its own model and effort
+/// chosen per turn (`turn/start`'s `model` and `effort`).
+const CODEX_PROTOCOLS: [&str; 4] = [
+    WORKSPACE_MOVEMENT_PROTOCOLS[0],
+    WORKSPACE_MOVEMENT_PROTOCOLS[1],
+    WORKSPACE_MOVEMENT_PROTOCOLS[2],
+    NATIVE_SESSION_OPTIONS_PROTOCOL,
+];
 
 pub(in crate::native_agent) mod own_holds;
 pub(in crate::native_agent) mod thread_continuation;
@@ -161,6 +171,9 @@ const TURN_START_ID: u64 = 3;
 const TURN_INTERRUPT_ID: u64 = 4;
 const SHUTDOWN_ID: u64 = 5;
 const THREAD_RESUME_ID: u64 = 6;
+/// Above the thread continuation's fixed ids (7–9).
+const MODEL_LIST_ID: u64 = 10;
+const MODEL_LIST_PAGES: usize = 4;
 
 /// Server requests that wait for a decision only Codex's own client may make:
 /// approvals, permission grants, questions to the user and MCP elicitations
@@ -191,6 +204,11 @@ struct CodexInvocationInputV1 {
     workspace: String,
     task: String,
     resume: bool,
+    /// Codex's own model and effort for this turn, only as its user chose
+    /// them. Absent: the thread keeps what it runs with (a new one starts
+    /// with Codex's configuration).
+    #[serde(default)]
+    options: NativeSessionOptionsV1,
 }
 
 /// The input carried by the original `pastey-native-agent-control-v1`
@@ -212,10 +230,36 @@ pub(in crate::native_agent) fn codex_input(
     task: &str,
     resume: bool,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
+    codex_input_with_options(workspace, task, resume, &NativeSessionOptionsV1::default())
+}
+
+/// `legacy_v1_input` with `options` added only when its user chose any:
+/// without a choice the input is exactly what it was before options
+/// existed, and a Host that cannot apply a choice refuses it (unknown
+/// field) rather than ignore it.
+pub(in crate::native_agent) fn with_options(
+    input: OpaqueCapabilityPayloadV1,
+    options: &NativeSessionOptionsV1,
+) -> AppResult<OpaqueCapabilityPayloadV1> {
+    options.validate()?;
+    if options.is_empty() {
+        return Ok(input);
+    }
+    let mut value = input.value().clone();
+    value["options"] = serde_json::to_value(options).map_err(AppError::from)?;
+    Ok(OpaqueCapabilityPayloadV1::new(value))
+}
+
+pub(in crate::native_agent) fn codex_input_with_options(
+    workspace: &Path,
+    task: &str,
+    resume: bool,
+    options: &NativeSessionOptionsV1,
+) -> AppResult<OpaqueCapabilityPayloadV1> {
     let workspace = workspace
         .to_str()
         .ok_or_else(|| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
-    Ok(legacy_v1_input(workspace, task, resume))
+    with_options(legacy_v1_input(workspace, task, resume), options)
 }
 
 /// The prefix of a folder reference a Bridge peer received for a folder
@@ -244,7 +288,7 @@ pub(in crate::native_agent) fn resolve_peer_workspace_ref(
     else {
         return invalid("This device may not ask to run agents in that folder.");
     };
-    codex_input(workspace, &parsed.task, parsed.resume).map(Some)
+    codex_input_with_options(workspace, &parsed.task, parsed.resume, &parsed.options).map(Some)
 }
 
 /// Codex holds one canonical workspace per unresolved task.
@@ -258,6 +302,7 @@ fn parse_input(input: &OpaqueCapabilityPayloadV1) -> AppResult<(CodexInvocationI
     if parsed.task.trim().is_empty() || parsed.task.len() > MAX_TASK_BYTES {
         return invalid("Native Agent task is empty or exceeds its bound.");
     }
+    parsed.options.validate()?;
     let workspace = Path::new(&parsed.workspace)
         .canonicalize()
         .map_err(|_| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
@@ -664,7 +709,7 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
     }
 
     fn supported_protocols(&self) -> &'static [&'static str] {
-        &WORKSPACE_MOVEMENT_PROTOCOLS
+        &CODEX_PROTOCOLS
     }
 
     /// A peer may name a folder this Host shares by its reference, or (as
@@ -803,6 +848,7 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
                 availability: self.availability.clone(),
                 session: existing,
                 prompt: parsed.task,
+                options: parsed.options,
             }),
         })
     }
@@ -922,6 +968,8 @@ struct CodexInvocationRunV1 {
     /// one this run opened.
     session: Option<(Arc<CodexAppServerV1>, String)>,
     prompt: String,
+    /// Codex's own model and effort for this turn, as its user chose them.
+    options: NativeSessionOptionsV1,
 }
 
 impl CodexInvocationRunV1 {
@@ -1011,6 +1059,13 @@ impl CodexInvocationRunV1 {
                 }
             },
         };
+        // A choice this Codex does not list ends the run here, before the
+        // thread is recorded as the conversation's: a refused first turn
+        // leaves no conversation behind.
+        if let Some(problem) = controller.options_problem(&self.options) {
+            controller.shutdown();
+            return Err(not_started(NativeTurnOutcomeV1::NotStarted, &problem));
+        }
         let Ok(mut attachment) = self.slot.attachment.lock() else {
             controller.shutdown();
             return Err(stopped());
@@ -1086,7 +1141,18 @@ fn evict_idle_sessions(
 impl NativeInvocationRunV1 for CodexInvocationRunV1 {
     fn run(&mut self, progress: &dyn NativeInvocationProgressV1) -> NativeInvocationOutcomeV1 {
         let (controller, thread_id) = match self.session.clone() {
-            Some(session) => session,
+            // The live session's thread: checked against the model it runs
+            // with now.
+            Some(session) => {
+                if let Some(problem) = session.0.options_problem(&self.options) {
+                    return NativeInvocationOutcomeV1 {
+                        kind: NativeTurnOutcomeV1::NotStarted,
+                        summary: Some(problem),
+                        output: None,
+                    };
+                }
+                session
+            }
             None => match self.open_session(progress) {
                 Ok(session) => {
                     self.session = Some(session.clone());
@@ -1095,7 +1161,7 @@ impl NativeInvocationRunV1 for CodexInvocationRunV1 {
                 Err(outcome) => return outcome,
             },
         };
-        let report = controller.run_turn(&thread_id, &self.prompt, None, progress);
+        let report = controller.run_turn(&thread_id, &self.prompt, None, &self.options, progress);
         // Windows ends a stopped turn's session (`end_after_stop`): no later
         // task may reuse it. Elsewhere the session is kept, as before.
         #[cfg(windows)]
@@ -2028,6 +2094,9 @@ pub(in crate::native_agent) struct CodexAppServerV1 {
     decisions: Mutex<HashMap<String, PendingNativeDecisionV1>>,
     /// The Codex version this app-server reported when it started.
     version: OnceLock<String>,
+    /// The model the thread on this app-server runs with, as Codex reported
+    /// it when the thread was started or reopened, or as a turn chose it.
+    thread_model: Mutex<Option<String>>,
     /// The Job Object holding the app-server and everything it starts
     /// (Windows). `None` only once dropped.
     #[cfg(windows)]
@@ -2357,6 +2426,7 @@ impl CodexAppServerV1 {
             in_use: AtomicBool::new(false),
             decisions: Mutex::default(),
             version: OnceLock::new(),
+            thread_model: Mutex::new(None),
             #[cfg(windows)]
             job: Some(job),
         };
@@ -2384,16 +2454,94 @@ impl CodexAppServerV1 {
         self.send(
             json!({"id": THREAD_START_ID, "method": "thread/start", "params": {"cwd": cwd}}),
         )?;
-        self.await_result(
+        let started = self.await_result(
             THREAD_START_ID,
             Instant::now() + NATIVE_AGENT_RPC_TIMEOUT,
             false,
-        )?
-        .pointer("/thread/id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| AppError::InvalidInput("Codex did not return a native session.".into()))
+        )?;
+        self.note_thread_model(&started);
+        started
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| AppError::InvalidInput("Codex did not return a native session.".into()))
+    }
+
+    /// Keeps the model a `thread/start` or `thread/resume` answer says the
+    /// thread runs with.
+    fn note_thread_model(&self, answer: &Value) {
+        let model =
+            crate::native_agent::agent_config::config_field(answer.get("model")).or_else(|| {
+                crate::native_agent::agent_config::config_field(answer.pointer("/thread/model"))
+            });
+        if let Ok(mut current) = self.thread_model.lock() {
+            *current = model;
+        }
+    }
+
+    /// Every model this Codex lists, hidden ones included (they are
+    /// accepted too), through its own `model/list`. Read only.
+    pub(in crate::native_agent) fn list_models(&self) -> AppResult<Vec<Value>> {
+        let mut entries = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MODEL_LIST_PAGES {
+            let mut params = json!({"includeHidden": true});
+            if let Some(cursor) = &cursor {
+                params["cursor"] = json!(cursor);
+            }
+            self.send(json!({"id": MODEL_LIST_ID, "method": "model/list", "params": params}))?;
+            let page = self.await_result(
+                MODEL_LIST_ID,
+                Instant::now() + NATIVE_AGENT_RPC_TIMEOUT,
+                false,
+            )?;
+            entries.extend(
+                page.get("data")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .take(crate::native_agent::model_catalog::MAX_MODELS)
+                    .cloned(),
+            );
+            cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty())
+                .map(str::to_owned);
+            if cursor.is_none() || entries.len() >= crate::native_agent::model_catalog::MAX_MODELS {
+                break;
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Why this thread's next turn may not run with `options`, or None. Only
+    /// a model and effort this very Codex lists are sent; nothing is asked
+    /// without options.
+    fn options_problem(&self, options: &NativeSessionOptionsV1) -> Option<String> {
+        if options.is_empty() {
+            return None;
+        }
+        let entries = match self.list_models() {
+            Ok(entries) => entries,
+            Err(_) => {
+                return Some(
+                    "Codex on this device did not list its models, so Pastey could not check the chosen model or effort, and nothing was sent.".into(),
+                )
+            }
+        };
+        let catalog = crate::native_agent::model_catalog::codex_catalog(&entries, true);
+        let thread_model = self
+            .thread_model
+            .lock()
+            .ok()
+            .and_then(|model| model.clone());
+        crate::native_agent::model_catalog::codex_options_problem(
+            options,
+            &catalog,
+            thread_model.as_deref(),
+        )
     }
 
     /// Reopens one saved thread with `thread/resume`. Codex answers an
@@ -2413,6 +2561,7 @@ impl CodexAppServerV1 {
         if resumed.pointer("/thread/id").and_then(Value::as_str) != Some(thread_id) {
             return invalid("Codex reopened a different conversation.");
         }
+        self.note_thread_model(&resumed);
         Ok(())
     }
 
@@ -2436,6 +2585,7 @@ impl CodexAppServerV1 {
         thread_id: &str,
         task: &str,
         client_message_id: Option<&str>,
+        options: &NativeSessionOptionsV1,
         progress: &dyn NativeInvocationProgressV1,
     ) -> CodexTurnReportV1 {
         let mut response = CodexResponseCaptureV1::default();
@@ -2444,13 +2594,23 @@ impl CodexAppServerV1 {
             response,
             stop_requested: self.interrupt_requested.load(Ordering::Acquire),
         };
+        let mut params = json!({"threadId": thread_id, "input": [{"type": "text", "text": task}]});
+        // Tags the turn in Codex's history, so its own record can later show
+        // whether this exact turn started.
+        if let Some(id) = client_message_id {
+            params["clientUserMessageId"] = json!(id);
+        }
+        // Codex applies these to this turn and the thread's later ones
+        // (measured with 0.163.0, also after `thread/resume`). Sent only as
+        // its user chose them.
+        if let Some(model) = &options.model {
+            params["model"] = json!(model);
+        }
+        if let Some(effort) = &options.effort {
+            params["effort"] = json!(effort);
+        }
         if self
-            .send(match client_message_id {
-                // Tags the turn in Codex's history, so its own record can
-                // later show whether this exact turn started.
-                Some(id) => json!({"id": TURN_START_ID, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}], "clientUserMessageId": id}}),
-                None => json!({"id": TURN_START_ID, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": task}]}}),
-            })
+            .send(json!({"id": TURN_START_ID, "method": "turn/start", "params": params}))
             .is_err()
         {
             return unknown(response);
@@ -2473,6 +2633,12 @@ impl CodexAppServerV1 {
         else {
             return unknown(response);
         };
+        // The thread now runs with the chosen model, whatever the turn does.
+        if let Some(model) = &options.model {
+            if let Ok(mut current) = self.thread_model.lock() {
+                *current = Some(model.clone());
+            }
+        }
         if self
             .active_turn
             .lock()
@@ -2951,11 +3117,12 @@ pub(in crate::native_agent) struct CodexHistoryReaderV1 {
 /// Methods the history reader may send. Nothing that starts or changes a
 /// thread or turn, or writes configuration, is allowed: `config/read` only
 /// reports the effective configuration (its writes are other methods).
-const HISTORY_METHODS: [&str; 4] = [
+const HISTORY_METHODS: [&str; 5] = [
     "thread/list",
     "thread/turns/list",
     "thread/items/list",
     "config/read",
+    "model/list",
 ];
 const HISTORY_RPC_TIMEOUT: Duration = Duration::from_secs(20);
 

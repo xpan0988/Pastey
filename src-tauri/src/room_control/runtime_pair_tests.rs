@@ -262,6 +262,7 @@ pub(crate) const MARKER: &str = "turn-0042";
 pub(crate) struct WindowsCodexV1 {
     pub(crate) workspace: PathBuf,
     turn_starts: PathBuf,
+    program: PathBuf,
 }
 
 impl Drop for WindowsCodexV1 {
@@ -277,6 +278,13 @@ impl WindowsCodexV1 {
         std::fs::read_to_string(&self.turn_starts)
             .map(|text| text.lines().count())
             .unwrap_or(0)
+    }
+
+    /// Each `turn/start` request line Windows's Codex received.
+    pub(crate) fn turn_start_lines(&self) -> Vec<String> {
+        std::fs::read_to_string(&self.turn_starts)
+            .map(|text| text.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -308,7 +316,9 @@ while IFS= read -r line; do
     *'"id":7,'*) echo '{{"id":7,"result":{{"data":[{{"id":"{MARKER}","status":"completed"}}]}}}}' ;;
     *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"{THREAD}","cwd":"{cwd}"}}}}}}' ;;
     *'"id":9,'*) echo '{{"id":9,"result":{{"data":[{{"id":"{THREAD}","cwd":"{cwd}"}}],"nextCursor":null}}}}' ;;
-    *'"id":3,'*) echo turn >> '{starts}'
+    *'"method":"model/list"'*) id=$(printf '%s' "$line" | sed -n 's/^{{"id":\([0-9]*\).*/\1/p')
+      echo "{{\"id\":$id,\"result\":{{\"data\":[{{\"id\":\"gpt-6-luna\",\"displayName\":\"GPT-6-Luna\",\"description\":\"Fast\",\"hidden\":false,\"isDefault\":false,\"defaultReasoningEffort\":\"low\",\"supportedReasoningEfforts\":[{{\"reasoningEffort\":\"low\",\"description\":\"Fast\"}}]}}],\"nextCursor\":null}}}}" ;;
+    *'"id":3,'*) printf '%s\n' "$line" >> '{starts}'
       echo '{{"id":3,"result":{{"turn":{{"id":"turn-new"}}}}}}'
       if [ ! -f '{hold}' ]; then
       echo '{{"method":"item/completed","params":{{"threadId":"{THREAD}","turnId":"turn-new","item":{{"type":"agentMessage","id":"m1","text":"continued","phase":"final_answer"}}}}}}'
@@ -337,6 +347,7 @@ rm -f '{lock}'
     WindowsCodexV1 {
         workspace,
         turn_starts,
+        program,
     }
 }
 
@@ -423,9 +434,64 @@ impl RuntimePairV1 {
                     scope_ref: None,
                     session_id: None,
                     folder: None,
+                    refresh: None,
                 },
             )
             .await
+    }
+
+    /// The Mac asks Windows which models its Codex lists, as the model
+    /// picker does.
+    pub(crate) async fn mac_asks_codex_models(
+        &self,
+    ) -> AppResult<crate::native_agent::sessions::remote::RemoteSessionResponseV1> {
+        use crate::native_agent::sessions::remote::{
+            RemoteSessionOperationV1, RemoteSessionQueryV1,
+        };
+        self.mac_presents_identity().await?;
+        self.mac_session()
+            .await?
+            .request_native_sessions(
+                self.mac.runtime.clone(),
+                RemoteSessionQueryV1 {
+                    schema_version: String::new(),
+                    request_id: String::new(),
+                    target_host_ref: String::new(),
+                    operation: RemoteSessionOperationV1::Models,
+                    provider: Some(crate::native_agent::sessions::PROVIDER_CODEX.into()),
+                    text: None,
+                    active_within_secs: None,
+                    scope_ref: None,
+                    session_id: None,
+                    folder: None,
+                    refresh: Some(true),
+                },
+            )
+            .await
+    }
+
+    /// As `mac_continues`, with the model and effort its user chose.
+    pub(crate) async fn mac_continues_with(
+        &self,
+        scope_ref: &str,
+        options: &crate::native_agent::NativeSessionOptionsV1,
+    ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+        crate::commands::invoke_remote_native_capability(
+            self.mac.runtime.clone(),
+            ROOM.into(),
+            self.windows.route_ref(),
+            self.windows.host_ref().as_str().into(),
+            crate::native_agent::CODEX_THREAD_CAPABILITY.into(),
+            crate::native_agent::codex_thread_peer_input(
+                scope_ref,
+                THREAD,
+                "Reply with the word ok",
+                Some(MARKER),
+                options,
+            )
+            .unwrap(),
+        )
+        .await
     }
 
     /// The Mac asks Windows to continue the thread, exactly as Continue
@@ -445,6 +511,7 @@ impl RuntimePairV1 {
                 THREAD,
                 "Reply with the word ok",
                 Some(MARKER),
+                &crate::native_agent::NativeSessionOptionsV1::default(),
             )
             .unwrap(),
         )
@@ -614,6 +681,75 @@ async fn a_shared_thread_is_continued_once_and_the_mac_learns_the_outcome() {
     );
 }
 
+/// The Mac picks Windows's Codex model by name: the list comes from
+/// Windows's own Codex, over the real channel; the chosen model and effort reach Windows's `turn/start` in the
+/// same thread after Accept; a model Windows's Codex does not list is
+/// refused there with nothing sent, and the Mac learns why.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_mac_runs_a_codex_model_windows_lists_and_nothing_it_does_not() {
+    use crate::native_agent::{NativeAgentTaskStateV1, NativeSessionOptionsV1};
+    let pair = RuntimePairV1::new().await;
+    let codex = install_windows_codex(&pair);
+    // Windows's Codex, not this machine's, answers `model/list`.
+    pair.windows
+        .runtime
+        .native_agents
+        .lock()
+        .use_codex_for_test(&codex.program);
+    // (Without Agent requests the answer is `not_authorized`:
+    // `a_hosts_models_go_only_to_a_device_that_may_run_agents_there`.)
+    pair.windows_shares(&codex, true, true).await;
+    let listed = pair.mac_asks_codex_models().await.unwrap();
+    let catalogs = listed.models.expect("Windows's models");
+    assert_eq!(catalogs.len(), 1);
+    assert_eq!(
+        catalogs[0].agent,
+        crate::native_agent::sessions::PROVIDER_CODEX
+    );
+    assert_eq!(catalogs[0].models[0].id, "gpt-6-luna");
+    let scope = pair.mac_lists_shares().await.unwrap().scopes[0]
+        .scope_ref
+        .clone();
+
+    let chosen = NativeSessionOptionsV1 {
+        model: Some("gpt-6-luna".into()),
+        effort: Some("low".into()),
+    };
+    let queued = pair.mac_continues_with(&scope, &chosen).await.unwrap();
+    pair.windows_review_appears(&queued.task_id).await;
+    assert_eq!(codex.turn_starts(), 0, "nothing runs before Accept");
+    pair.windows_accepts(&queued.task_id).unwrap();
+    let ended = pair.mac_task_ends(&queued.task_id).await;
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Completed, "{ended:?}");
+    let turn = codex.turn_start_lines().pop().unwrap();
+    assert!(
+        turn.contains(r#""model":"gpt-6-luna""#) && turn.contains(r#""effort":"low""#),
+        "{turn}"
+    );
+    assert!(turn.contains(THREAD));
+
+    let unknown = NativeSessionOptionsV1 {
+        model: Some("not-on-windows".into()),
+        effort: None,
+    };
+    let queued = pair.mac_continues_with(&scope, &unknown).await.unwrap();
+    pair.windows_review_appears(&queued.task_id).await;
+    pair.windows_accepts(&queued.task_id).unwrap();
+    let ended = pair.mac_task_ends(&queued.task_id).await;
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Failed, "{ended:?}");
+    assert_eq!(ended.code.as_deref(), Some("native_agent_start_failed"));
+    assert!(
+        ended
+            .result
+            .as_deref()
+            .unwrap_or_default()
+            .contains("does not list the model"),
+        "{ended:?}"
+    );
+    assert_eq!(codex.turn_starts(), 1, "nothing more was sent");
+}
+
 /// Claude Code on Windows, driven from the Mac over the real channel with
 /// the same product model as Codex: Windows shares a folder; the Mac starts
 /// a new Claude Code conversation there and continues an existing session
@@ -650,7 +786,16 @@ async fn windows_claude_code_runs_and_continues_for_the_mac_only_after_accept() 
     // A new conversation in the shared folder.
     let queued = invoke(
         crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY,
-        crate::native_agent::claude_code_conversation_peer_input(&scope, "Say hi", true).unwrap(),
+        crate::native_agent::claude_code_conversation_peer_input(
+            &scope,
+            "Say hi",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1 {
+                model: Some("sonnet".into()),
+                effort: None,
+            },
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -662,6 +807,11 @@ async fn windows_claude_code_runs_and_continues_for_the_mac_only_after_accept() 
     assert_eq!(ended.state, NativeAgentTaskStateV1::Completed, "{ended:?}");
     assert_eq!(claude.runs().len(), 1);
     assert!(claude.runs()[0].contains("--session-id"), "a new session");
+    assert!(
+        claude.runs()[0].ends_with("--model sonnet"),
+        "the Mac's choice reaches Windows's Claude Code: {:?}",
+        claude.runs()
+    );
 
     // The existing session, continued in place with the chosen effort.
     let options = crate::native_agent::NativeSessionOptionsV1 {
@@ -704,7 +854,13 @@ async fn windows_claude_code_runs_and_continues_for_the_mac_only_after_accept() 
     // Denied: nothing runs, and the Mac learns it.
     let queued = invoke(
         crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY,
-        crate::native_agent::claude_code_conversation_peer_input(&scope, "Again", true).unwrap(),
+        crate::native_agent::claude_code_conversation_peer_input(
+            &scope,
+            "Again",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
+        .unwrap(),
     )
     .await
     .unwrap();
@@ -759,6 +915,7 @@ async fn windows_claude_code_runs_and_continues_for_the_mac_only_after_accept() 
             "scope:ffffffffffffffff",
             "x",
             true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap(),
     )
@@ -789,6 +946,7 @@ async fn a_request_never_sent_ends_as_not_delivered_instead_of_staying_queued() 
         THREAD,
         "Reply with the word ok",
         Some(MARKER),
+        &crate::native_agent::NativeSessionOptionsV1::default(),
     )
     .unwrap();
     let task_id = "native-agent:never-sent";

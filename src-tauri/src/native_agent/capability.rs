@@ -94,7 +94,7 @@ impl OpaqueCapabilityPayloadV1 {
         Some(output)
     }
 
-    fn value(&self) -> &Value {
+    pub(in crate::native_agent) fn value(&self) -> &Value {
         &self.0
     }
 }

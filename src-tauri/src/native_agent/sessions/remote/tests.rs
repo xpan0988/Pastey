@@ -16,6 +16,7 @@ fn query(operation: RemoteSessionOperationV1) -> RemoteSessionQueryV1 {
         scope_ref: None,
         session_id: None,
         folder: None,
+        refresh: None,
     }
 }
 
@@ -100,6 +101,7 @@ fn the_requester_accepts_only_answers_to_its_own_queries_from_their_host() {
         snapshot: None,
         full_access: false,
         detail: None,
+        models: None,
     };
     assert!(
         pending
@@ -571,4 +573,118 @@ fn opening_a_folder_names_one_bounded_path_and_only_that_operation_carries_one()
     let detail = refused.detail.clone().unwrap();
     assert!(!detail.contains("Users"), "{detail}");
     validate_response(&refused).unwrap();
+}
+
+/// A fake Codex whose app-server answers `model/list`, and a fake Claude
+/// Code that answers the stream-json `initialize` control request.
+#[cfg(unix)]
+fn fake_agents(root: &std::path::Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(root).unwrap();
+    let codex = root.join("codex");
+    std::fs::write(
+        &codex,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli 0.163.0"; exit 0; fi
+if [ "$2" = "--help" ]; then exit 0; fi
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/^{"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"x/0.163.0"}}\n' "$id" ;;
+    *'"method":"model/list"'*) printf '{"id":%s,"result":{"data":[{"id":"gpt-6.1-sol","model":"gpt-6.1-sol","displayName":"GPT-6.1-Sol","description":"Workhorse in /Users/me/x","hidden":false,"isDefault":true,"defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"}]},{"id":"secret","displayName":"Hidden","description":"","hidden":true,"isDefault":false,"defaultReasoningEffort":"low","supportedReasoningEfforts":[]}],"nextCursor":null}}\n' "$id" ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    let claude = root.join("claude");
+    std::fs::write(
+        &claude,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$(dirname "$0")/claude-args"
+while IFS= read -r line; do
+  case "$line" in
+    *'"subtype":"initialize"'*)
+      rid=$(printf '%s' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"account":{"email":"someone@example.com"},"models":[{"value":"sonnet","resolvedModel":"claude-sonnet-5-5","displayName":"Sonnet","description":"Efficient","supportsEffort":true,"supportedEffortLevels":["low","high"]}]}}}\n' "$rid" ;;
+  esac
+done
+"#,
+    )
+    .unwrap();
+    for program in [&codex, &claude] {
+        std::fs::set_permissions(program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    (codex, claude)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_hosts_models_go_only_to_a_device_that_may_run_agents_there() {
+    let root = std::env::temp_dir().join(format!("pastey-models-{}", Uuid::new_v4()));
+    let (codex_cli, claude_cli) = fake_agents(&root);
+    let claude = ClaudeSessionSourceV1::at(&root, Some(&claude_cli));
+    let codex = CodexSessionSourceV1::new(codex_cli, vec![]);
+    let shared = |agent_requests: bool| crate::session_read_access::SessionReadScopeV1 {
+        scope_ref: "scope:0123456789abcdef".into(),
+        workspace: root.clone(),
+        label: "Pastey".into(),
+        read_sessions: true,
+        share_excerpts: false,
+        agent_requests,
+        expires_at: crate::storage::now_ts() + 3_600,
+        full_access: false,
+    };
+    let mut asked = query(RemoteSessionOperationV1::Models);
+    asked.refresh = Some(true);
+    validate_query(&asked).unwrap();
+
+    // Reading sessions alone does not tell what the Agents offer.
+    let refused = answer(&asked, &[shared(false)], &claude, &codex, "host:windows");
+    assert_eq!(refused.outcome, RemoteSessionOutcomeV1::NotAuthorized);
+    assert!(refused.models.is_none());
+    validate_response(&refused).unwrap();
+
+    let models = answer(&asked, &[shared(true)], &claude, &codex, "host:windows");
+    assert_eq!(models.outcome, RemoteSessionOutcomeV1::Ok);
+    validate_response(&models).unwrap();
+    let catalogs = models.models.as_ref().unwrap();
+    let codex_list = catalogs.iter().find(|c| c.agent == PROVIDER_CODEX).unwrap();
+    assert_eq!(codex_list.models.len(), 1, "hidden models are not offered");
+    assert_eq!(codex_list.models[0].id, "gpt-6.1-sol");
+    let claude_list = catalogs
+        .iter()
+        .find(|c| c.agent == PROVIDER_CLAUDE_CODE)
+        .unwrap();
+    assert_eq!(
+        claude_list.state,
+        crate::native_agent::model_catalog::ModelCatalogStateV1::Reported
+    );
+    assert_eq!(
+        claude_list.models[0].resolves_to.as_deref(),
+        Some("claude-sonnet-5-5")
+    );
+    // Nothing else of Claude Code's answer, and no path, leaves the Host.
+    let wire = serde_json::to_string(&models).unwrap();
+    assert!(
+        !wire.contains("someone@example.com") && !wire.contains("/Users/me"),
+        "{wire}"
+    );
+    // Claude Code was asked in its stream-json mode, with no prompt.
+    let args = std::fs::read_to_string(root.join("claude-args")).unwrap();
+    assert_eq!(
+        args.trim(),
+        "-p --input-format stream-json --output-format stream-json --verbose"
+    );
+
+    // One Agent only, when named.
+    asked.provider = Some(PROVIDER_CODEX.into());
+    let one = answer(&asked, &[shared(true)], &claude, &codex, "host:windows");
+    assert_eq!(one.models.as_ref().unwrap().len(), 1);
+
+    // A refresh flag belongs to a model query only.
+    let mut bad = query(RemoteSessionOperationV1::Discover);
+    bad.refresh = Some(true);
+    assert!(validate_query(&bad).is_err());
+    let _ = std::fs::remove_dir_all(root);
 }

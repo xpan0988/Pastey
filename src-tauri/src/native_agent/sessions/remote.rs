@@ -40,6 +40,7 @@ use crate::error::{AppError, AppResult};
 use crate::native_agent::agent_config::{
     remote_projection, AgentConfigScopeV1, NativeAgentConfigV1,
 };
+use crate::native_agent::model_catalog::NativeModelCatalogV1;
 use crate::session_read_access::SessionReadScopeV1;
 
 pub(crate) const NATIVE_SESSION_SCHEMA: &str = "pastey-native-session-v1";
@@ -67,6 +68,9 @@ pub(crate) enum RemoteSessionOperationV1 {
     /// requesting device's workspaces on that Host, then answers as
     /// `Workspaces`.
     OpenFolder,
+    /// The models its native Agents list (`provider` only, when named), for
+    /// a device that may ask to run agents there. Read only.
+    Models,
 }
 
 /// Longest folder a requester may name.
@@ -93,6 +97,9 @@ pub(crate) struct RemoteSessionQueryV1 {
     /// `OpenFolder` only: the folder on that Host, by its full path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) folder: Option<String>,
+    /// `Models` only: ask the Agents again rather than reuse a recent list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) refresh: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,6 +299,9 @@ pub(crate) struct RemoteSessionResponseV1 {
     /// Why `FolderRefused`, in the Host's words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) detail: Option<String>,
+    /// `Models`: what each native Agent on that Host lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) models: Option<Vec<NativeModelCatalogV1>>,
 }
 
 fn invalid<T>(message: &str) -> AppResult<T> {
@@ -372,6 +382,9 @@ pub(crate) fn validate_query(query: &RemoteSessionQueryV1) -> AppResult<()> {
         }
         (_, Some(_)) => return invalid("Invalid native session query."),
         (_, None) => {}
+    }
+    if query.refresh.is_some() && query.operation != RemoteSessionOperationV1::Models {
+        return invalid("Invalid native session query.");
     }
     Ok(())
 }
@@ -458,6 +471,14 @@ pub(crate) fn validate_response(response: &RemoteSessionResponseV1) -> AppResult
             }
         }
         discovery.sessions.iter().try_for_each(validate_session)?;
+    }
+    if let Some(models) = &response.models {
+        if models.len() > 2
+            || models.iter().any(|catalog| !catalog.is_valid())
+            || (models.len() == 2 && models[0].agent == models[1].agent)
+        {
+            return invalid("Invalid native model list.");
+        }
     }
     if let Some(snapshot) = &response.snapshot {
         validate_session(&snapshot.session)?;
@@ -714,6 +735,7 @@ fn response(
         snapshot: None,
         full_access: false,
         detail: None,
+        models: None,
     }
 }
 
@@ -757,6 +779,35 @@ pub(crate) fn answer(
         RemoteSessionOperationV1::Workspaces | RemoteSessionOperationV1::OpenFolder
     ) {
         return response(query, local_host_ref, RemoteSessionOutcomeV1::Ok, scopes);
+    }
+    if query.operation == RemoteSessionOperationV1::Models {
+        // Only a device that may ask to run agents here learns what they
+        // offer: the same permission a run needs.
+        if !scopes
+            .iter()
+            .any(|scope| scope.agent_requests || scope.full_access)
+        {
+            return response(
+                query,
+                local_host_ref,
+                RemoteSessionOutcomeV1::NotAuthorized,
+                scopes,
+            );
+        }
+        let mut answer = response(query, local_host_ref, RemoteSessionOutcomeV1::Ok, scopes);
+        let catalogs = crate::native_agent::model_catalog::read(
+            claude,
+            codex,
+            query.provider.as_deref(),
+            query.refresh == Some(true),
+        );
+        answer.models = Some(fit_models(
+            catalogs
+                .iter()
+                .map(crate::native_agent::model_catalog::remote_projection)
+                .collect(),
+        ));
+        return answer;
     }
     let selected: Vec<SessionReadScopeV1> = scopes
         .iter()
@@ -819,7 +870,9 @@ pub(crate) fn answer(
             }
             answer.discovery = Some(remote);
         }
-        RemoteSessionOperationV1::Workspaces | RemoteSessionOperationV1::OpenFolder => {}
+        RemoteSessionOperationV1::Workspaces
+        | RemoteSessionOperationV1::OpenFolder
+        | RemoteSessionOperationV1::Models => {}
         RemoteSessionOperationV1::Inspect => {
             let provider = query.provider.as_deref().unwrap_or_default();
             let session_id = query.session_id.as_deref().unwrap_or_default();
@@ -833,6 +886,44 @@ pub(crate) fn answer(
         }
     }
     answer
+}
+
+/// The catalogs within one event: effort descriptions go first, then model
+/// descriptions, then the last models of the longest list.
+fn fit_models(mut catalogs: Vec<NativeModelCatalogV1>) -> Vec<NativeModelCatalogV1> {
+    let size = |catalogs: &Vec<NativeModelCatalogV1>| {
+        serde_json::to_vec(catalogs).map_or(usize::MAX, |bytes| bytes.len())
+    };
+    if size(&catalogs) > MAX_RESPONSE_BYTES {
+        for model in catalogs
+            .iter_mut()
+            .flat_map(|catalog| catalog.models.iter_mut())
+        {
+            for effort in model.efforts.iter_mut().flatten() {
+                effort.description = None;
+            }
+        }
+    }
+    if size(&catalogs) > MAX_RESPONSE_BYTES {
+        for model in catalogs
+            .iter_mut()
+            .flat_map(|catalog| catalog.models.iter_mut())
+        {
+            model.description = None;
+        }
+    }
+    while size(&catalogs) > MAX_RESPONSE_BYTES {
+        let Some(longest) = catalogs
+            .iter_mut()
+            .max_by_key(|catalog| catalog.models.len())
+        else {
+            break;
+        };
+        if longest.models.pop().is_none() {
+            break;
+        }
+    }
+    catalogs
 }
 
 /// At most one query per Bridge is answered at a time.

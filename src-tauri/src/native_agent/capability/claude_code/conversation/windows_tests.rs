@@ -271,7 +271,12 @@ fn run(fixture: &FixtureV1, mode: &str, new_conversation: bool) -> NativeAgentTa
     fixture.mode(mode);
     let mut service = fixture.service();
     let started = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", new_conversation)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            new_conversation,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_terminal(&service, &started.task_id)
 }
@@ -293,7 +298,12 @@ fn availability_requires_windows_minimum_version_and_sign_in() {
     let mut service =
         NativeAgentServiceV1::with_paths_and_adapters(fixture.paths(), vec![adapter]).unwrap();
     assert!(service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
         .is_err());
     assert!(fixture.runs().is_empty(), "nothing ran");
 
@@ -411,6 +421,7 @@ fn a_follow_up_continues_exactly_that_session_and_a_new_conversation_begins_anot
                 &fixture.workspace,
                 "Do the task",
                 new_conversation,
+                &crate::native_agent::NativeSessionOptionsV1::default(),
             )
             .unwrap();
         let status = wait_terminal(&service, &started.task_id);
@@ -520,7 +531,12 @@ fn a_conversation_whose_session_is_gone_is_unavailable_and_never_replaced() {
     let fixture = FixtureV1::new("complete");
     let mut service = fixture.service();
     let first = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     assert_eq!(
         wait_terminal(&service, &first.task_id).state,
@@ -529,7 +545,12 @@ fn a_conversation_whose_session_is_gone_is_unavailable_and_never_replaced() {
     wait_released(&service, &fixture.workspace);
     fixture.mode("missing");
     let continued = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", false)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            false,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let status = wait_terminal(&service, &continued.task_id);
     assert_eq!(status.state, NativeAgentTaskStateV1::Failed);
@@ -545,7 +566,12 @@ fn a_session_another_process_holds_is_not_continued() {
     let fixture = FixtureV1::new("complete");
     let mut service = fixture.service();
     let first = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_terminal(&service, &first.task_id);
     wait_released(&service, &fixture.workspace);
@@ -557,7 +583,12 @@ fn a_session_another_process_holds_is_not_continued() {
     )
     .unwrap();
     let continued = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", false)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            false,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let status = wait_terminal(&service, &continued.task_id);
     assert_eq!(status.code.as_deref(), Some("native_agent_start_failed"));
@@ -572,7 +603,12 @@ fn stop_asks_claude_code_itself_then_confirms_every_process_ended() {
     let fixture = FixtureV1::new("hang");
     let mut service = fixture.service();
     let started = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(
         || fixture.busy() && fixture.processes().len() == 2,
@@ -610,7 +646,12 @@ fn a_run_that_ignores_stop_is_ended_with_its_whole_job() {
     let fixture = FixtureV1::new("stubborn");
     let mut service = fixture.service();
     let started = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(
         || fixture.busy() && fixture.processes().len() == 2,
@@ -657,7 +698,12 @@ fn a_stop_reads_confirmed_only_once_no_process_of_the_run_is_left() {
     let fixture = FixtureV1::new("stubborn");
     let mut service = fixture.service();
     let started = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(
         || fixture.busy() && fixture.processes().len() == 2,
@@ -718,7 +764,12 @@ fn a_stop_pending_at_restart_reads_not_confirmed() {
         NativeAgentServiceV1::with_paths_and_adapters(paths.clone(), vec![adapter.clone()])
             .unwrap();
     let started = before
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(
         || fixture.busy() && fixture.processes().len() == 2,
@@ -780,7 +831,12 @@ fn a_restart_during_a_run_keeps_the_outcome_unknown_then_observes_its_end() {
         NativeAgentServiceV1::with_paths_and_adapters(paths.clone(), vec![adapter.clone()])
             .unwrap();
     let started = before
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the run started");
     adapter.abandon_runs();
@@ -796,7 +852,12 @@ fn a_restart_during_a_run_keeps_the_outcome_unknown_then_observes_its_end() {
     );
     assert!(held(&after, &fixture.workspace));
     assert!(after
-        .start_claude_code_conversation_task(&fixture.workspace, "Again", false)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Again",
+            false,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
         .is_err());
 
     fs::write(fixture.root.join("finish"), b"").unwrap();
@@ -826,7 +887,12 @@ fn a_turn_that_ends_while_the_registry_is_asked_is_observed_as_it_ended() {
         NativeAgentServiceV1::with_paths_and_adapters(paths.clone(), vec![adapter.clone()])
             .unwrap();
     let started = before
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the run started");
     adapter.abandon_runs();
@@ -864,7 +930,12 @@ fn killed_pastey_helper() {
     let fixture = FixtureV1::at(Path::new(&root));
     let mut service = fixture.service();
     let started = service
-        .start_claude_code_conversation_task(&fixture.workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     println!("PASTEY_CRASH_TASK={}", started.task_id);
     std::mem::forget(fixture);
@@ -980,7 +1051,12 @@ fn a_running_folder_is_held_under_every_name_and_independent_folders_run_at_once
     fs::create_dir(&sibling).unwrap();
 
     let started = service
-        .start_claude_code_conversation_task(&workspace, "Do the task", true)
+        .start_claude_code_conversation_task(
+            &workspace,
+            "Do the task",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.busy(), "the run started");
 
@@ -1003,7 +1079,12 @@ fn a_running_folder_is_held_under_every_name_and_independent_folders_run_at_once
         );
         assert!(
             service
-                .start_claude_code_conversation_task(name, "Again", true)
+                .start_claude_code_conversation_task(
+                    name,
+                    "Again",
+                    true,
+                    &crate::native_agent::NativeSessionOptionsV1::default()
+                )
                 .is_err(),
             "{} was not refused",
             name.display()
@@ -1013,7 +1094,12 @@ fn a_running_folder_is_held_under_every_name_and_independent_folders_run_at_once
 
     // A sibling folder of this Host runs at once.
     let beside = service
-        .start_claude_code_conversation_task(&sibling, "Beside", true)
+        .start_claude_code_conversation_task(
+            &sibling,
+            "Beside",
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     wait_until(|| fixture.runs().len() == 2, "the sibling ran");
     // So does the same work on another Host (its own service and store).
@@ -1115,7 +1201,12 @@ fn a_repository_s_configuration_and_trust_count_for_its_subfolders() {
     let start = |fixture: &FixtureV1| {
         let mut service = fixture.service();
         let started = service
-            .start_claude_code_conversation_task(&inner, "Do the task", true)
+            .start_claude_code_conversation_task(
+                &inner,
+                "Do the task",
+                true,
+                &crate::native_agent::NativeSessionOptionsV1::default(),
+            )
             .unwrap();
         wait_terminal(&service, &started.task_id)
     };
@@ -1245,6 +1336,7 @@ fn installed_claude_code_conversation_runs_and_continues_on_windows() {
             &workspace,
             "Reply with exactly: pastey-windows-one",
             true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
     let first = live_terminal(&service, &first.task_id);
@@ -1264,6 +1356,7 @@ fn installed_claude_code_conversation_runs_and_continues_on_windows() {
             &workspace,
             "What exact text did you reply with last time? Reply with exactly that text.",
             false,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
     let follow_up = live_terminal(&service, &follow_up.task_id);
@@ -1298,7 +1391,12 @@ fn installed_claude_code_conversation_stops_with_its_tool_processes_on_windows()
     let root = std::env::temp_dir().join(format!("pastey-claude-live-{}", Uuid::new_v4()));
     let mut service = live_service(&root);
     let started = service
-        .start_claude_code_conversation_task(&workspace, LIVE_LONG_PROMPT, true)
+        .start_claude_code_conversation_task(
+            &workspace,
+            LIVE_LONG_PROMPT,
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     let pings = wait_for_live_ping();
     std::thread::sleep(Duration::from_secs(2));
@@ -1353,7 +1451,12 @@ fn installed_killed_pastey_helper() {
     };
     let mut service = live_service(Path::new(&root));
     let started = service
-        .start_claude_code_conversation_task(Path::new(&workspace), LIVE_LONG_PROMPT, true)
+        .start_claude_code_conversation_task(
+            Path::new(&workspace),
+            LIVE_LONG_PROMPT,
+            true,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
         .unwrap();
     println!("PASTEY_LIVE_WINDOWS_TASK={}", started.task_id);
     loop {

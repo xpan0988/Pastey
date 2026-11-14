@@ -67,8 +67,8 @@ use crate::native_agent::sessions::claude::{
 };
 use crate::native_agent::sessions::{in_workspaces, now_ms, LastTurnV1};
 use crate::native_agent::{
-    NativeAgentCapabilityStateV1, NativeSessionOptionsV1, NativeTurnOutcomeV1,
-    GENERIC_NATIVE_INVOKE_PROTOCOLS, MAX_TASK_BYTES,
+    NativeAgentCapabilityStateV1, NativeSessionOptionsV1, NativeTurnOutcomeV1, MAX_TASK_BYTES,
+    OPTIONS_INVOKE_PROTOCOLS,
 };
 
 pub(in crate::native_agent) mod conversation;
@@ -459,7 +459,7 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeNativeAdapterV1 {
     /// there may ask; each request waits for this Host's Review unless the
     /// peer holds Full Access.
     fn supported_protocols(&self) -> &'static [&'static str] {
-        &GENERIC_NATIVE_INVOKE_PROTOCOLS
+        &OPTIONS_INVOKE_PROTOCOLS
     }
 
     fn peer_folder_use(&self) -> Option<super::PeerFolderUseV1> {
@@ -665,6 +665,135 @@ fn claude_command(cli: &Path) -> Command {
         }
     }
     command
+}
+
+/// Longest stream Pastey reads from Claude Code while it lists its models.
+const MODEL_LIST_STREAM_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Claude Code's own model list on this device: the `models` its
+/// stream-json mode reports in answer to the `initialize` control request,
+/// which is what the Agent SDK's `supportedModels()` sends. No prompt is
+/// sent: Claude Code answers, then exits when its input closes, and writes
+/// no session (measured with 2.1.318). It runs in `cwd` (a neutral folder,
+/// not a project), contained as a probe is, and is ended if it does not
+/// answer within `timeout`.
+pub(in crate::native_agent) fn list_models(
+    cli: &Path,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<Vec<serde_json::Value>, String> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut command = claude_command(cli);
+    command
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
+        .current_dir(dunce::simplified(cwd))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // Its own process group, so whatever it started ends with it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only an async-signal-safe call before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    let (mut child, _job) = job::spawn_probe(&mut command)
+        .map_err(|_| "Claude Code could not be started".to_owned())?;
+    #[cfg(not(windows))]
+    let mut child = command
+        .spawn()
+        .map_err(|_| "Claude Code could not be started".to_owned())?;
+    let end = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        // SAFETY: signals only the process group this function created.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let request_id = format!("pastey-models-{}", uuid::Uuid::new_v4());
+    let request = json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {"subtype": "initialize"},
+    });
+    let mut stdin = child.stdin.take();
+    let sent = stdin.as_mut().is_some_and(|input| {
+        input
+            .write_all(format!("{request}\n").as_bytes())
+            .and_then(|()| input.flush())
+            .is_ok()
+    });
+    let Some(stdout) = child.stdout.take().filter(|_| sent) else {
+        end(&mut child);
+        return Err("Claude Code did not accept the request".into());
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let wanted = request_id.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(stdout.take(MODEL_LIST_STREAM_BYTES));
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if message.get("type").and_then(serde_json::Value::as_str) != Some("control_response")
+                || message
+                    .pointer("/response/request_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(wanted.as_str())
+            {
+                continue;
+            }
+            let answer = match message
+                .pointer("/response/subtype")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("success") => message
+                    .pointer("/response/response/models")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .ok_or_else(|| "its answer named no models".to_owned()),
+                _ => Err("it refused the request".to_owned()),
+            };
+            let _ = sender.send(answer);
+            return;
+        }
+        let _ = sender.send(Err("it ended without answering".into()));
+    });
+    let answer = receiver
+        .recv_timeout(timeout)
+        .unwrap_or_else(|_| Err("it did not answer in time".into()));
+    // Closing its input ends it; anything left is ended.
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            _ => {
+                end(&mut child);
+                break;
+            }
+        }
+    }
+    answer
 }
 
 /// Runs `command` to its end, bounded; its stdout and stderr together, or

@@ -790,3 +790,24 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
 .hljs-deletion { display: inline-block; width: 100%; background: var(--syn-del); }
 .hljs-emphasis { font-style: italic; }
 .hljs-strong { font-weight: 650; }
+
+/* Model and effort for the next turn: picked from what the Agent on the
+   executing device lists. */
+.model-picker-body { display: grid; gap: 8px; }
+.model-picker .model-confirmed { margin: 0; }
+.model-search { gap: 6px; align-items: center; }
+.model-search .input { flex: 1; min-width: 0; }
+.model-options { display: grid; max-height: 232px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface); }
+.model-option { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: var(--text-sm); line-height: 1.4; cursor: pointer; }
+.model-option:last-child { border-bottom: 0; }
+.model-option:hover { background: var(--surface-2); }
+.model-option.selected { background: var(--accent-soft); }
+.model-option input { margin: 3px 0 0; accent-color: var(--accent); flex: none; }
+.model-option > span { min-width: 0; overflow-wrap: anywhere; }
+.model-option small { display: block; color: var(--text-3); font-size: var(--text-xs); }
+.model-option .badge { height: 18px; vertical-align: 1px; }
+.model-id { margin-left: 6px; color: var(--text-3); font-size: var(--text-xs); }
+.model-empty { margin: 0; padding: 8px 10px; }
+.model-effort { gap: 8px; align-items: center; }
+.model-effort .select { flex: 1; min-width: 0; }
+.model-picker p { margin: 0; }

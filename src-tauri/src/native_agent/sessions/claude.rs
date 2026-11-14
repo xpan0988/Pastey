@@ -65,6 +65,31 @@ enum LiveRegistryV1 {
 }
 
 impl ClaudeSessionSourceV1 {
+    /// The models this Claude Code lists for its picker (its stream-json
+    /// `initialize` answer, as the Agent SDK's `supportedModels()` asks), or
+    /// its documented aliases, labelled as such, when it does not answer.
+    /// No prompt is sent and no session is written.
+    pub(crate) fn model_catalog(&self) -> crate::native_agent::model_catalog::NativeModelCatalogV1 {
+        use crate::native_agent::model_catalog::{
+            claude_catalog, claude_fallback, NativeModelCatalogV1, CLAUDE_CATALOG_SOURCE,
+        };
+        let Some(cli) = &self.cli else {
+            return NativeModelCatalogV1::unavailable(
+                PROVIDER_CLAUDE_CODE,
+                CLAUDE_CATALOG_SOURCE,
+                "Claude Code was not found on this device.",
+            );
+        };
+        match crate::native_agent::capability::claude_code::list_models(
+            cli,
+            &std::env::temp_dir(),
+            std::time::Duration::from_secs(30),
+        ) {
+            Ok(models) => claude_catalog(&models),
+            Err(reason) => claude_fallback(&reason),
+        }
+    }
+
     /// The user's installed Claude Code: `CLAUDE_CONFIG_DIR` or `~/.claude`,
     /// and the first `claude` executable found.
     pub(crate) fn installed() -> Self {

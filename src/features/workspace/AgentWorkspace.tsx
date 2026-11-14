@@ -160,6 +160,15 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
   }, [conversationId]);
 
   const list = useSessionList({ roomId: room.id, peers, members, target, shares, choice, active: true });
+  // When a turn of the followed task ends, its session has recorded the
+  // model and effort it ran with: read the folder's sessions again so the
+  // conversation shows that, not what it showed before.
+  const turnRunning = !!agent.status && ["queued", "running"].includes(agent.status.state);
+  const ranTurn = useRef(false);
+  useEffect(() => {
+    if (turnRunning) { ranTurn.current = true; return; }
+    if (ranTurn.current) { ranTurn.current = false; void list.look(); }
+  }, [turnRunning]); // eslint-disable-line react-hooks/exhaustive-deps
   const share = choice?.kind === "shared" ? sharedList.find((candidate) => candidate.scopeRef === choice.scopeRef) ?? null : null;
 
   // The followed task: which conversation it belongs to, and whether that

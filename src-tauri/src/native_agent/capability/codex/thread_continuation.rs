@@ -56,8 +56,8 @@ use crate::native_agent::capability::{
 };
 use crate::native_agent::{
     invalid, NativeAgentCapabilityStateV1, NativeAgentServiceV1, NativeConversationContinuityV1,
-    NativeDecisionV1, NativeTurnOutcomeV1, GENERIC_NATIVE_INVOKE_PROTOCOLS, MAX_TASK_BYTES,
-    NATIVE_AGENT_RPC_TIMEOUT,
+    NativeDecisionV1, NativeSessionOptionsV1, NativeTurnOutcomeV1, MAX_TASK_BYTES,
+    NATIVE_AGENT_RPC_TIMEOUT, OPTIONS_INVOKE_PROTOCOLS,
 };
 
 pub(in crate::native_agent) const CODEX_THREAD_CAPABILITY_ID: &str = "agent.coding.codex_thread";
@@ -79,6 +79,10 @@ struct ThreadContinueInputV1 {
     prompt: String,
     /// The last turn the user saw. The thread must still end with it.
     expected_last_turn_id: Option<String>,
+    /// Codex's own model and effort for this turn, only as its user chose
+    /// them; the thread keeps them for its later turns.
+    #[serde(default)]
+    options: NativeSessionOptionsV1,
 }
 
 /// What a Bridge peer sends: the folder only as the opaque scope reference
@@ -90,20 +94,28 @@ struct PeerThreadContinueInputV1 {
     thread_id: String,
     prompt: String,
     expected_last_turn_id: Option<String>,
+    #[serde(default)]
+    options: NativeSessionOptionsV1,
 }
 
+/// `options` are sent only when its user chose any, so a Host that cannot
+/// apply them refuses the input (unknown field) rather than ignore them.
 pub(in crate::native_agent) fn peer_input(
     scope_ref: &str,
     thread_id: &str,
     prompt: &str,
     expected_last_turn_id: Option<&str>,
+    options: &NativeSessionOptionsV1,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
-    let input = OpaqueCapabilityPayloadV1::new(json!({
-        "scopeRef": scope_ref,
-        "threadId": thread_id,
-        "prompt": prompt,
-        "expectedLastTurnId": expected_last_turn_id,
-    }));
+    let input = super::with_options(
+        OpaqueCapabilityPayloadV1::new(json!({
+            "scopeRef": scope_ref,
+            "threadId": thread_id,
+            "prompt": prompt,
+            "expectedLastTurnId": expected_last_turn_id,
+        })),
+        options,
+    )?;
     input.validate()?;
     Ok(input)
 }
@@ -131,6 +143,7 @@ pub(in crate::native_agent) fn resolve_peer_input(
         &peer.thread_id,
         &peer.prompt,
         peer.expected_last_turn_id.as_deref(),
+        &peer.options,
     )
 }
 
@@ -139,13 +152,17 @@ pub(in crate::native_agent) fn continue_input(
     thread_id: &str,
     prompt: &str,
     expected_last_turn_id: Option<&str>,
+    options: &NativeSessionOptionsV1,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
-    let input = OpaqueCapabilityPayloadV1::new(json!({
-        "workspace": workspace.to_string_lossy(),
-        "threadId": thread_id,
-        "prompt": prompt,
-        "expectedLastTurnId": expected_last_turn_id,
-    }));
+    let input = super::with_options(
+        OpaqueCapabilityPayloadV1::new(json!({
+            "workspace": workspace.to_string_lossy(),
+            "threadId": thread_id,
+            "prompt": prompt,
+            "expectedLastTurnId": expected_last_turn_id,
+        })),
+        options,
+    )?;
     input.validate()?;
     parse(&input)?;
     Ok(input)
@@ -171,6 +188,7 @@ fn parse(input: &OpaqueCapabilityPayloadV1) -> AppResult<(ThreadContinueInputV1,
     if parsed.prompt.trim().is_empty() || parsed.prompt.len() > MAX_TASK_BYTES {
         return invalid("Native Agent task is empty or exceeds its bound.");
     }
+    parsed.options.validate()?;
     let workspace = Path::new(&parsed.workspace)
         .canonicalize()
         .map_err(|_| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
@@ -275,7 +293,7 @@ impl NativeCapabilityAdapterV1 for CodexThreadAdapterV1 {
     /// Peers may ask; every such request waits for this Host's Review, and
     /// names only a folder the requester may read (`resolve_peer_input`).
     fn supported_protocols(&self) -> &'static [&'static str] {
-        &GENERIC_NATIVE_INVOKE_PROTOCOLS
+        &OPTIONS_INVOKE_PROTOCOLS
     }
 
     fn peer_folder_use(&self) -> Option<crate::native_agent::capability::PeerFolderUseV1> {
@@ -352,6 +370,7 @@ impl NativeCapabilityAdapterV1 for CodexThreadAdapterV1 {
                 thread_id: parsed.thread_id,
                 expected_last_turn_id: parsed.expected_last_turn_id,
                 prompt: parsed.prompt,
+                options: parsed.options,
                 client_message_id: task_id.to_owned(),
                 slot,
                 controller: None,
@@ -440,6 +459,8 @@ struct CodexThreadRunV1 {
     thread_id: String,
     expected_last_turn_id: Option<String>,
     prompt: String,
+    /// Codex's own model and effort for this turn, as its user chose them.
+    options: NativeSessionOptionsV1,
     client_message_id: String,
     slot: Arc<CodexTaskSlotV1>,
     /// This run's own app-server, closed when the run ends.
@@ -606,6 +627,11 @@ impl CodexThreadRunV1 {
         if let Some(problem) = last_turn_problem(self.expected_last_turn_id.as_deref(), last_turn) {
             return Err(not_started(problem));
         }
+        // A chosen model or effort, checked under the writer lock against
+        // this Codex's own list and the model the reopened thread runs with.
+        if let Some(problem) = controller.options_problem(&self.options) {
+            return Err(not_started(&problem));
+        }
         let Ok(mut attachment) = self.slot.attachment.lock() else {
             return Err(stopped());
         };
@@ -638,6 +664,7 @@ impl NativeInvocationRunV1 for CodexThreadRunV1 {
             &self.thread_id,
             &self.prompt,
             Some(&self.client_message_id),
+            &self.options,
             progress,
         );
         if report.stop_requested && !controller.end_after_stop() {
@@ -824,6 +851,11 @@ mod tests {
                 r#"if /usr/bin/perl -e 'use Fcntl qw(:flock); open(my $f, "<", $ARGV[0]) or exit 0; exit(flock($f, LOCK_EX | LOCK_NB) ? 0 : 1)' '{lock}'; then touch '{lock}'; echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}'; else echo '{{"id":6,"error":{{"code":-32600,"message":"thread {THREAD} already has an active writer"}}}}'; fi"#,
                 lock = lock.display()
             ),
+            // Codex reports the model the reopened thread runs with.
+            "ok-luna" => format!(
+                r#"touch '{}'; echo '{{"id":6,"result":{{"model":"gpt-6-luna","thread":{{"id":"{THREAD}"}}}}}}'"#,
+                lock.display()
+            ),
             _ => format!(
                 r#"touch '{}'; echo '{{"id":6,"result":{{"thread":{{"id":"{THREAD}"}}}}}}'"#,
                 lock.display()
@@ -847,6 +879,7 @@ while IFS= read -r line; do
     *'"id":7,'*) {turns_reply} ;;
     *'"id":8,'*) echo '{{"id":8,"result":{{"thread":{{"id":"{THREAD}","cwd":"{cwd}"}}}}}}' ;;
     *'"id":9,'*) echo '{{"id":9,"result":{{"data":[{{"id":"{THREAD}","cwd":"{cwd}"}}],"nextCursor":null}}}}' ;;
+    *'"id":10,'*) echo '{{"id":10,"result":{{"data":[{{"id":"gpt-6.1-sol","displayName":"GPT-6.1-Sol","description":"","hidden":false,"isDefault":true,"defaultReasoningEffort":"low","supportedReasoningEfforts":[{{"reasoningEffort":"low","description":""}},{{"reasoningEffort":"ultra","description":""}}]}},{{"id":"gpt-6-luna","displayName":"GPT-6-Luna","description":"","hidden":false,"isDefault":false,"defaultReasoningEffort":"low","supportedReasoningEfforts":[{{"reasoningEffort":"low","description":""}}]}}],"nextCursor":null}}}}' ;;
     *'"id":3,'*) echo '{{"id":3,"result":{{"turn":{{"id":"turn-new"}}}}}}'
       echo '{{"method":"item/completed","params":{{"threadId":"{THREAD}","turnId":"turn-new","item":{{"type":"agentMessage","id":"m1","text":"continued","phase":"final_answer"}}}}}}'
       echo '{{"method":"turn/completed","params":{{"threadId":"{THREAD}","turn":{{"id":"turn-new","items":[],"status":"completed","error":null}}}}}}' ;;
@@ -885,7 +918,14 @@ printf 'closed\n' >> '{log}'
 
     #[cfg(unix)]
     fn continue_once(fixture: &Fixture, expected: Option<&str>) -> NativeInvocationOutcomeV1 {
-        let input = continue_input(&fixture.workspace, THREAD, "run the tests", expected).unwrap();
+        let input = continue_input(
+            &fixture.workspace,
+            THREAD,
+            "run the tests",
+            expected,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
         let mut started = fixture
             .adapter
             .start("native-agent:task-1", &input, None)
@@ -960,6 +1000,96 @@ printf 'closed\n' >> '{log}'
             .contains("does not keep thread writer locks"));
         assert!(!received(&fixture).contains("turn/start"));
         let _ = std::fs::remove_dir_all(&fixture.root);
+    }
+
+    #[cfg(unix)]
+    fn continue_with_options(
+        fixture: &Fixture,
+        options: &crate::native_agent::NativeSessionOptionsV1,
+    ) -> NativeInvocationOutcomeV1 {
+        let input = continue_input(
+            &fixture.workspace,
+            THREAD,
+            "run the tests",
+            Some("turn-old"),
+            options,
+        )
+        .unwrap();
+        let mut started = fixture
+            .adapter
+            .start("native-agent:task-1", &input, None)
+            .unwrap();
+        let outcome = started.run.run(&Progress);
+        drop(started);
+        outcome
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chosen_model_and_effort_reach_the_same_thread_only_when_codex_lists_them() {
+        use crate::native_agent::NativeSessionOptionsV1;
+        let choose = |model: Option<&str>, effort: Option<&str>| NativeSessionOptionsV1 {
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        };
+        // Applied with the turn, in the thread it continues.
+        let fake = fixture("ok-luna", "turn-old", "completed");
+        let outcome = continue_with_options(&fake, &choose(Some("gpt-6.1-sol"), Some("ultra")));
+        assert_eq!(outcome.kind, NativeTurnOutcomeV1::Completed);
+        let log = received(&fake);
+        assert!(log.contains(r#""method":"model/list""#));
+        let turn = log
+            .lines()
+            .find(|line| line.contains("turn/start"))
+            .unwrap();
+        assert!(
+            turn.contains(r#""model":"gpt-6.1-sol""#) && turn.contains(r#""effort":"ultra""#),
+            "{turn}"
+        );
+        assert!(turn.contains(&format!(r#""threadId":"{THREAD}""#)));
+        assert!(!log.contains("thread/start"));
+        let _ = std::fs::remove_dir_all(&fake.root);
+
+        // An effort the reopened thread's model does not list: nothing sent.
+        let fake = fixture("ok-luna", "turn-old", "completed");
+        let outcome = continue_with_options(&fake, &choose(None, Some("ultra")));
+        assert_eq!(outcome.kind, NativeTurnOutcomeV1::NotStarted);
+        assert!(outcome.summary.unwrap().contains("GPT-6-Luna"));
+        assert!(!received(&fake).contains("turn/start"));
+        let _ = std::fs::remove_dir_all(&fake.root);
+
+        // No choice: Codex is asked for nothing more than before.
+        let fake = fixture("ok-luna", "turn-old", "completed");
+        let outcome = continue_with_options(&fake, &NativeSessionOptionsV1::default());
+        assert_eq!(outcome.kind, NativeTurnOutcomeV1::Completed);
+        let log = received(&fake);
+        assert!(!log.contains("model/list"));
+        let turn = log
+            .lines()
+            .find(|line| line.contains("turn/start"))
+            .unwrap();
+        assert!(
+            !turn.contains(r#""model""#) && !turn.contains(r#""effort""#),
+            "{turn}"
+        );
+        let _ = std::fs::remove_dir_all(&fake.root);
+
+        // A peer's choice survives resolving its folder reference.
+        let folder = std::env::temp_dir().canonicalize().unwrap();
+        let asked = peer_input(
+            "scope:0123456789abcdef",
+            "thread-1",
+            "next",
+            None,
+            &choose(Some("gpt-6-luna"), None),
+        )
+        .unwrap();
+        let resolved =
+            resolve_peer_input(&asked, &[("scope:0123456789abcdef".into(), folder)]).unwrap();
+        assert_eq!(
+            crate::native_agent::chosen_options(&resolved),
+            Some(choose(Some("gpt-6-luna"), None))
+        );
     }
 
     #[cfg(unix)]
@@ -1049,19 +1179,41 @@ printf 'closed\n' >> '{log}'
             "01a140f0-6af4-7ef3-b799-dcd84c0275a6",
             "run the tests",
             Some("01a140f1-0000"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         let (parsed, workspace) = parse(&input).unwrap();
         assert_eq!(parsed.thread_id, "01a140f0-6af4-7ef3-b799-dcd84c0275a6");
         assert_eq!(workspace, folder.canonicalize().unwrap());
-        assert!(continue_input(&folder, "../escape", "x", None).is_err());
-        assert!(continue_input(&folder, "abc", "   ", None).is_err());
-        assert!(continue_input(&folder, "abc", "x", Some("bad id!")).is_err());
+        assert!(continue_input(
+            &folder,
+            "../escape",
+            "x",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
+        .is_err());
+        assert!(continue_input(
+            &folder,
+            "abc",
+            "   ",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
+        .is_err());
+        assert!(continue_input(
+            &folder,
+            "abc",
+            "x",
+            Some("bad id!"),
+            &crate::native_agent::NativeSessionOptionsV1::default()
+        )
+        .is_err());
         let adapter = CodexThreadAdapterV1::default();
         // Peers may ask, through the generic invocation and its Review.
         assert_eq!(
             adapter.supported_protocols(),
-            &GENERIC_NATIVE_INVOKE_PROTOCOLS
+            &crate::native_agent::OPTIONS_INVOKE_PROTOCOLS
         );
         let prepared = adapter.prepare(&input).unwrap();
         assert_eq!(
@@ -1080,6 +1232,7 @@ printf 'closed\n' >> '{log}'
             "thread-1",
             "next step",
             Some("turn-9"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         let resolved = resolve_peer_input(&asked, &readable).unwrap();
@@ -1088,7 +1241,14 @@ printf 'closed\n' >> '{log}'
         assert_eq!(parsed.expected_last_turn_id.as_deref(), Some("turn-9"));
         // Another scope, or none readable: refused.
         assert!(resolve_peer_input(
-            &peer_input("scope:ffffffffffffffff", "thread-1", "x", None).unwrap(),
+            &peer_input(
+                "scope:ffffffffffffffff",
+                "thread-1",
+                "x",
+                None,
+                &crate::native_agent::NativeSessionOptionsV1::default()
+            )
+            .unwrap(),
             &readable
         )
         .is_err());
@@ -1098,7 +1258,14 @@ printf 'closed\n' >> '{log}'
             json!({"scopeRef": "scope:0123456789abcdef", "threadId": "thread-1", "prompt": "x", "expectedLastTurnId": null, "workspace": "/etc"}),
         );
         assert!(resolve_peer_input(&with_path, &readable).is_err());
-        let host_form = continue_input(&folder, "thread-1", "x", None).unwrap();
+        let host_form = continue_input(
+            &folder,
+            "thread-1",
+            "x",
+            None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
         assert!(resolve_peer_input(&host_form, &readable).is_err());
     }
 
@@ -1209,6 +1376,7 @@ exec /usr/bin/perl -e 'use Fcntl qw(:flock); $| = 1; open(my $f, ">>", $ARGV[0])
             THREAD,
             "run the tests",
             Some("turn-old"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         let mut started = adapter.start("native-agent:task-2", &input, None).unwrap();
@@ -1355,6 +1523,7 @@ exec /usr/bin/perl -e 'use Fcntl qw(:flock); $| = 1; open(my $f, ">>", $ARGV[0])
             &thread_id,
             &format!("Remember this code word for later: {word}. Reply with only: ok"),
             None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
             &Progress,
         );
         assert_eq!(report.outcome, NativeTurnOutcomeV1::Completed);
@@ -1375,6 +1544,7 @@ exec /usr/bin/perl -e 'use Fcntl qw(:flock); $| = 1; open(my $f, ">>", $ARGV[0])
             &thread_id,
             "What was the code word I asked you to remember? Reply with only the word.",
             Some(&last_turn),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         let mut started = adapter
@@ -1402,6 +1572,7 @@ exec /usr/bin/perl -e 'use Fcntl qw(:flock); $| = 1; open(my $f, ">>", $ARGV[0])
             &thread_id,
             "Reply with: should not run",
             Some(&last_turn),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         let mut again = adapter
@@ -1448,6 +1619,7 @@ exec /usr/bin/perl -e 'use Fcntl qw(:flock); $| = 1; open(my $f, ">>", $ARGV[0])
             &held,
             "Reply with: should not run",
             None,
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         let mut started = adapter

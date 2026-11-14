@@ -65,6 +65,7 @@ impl RuntimePairV1 {
                     scope_ref: None,
                     session_id: None,
                     folder: Some(folder.into()),
+                    refresh: None,
                 },
             )
             .await

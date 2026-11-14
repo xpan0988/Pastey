@@ -25,6 +25,7 @@ use crate::host_identity::HostSessionBinding;
 mod admission;
 pub(crate) mod agent_config;
 mod capability;
+pub(crate) mod model_catalog;
 pub(crate) mod sessions;
 pub(crate) use admission::NativeInvocationReviewV1;
 use admission::{
@@ -78,8 +79,9 @@ pub(crate) fn claude_code_conversation_peer_input(
     scope_ref: &str,
     task: &str,
     resume: bool,
+    options: &NativeSessionOptionsV1,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
-    capability::claude_code::conversation::peer_input(scope_ref, task, resume)
+    capability::claude_code::conversation::peer_input(scope_ref, task, resume, options)
 }
 
 /// A requesting device's input continuing one existing Claude Code session:
@@ -103,12 +105,14 @@ pub(crate) fn codex_thread_peer_input(
     thread_id: &str,
     prompt: &str,
     expected_last_turn_id: Option<&str>,
+    options: &NativeSessionOptionsV1,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
     capability::codex::thread_continuation::peer_input(
         scope_ref,
         thread_id,
         prompt,
         expected_last_turn_id,
+        options,
     )
 }
 
@@ -211,8 +215,19 @@ pub(crate) const WORKSPACE_MOVEMENT_PROTOCOLS: [&str; 3] = [
 pub(crate) const NATIVE_AGENT_INVOKE_V2_SCHEMA: &str = "pastey-native-agent-invoke-v2";
 pub(crate) const GENERIC_NATIVE_INVOKE_PROTOCOLS: [&str; 2] =
     [NATIVE_AGENT_PROTOCOL_SCHEMA, NATIVE_AGENT_INVOKE_V2_SCHEMA];
+/// A capability that applies `NativeSessionOptionsV1` its user chose to the
+/// turn it runs. A requesting device sends a choice only to a Host whose
+/// capability advertises this, so an older Host is never asked to apply
+/// one it would not understand.
+pub(crate) const NATIVE_SESSION_OPTIONS_PROTOCOL: &str = "pastey-native-session-options-v1";
+/// Generic invocation of a capability that applies chosen options.
+pub(crate) const OPTIONS_INVOKE_PROTOCOLS: [&str; 3] = [
+    NATIVE_AGENT_PROTOCOL_SCHEMA,
+    NATIVE_AGENT_INVOKE_V2_SCHEMA,
+    NATIVE_SESSION_OPTIONS_PROTOCOL,
+];
 /// A native Agent's own per-session options that its user explicitly chose
-/// for one continuation: the model, and the reasoning effort. Pastey keeps
+/// for one turn: the model, and the reasoning effort. Pastey keeps
 /// no default of either and never chooses one; absent means the Agent's own
 /// configuration decides. Each is an identifier the Agent itself validates
 /// (an unknown model is the Agent's own failure). Only capabilities whose
@@ -248,6 +263,23 @@ impl NativeSessionOptionsV1 {
         } else {
             invalid("The chosen model or reasoning effort is not a valid identifier.")
         }
+    }
+}
+
+/// The choice an invocation input carries (`options`), if its user made
+/// one: a Host is asked to apply it only when its capability advertises
+/// `NATIVE_SESSION_OPTIONS_PROTOCOL`. An empty `options` (a Claude Code
+/// session input always names one) is no choice; one that does not parse
+/// counts as a choice, so it is never sent where it could be ignored.
+pub(crate) fn chosen_options(input: &OpaqueCapabilityPayloadV1) -> Option<NativeSessionOptionsV1> {
+    let options = input.value().get("options")?;
+    match serde_json::from_value::<NativeSessionOptionsV1>(options.clone()) {
+        Ok(options) if options.is_empty() => None,
+        Ok(options) => Some(options),
+        Err(_) => Some(NativeSessionOptionsV1 {
+            model: Some(String::new()),
+            effort: None,
+        }),
     }
 }
 
@@ -306,11 +338,14 @@ pub(crate) fn parse_invoke(payload: Value) -> AppResult<NativeInvocationRequestV
             })?;
             validate_invoke(&request)?;
             Ok(NativeInvocationRequestV1 {
-                input: capability::codex::legacy_v1_input(
-                    &request.workspace,
-                    &request.task,
-                    request.resume,
-                ),
+                input: capability::codex::with_options(
+                    capability::codex::legacy_v1_input(
+                        &request.workspace,
+                        &request.task,
+                        request.resume,
+                    ),
+                    &request.options,
+                )?,
                 task_id: request.task_id,
                 target_host_ref: request.target_host_ref,
                 agent_capability: request.agent_capability,
@@ -329,6 +364,11 @@ pub(crate) struct NativeAgentInvokeV1 {
     pub(crate) workspace: String,
     pub(crate) task: String,
     pub(crate) resume: bool,
+    /// Codex's own model and effort for this turn, sent only when its user
+    /// chose them, and only to a Host whose Codex capability advertises
+    /// `NATIVE_SESSION_OPTIONS_PROTOCOL` (an older one refuses the field).
+    #[serde(default, skip_serializing_if = "NativeSessionOptionsV1::is_empty")]
+    pub(crate) options: NativeSessionOptionsV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1442,6 +1482,13 @@ impl NativeAgentServiceV1 {
 
     /// Tests: registers the Codex thread continuation adapter (registered
     /// only in the product otherwise) with a fixture Codex and Codex home.
+    /// Tests: the Codex this Host's conversations, sessions and model
+    /// catalog use.
+    #[cfg(test)]
+    pub(crate) fn use_codex_for_test(&self, executable: &Path) {
+        self.codex.use_executable(executable);
+    }
+
     #[cfg(test)]
     pub(crate) fn add_codex_thread_adapter_for_test(
         &mut self,
@@ -4081,6 +4128,7 @@ impl NativeAgentServiceV1 {
         workspace: &Path,
         task: &str,
         new_conversation: bool,
+        options: &NativeSessionOptionsV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
             return invalid("Native Agent task is empty or exceeds its bound.");
@@ -4096,6 +4144,7 @@ impl NativeAgentServiceV1 {
             &workspace,
             task,
             !new_conversation,
+            options,
         )
     }
 
@@ -4133,7 +4182,13 @@ impl NativeAgentServiceV1 {
             }
             return Ok(existing);
         }
-        self.start_codex_task_with_id_resume(task_id, &workspace, task, true)
+        self.start_codex_task_with_id_resume(
+            task_id,
+            &workspace,
+            task,
+            true,
+            &NativeSessionOptionsV1::default(),
+        )
     }
 
     pub(crate) fn start_codex_task_with_id_resume(
@@ -4142,6 +4197,7 @@ impl NativeAgentServiceV1 {
         workspace: &Path,
         task: &str,
         resume: bool,
+        options: &NativeSessionOptionsV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         if task_id.trim().is_empty() || task_id.len() > MAX_TASK_ID_BYTES {
             return invalid("Native Agent task identity is invalid.");
@@ -4170,12 +4226,13 @@ impl NativeAgentServiceV1 {
             }
             return Ok(existing);
         }
-        self.start_codex_task_with_executable_id_and_resume(
+        self.start_codex_task_with_executable_options(
             Path::new("codex"),
             task_id,
             &workspace,
             task,
             resume,
+            options,
         )
     }
 
@@ -4217,20 +4274,43 @@ impl NativeAgentServiceV1 {
         task: &str,
         resume: bool,
     ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_codex_task_with_executable_options(
+            executable,
+            task_id,
+            workspace,
+            task,
+            resume,
+            &NativeSessionOptionsV1::default(),
+        )
+    }
+
+    /// As above, with Codex's own model and effort for this turn, only as
+    /// its user chose them.
+    fn start_codex_task_with_executable_options(
+        &mut self,
+        executable: &Path,
+        task_id: &str,
+        workspace: &Path,
+        task: &str,
+        resume: bool,
+        options: &NativeSessionOptionsV1,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         self.codex.use_executable(executable);
-        let input = capability::codex::codex_input(workspace, task, resume)?;
+        let input = capability::codex::codex_input_with_options(workspace, task, resume, options)?;
         self.start_local_invocation(CODEX_CAPABILITY_ID, task_id, &input)
     }
 
     /// Runs `task` with Claude Code in `workspace` on this Host: continuing
     /// this Host's user's Claude Code conversation there, or beginning one
-    /// when none exists; `new_conversation` always begins a new one. Local
-    /// only.
+    /// when none exists; `new_conversation` always begins a new one.
+    /// `options` are Claude Code's own model and effort, only as its user
+    /// chose them for this turn.
     pub(crate) fn start_claude_code_conversation_task(
         &mut self,
         workspace: &Path,
         task: &str,
         new_conversation: bool,
+        options: &NativeSessionOptionsV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
             return invalid("Native Agent task is empty or exceeds its bound.");
@@ -4245,6 +4325,7 @@ impl NativeAgentServiceV1 {
             &workspace,
             task,
             !new_conversation,
+            options,
         )?;
         self.start_local_invocation(
             capability::claude_code::conversation::CLAUDE_CODE_CONVERSATION_ID,
@@ -4289,12 +4370,14 @@ impl NativeAgentServiceV1 {
         thread_id: &str,
         prompt: &str,
         expected_last_turn_id: Option<&str>,
+        options: &NativeSessionOptionsV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
         let input = capability::codex::thread_continuation::continue_input(
             workspace,
             thread_id,
             prompt,
             expected_last_turn_id,
+            options,
         )?;
         self.start_local_invocation(
             capability::codex::thread_continuation::CODEX_THREAD_CAPABILITY_ID,
@@ -7735,6 +7818,7 @@ pub(crate) fn validate_invoke(request: &NativeAgentInvokeV1) -> AppResult<()> {
         || request.workspace.len() > MAX_WORKSPACE_BYTES
         || request.task.trim().is_empty()
         || request.task.len() > MAX_TASK_BYTES
+        || request.options.validate().is_err()
     {
         return invalid("Native Agent invocation is invalid.");
     }
@@ -9063,11 +9147,14 @@ field() { printf '%s' "$line" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
 while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"model/list"'*)
+      printf '%s\n' "models" >> '{ROOT}/log'
+      printf '%s\n' '{"id":10,"result":{"data":[{"id":"gpt-6.1-sol","model":"gpt-6.1-sol","displayName":"GPT-6.1-Sol","description":"Workhorse","hidden":false,"isDefault":true,"defaultReasoningEffort":"low","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"},{"reasoningEffort":"ultra","description":"Most"}]},{"id":"gpt-6-luna","model":"gpt-6-luna","displayName":"GPT-6-Luna","description":"Fast","hidden":false,"isDefault":false,"defaultReasoningEffort":"medium","supportedReasoningEfforts":[{"reasoningEffort":"low","description":"Fast"},{"reasoningEffort":"medium","description":"Balanced"}]}],"nextCursor":null}}' ;;
     *'"method":"thread/start"'*)
       n=$(cat '{ROOT}/counter' 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > '{ROOT}/counter'
-      tid="thread-$n"; touch "$STORE/$tid"
+      tid="thread-$n"; printf '%s' gpt-6.1-sol > "$STORE/$tid"
       printf '%s\n' "start $tid" >> '{ROOT}/log'
-      printf '{"id":2,"result":{"thread":{"id":"%s"}}}\n' "$tid" ;;
+      printf '{"id":2,"result":{"model":"gpt-6.1-sol","thread":{"id":"%s"}}}\n' "$tid" ;;
     *'"method":"thread/resume"'*)
       tid=$(field threadId)
       printf '%s\n' "resume $tid" >> '{ROOT}/log'
@@ -9075,11 +9162,14 @@ while IFS= read -r line; do
       mode=$(cat '{ROOT}/resume-mode' 2>/dev/null)
       if [ "$mode" = unsupported ]; then printf '%s\n' '{"id":6,"error":{"code":-32601,"message":"method not found"}}'
       elif [ "$mode" = other ]; then printf '%s\n' '{"id":6,"result":{"thread":{"id":"thread-other"}}}'
-      elif [ -f "$STORE/$tid" ]; then printf '{"id":6,"result":{"thread":{"id":"%s"}}}\n' "$tid"
+      elif [ -f "$STORE/$tid" ]; then printf '{"id":6,"result":{"model":"%s","thread":{"id":"%s"}}}\n' "$(cat "$STORE/$tid")" "$tid"
       else printf '%s\n' '{"id":6,"error":{"code":-32600,"message":"thread not found"}}'; fi ;;
     *'"method":"turn/start"'*)
-      tid=$(field threadId); task=$(field text)
-      printf '%s\n' "turn $tid $task" >> '{ROOT}/log'
+      tid=$(field threadId); task=$(field text); model=$(field model); effort=$(field effort)
+      chosen=""
+      [ -n "$model" ] && { chosen=" model=$model"; printf '%s' "$model" > "$STORE/$tid"; }
+      [ -n "$effort" ] && chosen="$chosen effort=$effort"
+      printf '%s\n' "turn $tid $task$chosen" >> '{ROOT}/log'
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-x"}}}'
       while [ -f '{ROOT}/hold-turn' ]; do fixture_alive || exit 0; sleep 0.01; done
       printf '{"method":"item/completed","params":{"threadId":"%s","turnId":"turn-x","item":{"type":"agentMessage","id":"m","phase":"final_answer","text":"%s on %s"}}}\n' "$tid" "$task" "$tid"
@@ -9237,6 +9327,249 @@ done
         );
         restarted.shutdown();
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A local Codex turn with `options`, waited for as long as a loaded
+    /// test machine may take.
+    fn run_local_with(
+        service: &mut NativeAgentServiceV1,
+        agent: &Path,
+        workspace: &Path,
+        task: &str,
+        resume: bool,
+        options: &NativeSessionOptionsV1,
+    ) -> NativeAgentTaskStatusV1 {
+        live_run(
+            service,
+            agent,
+            &workspace.canonicalize().unwrap(),
+            task,
+            resume,
+            options,
+        )
+    }
+
+    fn chosen(model: Option<&str>, effort: Option<&str>) -> NativeSessionOptionsV1 {
+        NativeSessionOptionsV1 {
+            model: model.map(str::to_owned),
+            effort: effort.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_codex_conversation_runs_a_chosen_model_and_effort_in_its_own_thread() {
+        let (root, workspace, agent) = conversation_codex();
+        let paths = durable_paths(&root);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        // The first turn of a new conversation, with a model and effort.
+        let first = run_local_with(
+            &mut service,
+            &agent,
+            &workspace,
+            "first",
+            false,
+            &chosen(Some("gpt-6-luna"), Some("medium")),
+        );
+        assert_eq!(first.state, NativeAgentTaskStateV1::Completed, "{first:?}");
+        // A follow-up without a choice sends none: the thread keeps its own.
+        let second = run_local(&mut service, &agent, &workspace, "second", true);
+        assert_eq!(second.state, NativeAgentTaskStateV1::Completed);
+        assert!(second.session_reused);
+        // Only an effort, judged against the model the thread runs with now
+        // (gpt-6-luna lists low and medium, not ultra).
+        let refused = run_local_with(
+            &mut service,
+            &agent,
+            &workspace,
+            "third",
+            true,
+            &chosen(None, Some("ultra")),
+        );
+        assert_eq!(refused.state, NativeAgentTaskStateV1::Failed);
+        assert_eq!(refused.code.as_deref(), Some(START_FAILED_CODE));
+        assert!(
+            refused.result.as_deref().unwrap().contains("GPT-6-Luna"),
+            "{refused:?}"
+        );
+        // An unlisted model never reaches the thread, where Codex would keep it.
+        let unknown = run_local_with(
+            &mut service,
+            &agent,
+            &workspace,
+            "fourth",
+            true,
+            &chosen(Some("no-such-model"), None),
+        );
+        assert_eq!(unknown.code.as_deref(), Some(START_FAILED_CODE));
+        assert!(unknown
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("does not list the model"));
+        // Another model with its own effort, in the same thread.
+        let fifth = run_local_with(
+            &mut service,
+            &agent,
+            &workspace,
+            "fifth",
+            true,
+            &chosen(Some("gpt-6.1-sol"), Some("ultra")),
+        );
+        assert_eq!(fifth.state, NativeAgentTaskStateV1::Completed);
+        service.shutdown();
+        drop(service);
+
+        // After a restart the thread is reopened as it is: Codex reports the
+        // model it kept, and an effort is judged against that one.
+        let mut restarted = NativeAgentServiceV1::with_paths(paths).unwrap();
+        let sixth = run_local_with(
+            &mut restarted,
+            &agent,
+            &workspace,
+            "sixth",
+            true,
+            &chosen(None, Some("ultra")),
+        );
+        assert_eq!(sixth.state, NativeAgentTaskStateV1::Completed, "{sixth:?}");
+        assert_eq!(text_output(&sixth).unwrap().0, "sixth on thread-1");
+        assert_eq!(
+            native_log(&root),
+            [
+                "start thread-1",
+                "models",
+                "turn thread-1 first model=gpt-6-luna effort=medium",
+                "turn thread-1 second",
+                "models",
+                "models",
+                "models",
+                "turn thread-1 fifth model=gpt-6.1-sol effort=ultra",
+                "resume thread-1",
+                "models",
+                "turn thread-1 sixth effort=ultra",
+            ]
+        );
+        restarted.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_refused_first_turn_leaves_no_conversation_behind() {
+        let (root, workspace, agent) = conversation_codex();
+        let mut service = NativeAgentServiceV1::with_paths(durable_paths(&root)).unwrap();
+        let refused = run_local_with(
+            &mut service,
+            &agent,
+            &workspace,
+            "first",
+            false,
+            &chosen(Some("no-such-model"), None),
+        );
+        assert_eq!(refused.code.as_deref(), Some(START_FAILED_CODE));
+        assert_eq!(refused.conversation, None, "{refused:?}");
+        // The next message begins its own conversation: the empty thread of
+        // the refused turn was never recorded as one.
+        let next = run_local(&mut service, &agent, &workspace, "next", true);
+        assert_eq!(next.state, NativeAgentTaskStateV1::Completed);
+        assert_eq!(next.conversation, Some(NativeConversationContinuityV1::New));
+        assert_eq!(
+            native_log(&root),
+            [
+                "start thread-1",
+                "models",
+                "start thread-2",
+                "turn thread-2 next"
+            ]
+        );
+        service.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_chosen_model_reaches_codex_only_through_an_input_that_names_it() {
+        let workspace = std::env::temp_dir();
+        // Without a choice the input is exactly the original one, so an older
+        // Host still accepts it.
+        let plain = capability::codex::codex_input(&workspace, "task", true).unwrap();
+        assert!(chosen_options(&plain).is_none());
+        // A Claude Code session input always names its options: empty ones
+        // are no choice, so an older Host is still asked.
+        let session = capability::claude_code::peer_input(
+            "scope:0123456789abcdef",
+            "0a1b2c3d-0000-4000-8000-000000000001",
+            "go on",
+            None,
+            &NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+        assert!(chosen_options(&session).is_none());
+        let with = capability::codex::codex_input_with_options(
+            &workspace,
+            "task",
+            true,
+            &chosen(Some("gpt-6-luna"), Some("low")),
+        )
+        .unwrap();
+        assert_eq!(
+            chosen_options(&with),
+            Some(chosen(Some("gpt-6-luna"), Some("low")))
+        );
+        // Never something a command line or path could read.
+        for bad in [
+            chosen(Some("--model"), None),
+            chosen(Some("/bin/sh"), None),
+            chosen(None, Some("HIGH")),
+        ] {
+            assert!(
+                capability::codex::codex_input_with_options(&workspace, "task", true, &bad)
+                    .is_err()
+            );
+        }
+        // The original v1 invocation carries a choice only when made, and a
+        // Host parses it into the adapter's input.
+        let mut request = NativeAgentInvokeV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            task_id: "native-agent:x".into(),
+            target_host_ref: "host:x".into(),
+            agent_capability: CODEX_CAPABILITY_ID.into(),
+            workspace: "scope:0123456789abcdef".into(),
+            task: "task".into(),
+            resume: false,
+            options: NativeSessionOptionsV1::default(),
+        };
+        assert!(!serde_json::to_string(&request).unwrap().contains("options"));
+        request.options = chosen(Some("gpt-6-luna"), None);
+        let parsed = parse_invoke(serde_json::to_value(&request).unwrap()).unwrap();
+        assert_eq!(
+            chosen_options(&parsed.input),
+            Some(chosen(Some("gpt-6-luna"), None))
+        );
+        // A peer's folder reference resolves with the choice kept.
+        let resolved = capability::codex::resolve_peer_workspace_ref(
+            &parsed.input,
+            &[("scope:0123456789abcdef".into(), workspace.clone())],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            chosen_options(&resolved),
+            Some(chosen(Some("gpt-6-luna"), None))
+        );
+        // Every capability that applies a choice says so to a requester.
+        for capability_id in [
+            CODEX_CAPABILITY_ID,
+            CODEX_THREAD_CAPABILITY,
+            CLAUDE_CODE_CONVERSATION_CAPABILITY,
+            CLAUDE_CODE_SESSION_CAPABILITY,
+        ] {
+            let adapter = PeerFolderContractV1::of_product_capability(capability_id).unwrap();
+            assert!(
+                adapter
+                    .adapter
+                    .supported_protocols()
+                    .contains(&NATIVE_SESSION_OPTIONS_PROTOCOL),
+                "{capability_id}"
+            );
+        }
     }
 
     #[test]
@@ -11876,6 +12209,198 @@ done
 
     use NativeAgentCapabilityStateV1 as NativeCapabilityStateForTest;
 
+    /// Live, product path, on this Host's installed Codex: its own
+    /// `model/list` is read through Pastey's catalog reader; a conversation
+    /// begun with a listed model and effort keeps them in its one thread for
+    /// a follow-up without a choice (and its context); an unlisted model is
+    /// refused before anything is sent and never reaches the thread; and
+    /// after a restart the reopened thread takes a new effort the model
+    /// lists. Codex's own thread record confirms each step. Small turns, no
+    /// tools.
+    #[test]
+    #[ignore = "requires an installed, authenticated Codex 0.163 or later"]
+    fn installed_codex_lists_its_models_and_runs_a_chosen_one_in_one_thread() {
+        use crate::native_agent::model_catalog::ModelCatalogStateV1;
+        let (program, backend) =
+            capability::codex::installed_codex_program().expect("an installed Codex");
+        eprintln!("live run uses the {backend} backend: {}", program.display());
+        let catalog = sessions::CodexSessionSourceV1::new(program.clone(), vec![]).model_catalog();
+        eprintln!(
+            "catalog: {}",
+            serde_json::to_string_pretty(&catalog).unwrap()
+        );
+        assert_eq!(
+            catalog.state,
+            ModelCatalogStateV1::Reported,
+            "{:?}",
+            catalog.note
+        );
+        assert!(catalog.is_valid() && !catalog.models.is_empty());
+        // A model that is not the catalog default, and two efforts it lists.
+        let chosen = catalog
+            .models
+            .iter()
+            .filter(|entry| {
+                entry
+                    .efforts
+                    .as_ref()
+                    .is_some_and(|efforts| efforts.len() >= 2)
+            })
+            .find(|entry| !entry.is_default)
+            .or_else(|| catalog.models.first())
+            .expect("a model")
+            .clone();
+        let efforts: Vec<String> = chosen
+            .efforts
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|effort| effort.id)
+            .collect();
+        let (first_effort, later_effort) = (efforts[0].clone(), efforts[1].clone());
+        eprintln!(
+            "chosen: {} with {first_effort}, later {later_effort}",
+            chosen.id
+        );
+
+        let root =
+            std::env::temp_dir().join(format!("pastey-codex-models-live-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let paths = durable_paths(&root);
+        let record = || {
+            let (found, _) = sessions::CodexSessionSourceV1::new(program.clone(), vec![])
+                .discover(&[workspace.clone()]);
+            assert_eq!(found.len(), 1, "one thread in the folder");
+            let config = found[0].agent_config.clone().expect("a thread record");
+            (
+                found[0].session_id.clone(),
+                config.model,
+                config.reasoning_effort,
+            )
+        };
+        let word = format!("pastey-{}", &Uuid::new_v4().simple().to_string()[..6]);
+        let mut service = NativeAgentServiceV1::with_paths(paths.clone()).unwrap();
+        let first = live_run(
+            &mut service,
+            &program,
+            &workspace,
+            &format!("Remember this code word: {word}. Reply with only: ok"),
+            false,
+            &chosen_options_for(&chosen.id, Some(&first_effort)),
+        );
+        assert_eq!(first.state, NativeAgentTaskStateV1::Completed, "{first:?}");
+        let (thread, model, effort) = record();
+        assert_eq!(model.as_deref(), Some(chosen.id.as_str()));
+        assert_eq!(effort.as_deref(), Some(first_effort.as_str()));
+
+        // No choice: the thread keeps both, and its context.
+        let second = live_run(
+            &mut service,
+            &program,
+            &workspace,
+            "What was the code word? Reply with only the word.",
+            true,
+            &NativeSessionOptionsV1::default(),
+        );
+        assert_eq!(second.state, NativeAgentTaskStateV1::Completed);
+        assert!(
+            text_output(&second).unwrap().0.contains(&word),
+            "{second:?}"
+        );
+        assert_eq!(record(), (thread.clone(), model.clone(), effort.clone()));
+
+        // An unlisted model: refused, nothing sent, the thread unchanged.
+        let refused = live_run(
+            &mut service,
+            &program,
+            &workspace,
+            "Reply with: should not run",
+            true,
+            &chosen_options_for("pastey-no-such-model", None),
+        );
+        assert_eq!(
+            refused.code.as_deref(),
+            Some(START_FAILED_CODE),
+            "{refused:?}"
+        );
+        assert_eq!(record(), (thread.clone(), model.clone(), effort));
+        service.shutdown();
+        drop(service);
+
+        // After a restart: the same thread, reopened with its model, takes a
+        // new effort that model lists.
+        let mut restarted = NativeAgentServiceV1::with_paths(paths).unwrap();
+        let third = live_run(
+            &mut restarted,
+            &program,
+            &workspace,
+            "Reply with only: ok",
+            true,
+            &NativeSessionOptionsV1 {
+                model: None,
+                effort: Some(later_effort.clone()),
+            },
+        );
+        assert_eq!(third.state, NativeAgentTaskStateV1::Completed, "{third:?}");
+        assert_eq!(
+            third.conversation,
+            Some(NativeConversationContinuityV1::Continued)
+        );
+        let (same, model_now, effort_now) = record();
+        assert_eq!(same, thread);
+        assert_eq!(model_now, model);
+        assert_eq!(effort_now.as_deref(), Some(later_effort.as_str()));
+        restarted.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// As `run_local_with`, waiting as long as a real turn takes.
+    fn live_run(
+        service: &mut NativeAgentServiceV1,
+        agent: &Path,
+        workspace: &Path,
+        task: &str,
+        resume: bool,
+        options: &NativeSessionOptionsV1,
+    ) -> NativeAgentTaskStatusV1 {
+        let started = service
+            .start_codex_task_with_executable_options(
+                agent,
+                &format!("native-agent:{}", Uuid::new_v4()),
+                workspace,
+                task,
+                resume,
+                options,
+            )
+            .unwrap();
+        for _ in 0..3000 {
+            let status = service.task_status(&started.task_id).unwrap();
+            if !matches!(
+                status.state,
+                NativeAgentTaskStateV1::Running | NativeAgentTaskStateV1::Queued
+            ) {
+                for _ in 0..500 {
+                    if service.workspace_occupant(workspace).is_none() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                return status;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the installed Codex did not finish its turn")
+    }
+
+    fn chosen_options_for(model: &str, effort: Option<&str>) -> NativeSessionOptionsV1 {
+        NativeSessionOptionsV1 {
+            model: Some(model.into()),
+            effort: effort.map(str::to_owned),
+        }
+    }
+
     /// A live launcher for the installed Codex with configuration values
     /// overridden for this run through Codex's own `-c` flag; the user's
     /// configuration is not touched.
@@ -12649,6 +13174,7 @@ done
             workspace: "/remote/workspace".into(),
             task: "fix it".into(),
             resume: true,
+            options: Default::default(),
         };
         assert!(validate_invoke(&request).is_ok());
         request.agent_capability = "agent.coding.other".into();
@@ -17138,6 +17664,7 @@ done
             "thread-1",
             "first",
             Some("turn-old"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         let first = service
@@ -17157,8 +17684,13 @@ done
         assert_eq!(turn_started(), 1, "the first continuation runs");
         // A second, independent continuation of the same thread is refused
         // before any adapter sees it: one writer.
-        let second =
-            service.start_codex_thread_task(&workspace, "thread-1", "second", Some("turn-old"));
+        let second = service.start_codex_thread_task(
+            &workspace,
+            "thread-1",
+            "second",
+            Some("turn-old"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
+        );
         assert!(second
             .unwrap_err()
             .message()
@@ -17174,6 +17706,7 @@ done
             "thread-1",
             "different",
             Some("turn-old"),
+            &crate::native_agent::NativeSessionOptionsV1::default(),
         )
         .unwrap();
         assert!(service

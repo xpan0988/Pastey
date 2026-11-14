@@ -38,6 +38,8 @@ import { controlHealth, controlReasonLabel, refusalLine } from "../src/lib/contr
 import type { RoomControlDiagnostics } from "../src/lib/tauri";
 import { benchmarkFacts, benchmarkScope, deviceProfileFacts, measuredAgo, runtimeFacts } from "../src/lib/deviceDiagnostics";
 import { rememberedNativeTask, rememberStartedNativeTask } from "../src/features/workspace/AgentTaskLifecycle";
+import { catalogEntry, effortChoices } from "../src/features/workspace/AgentTurnOptions";
+import type { NativeModelCatalog } from "../src/lib/tauri";
 import type { FileTransferProgressEvent, NearbyDevice, ReceivedRoomControlEvent, RoomInfo, RoomItem } from "../src/lib/types";
 import { availableRevisionId, FINDER_SCOPES, remoteFindBlocks, remoteFindProgress } from "../src/lib/remoteFileFinder";
 import { bridgeConnectionErrorMessage, bridgeReachability, peerAddressProblem } from "../src/lib/bridgeAddress";
@@ -634,7 +636,7 @@ test("A selected remote Host shows its own advertised Codex availability", () =>
   assert.match(card, /const agentChoosable = !targetHostRef \|\| choice\?\.kind === "shared";/);
   assert.match(card, /agentChoosable \? localAgent : CODEX_AGENT_ID/);
   assert.match(card, /onChooseAgent=\{!agentChoosable \|\| shownView\?\.kind === "current" \? undefined : chooseLocalAgent\}/);
-  assert.match(composer, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
+  assert.match(composer, /canSend=\{readiness\.ready && !taskActive && !!place && !modelInvalid\}/);
   assert.match(lifecycle, /listRemoteNativeAgentCapabilities\(roomId, hostRef\)/);
   assert.match(bindings, /invoke\("list_remote_native_agent_capabilities", \{ roomId, targetHostRef \}\)/);
   // A finished task stays visible (with its response) when recovery drains.
@@ -677,16 +679,16 @@ test("Continued and new Agent conversations are shown only once confirmed, and a
   // from this device never does.
   assert.match(card, /const conversationRan = current && agent\.origin\?\.kind === "new"/);
   assert.match(card, /const followUp = conversationRan && kind !== "send";/);
-  assert.match(card, /agent\.start\(place, followUp, agentId\)/);
-  assert.match(card, /agent\.startRemote\(roomId, remote\.peerSessionId, targetHostRef, place, followUp, agentId\)/);
-  assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), sent, !followUp\)/);
-  assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, sent, followUp, shared\?\.label \?\? null\)/);
-  assert.match(lifecycle, /const start = useCallback\(async \(place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID\)/);
+  assert.match(card, /agent\.start\(place, followUp, agentId, options\)/);
+  assert.match(card, /agent\.startRemote\(roomId, remote\.peerSessionId, targetHostRef, place, followUp, agentId, options\)/);
+  assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), sent, !followUp, options\)/);
+  assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, sent, followUp, shared\?\.label \?\? null, options\)/);
+  assert.match(lifecycle, /const start = useCallback\(async \(place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID, options: NativeSessionOptions \| null = null\): Promise<boolean>/);
   // A follow-up keeps its conversation's Agent; a new one runs the chosen.
   assert.match(lifecycle, /const agentId = followUp && origin\?\.kind === "new" \? conversationAgent\(origin\) : chosen;/);
-  assert.match(lifecycle, /startNativeClaudeCodeTask\(workspace\.trim\(\), sent, !followUp\)/);
-  assert.match(bindings, /invoke\("start_native_claude_code_task", \{ workspace, task, newConversation \}\)/);
-  assert.match(lifecycle, /const startRemote = useCallback\(async \(roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID\)/);
+  assert.match(lifecycle, /startNativeClaudeCodeTask\(workspace\.trim\(\), sent, !followUp, options\)/);
+  assert.match(bindings, /invoke\("start_native_claude_code_task", \{ workspace, task, newConversation, options \}\)/);
+  assert.match(lifecycle, /const startRemote = useCallback\(async \(roomId: string, peerSessionId: string, hostRef: string, place: ConversationPlace, followUp = false, chosen: ConversationAgentId = CODEX_AGENT_ID, options: NativeSessionOptions \| null = null\): Promise<boolean>/);
   // A follow-up stays in the conversation its view began; anything else
   // begins a new one, with its own id.
   // …and with the same Agent: a follow-up never crosses into another Agent's conversation.
@@ -694,7 +696,7 @@ test("Continued and new Agent conversations are shown only once confirmed, and a
   assert.match(lifecycle, /const conversationId = sameConversation\?\.conversationId \?\? crypto\.randomUUID\(\);/);
   // A shared folder is sent by its reference only, never a path from here.
   assert.match(lifecycle, /const target = shared \? shared\.scopeRef : workspace\.trim\(\);/);
-  assert.match(bindings, /invoke\("start_native_codex_task", \{ workspace, task, newConversation \}\)/);
+  assert.match(bindings, /invoke\("start_native_codex_task", \{ workspace, task, newConversation, options \}\)/);
   assert.match(bindings, /conversation\?: "new" \| "continued" \| null;/);
   assert.doesNotMatch(bindings, /threadId/);
 });
@@ -1059,6 +1061,105 @@ test("session filters, folder labels and evidence groups are normalized for disp
   assert.deepEqual([groups.facts.length, groups.inferences.length, groups.unknowns.length], [1, 1, 1]);
 });
 
+test("every view that sends a turn to Codex or Claude Code offers the same model picker, asked of the executing device", () => {
+  const panel = readFileSync("src/features/workspace/NativeAgentPanel.tsx", "utf8");
+  const detail = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
+  const lifecycle = readFileSync("src/features/workspace/AgentTaskLifecycle.tsx", "utf8");
+  const workspace = readFileSync("src/features/workspace/AgentWorkspace.tsx", "utf8");
+  const bindings = readFileSync("src/lib/tauri.ts", "utf8");
+  const sessions = readFileSync("src/lib/nativeSessions.ts", "utf8");
+  const shared = readFileSync("src/features/workspace/AgentTurnOptions.tsx", "utf8");
+  // One control, used by both views: a conversation begun here (first and
+  // later turns) and a discovered session, for both Agents.
+  for (const view of [panel, detail]) {
+    assert.match(view, /import \{ AgentTurnOptionsChoice, catalogEntry, useAgentTurnOptions, useModelCatalog \} from "\.\/AgentTurnOptions";/);
+    assert.match(view, /<AgentTurnOptionsChoice agent=\{/);
+    assert.match(view, /catalog=\{catalog\}/);
+    assert.doesNotMatch(view, /function SessionOptionsChoice/);
+  }
+  assert.match(panel, /target="conversation"/);
+  assert.match(detail, /target="session"/);
+  assert.match(sessions, /return provider === "claude_code" \|\| provider === "codex";/);
+  // Offered wherever the Agent runs a turn itself; a folder sent from here
+  // is reviewed as sent, and Claude Code never runs in a folder by path.
+  assert.match(panel, /const optionsOffered = availability\.state === "available" && kind !== "send" && \(agentId !== CLAUDE_CODE_AGENT_ID \|\| kind !== "path"\)/);
+  assert.match(panel, /const options = optionsOffered \? turnOptions\.options : null;/);
+  // The catalog is asked of the device that runs the turn, never this one
+  // on its behalf.
+  assert.match(panel, /useModelCatalog\(provider, targetHostRef && remote \? \{ kind: "remote", roomId, hostRef: targetHostRef, hostName: targetName \} : \{ kind: "local" \}, optionsOffered\)/);
+  assert.match(detail, /useModelCatalog\(session\.provider, route \? \{ kind: "remote", roomId: route\.roomId, hostRef: route\.hostRef, hostName \} : \{ kind: "local" \}/);
+  assert.match(shared, /readRemoteNativeModelCatalogs\(roomId, hostRef, agent, refresh\)/);
+  assert.match(shared, /readNativeModelCatalogs\(agent, refresh\)/);
+  assert.match(bindings, /invoke\("read_native_model_catalogs", \{ agent, refresh \}\)/);
+  assert.match(bindings, /invoke\("read_remote_native_model_catalogs", \{ roomId, targetHostRef, agent, refresh \}\)/);
+  // A Codex model it does not list is never sent (Codex would keep it).
+  assert.match(panel, /provider === "codex" && !!turnOptions\.model && !catalogEntry\(catalog\.catalog, turnOptions\.model\)/);
+  assert.match(detail, /view\?\.provider === "codex" && !!turnOptions\.model && !catalogEntry\(catalog\.catalog, turnOptions\.model\)/);
+  // The choice is for one turn: cleared once that turn started.
+  assert.match(panel, /if \(started\) turnOptions\.clear\(\);/);
+  assert.match(detail, /turnOptions\.clear\(\);/);
+  // It reaches every native start, local and remote, for both Agents; none
+  // is refused or dropped on the way.
+  assert.match(lifecycle, /startNativeClaudeCodeTask\(workspace\.trim\(\), sent, !followUp, options\)/);
+  assert.match(lifecycle, /startRemoteNativeClaudeCodeTask\(roomId, peerSessionId, hostRef, shared\.scopeRef, sent, followUp, options\)/);
+  assert.match(lifecycle, /startNativeCodexTask\(workspace\.trim\(\), sent, !followUp, options\)/);
+  assert.match(lifecycle, /startRemoteNativeCodexTask\(roomId, peerSessionId, hostRef, target, sent, followUp, shared\?\.label \?\? null, options\)/);
+  assert.doesNotMatch(lifecycle, /not supported yet/);
+  assert.match(bindings, /invoke\("start_native_codex_task", \{ workspace, task, newConversation, options \}\)/);
+  assert.match(bindings, /invoke\("start_remote_native_codex_task", \{ roomId, peerSessionId, targetHostRef, workspace, task, resume, workspaceLabel, options \}\)/);
+  assert.match(bindings, /invoke\("start_native_claude_code_task", \{ workspace, task, newConversation, options \}\)/);
+  assert.match(bindings, /invoke\("start_remote_native_claude_code_task", \{ roomId, peerSessionId, targetHostRef, scopeRef, task, resume, options \}\)/);
+  // The next turn's choice and the last turn's confirmed record are shown
+  // apart, with an explicit native option for both model and effort.
+  assert.match(shared, /Next turn: /);
+  assert.match(shared, /Last confirmed turn:/);
+  assert.match(shared, /<strong>Use native configuration<\/strong>/);
+  assert.match(shared, /<option value="">Use native configuration<\/option>/);
+  assert.match(panel, /confirmed=\{showTurns \? sessionConfig : null\}/);
+  assert.match(detail, /confirmed=\{view\.agentConfig\}/);
+  assert.match(panel, /<AgentConfigSummary strip config=\{configView\.shown\}/);
+  // A listed model is never presented as guaranteed for the account.
+  assert.match(shared, /not a promise that your account can use it/);
+  // Nothing persists: the catalog is held in memory only, never stored.
+  assert.doesNotMatch(shared, /localStorage|sessionStorage/);
+  // After a conversation's turn, the session's own record is read again.
+  assert.match(workspace, /if \(ranTurn\.current\) \{ ranTurn\.current = false; void list\.look\(\); \}/);
+});
+
+test("effort choices follow the model the next turn would run with", () => {
+  const codex: NativeModelCatalog = {
+    agent: "codex", state: "reported", customModels: false, efforts: [], source: "Codex model/list", observedAtMs: 1,
+    models: [
+      { id: "gpt-6.1-sol", displayName: "GPT-6.1-Sol", isDefault: true, efforts: [{ id: "low" }, { id: "ultra", description: "Most" }] },
+      { id: "gpt-6-luna", displayName: "GPT-6-Luna", isDefault: false, efforts: [{ id: "low" }, { id: "medium" }] },
+      { id: "plain", displayName: "Plain", isDefault: false, efforts: [] },
+    ],
+  };
+  // The chosen model's own efforts.
+  assert.deepEqual(effortChoices(codex, "gpt-6-luna", "gpt-6.1-sol", "Codex").efforts.map((e) => e.id), ["low", "medium"]);
+  // No model chosen: the model the session runs with now.
+  assert.deepEqual(effortChoices(codex, "", "gpt-6.1-sol", "Codex").efforts.map((e) => e.id), ["low", "ultra"]);
+  // A model with no effort setting offers none, and says so.
+  const plain = effortChoices(codex, "plain", null, "Codex");
+  assert.equal(plain.efforts.length, 0);
+  assert.match(plain.note ?? "", /no effort setting for Plain/);
+  // A model the session runs with that is not listed: what the Agent
+  // lists overall, said as not reported for it.
+  const unknown = effortChoices(codex, "", "custom-model", "Codex");
+  assert.deepEqual(unknown.efforts.map((e) => e.id), ["low", "ultra", "medium"]);
+  assert.match(unknown.note ?? "", /does not report which efforts/);
+  // Claude Code: an alias matches the session's recorded full model name.
+  const claude: NativeModelCatalog = {
+    agent: "claude_code", state: "fallback", customModels: true, efforts: ["low", "medium", "high", "xhigh", "max"], source: "aliases", observedAtMs: 1,
+    models: [{ id: "sonnet", displayName: "Sonnet", isDefault: false, resolvesTo: "claude-sonnet-5-5", efforts: [{ id: "low" }, { id: "high" }] }, { id: "opus", displayName: "Opus (alias)", isDefault: false }],
+  };
+  assert.equal(catalogEntry(claude, "claude-sonnet-5-5")?.id, "sonnet");
+  assert.deepEqual(effortChoices(claude, "", "claude-sonnet-5-5", "Claude Code").efforts.map((e) => e.id), ["low", "high"]);
+  // An alias whose efforts are not reported: Claude Code's documented ones.
+  assert.deepEqual(effortChoices(claude, "opus", null, "Claude Code").efforts.map((e) => e.id), ["low", "medium", "high", "xhigh", "max"]);
+  assert.equal(effortChoices(null, "", null, "Codex").efforts.length, 0);
+});
+
 test("the sessions card continues only this device's own sessions and never grants anything", () => {
   const browser = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   const card = readFileSync("src/features/workspace/SessionDetail.tsx", "utf8");
@@ -1074,7 +1175,7 @@ test("the sessions card continues only this device's own sessions and never gran
   assert.equal(card.match(/continueRemoteNativeSession\(/g)?.length, 1);
   assert.match(card, /continueNativeSession\(\{ workspaces: \[folder\], provider: view\.provider, sessionId: view\.sessionId, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null, \.\.\.\(options \? \{ options \} : \{\}\) \}\)/);
   // The Agent's own model and effort only as chosen here, only for Claude Code.
-  assert.match(card, /const options = optionsSupported \? chosenSessionOptions\(model, effort\) : null;/);
+  assert.match(card, /const options = optionsSupported \? turnOptions\.options : null;/);
   assert.match(card, /continueRemoteNativeSession\(\{ roomId: route\.roomId, peerSessionId: route\.peerSessionId, targetHostRef: route\.hostRef, provider: view\.provider, sessionId: view\.sessionId, scopeRef: view\.scopeRef, prompt: prompt\.trim\(\), expectedMarker: view\.lastTurn\.marker \?\? null, options \}\)/);
   assert.match(card, /continuationAvailability\(view, !route, hostName, share\)/);
   assert.match(card, /agent\.adoptTask\(started, route\?\.hostRef \?\? null, continued, text\)/);
@@ -1159,7 +1260,7 @@ test("Native execution readiness never depends on Session reading permissions", 
     assert.doesNotMatch(source, /SessionReadGrant|listSessionReadGrants|readGrant|discoverRemoteNativeSessions/);
   }
   // Send is enabled only by the readiness model, which says why not.
-  assert.match(panel, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
+  assert.match(panel, /canSend=\{readiness\.ready && !taskActive && !!place && !modelInvalid\}/);
   assert.match(panel, /<Checklist items=\{readiness\.requirements\} \/>/);
   assert.match(panel, /readiness\.next/);
   assert.match(panel, /const blocker = taskActive \?/);
@@ -1525,9 +1626,9 @@ test("A session is offered for continuation only where the Host would accept it"
   const heldThere = continuationAvailability({ ...remoteClaude, resume: { verdict: "unsafe", reasons: [] } }, false, "DESKTOP");
   assert.equal(heldThere.allowed, false);
   assert.match(heldThere.reason, /A Claude Code process on DESKTOP holds this session/);
-  // Model and effort: only Claude Code's, only identifiers, only as chosen.
+  // Model and effort: either Agent's, only identifiers, only as chosen.
   assert.equal(sessionOptionsSupported("claude_code"), true);
-  assert.equal(sessionOptionsSupported("codex"), false);
+  assert.equal(sessionOptionsSupported("codex"), true);
   assert.equal(validModelChoice("claude-haiku-5-5"), true);
   assert.equal(validModelChoice("sonnet"), true);
   for (const bad of ["--dangerously-skip-permissions", "two words", "/etc/model", "C:model", "a//b"]) assert.equal(validModelChoice(bad), false, bad);
@@ -1960,10 +2061,10 @@ test("every composer shares one input: IME-safe keys, kept focus while sending, 
   // A running turn blocks sending, never writing the next message.
   assert.match(session, /disabled=\{!!availability && !availability\.allowed\}/);
   assert.doesNotMatch(run, /disabled=\{locked\}\s*\n\s*sending=/);
-  assert.match(run, /canSend=\{readiness\.ready && !taskActive && !!place\}/);
+  assert.match(run, /canSend=\{readiness\.ready && !taskActive && !!place && !modelInvalid\}/);
   // Each sender hands its promise to the guard.
   assert.match(session, /onSend=\{send\}/);
-  assert.match(run, /if \(!remote \|\| !targetHostRef\) return agent\.start\(place, followUp, agentId\);/);
+  assert.match(run, /if \(!remote \|\| !targetHostRef\) return agent\.start\(place, followUp, agentId, options\)\.then\(sent\);/);
   // A session's unsent draft survives moving to another session, in memory only.
   assert.match(session, /const drafts = new Map<string, string>\(\);/);
   assert.doesNotMatch(session, /localStorage/);

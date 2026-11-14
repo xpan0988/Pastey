@@ -243,12 +243,13 @@ export function continuationAvailability(
 /** Claude Code's own effort levels, as its CLI lists them (`--effort`). */
 export const CLAUDE_CODE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 
-/** Whether `provider`'s own model and effort can be chosen for one
- * continuation from Pastey. Claude Code: its native `--model` / `--effort`
- * were measured to apply to the same session (the model stays the session's
- * for later turns, the effort applies to the turn). Codex: not yet. */
+/** Whether `provider`'s own model and effort can be chosen for one turn
+ * from Pastey. Both were measured to apply them to the same session:
+ * Claude Code's `--model` / `--effort` (the model stays the session's, the
+ * effort is the turn's) and Codex's `turn/start` `model` / `effort` (both
+ * stay the thread's for its later turns). */
 export function sessionOptionsSupported(provider: NativeSessionProvider): boolean {
-  return provider === "claude_code";
+  return provider === "claude_code" || provider === "codex";
 }
 
 /** A model the user typed, if it is an identifier the Host would accept

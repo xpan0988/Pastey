@@ -16,6 +16,7 @@ import {
   type useNativeAgentTask,
 } from "./AgentTaskLifecycle";
 import { AgentConfigSummary } from "./AgentConfigSummary";
+import { AgentTurnOptionsChoice, catalogEntry, useAgentTurnOptions, useModelCatalog } from "./AgentTurnOptions";
 import { PastTurnView, TaskTurn } from "./AgentTaskTracker";
 import type { PeerShares } from "./BridgeWorkspaces";
 import { Composer, ConversationHeader, ConversationThread } from "./Conversation";
@@ -141,18 +142,35 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
   const runningName = nativeAgentDisplayName(agent.status?.agentId);
   const blocker = taskActive ? `${current ? `${runningName} is working on this` : `${runningName} is working on another task in this Bridge`}. Wait for it, or stop it.` : readiness.blocker;
   const locked = taskActive || agent.busy;
+  // The Agent's own model and effort for the next turn of this
+  // conversation (its first turn or any later one), only as chosen here,
+  // from what the Agent on the device that runs it lists. Not for a folder
+  // sent from here (that run is reviewed as it is), nor for Claude Code in
+  // a folder named by path, which it does not run in.
+  const provider = agentId === CLAUDE_CODE_AGENT_ID ? "claude_code" as const : "codex" as const;
+  const turnOptions = useAgentTurnOptions();
+  const optionsOffered = availability.state === "available" && kind !== "send" && (agentId !== CLAUDE_CODE_AGENT_ID || kind !== "path")
+    && (!targetHostRef || !!remote);
+  const catalog = useModelCatalog(provider, targetHostRef && remote ? { kind: "remote", roomId, hostRef: targetHostRef, hostName: targetName } : { kind: "local" }, optionsOffered);
+  // Codex runs only a model it lists; it would record any other in the
+  // thread, so the Host refuses one before sending, and so does this view.
+  const modelInvalid = optionsOffered && (turnOptions.invalid
+    || (provider === "codex" && !!turnOptions.model && !catalogEntry(catalog.catalog, turnOptions.model)));
 
   async function chooseFolder() {
     const chosen = await open({ directory: true, multiple: false });
     if (typeof chosen === "string") agent.setWorkspace(chosen);
   }
 
-  function run(): Promise<void> | undefined {
-    if (!readiness.ready || taskActive || !place) return;
+  function run(): Promise<unknown> | undefined {
+    if (!readiness.ready || taskActive || !place || modelInvalid) return;
     if (place.kind !== "shared") rememberWorkspace(memoryKey, agent.workspace.trim());
-    if (!remote || !targetHostRef) return agent.start(place, followUp, agentId);
+    const options = optionsOffered ? turnOptions.options : null;
+    // A choice is for one turn: cleared once that turn started.
+    const sent = (started: boolean) => { if (started) turnOptions.clear(); };
+    if (!remote || !targetHostRef) return agent.start(place, followUp, agentId, options).then(sent);
     if (readiness.action === "review_movement") return agent.proposeRemoteMovement(roomId, targetHostRef, place);
-    return agent.startRemote(roomId, remote.peerSessionId, targetHostRef, place, followUp, agentId);
+    return agent.startRemote(roomId, remote.peerSessionId, targetHostRef, place, followUp, agentId, options).then(sent);
   }
 
   const showTurns = current && (agent.origin?.kind === "new" || (!agent.origin && (agent.status || agent.movement)));
@@ -208,11 +226,14 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
       value={agent.taskText}
       onChange={agent.setTaskText}
       onSend={run}
-      canSend={readiness.ready && !taskActive && !!place}
+      canSend={readiness.ready && !taskActive && !!place && !modelInvalid}
       sending={agent.busy}
       autoFocus
       placeholder={followUp ? "Reply to continue this conversation…" : `What should ${agentName} do?`}
-      above={above}
+      above={above || optionsOffered ? <>
+        {above}
+        {optionsOffered ? <AgentTurnOptionsChoice agent={provider} provider={agentName} hostName={targetHostRef ? targetName : "this device"} choice={turnOptions} catalog={catalog} confirmed={showTurns ? sessionConfig : null} current={(showTurns ? sessionConfig?.model : null) ?? nativeDefault?.model ?? null} disabled={locked} target="conversation" /> : null}
+      </> : null}
       bar={<><Icon name="agent" small />{agentName} · {label}{targetHostRef ? ` · ${targetName}` : ""}</>}
       hint={blocker && (agent.taskText.trim() || taskActive || readiness.requirements.some((requirement) => !requirement.met && requirement.id !== "task")) ? blocker
         : followUp ? `Continues this conversation in ${label}. ${targetHostRef ? remoteStartLine(targetName, fullAccess) : ""}`
