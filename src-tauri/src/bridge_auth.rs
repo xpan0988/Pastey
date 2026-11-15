@@ -1489,6 +1489,11 @@ pub(crate) struct VerifiedPeerRequest {
 }
 
 impl VerifiedPeerRequest {
+    /// The peer transport key whose request this is.
+    pub(crate) fn peer_public_key(&self) -> &[u8; 32] {
+        &self.peer_public
+    }
+
     /// The liveness answer: proof of this room server's key, bound to the
     /// requester's nonce.
     pub(crate) fn ping_proof(&self, room_id: &str) -> String {

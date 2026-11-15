@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde::Deserialize;
 use tokio::{sync::oneshot, time::sleep};
@@ -28,9 +31,24 @@ const LIVENESS_FAILURES_BEFORE_INVALIDATION: u8 = 3;
 /// the carrier finds the new path. The tunnel's endpoint does not change
 /// meanwhile, so tolerating it keeps the session instead of rotating its
 /// keys; a session that is really gone still ends within about half a
-/// minute (4 rounds of a probe and the 2 s cadence).
+/// minute (4 rounds of a probe and the 2 s cadence, after
+/// `TUNNEL_TRAFFIC_PROOF_WINDOW` since its last signed request: 36 s at
+/// most).
 const TUNNEL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 const TUNNEL_LIVENESS_FAILURES_BEFORE_INVALIDATION: u8 = 4;
+/// A tunnel session whose probe failed is still treated as alive if this
+/// room server accepted a signed request from that same peer key this
+/// recently. On a loaded tunnel (a large transfer on a slow or relayed
+/// path) a probe's reply can queue behind the data for longer than the
+/// probe's bound while the peer is plainly there: its own probes and
+/// requests keep arriving, each one fresh, unreplayed and signed under the
+/// session's keys, which is a stronger proof than the ping. The window
+/// covers one round of the peer's probe cadence (5 s bound and the 2 s
+/// interval) with a second to spare. A peer that is gone sends nothing, so
+/// its session still ends: at most this much later than before.
+const TUNNEL_TRAFFIC_PROOF_WINDOW: Duration = Duration::from_secs(8);
+/// Traffic records older than this are dropped.
+const TRAFFIC_RECORD_TTL: Duration = Duration::from_secs(120);
 /// Proofs a current-session resolution tries before calling a Connected
 /// session unavailable. Liveness keeps a session through a few lost probes
 /// (above), so one lost probe here would refuse a query on a session the
@@ -402,8 +420,16 @@ async fn invalidate_unreachable_sessions(state: Arc<AppState>) -> AppResult<()> 
             }
             let failure_key = format!("{}\n{}", room.id, peer.peer_session_id);
             let tunnel = through_tunnel(&state, &peer);
-            if probe_exact_peer(&state, &room, &peer, tunnel).await {
+            let probe_ok = probe_exact_peer(&state, &room, &peer, tunnel).await;
+            let last_traffic = last_authenticated_traffic(&state, &room.id, &peer);
+            if session_shown_alive(probe_ok, tunnel, last_traffic, Instant::now()) {
                 state.bridge_liveness_failures.lock().remove(&failure_key);
+                if !probe_ok {
+                    logging::write_transfer_line(&format!(
+                        "[pastey bridge-lifecycle] event=liveness_probe_failed_peer_traffic_recent room_id={} peer_session_id={}",
+                        room.id, peer.peer_session_id
+                    ));
+                }
                 continue;
             }
             let threshold = if tunnel {
@@ -445,6 +471,47 @@ fn through_tunnel(state: &AppState, peer: &StoredBridgePeerEndpoint) -> bool {
         (Some(host), Some(port)) => crate::connectivity::is_tunnel_endpoint(state, host, port),
         _ => false,
     }
+}
+
+/// Records that a Bridge's room server accepted a signed request from a
+/// peer transport key now. Called only after `verify_peer_request` passed
+/// (current peer key, MAC, fresh timestamp, unused nonce).
+pub(crate) fn record_authenticated_traffic(state: &AppState, room_id: &str, peer_key: &[u8; 32]) {
+    let now = Instant::now();
+    let mut traffic = state.bridge_peer_traffic.lock();
+    traffic.retain(|_, at| now.duration_since(*at) < TRAFFIC_RECORD_TTL);
+    traffic.insert((room_id.to_owned(), *peer_key), now);
+}
+
+/// When this room server last accepted a signed request from the transport
+/// key of this exact stored peer session.
+fn last_authenticated_traffic(
+    state: &AppState,
+    room_id: &str,
+    peer: &StoredBridgePeerEndpoint,
+) -> Option<Instant> {
+    let key = crate::crypto::decode_key(peer.transport_public_key.as_deref()?).ok()?;
+    state
+        .bridge_peer_traffic
+        .lock()
+        .get(&(room_id.to_owned(), key))
+        .copied()
+}
+
+/// Whether this round shows the session alive: its probe answered, or, for
+/// a tunnel session only, its peer's signed traffic arrived within
+/// `TUNNEL_TRAFFIC_PROOF_WINDOW`. LAN and overlay sessions use the probe
+/// alone, as before. Non-authorizing, like the probe.
+fn session_shown_alive(
+    probe_ok: bool,
+    tunnel: bool,
+    last_traffic: Option<Instant>,
+    now: Instant,
+) -> bool {
+    probe_ok
+        || (tunnel
+            && last_traffic
+                .is_some_and(|at| now.saturating_duration_since(at) <= TUNNEL_TRAFFIC_PROOF_WINDOW))
 }
 
 /// Counts one failed probe; true once enough consecutive ones confirm it.
@@ -1377,6 +1444,53 @@ mod tests {
         assert!(native_v2.contains("resolve_current_remote_host_session"));
         assert!(!native_v2.contains("list_bridge_peer_endpoints"));
         assert!(!native_v2.contains("probe_exact_peer"));
+    }
+
+    #[test]
+    fn a_failed_tunnel_probe_is_outweighed_only_by_recent_peer_traffic() {
+        let now = Instant::now();
+        let recent = Some(now - Duration::from_secs(3));
+        let stale = Some(now - TUNNEL_TRAFFIC_PROOF_WINDOW - Duration::from_millis(1));
+        // A probe that answered is enough on any path.
+        assert!(session_shown_alive(true, false, None, now));
+        assert!(session_shown_alive(true, true, None, now));
+        // A tunnel session under load: the probe timed out, the peer's own
+        // signed requests keep arriving.
+        assert!(session_shown_alive(false, true, recent, now));
+        // A peer that is gone sends nothing: the failure counts.
+        assert!(!session_shown_alive(false, true, None, now));
+        assert!(!session_shown_alive(false, true, stale, now));
+        // LAN and overlay sessions keep the probe as the only proof.
+        assert!(!session_shown_alive(false, false, recent, now));
+    }
+
+    #[test]
+    fn a_silent_tunnel_peer_is_still_invalidated_within_the_documented_bound() {
+        // Worst case after the last signed request: the proof window, then
+        // the full run of failed probes at the reconcile cadence.
+        let worst = TUNNEL_TRAFFIC_PROOF_WINDOW
+            + (TUNNEL_LIVENESS_TIMEOUT + RECONCILE_INTERVAL)
+                * u32::from(TUNNEL_LIVENESS_FAILURES_BEFORE_INVALIDATION);
+        assert!(worst <= Duration::from_secs(36));
+        // The window must span one round of the peer's own probe cadence,
+        // or a loaded but healthy tunnel would still be dropped.
+        assert!(TUNNEL_TRAFFIC_PROOF_WINDOW > TUNNEL_LIVENESS_TIMEOUT + RECONCILE_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn authenticated_traffic_is_recorded_per_bridge_and_peer_key() {
+        let fixture = ResolverFixture::new("peer-traffic").await;
+        let peer = fixture.peer("route-current", BridgePeerLiveness::Connected);
+        assert!(last_authenticated_traffic(&fixture.runtime, &fixture.room.id, &peer).is_none());
+        let key = crate::crypto::decode_key(peer.transport_public_key.as_deref().unwrap()).unwrap();
+        // Another key, or the same key on another Bridge, proves nothing
+        // about this session.
+        record_authenticated_traffic(&fixture.runtime, &fixture.room.id, &[7u8; 32]);
+        record_authenticated_traffic(&fixture.runtime, "another-bridge", &key);
+        assert!(last_authenticated_traffic(&fixture.runtime, &fixture.room.id, &peer).is_none());
+        record_authenticated_traffic(&fixture.runtime, &fixture.room.id, &key);
+        let at = last_authenticated_traffic(&fixture.runtime, &fixture.room.id, &peer).unwrap();
+        assert!(at.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

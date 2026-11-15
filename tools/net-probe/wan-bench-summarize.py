@@ -52,6 +52,11 @@ def main():
                 notes.append(f"{o['kind']} {o['lasts_s']:g} s at {o['at_s']:g} s")
             if probes.get("session_invalidated_at_s") is not None:
                 notes.append(f"session invalidated at {probes['session_invalidated_at_s']} s")
+            if probes.get("longest_gap_between_arrivals_s") is not None:
+                notes.append(
+                    f"{probes['arrived_at_receiver']} pings reached the receiver, "
+                    f"longest gap {probes['longest_gap_between_arrivals_s']} s"
+                )
             if r.get("carrier_dials", 1) > 1:
                 notes.append(f"{r['carrier_dials'] - 1} redial(s)")
             if r.get("error"):

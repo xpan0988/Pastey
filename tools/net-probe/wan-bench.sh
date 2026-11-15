@@ -15,7 +15,7 @@ set -eu
 cd "$(dirname "$0")"
 BIN=target/release/examples/wan_bench
 OUT=${1:-results/wan-bench-emulated.jsonl}
-WAN_GROUPS=${WAN_GROUPS:-"A B C D E F G H I J K"}
+WAN_GROUPS=${WAN_GROUPS:-"A B C D E F G H I J K L"}
 mkdir -p "$(dirname "$OUT")"
 
 run() { "$BIN" "$@" >>"$OUT" || echo "run failed: $*" >&2; }
@@ -152,4 +152,17 @@ if want K; then
     run label=K-adaptive-unlimited mode=$mode work=pastey rtt_ms=50 adaptive=1 mib=256 max_s=300
     run label=K-fixed-unlimited mode=$mode work=pastey rtt_ms=50 mib=256 max_s=300
   done
+fi
+
+# L. What the receiving Host sees of the sender's liveness pings while a
+#    slow relay path is loaded (longest gap between arrivals, against the
+#    8 s window in which a signed request counts as proof of the session).
+if want L; then
+  for rate in 384 256 128; do
+    run label=L-ping-arrivals mode=relay work=pastey rtt_ms=150 rate_kib=$rate adaptive=1 mib=32 max_s=900 &
+  done
+  run label=L-ping-arrivals mode=relay work=pastey rtt_ms=350 rate_kib=1126 adaptive=1 mib=64 max_s=300 &
+  run label=L-ping-arrivals mode=relay work=pastey rtt_ms=150 rate_kib=256 mib=32 max_s=900 &
+  run label=L-ping-arrivals mode=direct work=pastey rtt_ms=150 rate_kib=128 adaptive=1 mib=32 max_s=900 &
+  wait
 fi

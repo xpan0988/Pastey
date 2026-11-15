@@ -426,6 +426,10 @@ async fn endpoint(
 struct Counters {
     /// Payload bytes the receiving side has taken.
     rx_bytes: AtomicU64,
+    /// When each liveness ping reached the room server. In Pastey each is
+    /// a signed request, and its arrival counts as proof of the session
+    /// (`bridge_lifecycle.rs::TUNNEL_TRAFFIC_PROOF_WINDOW`, 8 s).
+    ping_arrivals: Mutex<Vec<Instant>>,
 }
 
 type BoxRead = Box<dyn AsyncRead + Send + Unpin>;
@@ -516,7 +520,16 @@ async fn room_server(counters: Arc<Counters>) -> Result<u16> {
             })
             .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
-        .route("/rooms/r/diagnostics/ping", post(|| async { "{}" }));
+        .route(
+            "/rooms/r/diagnostics/ping",
+            post(move || {
+                let counters = counters.clone();
+                async move {
+                    counters.ping_arrivals.lock().unwrap().push(Instant::now());
+                    "{}"
+                }
+            }),
+        );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     tokio::spawn(async move {
@@ -857,6 +870,7 @@ async fn main() -> Result<()> {
 
     let counters = Arc::new(Counters {
         rx_bytes: AtomicU64::new(0),
+        ping_arrivals: Mutex::new(Vec::new()),
     });
     let room_port = room_server(counters.clone()).await?;
 
@@ -1003,6 +1017,18 @@ async fn main() -> Result<()> {
         })
         .0;
     let probes = probes.lock().unwrap();
+    // The receiving Host's view: the longest it went without a ping from
+    // the sender arriving, from the first arrival to the end of the run.
+    let arrivals = counters.ping_arrivals.lock().unwrap().clone();
+    let finished = started + Duration::from_secs_f64(seconds);
+    let longest_ping_gap = arrivals
+        .iter()
+        .copied()
+        .skip(1)
+        .chain(std::iter::once(finished))
+        .zip(arrivals.iter().copied())
+        .map(|(later, earlier)| later.saturating_duration_since(earlier).as_secs_f64())
+        .fold(None::<f64>, |longest, gap| Some(longest.map_or(gap, |l| l.max(gap))));
     let report = serde_json::json!({
         "schema": "pastey-wan-bench-v1",
         "emulated": true,
@@ -1054,6 +1080,8 @@ async fn main() -> Result<()> {
             "max_ms": percentile(&probes.millis, 1.0).map(round),
             "worst_failure_run": probes.worst_run,
             "session_invalidated_at_s": probes.invalidated_at_s.map(round),
+            "arrived_at_receiver": arrivals.len(),
+            "longest_gap_between_arrivals_s": longest_ping_gap.map(round),
         },
     });
     println!("{report}");

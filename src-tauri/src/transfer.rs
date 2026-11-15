@@ -171,7 +171,7 @@ impl RoomServerContext {
             .lock()
             .get(&self.room_id)
             .map(|server| server.transport_secret)?;
-        crate::bridge_auth::verify_peer_request(
+        let verified = crate::bridge_auth::verify_peer_request(
             &self.state.paths,
             &self.room_id,
             &secret,
@@ -180,7 +180,15 @@ impl RoomServerContext {
             body,
             &self.request_replay,
         )
-        .ok()
+        .ok()?;
+        // The peer's current session just proved its key to this room
+        // server: it is alive, whatever a liveness probe's reply is doing.
+        crate::bridge_lifecycle::record_authenticated_traffic(
+            &self.state,
+            &self.room_id,
+            verified.peer_public_key(),
+        );
+        Some(verified)
     }
 }
 

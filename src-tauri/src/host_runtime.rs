@@ -81,6 +81,10 @@ pub struct HostRuntime {
     pub(crate) verified_peer_devices: Mutex<Vec<crate::device_identity::VerifiedPeerDevice>>,
     /// Consecutive failed liveness probes per Bridge peer session.
     pub(crate) bridge_liveness_failures: Mutex<HashMap<String, u8>>,
+    /// When each Bridge's room server last accepted a signed request from a
+    /// peer transport key (`bridge_lifecycle::record_authenticated_traffic`).
+    /// Process-local and never authority: liveness only.
+    pub(crate) bridge_peer_traffic: Mutex<HashMap<(String, [u8; 32]), std::time::Instant>>,
     pub(crate) bridge_reconnect_rotations: Mutex<HashSet<String>>,
     /// Internet carrier state: its connections and loopback tunnels.
     /// Process-local, and never authority (`connectivity`).
@@ -212,6 +216,7 @@ impl HostRuntime {
             bridge_lifecycle_handle: Mutex::new(None),
             bridge_reconnect_attempts: Mutex::new(HashMap::new()),
             bridge_liveness_failures: Mutex::new(HashMap::new()),
+            bridge_peer_traffic: Mutex::new(HashMap::new()),
             verified_peer_devices: Mutex::new(Vec::new()),
             bridge_reconnect_rotations: Mutex::new(HashSet::new()),
             connectivity: Default::default(),

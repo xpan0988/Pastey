@@ -1,6 +1,6 @@
 # WAN reliability and throughput: investigation (2026-11-15)
 
-Status: investigation, plus Step 1 of the proposal (the adaptive in-flight window), implemented afterwards on branch `tunnel-adaptive-transfer-window` and measured in [Step 1 result](#step-1-result-emulated). The findings in Phases 1–3 describe the code before that change. The benchmark harness and its results are in `tools/net-probe/`.
+Status: investigation, plus Steps 1 and 2 of the proposal (the adaptive in-flight window, and signed peer traffic as liveness), implemented afterwards on branch `tunnel-adaptive-transfer-window`; see [Step 1 result](#step-1-result-emulated) and [Step 2 result](#step-2-result-emulated). The findings in Phases 1–3 describe the code before that change. The benchmark harness and its results are in `tools/net-probe/`.
 
 ## What kind of evidence this is
 
@@ -11,7 +11,7 @@ The only physical evidence in the repository is still:
 - `tools/net-probe/results/2026-10-15-mac-single-machine.jsonl`: both endpoints on one Mac, relay-only through n0's public relays, 8 MiB per run, about 1.1 MiB/s at about 350 ms RTT.
 - The changelog's Test connection figures over a phone hotspot (0.2–0.4 MB/s), without the per-run records.
 
-Full tables: [`tools/net-probe/results/2026-11-15-wan-bench-emulated.md`](../../tools/net-probe/results/2026-11-15-wan-bench-emulated.md) (96 runs).
+Full tables: [`tools/net-probe/results/2026-11-15-wan-bench-emulated.md`](../../tools/net-probe/results/2026-11-15-wan-bench-emulated.md) (102 runs).
 
 ## Phase 1: the data path as built
 
@@ -225,7 +225,28 @@ What it costs: on a fast, high-latency link the first six chunks ramp from 2 to 
 
 Automated checks: four unit tests of the controller in `transfer_tuning.rs`; the `transfer` (104) and `connectivity` (13) Rust suites pass. Not exercised: a real Pastey transfer through a real tunnel, on any network.
 
-**Step 2 — traffic counts as liveness (rank 2).** In `bridge_lifecycle.rs`. Acceptance: a peer that stops answering is still invalidated within the current bound; a loaded but working tunnel is not.
+**Step 2 — traffic counts as liveness (rank 2). Done; see the result below.** In `bridge_lifecycle.rs`. Acceptance: a peer that stops answering is still invalidated within the current bound; a loaded but working tunnel is not.
+
+### Step 2 result (emulated)
+
+What counts: only a request that passed `verify_peer_request` on this Host's room server (the Bridge's current peer key, a MAC under the session's key agreement, a fresh timestamp, an unused nonce). The peer's own liveness probes are such requests, so each side sees the other's every round. A chunk acknowledgement does not count: it is an unsigned HTTP response. A tunnel session whose probe failed is treated as alive for that round if such a request arrived within 8 s (`TUNNEL_TRAFFIC_PROOF_WINDOW`). LAN and overlay sessions keep the probe as the only proof. Resolving a session for use (`prove_current_peer`) is unchanged and still needs the probe's key proof.
+
+Bound for a peer that is really gone: 8 s after its last signed request, then four rounds of 5 s + 2 s: 36 s at most (before: 28 s). A unit test holds this.
+
+The harness has one probing side, so it cannot run the rule itself. Group L records what the rule depends on: when the sender's pings reach the receiver's room server on a loaded relay path.
+
+| Relay path (adaptive window unless noted) | Probes timed out for the sender (longest run) | Pings that reached the receiver | Longest gap between arrivals |
+| --- | --- | --- | --- |
+| 1.1 MiB/s, 350 ms | 0 | 21 | 3.8 s |
+| 384 KiB/s | 6 (2) | 19 | 8.6 s |
+| 256 KiB/s | 5 (2) | 24 | 10.5 s |
+| 128 KiB/s | 37 (10): invalidated at 32 s under the old rule | 40 | 19.0 s |
+| 256 KiB/s, fixed window 8 | 67 (63): invalidated at 32 s under the old rule | 55 | 22.7 s |
+| 128 KiB/s, direct | 0 | 113 | 2.4 s |
+
+Reading it: the requests do keep arriving while their replies time out, which is the premise. The gaps are longer than the 8 s window, so single failed rounds still count; ending the session takes four in a row, which needs roughly 29 s or more without one arrival (8 s of credit, then three more rounds and the next probe's bound). The longest observed gap is 23 s. So, **by arithmetic on these runs, not by running the rule**, none of these sessions would now be invalidated, including the two that were before. The other direction (the receiver's probes reaching the sender) travels against the data and was not modelled; it should queue less.
+
+Not done: the rule was not run end to end with two Hosts on a loaded tunnel, in emulation or on a real network. Automated checks: three unit tests in `bridge_lifecycle.rs` (the decision, the bound, the per-Bridge-and-key record); the `bridge_lifecycle` (21), `transfer` (104), `connectivity` (13), `room_control` (58) and `bridge_auth` (6) Rust suites pass. If real paths show gaps beyond about 29 s, the remaining lever is the queue itself (rank 3, BBRv3), not a longer window.
 
 **Step 3 — BBRv3 behind a developer setting (rank 3), default off.** Turn it on by default only after Step 0's matrix is repeated with it on real paths and shows no regression on direct LAN-like paths.
 
