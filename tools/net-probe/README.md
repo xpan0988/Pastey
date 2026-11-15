@@ -20,6 +20,10 @@ A separate STUN check, `stun_probe.py`, sends binding requests from one UDP sock
 
 Pastey itself now has an internet carrier built on iroh ([Connectivity](../../docs/layers/layer-4-connectivity.md)). This probe stays separate: it measures raw paths and is useful when a Bridge across the internet misbehaves.
 
+## wan-bench: emulated latency, rate, loss and outages
+
+`examples/wan_bench.rs` runs two endpoints in one process behind a user-space shaper and compares raw QUIC with the shape of Pastey's tunnel and Transfer (chunk window, timeouts, retries, liveness probe). It is an emulation on loopback, never WAN evidence. Run the matrix with `sh tools/net-probe/wan-bench.sh` and print tables with `python3 -I tools/net-probe/wan-bench-summarize.py <file.jsonl>`. Findings: [WAN reliability and throughput](../../docs/research/wan-reliability-throughput.md).
+
 ## Build
 
 macOS (Rust via rustup):

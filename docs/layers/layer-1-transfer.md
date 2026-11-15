@@ -12,6 +12,8 @@ The implementation includes UDP LAN discovery, nearby join and code-join plumbin
 
 For a file-like transfer, the sender divides the file into 4 MiB chunks, encrypts each one with ChaCha20-Poly1305 bound to its transfer id, index, total, size and final flag, and sends each chunk as one HTTP request to the resolved peer endpoint. Up to the transfer's window of chunks (8 by default) are in flight at once; the sender advances as acknowledgements arrive. The receiver authenticates each chunk, writes it at its position, and at finalization checks the expected chunk count, total bytes and the sender's signed BLAKE3 digest of the whole file before exposing a terminal outcome. A malformed or forged chunk request is refused on its own and does not cancel the transfer; a chunk that fails authentication is never accepted as payload bytes.
 
+Through an internet tunnel ([Connectivity](layer-4-connectivity.md)) the sender lowers the chunks in flight to what the link shows (`transfer_tuning.rs::TunnelWindow`): it starts at 2, adds one for each chunk acknowledged within 10 s and halves when a chunk takes more than 30 s, never above the configured window. This is a sender-local bound on the link, not a scheduling policy; a diagnostic window override is used as set, and LAN and overlay transfers are unaffected.
+
 The sender may update a supported active binary-v1 window at runtime. Window policy is Layer 3 policy; Layer 1 provides the update primitive and does not create its own scheduler.
 
 Layer 1 reports that an encrypted transfer safely landed. It does not read a Bridge Plan, decide which managed primitive follows, infer Transform, or create Layer 5 execution authority. A landed native workspace likewise only waits for the executing Host's executor Review.

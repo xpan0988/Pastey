@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 pub const DEFAULT_BINARY_V1_WINDOW: usize = 8;
 pub const MIN_TRANSFER_WINDOW: usize = 1;
 pub const MAX_TRANSFER_WINDOW: usize = 16;
@@ -91,6 +93,69 @@ pub fn effective_transfer_tuning(
 
 pub fn clamp_transfer_window(value: usize) -> usize {
     value.clamp(MIN_TRANSFER_WINDOW, MAX_TRANSFER_WINDOW)
+}
+
+/// Chunks in flight when a transfer starts on an internet tunnel.
+pub const TUNNEL_INITIAL_WINDOW: usize = 2;
+/// A chunk acknowledged faster than this lets one more chunk fly.
+const TUNNEL_GROW_BELOW: Duration = Duration::from_secs(10);
+/// A chunk slower than this halves the chunks in flight. Well inside the
+/// chunk request deadline, so a slow link shrinks before chunks time out.
+const TUNNEL_SHRINK_ABOVE: Duration = Duration::from_secs(30);
+
+/// How many chunks one transfer keeps in flight on an internet tunnel.
+///
+/// On a LAN the configured window is right: the link is fast and every
+/// chunk returns in milliseconds. Across the internet the same window puts
+/// `window x chunk size` bytes on a link whose rate is unknown, and each
+/// chunk must still return within its request deadline; on a slow link all
+/// of them time out together and nothing is ever delivered. This starts
+/// small and follows what the link shows: fast chunks add one, a slow chunk
+/// halves. It only ever lowers the configured window (`ceiling`), never
+/// raises it, and it is local to the sender: nothing on the wire changes.
+#[derive(Clone, Copy, Debug)]
+pub struct TunnelWindow {
+    window: usize,
+    /// Chunks issued before this were sized by an older window; their
+    /// timings say nothing about the current one.
+    changed_at: Instant,
+}
+
+impl TunnelWindow {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            window: TUNNEL_INITIAL_WINDOW,
+            changed_at: now,
+        }
+    }
+
+    /// Chunks that may be in flight now, given the configured window.
+    pub fn limit(&self, ceiling: usize) -> usize {
+        self.window.min(ceiling).max(MIN_TRANSFER_WINDOW)
+    }
+
+    /// Takes one acknowledged chunk's timing (issued at `issued_at`, it took
+    /// `elapsed` including any retries). Returns the new limit if it changed.
+    pub fn observe(
+        &mut self,
+        issued_at: Instant,
+        elapsed: Duration,
+        ceiling: usize,
+        now: Instant,
+    ) -> Option<usize> {
+        let before = self.limit(ceiling);
+        if elapsed > TUNNEL_SHRINK_ABOVE {
+            // One slow window of chunks shrinks once, not once per chunk.
+            if issued_at >= self.changed_at {
+                self.window = (before / 2).max(MIN_TRANSFER_WINDOW);
+                self.changed_at = now;
+            }
+        } else if elapsed < TUNNEL_GROW_BELOW && before < ceiling {
+            self.window = before + 1;
+        }
+        let after = self.limit(ceiling);
+        (after != before).then_some(after)
+    }
 }
 
 #[cfg(test)]
@@ -219,5 +284,71 @@ mod tests {
             tuning.override_source,
             TransferWindowOverrideSource::DevSettings
         );
+    }
+
+    #[test]
+    fn tunnel_window_starts_small_and_grows_with_fast_chunks() {
+        let start = Instant::now();
+        let mut window = TunnelWindow::new(start);
+        assert_eq!(window.limit(8), TUNNEL_INITIAL_WINDOW);
+        let fast = Duration::from_secs(2);
+        for expected in 3..=8 {
+            assert_eq!(window.observe(start, fast, 8, start + fast), Some(expected));
+        }
+        // Never above the configured window.
+        assert_eq!(window.observe(start, fast, 8, start + fast), None);
+        assert_eq!(window.limit(8), 8);
+    }
+
+    #[test]
+    fn tunnel_window_never_exceeds_a_smaller_configured_window() {
+        let start = Instant::now();
+        let mut window = TunnelWindow::new(start);
+        assert_eq!(window.limit(1), 1);
+        assert_eq!(window.observe(start, Duration::from_secs(1), 1, start), None);
+        // The configured window was lowered while the transfer ran.
+        let mut window = TunnelWindow::new(start);
+        for _ in 0..6 {
+            window.observe(start, Duration::from_secs(1), 8, start);
+        }
+        assert_eq!(window.limit(3), 3);
+    }
+
+    #[test]
+    fn tunnel_window_holds_between_the_two_bounds() {
+        let start = Instant::now();
+        let mut window = TunnelWindow::new(start);
+        let steady = Duration::from_secs(20);
+        assert_eq!(window.observe(start, steady, 8, start + steady), None);
+        assert_eq!(window.limit(8), TUNNEL_INITIAL_WINDOW);
+    }
+
+    #[test]
+    fn one_slow_window_of_chunks_halves_once() {
+        let start = Instant::now();
+        let mut window = TunnelWindow::new(start);
+        for _ in 0..6 {
+            window.observe(start, Duration::from_secs(1), 8, start);
+        }
+        assert_eq!(window.limit(8), 8);
+        // Eight chunks issued together all come back slow.
+        let issued = start + Duration::from_secs(1);
+        let slow = Duration::from_secs(40);
+        let done = issued + slow;
+        assert_eq!(window.observe(issued, slow, 8, done), Some(4));
+        for _ in 0..7 {
+            assert_eq!(window.observe(issued, slow, 8, done), None);
+        }
+        // Chunks issued under the smaller window, still slow: halve again,
+        // down to one and no further.
+        let issued = done + Duration::from_secs(1);
+        let done = issued + slow;
+        assert_eq!(window.observe(issued, slow, 8, done), Some(2));
+        let issued = done + Duration::from_secs(1);
+        let done = issued + slow;
+        assert_eq!(window.observe(issued, slow, 8, done), Some(1));
+        let issued = done + Duration::from_secs(1);
+        assert_eq!(window.observe(issued, slow, 8, issued + slow), None);
+        assert_eq!(window.limit(8), 1);
     }
 }

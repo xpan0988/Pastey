@@ -1047,6 +1047,20 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         chunk_protocol,
     );
 
+    // Across the internet the link's rate is unknown: start with few chunks
+    // in flight and follow what the link shows. A diagnostic override is
+    // used exactly as set.
+    let tunnel_window = (crate::connectivity::is_tunnel_endpoint(
+        &state,
+        &endpoint.host,
+        endpoint.port,
+    ) && !matches!(
+        transfer_tuning.override_source,
+        transfer_tuning::TransferWindowOverrideSource::Env
+            | transfer_tuning::TransferWindowOverrideSource::DevSettings
+    ))
+    .then(|| transfer_tuning::TunnelWindow::new(Instant::now()));
+
     // The whole plaintext, hashed as it is read; the receiver checks it
     // before finalizing.
     let mut plaintext_hasher = blake3::Hasher::new();
@@ -1067,6 +1081,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             &cancel_token,
             transfer_tuning,
             runtime_window,
+            tunnel_window,
         )
         .await
         {
@@ -1531,6 +1546,7 @@ async fn send_binary_chunks_pipelined<R>(
     cancel_token: &CancellationToken,
     tuning: TransferTuning,
     runtime_window: Arc<AtomicUsize>,
+    mut tunnel_window: Option<transfer_tuning::TunnelWindow>,
 ) -> Result<u64, ChunkSendFailure>
 where
     R: AsyncRead + Unpin,
@@ -1545,7 +1561,10 @@ where
     let mut timing_summary = SenderTimingSummary::default();
 
     while !eof || !in_flight.is_empty() {
-        while !eof && in_flight.len() < current_runtime_window(&runtime_window) {
+        while !eof
+            && in_flight.len()
+                < in_flight_limit(current_runtime_window(&runtime_window), tunnel_window.as_ref())
+        {
             if cancel_token.is_cancelled() {
                 return Err(ChunkSendFailure {
                     message: TRANSFER_CANCELLED_MESSAGE.into(),
@@ -1650,6 +1669,21 @@ where
             continue;
         };
         let ack = result?;
+        if let Some(window) = tunnel_window.as_mut() {
+            let now = Instant::now();
+            let issued_at = now.checked_sub(send_elapsed).unwrap_or(now);
+            if let Some(limit) = window.observe(
+                issued_at,
+                send_elapsed,
+                current_runtime_window(&runtime_window),
+                now,
+            ) {
+                logging::write_transfer_line(&format!(
+                    "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=tunnel_window_changed in_flight_limit={limit} chunk_index={chunk_index} chunk_ms={}",
+                    send_elapsed.as_millis()
+                ));
+            }
+        }
         timing_summary.chunks += 1;
         timing_summary.read_ms += read_elapsed.as_millis();
         timing_summary.encrypt_ms += encrypt_elapsed.as_millis();
@@ -1699,6 +1733,15 @@ where
         timing_summary,
     );
     Ok(next_chunk_index)
+}
+
+/// Chunks that may be in flight: the configured window, lowered by what an
+/// internet tunnel's link shows.
+fn in_flight_limit(
+    configured_window: usize,
+    tunnel_window: Option<&transfer_tuning::TunnelWindow>,
+) -> usize {
+    tunnel_window.map_or(configured_window, |window| window.limit(configured_window))
 }
 
 fn current_runtime_window(runtime_window: &AtomicUsize) -> usize {

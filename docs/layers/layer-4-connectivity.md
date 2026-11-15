@@ -73,7 +73,7 @@ Unchanged from before the carrier. Joining by code may name the creator's addres
 - Physical evidence comes from one device pair on one pair of networks; relay-only operation is not yet recorded (see Status).
 - First pairing needs the LAN or an overlay.
 - A session that started over the carrier stays on it when both devices come back to one network (iroh then usually finds a direct local path); the LAN path is used again at the next reconnect.
-- Large transfers over a relay are slow and are not resumable; an interrupted transfer fails as on a LAN.
+- Large transfers over a relay are slow and are not resumable; an interrupted transfer fails as on a LAN. A transfer through a tunnel adapts its chunks in flight to the link ([Layer 1](layer-1-transfer.md)); below about 70 KiB/s it still fails, and a loaded slow relay path can still fail the liveness check ([investigation](../research/wan-reliability-throughput.md)).
 - Both sides symmetric NAT, or UDP blocked on one side: relay only. If the relay is unreachable too, the Bridge is not reachable across the internet.
 - Liveness checks run one after another: a stalled tunnel probe delays the other Bridges' checks by up to 5 s per round.
 - Windows Defender Firewall may ask about network access on first start of the carrier; the answer and the network profile matter.
