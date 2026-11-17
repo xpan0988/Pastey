@@ -85,6 +85,12 @@ pub(crate) fn kept_resumable_partials(state: &AppState) -> usize {
     resume::kept_count(state)
 }
 
+/// Tests: makes this Host's kept partials `by` older.
+#[cfg(test)]
+pub(crate) fn age_resumable_partials(state: &AppState, by: Duration) {
+    resume::age_all(state, by)
+}
+
 /// Deletes partial files kept for a resend past `resume::RESUMABLE_PARTIAL_TTL`.
 pub(crate) fn expire_resumable_partials(state: &AppState) {
     resume::expire(state);
@@ -8094,6 +8100,8 @@ mod join_authentication {
         receiver: HostFixture,
         sender: HostFixture,
         device: Joiner,
+        /// The device's pin of the receiving Host, for a reconnect.
+        receiver_pin: storage::BridgePeerPin,
     }
 
     const RESUME_NAME: &str = "payload.bin";
@@ -8120,12 +8128,42 @@ mod join_authentication {
                 identity: DeviceIdentity::generate_for_test(),
                 host_ref: sender.state.local_host_ref.as_str().to_string(),
             };
-            device.pair(&receiver, CODE).await.expect("pairs");
+            let (verified, _) = device.pair(&receiver, CODE).await.expect("pairs");
+            let receiver_pin = storage::BridgePeerPin {
+                peer_host_ref: verified.offer.host_ref.clone(),
+                peer_device_public_key: verified.device_public_key,
+            };
             Self {
                 receiver,
                 sender,
                 device,
+                receiver_pin,
             }
+        }
+
+        /// The device reconnects as after a restart: a new transport key,
+        /// the same device key, proven by the signed reconnect.
+        async fn reconnect_device(&mut self) {
+            let old = std::mem::replace(&mut self.device, Joiner::new("placeholder"));
+            let host_ref = crate::host_identity::HostRef::parse(old.host_ref.clone()).unwrap();
+            let restarted = Joiner {
+                secret: crypto::generate_transport_secret(),
+                identity: old.identity,
+                host_ref: old.host_ref,
+            };
+            let attempt = ReconnectAttempt::new(ROOM_ID, &host_ref, self.receiver_pin.clone());
+            let offer = bridge_auth::answer_reconnect_query(&self.receiver.state, &attempt.query())
+                .unwrap();
+            let offered = attempt
+                .verify_offer(&offer)
+                .expect("signed by the pinned Host");
+            let mut request = restarted.request();
+            let digest = attempt.authenticate_join(&restarted.identity, &offered, &mut request);
+            let response = self.receiver.post_join(&request).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response: JoinRoomResponse = response.json().await.unwrap();
+            attempt.verify_ack(&offered, &digest, &response).unwrap();
+            self.device = restarted;
         }
 
         fn inbox(&self) -> PathBuf {
@@ -8199,9 +8237,10 @@ mod join_authentication {
             .await
         }
 
-        /// A start request for `content`, as the sending device makes it.
+        /// A start request for `content`, as `device` makes it.
         fn start_request(
             &self,
+            device: &Joiner,
             transfer_id: &str,
             content: &[u8],
             payload_key: &[u8; 32],
@@ -8209,7 +8248,7 @@ mod join_authentication {
         ) -> FileTransferStartRequest {
             let receiver_key = crypto::decode_key(&self.receiver.server_public_key).unwrap();
             let (wrapped_session_key, transport_nonce, sender_public_key) =
-                crypto::wrap_session_for_receiver(payload_key, &self.device.secret, &receiver_key)
+                crypto::wrap_session_for_receiver(payload_key, &device.secret, &receiver_key)
                     .unwrap();
             FileTransferStartRequest {
                 transfer_id: transfer_id.into(),
@@ -8231,8 +8270,11 @@ mod join_authentication {
             }
         }
 
-        async fn start(
+        /// Starts a transfer of `content` by hand as `device`; returns the
+        /// start response's body.
+        async fn start_as(
             &self,
+            device: &Joiner,
             transfer_id: &str,
             content: &[u8],
             payload_key: &[u8; 32],
@@ -8240,7 +8282,7 @@ mod join_authentication {
         ) -> String {
             let response = reqwest::Client::new()
                 .post(format!("{}/transfers/start", self.receiver.base_url))
-                .json(&self.start_request(transfer_id, content, payload_key, resumable))
+                .json(&self.start_request(device, transfer_id, content, payload_key, resumable))
                 .send()
                 .await
                 .unwrap();
@@ -8248,24 +8290,60 @@ mod join_authentication {
             response.text().await.unwrap()
         }
 
-        /// Starts sending `content` by hand, delivers its first `chunks`
-        /// chunks, then ends it as an interrupted sender does
-        /// (`notify_transfer_interrupted`), or as a cancel when `cancel`.
-        async fn interrupted_after(&self, content: &[u8], chunks: u64, cancel: bool) {
-            let transfer_id = uuid::Uuid::new_v4().to_string();
-            let payload_key = crypto::generate_transport_secret();
-            self.start(&transfer_id, content, &payload_key, true).await;
+        async fn start(
+            &self,
+            transfer_id: &str,
+            content: &[u8],
+            payload_key: &[u8; 32],
+            resumable: bool,
+        ) -> String {
+            self.start_as(&self.device, transfer_id, content, payload_key, resumable)
+                .await
+        }
+
+        /// The chunk indexes a start response offered as held.
+        fn offered(
+            &self,
+            body: &str,
+            transfer_id: &str,
+            key: &[u8; 32],
+            content: &[u8],
+        ) -> Vec<u64> {
+            let total = chunk_count(content.len() as u64, DEFAULT_CHUNK_SIZE_BYTES as usize);
+            let response: FileTransferStartResponse = serde_json::from_str(body).unwrap();
+            let Some(offer) = response.resume else {
+                return Vec::new();
+            };
+            let held = resume::open_offer(key, transfer_id, total, &offer).expect("opens");
+            for (index, digest) in &held {
+                let start = (*index * DEFAULT_CHUNK_SIZE_BYTES) as usize;
+                let end = (start + DEFAULT_CHUNK_SIZE_BYTES as usize).min(content.len());
+                assert_eq!(digest, blake3::hash(&content[start..end]).as_bytes());
+            }
+            let mut indexes: Vec<u64> = held.into_keys().collect();
+            indexes.sort_unstable();
+            indexes
+        }
+
+        /// Sends the given chunks of `content` for a hand-started transfer.
+        async fn send_chunks(
+            &self,
+            transfer_id: &str,
+            content: &[u8],
+            payload_key: &[u8; 32],
+            indexes: &[u64],
+        ) {
             let client = reqwest::Client::new();
             let total = chunk_count(content.len() as u64, DEFAULT_CHUNK_SIZE_BYTES as usize);
-            for index in 0..chunks {
+            for &index in indexes {
                 let start = (index * DEFAULT_CHUNK_SIZE_BYTES) as usize;
                 let end = (start + DEFAULT_CHUNK_SIZE_BYTES as usize).min(content.len());
                 let plaintext = &content[start..end];
                 let (ciphertext, nonce) = crypto::encrypt_bytes_with_aad(
                     plaintext,
-                    &payload_key,
+                    payload_key,
                     &chunk_associated_data(
-                        &transfer_id,
+                        transfer_id,
                         index,
                         total,
                         plaintext.len() as u64,
@@ -8277,7 +8355,7 @@ mod join_authentication {
                     &client,
                     &self.receiver.base_url,
                     ROOM_ID,
-                    &transfer_id,
+                    transfer_id,
                     index,
                     total,
                     plaintext.len(),
@@ -8289,168 +8367,140 @@ mod join_authentication {
                 .await
                 .expect("chunk accepted");
             }
-            let signer = self.device.signer(&self.receiver);
+        }
+
+        /// Ends a hand-started transfer as an interrupted sender does
+        /// (`notify_transfer_interrupted`), or as a cancel when `cancel`.
+        async fn end(&self, device: &Joiner, transfer_id: &str, cancel: bool) {
+            let client = reqwest::Client::new();
+            let signer = device.signer(&self.receiver);
             if cancel {
-                notify_transfer_cancel(&client, &self.receiver.base_url, &signer, &transfer_id)
+                notify_transfer_cancel(&client, &self.receiver.base_url, &signer, transfer_id)
                     .await;
             } else {
                 notify_transfer_interrupted(
                     &client,
                     &self.receiver.base_url,
                     &signer,
-                    &transfer_id,
+                    transfer_id,
                     TRANSFER_INTERRUPTED_MESSAGE,
                 )
                 .await;
             }
         }
+
+        /// Starts sending `content` by hand, delivers its first `chunks`
+        /// chunks, then ends it as interrupted, or as a cancel when `cancel`.
+        async fn interrupted_after(&self, content: &[u8], chunks: u64, cancel: bool) {
+            let transfer_id = uuid::Uuid::new_v4().to_string();
+            let payload_key = crypto::generate_transport_secret();
+            self.start(&transfer_id, content, &payload_key, true).await;
+            let indexes: Vec<u64> = (0..chunks).collect();
+            self.send_chunks(&transfer_id, content, &payload_key, &indexes)
+                .await;
+            self.end(&self.device, &transfer_id, cancel).await;
+        }
+
+        /// A hand-started resend of `content`: its id, key and the chunks
+        /// the receiver offered as held.
+        async fn resend_by_hand(&self, content: &[u8]) -> (String, [u8; 32], Vec<u64>) {
+            let transfer_id = uuid::Uuid::new_v4().to_string();
+            let key = crypto::generate_transport_secret();
+            let body = self.start(&transfer_id, content, &key, true).await;
+            let held = self.offered(&body, &transfer_id, &key, content);
+            (transfer_id, key, held)
+        }
+
+        fn receiving(&self) -> Vec<String> {
+            self.receiver
+                .state
+                .active_file_transfers
+                .lock()
+                .keys()
+                .cloned()
+                .collect()
+        }
     }
 
-    /// An interrupted transfer keeps its partial; sending the same file again
-    /// completes it from there, intact, once, and leaves nothing behind.
+    /// A resumed transfer interrupted again keeps everything received in
+    /// both attempts (held chunks keep their recorded digests), even when the
+    /// second attempt adds nothing; the next resend completes it.
     #[tokio::test]
-    async fn an_interrupted_transfer_resumes_and_lands_once() {
-        let pair = ResumePair::new("resume").await;
-        let content = resume_content(1);
+    async fn a_resume_interrupted_again_keeps_all_it_has_and_completes() {
+        let pair = ResumePair::new("resume-again").await;
+        let content = resume_content(7);
         pair.interrupted_after(&content, 2, false).await;
+
+        let (second, key, held) = pair.resend_by_hand(&content).await;
+        assert_eq!(held, vec![0, 1]);
+        pair.send_chunks(&second, &content, &key, &[2]).await;
+        pair.end(&pair.device, &second, false).await;
+        assert_eq!(resume::kept_count(&pair.receiver.state), 1);
+
+        let (third, _, held) = pair.resend_by_hand(&content).await;
+        assert_eq!(held, vec![0, 1, 2], "both attempts' chunks are held");
+        pair.end(&pair.device, &third, false).await;
         assert_eq!(
             resume::kept_count(&pair.receiver.state),
             1,
-            "the partial is kept"
+            "kept with nothing new"
         );
         assert_eq!(pair.parts().len(), 1);
 
-        pair.send(&content).await.expect("the resend completes");
-        assert_eq!(pair.copies(&content), 1, "exactly one intact copy");
-        assert_eq!(resume::kept_count(&pair.receiver.state), 0, "adopted");
-        assert!(pair.parts().is_empty(), "no partial file left");
-    }
-
-    /// The sender skips the chunks the receiver holds when their digests
-    /// match what it reads; so a held chunk whose bytes were altered after
-    /// they were recorded is not sent again, and the whole-file digest
-    /// refuses the result: nothing is finalized and nothing is left.
-    #[tokio::test]
-    async fn held_chunks_are_skipped_and_still_checked_by_the_whole_file_digest() {
-        let pair = ResumePair::new("resume-tampered").await;
-        let content = resume_content(2);
-        pair.interrupted_after(&content, 2, false).await;
-        let part = pair.parts().pop().expect("a kept partial");
-        let mut bytes = std::fs::read(&part).unwrap();
-        bytes[..64].fill(0);
-        std::fs::write(&part, &bytes).unwrap();
-
-        assert!(
-            pair.send(&content).await.is_err(),
-            "the digest check refuses it"
-        );
-        assert_eq!(pair.copies(&content), 0);
-        assert!(files_under(&pair.inbox())
-            .iter()
-            .all(|file| file.len() != content.len()));
-        assert!(pair.parts().is_empty(), "no partial file left");
+        pair.send(&content)
+            .await
+            .expect("the last resend completes");
+        assert_eq!(pair.copies(&content), 1);
         assert_eq!(resume::kept_count(&pair.receiver.state), 0);
-    }
-
-    /// Another file with the same name and size: no held chunk matches, so
-    /// every chunk is sent and overwrites what was held.
-    #[tokio::test]
-    async fn a_different_file_with_the_same_name_and_size_is_sent_whole() {
-        let pair = ResumePair::new("resume-other").await;
-        let first = resume_content(3);
-        let second = resume_content(4);
-        assert_eq!(first.len(), second.len());
-        pair.interrupted_after(&first, 3, false).await;
-        pair.send(&second).await.expect("completes");
-        assert_eq!(pair.copies(&second), 1);
-        assert_eq!(pair.copies(&first), 0);
         assert!(pair.parts().is_empty());
     }
 
-    /// The offer reaches only the sender: sealed under the new transfer's
-    /// session key and bound to its id, with no digest in the clear. A
-    /// sender that does not resume gets none, and the partial stays kept.
+    /// A cancel during a resumed transfer deletes the adopted partial; so
+    /// does a Burn. Neither is kept for another resend.
     #[tokio::test]
-    async fn the_resume_offer_is_sealed_and_only_for_a_resuming_sender() {
-        let pair = ResumePair::new("resume-offer").await;
-        let content = resume_content(5);
+    async fn cancel_and_burn_during_a_resume_delete_the_partial() {
+        let pair = ResumePair::new("resume-cancel-during").await;
+        let content = resume_content(8);
         pair.interrupted_after(&content, 2, false).await;
-        let chunk_digest = |index: usize| {
-            let start = index * DEFAULT_CHUNK_SIZE_BYTES as usize;
-            *blake3::hash(&content[start..start + DEFAULT_CHUNK_SIZE_BYTES as usize]).as_bytes()
-        };
-
-        let key = crypto::generate_transport_secret();
-        let plain = pair.start("old-sender", &content, &key, false).await;
-        let plain: serde_json::Value = serde_json::from_str(&plain).unwrap();
-        assert!(plain.get("resume").is_none(), "no offer without resume");
-        assert_eq!(resume::kept_count(&pair.receiver.state), 1, "still kept");
-
-        let key = crypto::generate_transport_secret();
-        let body = pair.start("new-sender", &content, &key, true).await;
-        assert!(
-            !body.contains(&hex::encode(chunk_digest(0))),
-            "no digest in the clear"
-        );
-        let response: FileTransferStartResponse = serde_json::from_str(&body).unwrap();
-        let offer = response.resume.expect("an offer");
-        let total = chunk_count(content.len() as u64, DEFAULT_CHUNK_SIZE_BYTES as usize);
-        let held = resume::open_offer(&key, "new-sender", total, &offer).expect("opens");
-        assert_eq!(held.len(), 2);
-        assert_eq!(held[&0], chunk_digest(0));
-        assert_eq!(held[&1], chunk_digest(1));
-        assert!(resume::open_offer(&key, "another-transfer", total, &offer).is_none());
-        let other_key = crypto::generate_transport_secret();
-        assert!(resume::open_offer(&other_key, "new-sender", total, &offer).is_none());
-        assert_eq!(resume::kept_count(&pair.receiver.state), 0, "adopted once");
-    }
-
-    /// Cancel, Burn and time each delete a partial; a session lost under a
-    /// receiver keeps it.
-    #[tokio::test]
-    async fn cancel_burn_and_time_delete_a_kept_partial() {
-        let pair = ResumePair::new("resume-cancel").await;
-        let content = resume_content(6);
-        pair.interrupted_after(&content, 1, true).await;
+        let (resend, key, held) = pair.resend_by_hand(&content).await;
+        assert_eq!(held, vec![0, 1]);
+        pair.send_chunks(&resend, &content, &key, &[2]).await;
+        pair.end(&pair.device, &resend, true).await;
         assert_eq!(
             resume::kept_count(&pair.receiver.state),
             0,
             "a cancel keeps nothing"
         );
         assert!(pair.parts().is_empty());
+        assert!(pair.receiving().is_empty());
 
-        pair.interrupted_after(&content, 1, false).await;
-        assert_eq!(pair.parts().len(), 1);
-        resume::age_all(&pair.receiver.state, resume::RESUMABLE_PARTIAL_TTL);
-        expire_resumable_partials(&pair.receiver.state);
-        assert_eq!(resume::kept_count(&pair.receiver.state), 0, "expired");
-        assert!(pair.parts().is_empty());
-
-        // The session ends under a receiving transfer: kept.
-        let transfer_id = uuid::Uuid::new_v4().to_string();
-        let key = crypto::generate_transport_secret();
-        pair.start(&transfer_id, &content, &key, true).await;
-        let (ciphertext, nonce) = crypto::encrypt_bytes_with_aad(
-            &content[..DEFAULT_CHUNK_SIZE_BYTES as usize],
-            &key,
-            &chunk_associated_data(&transfer_id, 0, 5, DEFAULT_CHUNK_SIZE_BYTES, false),
-        )
-        .unwrap();
-        send_chunk_with_retry(
-            &reqwest::Client::new(),
-            &pair.receiver.base_url,
-            ROOM_ID,
-            &transfer_id,
+        pair.interrupted_after(&content, 2, false).await;
+        let (resend, key, held) = pair.resend_by_hand(&content).await;
+        assert_eq!(held, vec![0, 1]);
+        pair.send_chunks(&resend, &content, &key, &[2]).await;
+        crate::commands::burn_bridge_scope(pair.receiver.state.clone(), ROOM_ID, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            resume::kept_count(&pair.receiver.state),
             0,
-            5,
-            DEFAULT_CHUNK_SIZE_BYTES as usize,
-            &nonce,
-            &ciphertext,
-            &CancellationToken::new(),
-            ChunkProtocol::BinaryV1,
-        )
-        .await
-        .unwrap();
+            "Burn keeps nothing"
+        );
+        assert!(pair.parts().is_empty());
+        assert!(pair.receiving().is_empty());
+        assert_eq!(pair.copies(&content), 0);
+    }
+
+    /// The session ends under a resumed transfer: its partial, with what both
+    /// attempts delivered, is kept, and the next resend completes it.
+    #[tokio::test]
+    async fn session_loss_during_a_resume_keeps_the_partial() {
+        let pair = ResumePair::new("resume-session-lost").await;
+        let content = resume_content(9);
+        pair.interrupted_after(&content, 1, false).await;
+        let (resend, key, held) = pair.resend_by_hand(&content).await;
+        assert_eq!(held, vec![0]);
+        pair.send_chunks(&resend, &content, &key, &[1, 2]).await;
         cancel_room_transfers(
             pair.receiver.state.clone(),
             ROOM_ID,
@@ -8460,22 +8510,105 @@ mod join_authentication {
         )
         .await
         .unwrap();
-        assert_eq!(
-            resume::kept_count(&pair.receiver.state),
-            1,
-            "kept on session loss"
-        );
+        assert_eq!(resume::kept_count(&pair.receiver.state), 1);
+        assert!(pair.receiving().is_empty());
 
-        crate::commands::burn_bridge_scope(pair.receiver.state.clone(), ROOM_ID, true)
-            .await
+        let (probe, _, held) = pair.resend_by_hand(&content).await;
+        assert_eq!(held, vec![0, 1, 2]);
+        pair.end(&pair.device, &probe, false).await;
+        pair.send(&content).await.expect("completes");
+        assert_eq!(pair.copies(&content), 1);
+        assert!(pair.parts().is_empty());
+    }
+
+    /// An expired partial is gone: the resend is offered nothing and sends
+    /// the whole file.
+    #[tokio::test]
+    async fn after_expiry_a_resend_sends_the_whole_file() {
+        let pair = ResumePair::new("resume-expired").await;
+        let content = resume_content(10);
+        pair.interrupted_after(&content, 3, false).await;
+        resume::age_all(&pair.receiver.state, resume::RESUMABLE_PARTIAL_TTL);
+        expire_resumable_partials(&pair.receiver.state);
+        assert!(pair.parts().is_empty());
+        let (probe, _, held) = pair.resend_by_hand(&content).await;
+        assert!(held.is_empty(), "nothing offered after expiry");
+        pair.end(&pair.device, &probe, true).await;
+        pair.send(&content).await.expect("completes");
+        assert_eq!(pair.copies(&content), 1);
+        assert!(pair.parts().is_empty());
+    }
+
+    /// A file of the same name but another size is not the kept one: it is
+    /// sent whole, and the kept partial stays until it expires.
+    #[tokio::test]
+    async fn a_same_name_file_of_another_size_does_not_adopt() {
+        let pair = ResumePair::new("resume-other-size").await;
+        let first = resume_content(11);
+        let mut second = resume_content(12);
+        second.extend_from_slice(b"longer");
+        pair.interrupted_after(&first, 2, false).await;
+        pair.send(&second).await.expect("completes");
+        assert_eq!(pair.copies(&second), 1);
+        assert_eq!(resume::kept_count(&pair.receiver.state), 1, "not adopted");
+        resume::age_all(&pair.receiver.state, resume::RESUMABLE_PARTIAL_TTL);
+        expire_resumable_partials(&pair.receiver.state);
+        assert_eq!(resume::kept_count(&pair.receiver.state), 0);
+        assert!(pair.parts().is_empty());
+    }
+
+    /// A receiver still waiting on an earlier session's sender (it started
+    /// under the device's previous transport key) can never finish; the same
+    /// device's resend after a reconnect takes it over.
+    #[tokio::test]
+    async fn a_resend_after_a_reconnect_takes_over_an_abandoned_receiver() {
+        let mut pair = ResumePair::new("resume-takeover").await;
+        let content = resume_content(13);
+        let first = uuid::Uuid::new_v4().to_string();
+        let key = crypto::generate_transport_secret();
+        pair.start(&first, &content, &key, true).await;
+        pair.send_chunks(&first, &content, &key, &[0, 1]).await;
+        assert_eq!(pair.receiving(), vec![first.clone()]);
+
+        pair.reconnect_device().await;
+        let (resend, _, held) = pair.resend_by_hand(&content).await;
+        assert_eq!(held, vec![0, 1]);
+        assert_eq!(pair.receiving(), vec![resend], "the old receiver is gone");
+        assert_eq!(pair.parts().len(), 1, "one partial, now the resend's");
+    }
+
+    /// A different device paired afresh under the same HostRef inherits
+    /// nothing: fresh trust deletes the earlier device's partial at once
+    /// (`establish_fresh_peer_trust`), and the newcomer is offered nothing.
+    #[tokio::test]
+    async fn a_freshly_paired_device_inherits_no_partial() {
+        let pair = ResumePair::new("resume-new-device").await;
+        let content = resume_content(14);
+        pair.interrupted_after(&content, 2, false).await;
+        assert_eq!(resume::kept_count(&pair.receiver.state), 1);
+        storage::open_pairing_window(&pair.receiver.state.paths, ROOM_ID, storage::now_ts() + 600)
             .unwrap();
+        let newcomer = Joiner {
+            secret: crypto::generate_transport_secret(),
+            identity: DeviceIdentity::generate_for_test(),
+            host_ref: pair.device.host_ref.clone(),
+        };
+        newcomer
+            .pair(&pair.receiver, CODE)
+            .await
+            .expect("pairs as new trust");
         assert_eq!(
             resume::kept_count(&pair.receiver.state),
             0,
-            "Burn deletes it"
+            "fresh trust deletes it"
         );
         assert!(pair.parts().is_empty());
-        drop(pair.sender);
+        let resend = uuid::Uuid::new_v4().to_string();
+        let key = crypto::generate_transport_secret();
+        let body = pair
+            .start_as(&newcomer, &resend, &content, &key, true)
+            .await;
+        assert!(pair.offered(&body, &resend, &key, &content).is_empty());
     }
 
     fn host_device_key(host: &HostFixture) -> [u8; 32] {

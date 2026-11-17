@@ -558,8 +558,13 @@ struct Payload {
 
 /// A file of incompressible bytes on the Mac.
 fn payload(pair: &ShapedPair, name: &str, mib: u64) -> Payload {
+    payload_seeded(pair, name, mib, 0)
+}
+
+/// The same, with other bytes for another `seed`, written to the same path.
+fn payload_seeded(pair: &ShapedPair, name: &str, mib: u64, seed: u64) -> Payload {
     let len = mib * 1_048_576;
-    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ len;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64 ^ len ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D);
     let mut bytes = Vec::with_capacity(len as usize);
     while (bytes.len() as u64) < len {
         state ^= state << 13;
@@ -858,80 +863,289 @@ async fn wan_long_outage_fails_cleanly_and_the_bridge_reconnects() {
 // Step 4: an interrupted transfer, sent again, resumes.
 // ---------------------------------------------------------------------------
 
-/// A transfer on a 1 MiB/s relay path is cut by a 45 s outage that ends both
-/// sessions. Once the Bridge reconnects, the same file is sent again: the
-/// receiver adopts what it kept, the sender sends only the rest, and the
-/// file lands intact and once.
+/// While alive, the pair reconnects through its tunnel, as two Hosts on two
+/// networks do: the LAN broadcast finds nothing. Without it, two Hosts on one
+/// machine reconnect over the LAN and a resend skips the emulated path.
+struct TunnelOnlyReconnect;
+
+impl TunnelOnlyReconnect {
+    fn on() -> Self {
+        crate::discovery::LAN_RECONNECT_OFF.store(true, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for TunnelOnlyReconnect {
+    fn drop(&mut self) {
+        crate::discovery::LAN_RECONNECT_OFF.store(false, Ordering::SeqCst);
+    }
+}
+
+const RESUME_MIB: u64 = 24;
+const RESUME_OUTAGE_S: f64 = 45.0;
+
+fn resume_spec() -> NetSpec {
+    spec(PathMode::Relay, 150, Some(1024), 0.0)
+}
+
+impl ShapedPair {
+    /// Waits for the network to return at `network_back` and for the Bridge
+    /// to reconnect; the seconds that took, if within two minutes.
+    async fn reconnected_after(&self, network_back: f64) -> Option<f64> {
+        while self.secs() < network_back {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        while self.secs() < network_back + 120.0 {
+            if self.connected_both_ways() && self.mac_endpoint_for_windows().is_some() {
+                return Some(self.secs() - network_back);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        None
+    }
+
+    fn resend_through_tunnel(&self) -> bool {
+        self.mac_endpoint_for_windows().is_some_and(|endpoint| {
+            is_tunnel_endpoint(&self.pair.mac.runtime, &endpoint.host, endpoint.port)
+        })
+    }
+
+    /// Sends `file`, cuts the network `after` seconds in for
+    /// `RESUME_OUTAGE_S`, and waits for the reconnect: the interrupted
+    /// attempt's report.
+    async fn interrupted_send(&self, scenario: &str, file: &Payload, after: f64) -> Report {
+        let sending = self.send(file);
+        let outage_at = self.secs() + after;
+        self.outage(after, RESUME_OUTAGE_S);
+        let report = self
+            .report(
+                scenario,
+                file,
+                sending,
+                json!({"outage_after_s": after, "outage_s": RESUME_OUTAGE_S}),
+            )
+            .await;
+        report.assert_interrupted_keeping_at_most_a_resumable_partial();
+        let reconnected = self.reconnected_after(outage_at + RESUME_OUTAGE_S).await;
+        assert!(reconnected.is_some(), "the Bridge reconnects");
+        assert!(self.resend_through_tunnel(), "through the tunnel");
+        report
+    }
+
+    /// Sends `file` to completion or failure and returns its report with the
+    /// bytes the emulated path carried meanwhile.
+    async fn send_measured(&self, scenario: &str, file: &Payload) -> (Report, u64) {
+        let before = self.net.shape.carried_bytes();
+        let sending = self.send(file);
+        let report = self.report(scenario, file, sending, json!({})).await;
+        let carried = self.net.shape.carried_bytes() - before;
+        self.note_carried(scenario, file, carried);
+        (report, carried)
+    }
+
+    fn note_carried(&self, scenario: &str, file: &Payload, carried: u64) {
+        println!(
+            "WAN_PAIR {}",
+            json!({
+                "schema": "pastey-wan-pair-v1",
+                "scenario": format!("{scenario}_wire"),
+                "build": option_env!("WAN_PAIR_BUILD").unwrap_or("working-tree"),
+                "file_mib": round(file.len as f64 / 1_048_576.0),
+                "carried_mib": round(carried as f64 / 1_048_576.0),
+            })
+        );
+    }
+
+    fn windows_kept(&self) -> usize {
+        crate::transfer::kept_resumable_partials(&self.pair.windows.runtime)
+    }
+}
+
+const MIB: f64 = 1_048_576.0;
+
+/// A transfer cut by an outage that ends both sessions; after the reconnect
+/// (through the tunnel) the same file is sent again: the receiver adopts
+/// what it kept and only the rest crosses the path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "long: emulated outage and resend"]
 async fn wan_a_resend_after_a_long_outage_resumes() {
-    let pair = ShapedPair::new(spec(PathMode::Relay, 150, Some(1024), 0.0)).await;
-    let file = payload(&pair, "resume", 24);
-    let sending = pair.send(&file);
-    let outage_at = pair.secs() + 12.0;
-    pair.outage(12.0, 45.0);
-    let first = pair
-        .report(
-            "resume_first_attempt_relay_1mib_24mib",
-            &file,
-            sending,
-            json!({"outage_at_s": 12.0, "outage_s": 45.0}),
-        )
-        .await;
-    first.assert_interrupted_keeping_at_most_a_resumable_partial();
+    let _tunnel = TunnelOnlyReconnect::on();
+    let pair = ShapedPair::new(resume_spec()).await;
+    let file = payload(&pair, "resume", RESUME_MIB);
+    let first = pair.interrupted_send("resume_first", &file, 12.0).await;
     assert_eq!(first.kept, 1, "the receiver kept what arrived");
+    assert!(first.receiver_received > 0);
 
-    let network_back = outage_at + 45.0;
-    while pair.secs() < network_back {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    while pair.secs() < network_back + 120.0 {
-        if pair.connected_both_ways() && pair.mac_endpoint_for_windows().is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    // On one machine the reconnect's LAN answer wins (as it should), so the
-    // resend may not cross the emulated path; record which it took.
-    let through_tunnel = pair.mac_endpoint_for_windows().is_some_and(|endpoint| {
-        is_tunnel_endpoint(&pair.pair.mac.runtime, &endpoint.host, endpoint.port)
-    });
-    let carried_before = pair.net.shape.carried_bytes();
-    let sending = pair.send(&file);
-    let second = pair
-        .report(
-            "resume_resend_relay_1mib_24mib",
-            &file,
-            sending,
-            json!({"kept_before_resend": first.kept}),
-        )
-        .await;
-    let carried = pair.net.shape.carried_bytes() - carried_before;
-    println!(
-        "WAN_PAIR {}",
-        json!({
-            "schema": "pastey-wan-pair-v1",
-            "scenario": "resume_resend_wire",
-            "build": option_env!("WAN_PAIR_BUILD").unwrap_or("working-tree"),
-            "file_mib": round(file.len as f64 / 1_048_576.0),
-            "resend_through_tunnel": through_tunnel,
-            "carried_mib_during_resend": round(carried as f64 / 1_048_576.0),
-            "first_attempt_received_mib": round(first.receiver_received as f64 / 1_048_576.0),
-        })
-    );
+    let (second, carried) = pair.send_measured("resume_resend", &file).await;
     second.assert_delivered_once();
-    assert_eq!(second.kept, 0, "the kept partial was adopted");
+    assert_eq!(second.kept, 0, "adopted");
     assert_eq!(
         second.receiver_first_event_bytes,
-        Some(first.receiver_received),
-        "the resend started from exactly what was kept"
+        Some(first.receiver_received)
     );
-    if through_tunnel {
-        assert!(
-            (carried as f64) < (file.len - first.receiver_received) as f64 * 1.1 + 1_048_576.0,
-            "the resend carried only what was missing: {carried} bytes"
-        );
-    }
+    let missing = (file.len - first.receiver_received) as f64;
+    assert!(
+        (carried as f64) < missing * 1.1 + MIB,
+        "only the missing part crossed: {carried} of {} bytes",
+        file.len
+    );
+}
+
+/// The resend is cut too; the third send completes from everything both
+/// earlier attempts delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: emulated outages and resends"]
+async fn wan_a_resume_interrupted_again_completes() {
+    let _tunnel = TunnelOnlyReconnect::on();
+    let pair = ShapedPair::new(resume_spec()).await;
+    let file = payload(&pair, "resume-again", RESUME_MIB);
+    let carried_from = pair.net.shape.carried_bytes();
+    // At 1 MiB/s the first two chunks take about 8-10 s; each cut comes
+    // after at least one has arrived, so there is something to keep.
+    let first = pair
+        .interrupted_send("resume_again_first", &file, 14.0)
+        .await;
+    assert_eq!(first.kept, 1);
+    let second = pair
+        .interrupted_send("resume_again_second", &file, 14.0)
+        .await;
+    assert_eq!(second.kept, 1, "kept again");
+    assert!(
+        second.receiver_received > first.receiver_received,
+        "the second attempt added to the partial"
+    );
+    let (third, carried) = pair.send_measured("resume_again_third", &file).await;
+    third.assert_delivered_once();
+    assert_eq!(
+        third.receiver_first_event_bytes,
+        Some(second.receiver_received)
+    );
+    assert!((carried as f64) < (file.len - second.receiver_received) as f64 * 1.1 + MIB);
+    let total = pair.net.shape.carried_bytes() - carried_from;
+    pair.note_carried("resume_again_all_attempts", &file, total);
+    assert!(
+        (total as f64) < file.len as f64 * 1.5,
+        "three attempts carried about one file plus the chunks cut mid-way: {total}"
+    );
+}
+
+/// The user cancels the resend: the receiver deletes the partial it had
+/// adopted, and the next send carries the whole file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: emulated outage and resend"]
+async fn wan_cancel_during_a_resume_deletes_the_partial() {
+    let _tunnel = TunnelOnlyReconnect::on();
+    let pair = ShapedPair::new(resume_spec()).await;
+    let file = payload(&pair, "resume-cancel", RESUME_MIB);
+    pair.interrupted_send("resume_cancel_first", &file, 12.0)
+        .await;
+    let sending = pair.send(&file);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let item_id = sending.item_id.clone();
+    assert!(
+        crate::transfer::cancel_transfer(
+            pair.pair.mac.runtime.clone(),
+            &item_id,
+            Some("user".into())
+        )
+        .await
+        .unwrap(),
+        "the resend was still running"
+    );
+    let cancelled = pair
+        .report("resume_cancel_cancelled", &file, sending, json!({}))
+        .await;
+    cancelled.assert_failed_without_residue();
+    assert_eq!(cancelled.kept, 0, "a cancel keeps nothing");
+
+    let (whole, carried) = pair.send_measured("resume_cancel_whole", &file).await;
+    whole.assert_delivered_once();
+    assert_eq!(whole.receiver_first_event_bytes, Some(0), "nothing held");
+    assert!(
+        (carried as f64) > file.len as f64 * 0.95,
+        "the whole file crossed"
+    );
+}
+
+/// The receiver Burns during the resend: nothing of the transfer is left,
+/// kept or otherwise, and the carrier pin goes with the Bridge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: emulated outage and resend"]
+async fn wan_burn_during_a_resume_leaves_nothing() {
+    let _tunnel = TunnelOnlyReconnect::on();
+    let pair = ShapedPair::new(resume_spec()).await;
+    let file = payload(&pair, "resume-burn", RESUME_MIB);
+    pair.interrupted_send("resume_burn_first", &file, 12.0)
+        .await;
+    let sending = pair.send(&file);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    crate::commands::burn_bridge_scope(pair.pair.windows.runtime.clone(), ROOM, true)
+        .await
+        .unwrap();
+    let burned = pair
+        .report("resume_burn_burned", &file, sending, json!({}))
+        .await;
+    burned.assert_failed_without_residue();
+    assert_eq!(burned.kept, 0);
+    assert!(
+        storage::bridge_carrier_pin(&pair.pair.windows.runtime.paths, ROOM)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// The kept partial expires before the resend: it is gone, and the resend
+/// carries the whole file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: emulated outage and resend"]
+async fn wan_after_expiry_the_resend_is_whole() {
+    let _tunnel = TunnelOnlyReconnect::on();
+    let pair = ShapedPair::new(resume_spec()).await;
+    let file = payload(&pair, "resume-expiry", RESUME_MIB);
+    let first = pair
+        .interrupted_send("resume_expiry_first", &file, 12.0)
+        .await;
+    assert_eq!(first.kept, 1);
+    crate::transfer::age_resumable_partials(
+        &pair.pair.windows.runtime,
+        Duration::from_secs(31 * 60),
+    );
+    crate::transfer::expire_resumable_partials(&pair.pair.windows.runtime);
+    assert_eq!(pair.windows_kept(), 0);
+    assert_eq!(part_files(&pair.pair.root.join(pair.pair.windows.name)), 0);
+    let (whole, carried) = pair.send_measured("resume_expiry_whole", &file).await;
+    whole.assert_delivered_once();
+    assert_eq!(whole.receiver_first_event_bytes, Some(0));
+    assert!((carried as f64) > file.len as f64 * 0.95);
+}
+
+/// A different file with the same name and size is sent after the
+/// interruption: the receiver adopts the partial, but no held chunk matches,
+/// so the whole file crosses and the new file lands, not the old.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: emulated outage and resend"]
+async fn wan_a_same_name_replacement_is_sent_whole() {
+    let _tunnel = TunnelOnlyReconnect::on();
+    let pair = ShapedPair::new(resume_spec()).await;
+    let old = payload(&pair, "resume-replace", RESUME_MIB);
+    let first = pair
+        .interrupted_send("resume_replace_first", &old, 12.0)
+        .await;
+    assert_eq!(first.kept, 1);
+    let new = payload_seeded(&pair, "resume-replace", RESUME_MIB, 7);
+    assert_eq!(new.path, old.path);
+    assert_ne!(new.sha256, old.sha256);
+    let (replaced, carried) = pair.send_measured("resume_replace_new", &new).await;
+    replaced.assert_delivered_once();
+    assert_eq!(
+        copies_of(&pair.pair.root.join(pair.pair.windows.name), &old),
+        0
+    );
+    assert_eq!(replaced.kept, 0);
+    assert!(
+        (carried as f64) > new.len as f64 * 0.95,
+        "every chunk crossed"
+    );
 }
 
 // ---------------------------------------------------------------------------

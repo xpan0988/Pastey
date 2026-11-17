@@ -700,10 +700,23 @@ pub(crate) async fn discover_pairing(
 
 /// Finds a pinned Bridge's peer again. Only an offer signed by the pinned
 /// device key for this attempt's nonce is returned.
+/// Tests: while set, a reconnect's LAN broadcast finds nothing, as between
+/// two networks, so two Hosts on one machine reconnect through their
+/// internet tunnel (`connectivity::wan_pair_tests`).
+#[cfg(test)]
+pub(crate) static LAN_RECONNECT_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) async fn discover_reconnect(
     attempt: &bridge_auth::ReconnectAttempt,
     targets: &DiscoveryTargets,
 ) -> AppResult<(SocketAddr, bridge_auth::VerifiedReconnectOffer)> {
+    #[cfg(test)]
+    if matches!(targets, DiscoveryTargets::Lan)
+        && LAN_RECONNECT_OFF.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(AppError::Network("No LAN in this test.".into()));
+    }
     let payload = serde_json::to_vec(&attempt.query())?;
     exchange(targets, &payload, |bytes| {
         serde_json::from_slice::<bridge_auth::ReconnectOffer>(bytes)

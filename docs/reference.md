@@ -387,7 +387,7 @@ Design: [Transfer](layers/layer-1-transfer.md). Source: `src-tauri/src/transfer/
 | Wire | Start request `resumable: true` (ordinary transfers only; omitted otherwise). Start response `resume: { nonce, ciphertext }` when a kept partial was adopted. Signed cancel body `keep_partial: true` marks an interruption |
 | Offer | ChaCha20-Poly1305 under the transfer's session key, associated data `pastey-transfer-resume-offer-v1\n<transferId>`; plaintext `{ held: [{ index, blake3 }] }`, hex BLAKE3 of each held chunk's plaintext |
 | Kept | On `peer_disconnected` (session ended) or `keep_partial`, if at least one chunk arrived and the Bridge is not burned. At most 16 per Host, 30 min, in memory only; Burn and room expiry delete them |
-| Match | Bridge, sending device (its HostRef, else its transport key), display name, size, chunk size |
+| Match | Bridge, sending device (the device key the Bridge is pinned to, else its transport key), display name, size, chunk size. Fresh trust (pairing another device), forgetting the device and the peer leaving delete kept partials (`purge_bridge_runtime_authority`) |
 
 ## Internet carrier facts
 

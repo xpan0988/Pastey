@@ -3,8 +3,8 @@
 //! When a transfer is *interrupted* (its session dropped, or the sender
 //! reports a timeout, a departed or unreachable peer), the receiver keeps its
 //! partial file for a while instead of deleting it. A later transfer of a file
-//! with the same name, size and chunk size, from the same peer device on the
-//! same Bridge, adopts it: the receiver answers the start with each held
+//! with the same name, size and chunk size, from the same pinned peer device
+//! on the same Bridge, adopts it: the receiver answers the start with each held
 //! chunk's BLAKE3 digest, sealed under the new transfer's session key, and the
 //! sender skips the chunks whose digest matches what it reads now. A held
 //! chunk the sender sends anyway is overwritten. The whole-file digest at
@@ -41,8 +41,7 @@ const OFFER_AAD_PREFIX: &[u8] = b"pastey-transfer-resume-offer-v1\n";
 /// What a receiver of an ordinary transfer remembers for a later resume.
 #[derive(Clone, Debug)]
 pub(crate) struct ReceiverResumeState {
-    /// The sending device on this Bridge: its HostRef, or its transport key
-    /// when the Bridge has none on record.
+    /// The sending device on this Bridge (`peer_identity`).
     pub(crate) peer: String,
     /// The sender transport key the transfer started under.
     pub(crate) sender_key: String,
@@ -179,19 +178,16 @@ pub(crate) fn open_offer(
     Some(held)
 }
 
-/// Who sent a transfer on this Bridge, stable across reconnects: the peer's
-/// HostRef where the Bridge records it, otherwise its transport key.
+/// Who sent a transfer on this Bridge: the device key the Bridge is pinned
+/// to, which a reconnect proves again and only a fresh pairing replaces (a
+/// new device inherits nothing, its partials included). A Bridge without a
+/// pin falls back to the sender's transport key, so resume then works only
+/// within one session.
 pub(crate) fn peer_identity(state: &AppState, room_id: &str, sender_key: &str) -> String {
-    storage::list_bridge_peer_endpoints(&state.paths, room_id)
-        .ok()
-        .and_then(|peers| {
-            peers
-                .into_iter()
-                .filter(|peer| peer.transport_public_key.as_deref() == Some(sender_key))
-                .find_map(|peer| peer.logical_host_ref)
-        })
-        .map(|host_ref| format!("host:{host_ref}"))
-        .unwrap_or_else(|| format!("key:{sender_key}"))
+    match storage::bridge_peer_pin(&state.paths, room_id) {
+        Ok(Some(pin)) => format!("device:{}", hex::encode(pin.peer_device_public_key)),
+        _ => format!("key:{sender_key}"),
+    }
 }
 
 fn delete_part(part_path: &PathBuf, why: &str) {

@@ -138,3 +138,24 @@ Builds: before = 2214d79 (neither step), step1 = 19621ac, step1+2 = 77607a9, ste
 | bbr3 | 0.01 | 4.26 | 3.76 |
 | cubic | 0.0 | 6.88 | 2.32 |
 | bbr3 | 0.0 | 7.18 | 2.23 |
+
+## Run 7-8: Step 4 matrix (2026-11-18), resume scenarios reconnect through the tunnel
+
+| scenario | done | s | kept | .part | copies | receiver held at start | carried MiB |
+|---|---|---|---|---|---|---|---|
+| resume_first | NO | 54.29 | 1 | 1 | 0 | 0 | – |
+| resume_resend | yes | 25.13 | 0 | 0 | 1 | 8388608 | 17.1 |
+| resume_replace_first | NO | 54.31 | 1 | 1 | 0 | 0 | – |
+| resume_replace_new | yes | 30.91 | 0 | 0 | 1 | 8388608 | 25.53 |
+| resume_expiry_first | NO | 54.31 | 1 | 1 | 0 | 0 | – |
+| resume_expiry_whole | yes | 30.77 | 0 | 0 | 1 | 0 | 25.54 |
+| resume_burn_first | NO | 41.99 | 1 | 1 | 0 | 0 | – |
+| resume_burn_burned | NO | 10.32 | 0 | 0 | 0 | 8388608 | – |
+| resume_cancel_first | NO | 54.29 | 1 | 1 | 0 | 0 | – |
+| resume_cancel_cancelled | NO | 4.2 | 0 | 0 | 0 | 8388608 | – |
+| resume_cancel_whole | yes | 37.77 | 0 | 0 | 1 | 0 | 32.18 |
+| resume_again_first | NO | 56.3 | 1 | 1 | 0 | 0 | – |
+| resume_again_second | NO | 46.05 | 1 | 1 | 0 | 8388608 | – |
+| resume_again_third | yes | 11.37 | 0 | 0 | 1 | 16777216 | 8.53 |
+
+Every other scenario in run 7 passed with the outcomes of the earlier runs.

@@ -344,7 +344,7 @@ What was built, against the sketch's open questions:
   - or the sender reports a timeout, a departed or an unreachable peer, with `keep_partial` in its signed cancel.
 
   It is never kept on a cancel by either user, a Burn, an expired room, an integrity or write failure or a digest mismatch, nor when nothing had arrived. Kept partials live in memory: at most 16 per Host, for 30 minutes, and Burn and room expiry delete them. A restart deletes them as before, since startup recovery removes every `.part` file.
-- **Binding.** A resend adopts a partial only on the same Bridge, from the same sending device: its HostRef as the Bridge records it, so a reconnect with new transport keys still matches. The file name, size and chunk size must also match. A receiver still waiting for an earlier session's sender (started under another transport key, so it can never finish) is taken over and ends as interrupted.
+- **Binding.** A resend adopts a partial only on the same Bridge, from the same sending device: the device key the Bridge is pinned to. A reconnect proves that key again, so it still matches. Only a fresh pairing replaces it, and fresh trust deletes kept partials, as forgetting the device and the peer leaving do. A first version used the peer's HostRef, which a different, freshly paired device can claim; a test caught it. The file name, size and chunk size must also match. A receiver still waiting for an earlier session's sender (started under another transport key, so it can never finish) is taken over and ends as interrupted.
 - **What crosses.** The receiver answers the start with each held chunk's BLAKE3 digest, sealed under the new transfer's session key and bound to its id. Only the sender that wrapped that key can read it, and on a LAN nothing about the file is visible. The sender still reads and hashes the whole file, skips each held chunk whose digest matches what it reads now, and sends the rest. A held chunk it sends anyway (the file changed) overwrites the old one. The whole-file digest at finish is unchanged, so a partial altered on disk is refused, never finalized.
 - **Nothing is resent by itself.** The user sends the file again. The carrier contract's "nothing is resent or rerun" holds.
 
@@ -360,7 +360,27 @@ Evidence:
 | Two Hosts, 1 MiB/s relay, a 45 s outage ends both sessions, then the same 24 MiB file sent again | 8 MiB (2 chunks) kept; on the resend the receiver adopted 2 chunks, the sender skipped 2, only chunks from index 2 on were received; one intact copy, no partial left |
 | All other shaped scenarios on this build | Same outcomes as before; the long-outage scenario's failed transfer now leaves at most the one partial kept for a resend |
 
-Not shown: the resend crossing the emulated path. On one machine the reconnect's LAN answer wins, so the resend went over the LAN. The chunk counts above show what it sent, but its time and byte counts say nothing about a real WAN. Not tried: two real networks, Windows, a restart between the attempts (which deletes the partial, by design), and resuming from a third device.
+Follow-up matrix (2026-11-18). A test-only switch (`discovery::LAN_RECONNECT_OFF`) makes the reconnect's LAN broadcast find nothing, as between two networks, so the pair reconnects through its tunnel and the resend crosses the emulated path. All on a 1 MiB/s relay with a 24 MiB file and 45 s outages that end both sessions:
+
+| Scenario | Result |
+| --- | --- |
+| Resend after one outage | 8 MiB kept; the resend carried 17.1 MiB (the 16 MiB missing, plus QUIC and relay overhead); one intact copy |
+| Interrupted again during the resend | Kept 8 MiB, then 16 MiB; the third send carried 8.5 MiB and completed. All three attempts together: 34.4 MiB |
+| The user cancels the resend | The adopted partial is deleted; the next send starts from nothing and carries the whole file |
+| The receiver Burns during the resend | Nothing kept, no partial file, carrier pin gone |
+| The partial expires before the resend | Deleted; the resend carries the whole file (25.5 MiB) |
+| Another file, same name and size | The partial is adopted but no chunk matches: the whole file crosses (25.5 MiB) and the new file lands, not the old |
+
+Unit tests added with it cover:
+- a resumed transfer interrupted again (both attempts' chunks held, also when the second added nothing);
+- Cancel and Burn during a resume;
+- session loss during a resume;
+- a resend after expiry;
+- a same-name file of another size (not adopted);
+- takeover of a receiver left by an earlier session, after the same device reconnects;
+- a freshly paired device inheriting nothing.
+
+The full Rust suite and the whole shaped matrix (19 scenarios) pass. One scenario first failed on its own timing: its cut came before any chunk had arrived, so there was nothing to keep. The cut was moved later and the assertions were left unchanged. Still not shown: a resend across a real network.
 
 ## Reproducing
 

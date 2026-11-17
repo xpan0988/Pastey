@@ -1142,7 +1142,23 @@ async fn a_burst_beyond_the_budget_is_refused_cleanly_and_recovers() {
     assert_eq!(refused(&windows, "native_agent", "rate_limited"), 0);
     // Every refusal came before Windows acted: one answer per accepted
     // query, and the Mac refused none of the answers to its own burst.
-    let mac = pair.diagnostics(&pair.mac);
+    // Windows answers off the request path (`room_control`: built and sent
+    // in a spawned task, with up to 5 s of delivery retries), and a check
+    // returns as soon as any answer fills the shared projection, so answers
+    // to the last accepted queries can still be on their way when every
+    // check has returned. Count once they have landed (bounded); a lost or
+    // extra answer still fails the comparison.
+    let settle_by = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let (mac, windows) = loop {
+        let windows = pair.diagnostics(&pair.windows);
+        let mac = pair.diagnostics(&pair.mac);
+        if accepted(&mac, "capability_answer") >= accepted(&windows, "capability_query")
+            || std::time::Instant::now() >= settle_by
+        {
+            break (mac, windows);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!(
         accepted(&mac, "capability_answer"),
         accepted(&windows, "capability_query"),
