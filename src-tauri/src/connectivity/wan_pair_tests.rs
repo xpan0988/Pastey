@@ -370,6 +370,7 @@ impl ShapedPair {
         let parts = part_files(&windows_root);
         let sender_active = mac.runtime.active_file_transfers.lock().len();
         let receiver_active = windows.runtime.active_file_transfers.lock().len();
+        let kept = crate::transfer::kept_resumable_partials(&windows.runtime);
         let invalidations = self.invalidations();
         let timeline = self.timeline.lock();
         let rtt_max = timeline.rtt.iter().map(|(_, rtt)| *rtt).fold(0.0, f64::max);
@@ -392,6 +393,8 @@ impl ShapedPair {
             "receiver_progress": receiver.json(),
             "intact_copies_on_receiver": copies,
             "part_files_on_receiver": parts,
+            "kept_for_resend_on_receiver": kept,
+            "transfer_id": item_id,
             "sender_active_transfers": sender_active,
             "receiver_active_transfers": receiver_active,
             "invalidations": invalidations.iter().map(|(at, host, state)| json!([round(*at), host, state])).collect::<Vec<_>>(),
@@ -409,6 +412,9 @@ impl ShapedPair {
             sender,
             copies,
             parts,
+            kept,
+            receiver_received: receiver.last_bytes,
+            receiver_first_event_bytes: receiver.first_event_bytes,
             sender_active,
             receiver_active,
             invalidations: invalidations.len(),
@@ -431,6 +437,12 @@ struct Report {
     sender: Progress,
     copies: usize,
     parts: usize,
+    /// Partials the receiver keeps for a resend (`transfer::resume`).
+    kept: usize,
+    /// The receiver's last reported received bytes.
+    receiver_received: u64,
+    /// The receiver's first reported bytes (what it held at the start).
+    receiver_first_event_bytes: Option<u64>,
     sender_active: usize,
     receiver_active: usize,
     invalidations: usize,
@@ -454,6 +466,20 @@ impl Report {
         assert_eq!(self.sender_active, 0, "no sender state left");
         assert_eq!(self.receiver_active, 0, "no receiver state left");
     }
+
+    /// Interrupted (not cancelled): as above, except that the receiver may
+    /// keep its partial file, and only as one partial kept for a resend.
+    fn assert_interrupted_keeping_at_most_a_resumable_partial(&self) {
+        assert!(!self.completed, "the transfer must not complete");
+        assert_eq!(self.copies, 0, "no copy on the receiver");
+        assert!(self.kept <= 1);
+        assert_eq!(
+            self.parts, self.kept,
+            "no partial file but one kept for a resend"
+        );
+        assert_eq!(self.sender_active, 0, "no sender state left");
+        assert_eq!(self.receiver_active, 0, "no receiver state left");
+    }
 }
 
 #[derive(Default)]
@@ -461,6 +487,8 @@ struct Progress {
     events: usize,
     /// Seconds from the transfer's start to the first progress above zero.
     first_bytes_s: Option<f64>,
+    /// Bytes in the first event: what a resumed receiver already holds.
+    first_event_bytes: Option<u64>,
     /// Longest stretch with no new bytes reported, from the start.
     longest_stall_s: f64,
     last_bytes: u64,
@@ -473,6 +501,7 @@ impl Progress {
         json!({
             "events": self.events,
             "first_bytes_s": self.first_bytes_s.map(round),
+            "first_event_bytes": self.first_event_bytes,
             "longest_stall_s": round(self.longest_stall_s),
             "last_bytes": self.last_bytes,
             "last_status": self.last_status,
@@ -497,6 +526,7 @@ fn progress(host: &PairHostV1, item_id: &str, origin: Instant, started_at: f64) 
             .and_then(|bytes| bytes.as_u64())
             .unwrap_or(0);
         progress.events += 1;
+        progress.first_event_bytes.get_or_insert(bytes);
         if bytes < progress.last_bytes {
             progress.monotonic = false;
         }
@@ -777,7 +807,7 @@ async fn wan_long_outage_fails_cleanly_and_the_bridge_reconnects() {
             json!({"outage_at_s": 8.0, "outage_s": 45.0}),
         )
         .await;
-    report.assert_failed_without_residue();
+    report.assert_interrupted_keeping_at_most_a_resumable_partial();
     assert!(report.invalidations > 0, "a 45 s silence invalidates");
 
     // Recovery: wait for the network, then for a reconnected session.
@@ -822,6 +852,86 @@ async fn wan_long_outage_fails_cleanly_and_the_bridge_reconnects() {
     );
     let after = after.expect("the Bridge reconnects within two minutes of the network");
     after.assert_delivered_once();
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: an interrupted transfer, sent again, resumes.
+// ---------------------------------------------------------------------------
+
+/// A transfer on a 1 MiB/s relay path is cut by a 45 s outage that ends both
+/// sessions. Once the Bridge reconnects, the same file is sent again: the
+/// receiver adopts what it kept, the sender sends only the rest, and the
+/// file lands intact and once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: emulated outage and resend"]
+async fn wan_a_resend_after_a_long_outage_resumes() {
+    let pair = ShapedPair::new(spec(PathMode::Relay, 150, Some(1024), 0.0)).await;
+    let file = payload(&pair, "resume", 24);
+    let sending = pair.send(&file);
+    let outage_at = pair.secs() + 12.0;
+    pair.outage(12.0, 45.0);
+    let first = pair
+        .report(
+            "resume_first_attempt_relay_1mib_24mib",
+            &file,
+            sending,
+            json!({"outage_at_s": 12.0, "outage_s": 45.0}),
+        )
+        .await;
+    first.assert_interrupted_keeping_at_most_a_resumable_partial();
+    assert_eq!(first.kept, 1, "the receiver kept what arrived");
+
+    let network_back = outage_at + 45.0;
+    while pair.secs() < network_back {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    while pair.secs() < network_back + 120.0 {
+        if pair.connected_both_ways() && pair.mac_endpoint_for_windows().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // On one machine the reconnect's LAN answer wins (as it should), so the
+    // resend may not cross the emulated path; record which it took.
+    let through_tunnel = pair.mac_endpoint_for_windows().is_some_and(|endpoint| {
+        is_tunnel_endpoint(&pair.pair.mac.runtime, &endpoint.host, endpoint.port)
+    });
+    let carried_before = pair.net.shape.carried_bytes();
+    let sending = pair.send(&file);
+    let second = pair
+        .report(
+            "resume_resend_relay_1mib_24mib",
+            &file,
+            sending,
+            json!({"kept_before_resend": first.kept}),
+        )
+        .await;
+    let carried = pair.net.shape.carried_bytes() - carried_before;
+    println!(
+        "WAN_PAIR {}",
+        json!({
+            "schema": "pastey-wan-pair-v1",
+            "scenario": "resume_resend_wire",
+            "build": option_env!("WAN_PAIR_BUILD").unwrap_or("working-tree"),
+            "file_mib": round(file.len as f64 / 1_048_576.0),
+            "resend_through_tunnel": through_tunnel,
+            "carried_mib_during_resend": round(carried as f64 / 1_048_576.0),
+            "first_attempt_received_mib": round(first.receiver_received as f64 / 1_048_576.0),
+        })
+    );
+    second.assert_delivered_once();
+    assert_eq!(second.kept, 0, "the kept partial was adopted");
+    assert_eq!(
+        second.receiver_first_event_bytes,
+        Some(first.receiver_received),
+        "the resend started from exactly what was kept"
+    );
+    if through_tunnel {
+        assert!(
+            (carried as f64) < (file.len - first.receiver_received) as f64 * 1.1 + 1_048_576.0,
+            "the resend carried only what was missing: {carried} bytes"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

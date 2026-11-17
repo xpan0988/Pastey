@@ -305,7 +305,10 @@ mod tests {
         let start = Instant::now();
         let mut window = TunnelWindow::new(start);
         assert_eq!(window.limit(1), 1);
-        assert_eq!(window.observe(start, Duration::from_secs(1), 1, start), None);
+        assert_eq!(
+            window.observe(start, Duration::from_secs(1), 1, start),
+            None
+        );
         // The configured window was lowered while the transfer ran.
         let mut window = TunnelWindow::new(start);
         for _ in 0..6 {

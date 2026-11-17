@@ -71,9 +71,16 @@ pub(crate) struct Shape {
     rate: Option<f64>,
     loss: f64,
     blackout: AtomicBool,
+    /// Bytes the network carried toward the listener or relay (each
+    /// datagram or relay byte the dialer side sent and was not dropped).
+    carried: std::sync::atomic::AtomicU64,
 }
 
 impl Shape {
+    pub(crate) fn carried_bytes(&self) -> u64 {
+        self.carried.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn set_blackout(&self, on: bool) {
         self.blackout.store(on, Ordering::SeqCst);
     }
@@ -142,6 +149,7 @@ async fn udp_hop(upstream: SocketAddr, shape: Arc<Shape>) -> std::io::Result<Soc
                 }
             } else {
                 client = Some(from);
+                shape.carried.fetch_add(len as u64, Ordering::SeqCst);
                 (&up, &tx_up, upstream)
             };
             let depart = match shape.rate {
@@ -176,8 +184,20 @@ async fn tcp_hop(upstream: SocketAddr, shape: Arc<Shape>) -> std::io::Result<Soc
             let _ = server.set_nodelay(true);
             let (client_read, client_write) = client.into_split();
             let (server_read, server_write) = server.into_split();
-            tokio::spawn(pump(client_read, server_write, up.clone(), shape.clone()));
-            tokio::spawn(pump(server_read, client_write, down.clone(), shape.clone()));
+            tokio::spawn(pump(
+                client_read,
+                server_write,
+                up.clone(),
+                shape.clone(),
+                true,
+            ));
+            tokio::spawn(pump(
+                server_read,
+                client_write,
+                down.clone(),
+                shape.clone(),
+                false,
+            ));
         }
     });
     Ok(addr)
@@ -188,6 +208,7 @@ async fn pump(
     mut writer: impl AsyncWrite + Unpin + Send + 'static,
     bucket: Arc<Bucket>,
     shape: Arc<Shape>,
+    count: bool,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel::<(Instant, Vec<u8>)>();
     let hold = shape.clone();
@@ -214,6 +235,9 @@ async fn pump(
         };
         if len == 0 {
             break;
+        }
+        if count {
+            shape.carried.fetch_add(len as u64, Ordering::SeqCst);
         }
         let depart = match shape.rate {
             Some(rate) => {
@@ -344,6 +368,7 @@ pub(crate) async fn start_pair(
         rate: spec.rate_kib.map(|kib| (kib * 1024) as f64),
         loss: spec.loss,
         blackout: AtomicBool::new(false),
+        carried: std::sync::atomic::AtomicU64::new(0),
     });
     match spec.mode {
         PathMode::Direct => {

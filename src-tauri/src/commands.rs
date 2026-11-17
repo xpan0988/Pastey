@@ -6937,6 +6937,8 @@ pub(crate) fn purge_bridge_runtime_authority(
     state.bridge_auth.lock().purge_room(room_id);
     state.purge_room(room_id);
     crate::connectivity::forget_bridge(state, room_id);
+    // Burn: no partial file kept for a resend survives it.
+    crate::transfer::purge_resumable_partials(state, room_id);
 
     let mut candidates = state.bridge_plan_candidate_store.lock();
     // Direct requester sources are never durable. Clearing the small

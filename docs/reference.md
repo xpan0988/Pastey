@@ -378,6 +378,17 @@ The receiver verifies it against its remembered key and the requester's `device_
 
 Storage: `bridge_peer_pins` (Bridge id → peer HostRef and device key) and `bridge_pairing_windows` (open time, expiry, answered count, close time). Both are deleted at the Burn authority cutoff; an authenticated departure deletes the pin. `RoomInfo.pairing_state` is `paired`, `awaiting_peer` or `pairing_required`. Commands: `open_bridge_pairing` (fresh code for an existing Bridge), `repair_bridge` (pair an existing Bridge with the other device's code), `request_nearby_join` (returns a pending request), `complete_nearby_join` (request id and code).
 
+## Transfer resume facts
+
+Design: [Transfer](layers/layer-1-transfer.md). Source: `src-tauri/src/transfer/resume.rs`, `transfer.rs`.
+
+| Item | Value |
+| --- | --- |
+| Wire | Start request `resumable: true` (ordinary transfers only; omitted otherwise). Start response `resume: { nonce, ciphertext }` when a kept partial was adopted. Signed cancel body `keep_partial: true` marks an interruption |
+| Offer | ChaCha20-Poly1305 under the transfer's session key, associated data `pastey-transfer-resume-offer-v1\n<transferId>`; plaintext `{ held: [{ index, blake3 }] }`, hex BLAKE3 of each held chunk's plaintext |
+| Kept | On `peer_disconnected` (session ended) or `keep_partial`, if at least one chunk arrived and the Bridge is not burned. At most 16 per Host, 30 min, in memory only; Burn and room expiry delete them |
+| Match | Bridge, sending device (its HostRef, else its transport key), display name, size, chunk size |
+
 ## Internet carrier facts
 
 Design and contract: [Connectivity](layers/layer-4-connectivity.md). Source: `src-tauri/src/connectivity.rs`, `connectivity/iroh_carrier.rs`.

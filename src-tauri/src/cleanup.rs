@@ -26,6 +26,8 @@ pub async fn run_cleanup_once(state: &Arc<AppState>) -> AppResult<()> {
         if let Err(error) = transfer::stop_room_server(state.clone(), &room_id).await {
             eprintln!("cleanup failed to stop room server for {room_id}: {error}");
         }
+        // An expired room receives nothing more: no partial is kept for it.
+        transfer::purge_resumable_partials(state, &room_id);
     }
 
     Ok(())

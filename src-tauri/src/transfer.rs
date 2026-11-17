@@ -71,6 +71,25 @@ pub(crate) struct NativeAgentWorkspaceTransferFailure {
     pub(crate) final_receipt_ambiguous: bool,
 }
 
+mod resume;
+pub(crate) use resume::ResumablePartial;
+
+/// Burn: deletes this Bridge's partial files kept for a resend.
+pub(crate) fn purge_resumable_partials(state: &AppState, room_id: &str) {
+    resume::purge_room(state, room_id);
+}
+
+/// Tests: how many partial files this Host keeps for a resend.
+#[cfg(test)]
+pub(crate) fn kept_resumable_partials(state: &AppState) -> usize {
+    resume::kept_count(state)
+}
+
+/// Deletes partial files kept for a resend past `resume::RESUMABLE_PARTIAL_TTL`.
+pub(crate) fn expire_resumable_partials(state: &AppState) {
+    resume::expire(state);
+}
+
 pub struct ActiveFileTransfer {
     room_id: String,
     item_id: String,
@@ -121,6 +140,8 @@ enum ActiveFileTransferKind {
         expected_chunk_index: u64,
         received_chunks: Vec<bool>,
         timing: ReceiverTimingSummary,
+        /// Ordinary transfers from a Host that resumes (`resume`).
+        resume: Option<resume::ReceiverResumeState>,
     },
 }
 
@@ -219,6 +240,10 @@ struct FileTransferStartResponse {
     preferred_chunk_protocol: Option<String>,
     #[serde(default)]
     supported_chunk_protocols: Vec<String>,
+    /// The chunks of a kept partial this transfer adopted, sealed for the
+    /// sender (`resume`). Absent when nothing was adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<resume::SealedResumeOffer>,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +251,10 @@ struct TransferCancelRequest {
     status: Option<String>,
     message: Option<String>,
     reason: Option<String>,
+    /// The sender was interrupted (not cancelled): keep the partial file for
+    /// a resend (`resume`).
+    #[serde(default)]
+    keep_partial: bool,
 }
 
 struct ResponseErrorDetails {
@@ -956,6 +985,14 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         total_chunks,
         file_size,
     );
+    // Only an ordinary transfer resumes (`resume`): never a Plan handoff, a
+    // managed Transfer or a Native Agent workspace movement.
+    let resumable = capacity_origin
+        == crate::transfer_orchestration::TransferCapacityOrigin::Ordinary
+        && expected_source.is_none()
+        && pipeline_handoff.is_none()
+        && native_v2_transfer.is_none()
+        && native_agent_workspace_transfer.is_none();
     let start = FileTransferStartRequest {
         transfer_id: transfer_id.clone(),
         item_id: item.id.clone(),
@@ -972,14 +1009,30 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
         pipeline_handoff,
         native_v2_transfer,
         native_agent_workspace_transfer,
+        resumable,
     };
 
     let start_response = client.post(&start_url).json(&start).send().await;
+    let mut held_chunks = std::collections::HashMap::new();
     let chunk_protocol = match start_response {
         Ok(response) if response.status().is_success() => {
             let status = response.status();
             let body_text = response.text().await.unwrap_or_default();
             dev_log_sender_transfer_start_response(&transfer_id, room_id, status, &body_text);
+            if resumable {
+                if let Some(offer) = serde_json::from_str::<FileTransferStartResponse>(&body_text)
+                    .ok()
+                    .and_then(|response| response.resume)
+                {
+                    held_chunks =
+                        resume::open_offer(&payload_key, &transfer_id, total_chunks, &offer)
+                            .unwrap_or_default();
+                    emit_transfer_log(format!(
+                        "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=resume_offer held_chunks={}",
+                        held_chunks.len()
+                    ));
+                }
+            }
             let protocol = selected_chunk_protocol_from_start_response(&body_text);
             dev_log_sender_chunk_protocol_selected(&transfer_id, room_id, protocol, &body_text);
             if protocol == ChunkProtocol::JsonV1 {
@@ -1058,16 +1111,14 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
     // Across the internet the link's rate is unknown: start with few chunks
     // in flight and follow what the link shows. A diagnostic override is
     // used exactly as set.
-    let tunnel_window = (crate::connectivity::is_tunnel_endpoint(
-        &state,
-        &endpoint.host,
-        endpoint.port,
-    ) && !matches!(
-        transfer_tuning.override_source,
-        transfer_tuning::TransferWindowOverrideSource::Env
-            | transfer_tuning::TransferWindowOverrideSource::DevSettings
-    ))
-    .then(|| transfer_tuning::TunnelWindow::new(Instant::now()));
+    let tunnel_window =
+        (crate::connectivity::is_tunnel_endpoint(&state, &endpoint.host, endpoint.port)
+            && !matches!(
+                transfer_tuning.override_source,
+                transfer_tuning::TransferWindowOverrideSource::Env
+                    | transfer_tuning::TransferWindowOverrideSource::DevSettings
+            ))
+        .then(|| transfer_tuning::TunnelWindow::new(Instant::now()));
 
     // The whole plaintext, hashed as it is read; the receiver checks it
     // before finalizing.
@@ -1090,6 +1141,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
             transfer_tuning,
             runtime_window,
             tunnel_window,
+            &held_chunks,
         )
         .await
         {
@@ -1106,6 +1158,7 @@ async fn send_room_file_to_bridge_peer_endpoint_with_orchestration(
                     None,
                     error,
                     &cancel_token,
+                    resumable,
                 )
                 .await);
             }
@@ -1499,9 +1552,27 @@ async fn finish_sender_after_chunk_error(
     chunk_index: Option<u64>,
     error: ChunkSendFailure,
     cancel_token: &CancellationToken,
+    resumable: bool,
 ) -> AppError {
     if error.kind == ChunkSendFailureKind::Cancelled || cancel_token.is_cancelled() {
-        notify_transfer_cancel(client, base_url, signer, transfer_id).await;
+        // Cancelled because the session ended under it: an interruption,
+        // which leaves the peer's partial for a resend. Any other cancel
+        // (the user, Burn) deletes it.
+        let session_lost = resumable
+            && terminal_transfer_reason(state, transfer_id)
+                .is_some_and(|reason| reason.code == "peer_disconnected");
+        if session_lost {
+            notify_transfer_interrupted(
+                client,
+                base_url,
+                signer,
+                transfer_id,
+                TRANSFER_INTERRUPTED_MESSAGE,
+            )
+            .await;
+        } else {
+            notify_transfer_cancel(client, base_url, signer, transfer_id).await;
+        }
         let _ = storage::set_room_item_status(&state.paths, item_id, RoomItemStatus::Cancelled);
         finish_transfer_locally(
             state,
@@ -1512,7 +1583,17 @@ async fn finish_sender_after_chunk_error(
         return AppError::InvalidInput(TRANSFER_CANCELLED_MESSAGE.into());
     }
 
-    notify_transfer_failed(client, base_url, signer, transfer_id, &error.message).await;
+    let interrupted = matches!(
+        error.kind,
+        ChunkSendFailureKind::PeerLeft
+            | ChunkSendFailureKind::Timeout
+            | ChunkSendFailureKind::Unreachable
+    );
+    if interrupted && resumable {
+        notify_transfer_interrupted(client, base_url, signer, transfer_id, &error.message).await;
+    } else {
+        notify_transfer_failed(client, base_url, signer, transfer_id, &error.message).await;
+    }
     dev_log_sender_final_error(
         transfer_id,
         room_id,
@@ -1520,12 +1601,7 @@ async fn finish_sender_after_chunk_error(
         error.kind.as_str(),
         &error.message,
     );
-    if matches!(
-        error.kind,
-        ChunkSendFailureKind::PeerLeft
-            | ChunkSendFailureKind::Timeout
-            | ChunkSendFailureKind::Unreachable
-    ) {
+    if interrupted {
         finish_sender_terminal(state, transfer_id, item_id, "interrupted", &error.message);
     } else {
         fail_transfer(state, transfer_id, item_id, error.message.clone());
@@ -1555,6 +1631,7 @@ async fn send_binary_chunks_pipelined<R>(
     tuning: TransferTuning,
     runtime_window: Arc<AtomicUsize>,
     mut tunnel_window: Option<transfer_tuning::TunnelWindow>,
+    held_chunks: &std::collections::HashMap<u64, [u8; 32]>,
 ) -> Result<u64, ChunkSendFailure>
 where
     R: AsyncRead + Unpin,
@@ -1567,11 +1644,18 @@ where
     let mut last_report_bytes = 0u64;
     let mut in_flight = FuturesUnordered::new();
     let mut timing_summary = SenderTimingSummary::default();
+    // Chunks the receiver already holds, confirmed identical here: read and
+    // hashed like the rest, but not sent (`resume`).
+    let mut skipped_chunks = 0u64;
+    let mut skipped_bytes = 0u64;
 
     while !eof || !in_flight.is_empty() {
         while !eof
             && in_flight.len()
-                < in_flight_limit(current_runtime_window(&runtime_window), tunnel_window.as_ref())
+                < in_flight_limit(
+                    current_runtime_window(&runtime_window),
+                    tunnel_window.as_ref(),
+                )
         {
             if cancel_token.is_cancelled() {
                 return Err(ChunkSendFailure {
@@ -1613,6 +1697,35 @@ where
             }
 
             plaintext_hasher.update(&buffer[..bytes_read]);
+            if held_chunks
+                .get(&chunk_index)
+                .is_some_and(|held| held == blake3::hash(&buffer[..bytes_read]).as_bytes())
+            {
+                next_chunk_index += 1;
+                skipped_chunks += 1;
+                skipped_bytes += bytes_read as u64;
+                max_acknowledged_bytes = max_acknowledged_bytes.max(skipped_bytes);
+                let now = Instant::now();
+                update_sender_transfer_report(state, transfer_id, max_acknowledged_bytes, now);
+                if now.duration_since(last_report_at) >= PROGRESS_EMIT_INTERVAL
+                    || max_acknowledged_bytes >= file_size
+                {
+                    emit_progress(
+                        state,
+                        transfer_id,
+                        "outgoing",
+                        "transferring",
+                        max_acknowledged_bytes,
+                        0.0,
+                        0.0,
+                        None,
+                        None,
+                    );
+                    last_report_at = now;
+                    last_report_bytes = max_acknowledged_bytes;
+                }
+                continue;
+            }
             let encrypt_started = Instant::now();
             let (encrypted_bytes, nonce) = crypto::encrypt_bytes_with_aad(
                 &buffer[..bytes_read],
@@ -1740,6 +1853,11 @@ where
         started_at.elapsed(),
         timing_summary,
     );
+    if skipped_chunks > 0 {
+        emit_transfer_log(format!(
+            "[pastey transfer][sender][transfer_id={transfer_id}][room_id={room_id}] event=resume_skipped chunks={skipped_chunks} bytes={skipped_bytes}"
+        ));
+    }
     Ok(next_chunk_index)
 }
 
@@ -2919,6 +3037,14 @@ pub async fn cancel_room_transfers(
             };
             if let Some(transfer) = transfer {
                 transfer.cancel_token.cancel();
+                // The session ended under a transfer: an interruption, not a
+                // cancel. A receiver keeps its partial for a resend; a
+                // sender tells its peer so (`finish_sender_after_chunk_error`).
+                let session_lost = receiver_reason == Some("peer_disconnected")
+                    && !room_is_burned(&state, room_id);
+                if session_lost && matches!(transfer.kind, ActiveFileTransferKind::Sender { .. }) {
+                    record_terminal_transfer_reason(&state, &transfer_id, "peer_disconnected");
+                }
                 if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
                     if let Some(reason) = receiver_reason {
                         record_terminal_transfer_reason(&state, &transfer_id, reason);
@@ -2926,9 +3052,11 @@ pub async fn cancel_room_transfers(
                             "[pastey transfer][transfer_id={transfer_id}] event=active_transfer_removed reason={reason}"
                         ));
                     }
-                    if remove_active_receiver_part_file(room_id, "active_part", part_path)
-                        .await
-                        .is_err()
+                    let kept = session_lost && resume::keep(&state, &transfer, false);
+                    if !kept
+                        && remove_active_receiver_part_file(room_id, "active_part", part_path)
+                            .await
+                            .is_err()
                     {
                         cleanup_failed = true;
                     }
@@ -3667,6 +3795,39 @@ async fn start_file_transfer_handler(
         let part_path = storage::transfer_part_path(&destination_dir, &start.transfer_id);
         (final_path, part_path)
     };
+    // Resume: an ordinary transfer from a Host that resumes may adopt a
+    // partial this Host kept from an interrupted transfer of the same file
+    // by the same device on this Bridge.
+    let resume_state = (start.resumable && !managed_private_landing).then(|| {
+        resume::ReceiverResumeState::new(
+            resume::peer_identity(&ctx.state, &room_id, &start.sender_public_key),
+            start.sender_public_key.clone(),
+            start.display_name.clone(),
+            start.total_chunks,
+        )
+    });
+    let adopted = resume_state.as_ref().and_then(|resume_state| {
+        resume::adopt(
+            &ctx.state,
+            &resume::ResumeKey {
+                room_id: &room_id,
+                peer: &resume_state.peer,
+                sender_key: &start.sender_public_key,
+                display_name: start.display_name.as_deref(),
+                size_bytes: start.size_bytes,
+                chunk_size: start.chunk_size,
+                total_chunks: start.total_chunks,
+            },
+        )
+    });
+    let (part_path, adopted) = match adopted {
+        Some(adopted) if adopted.part_path.is_file() => (adopted.part_path.clone(), Some(adopted)),
+        Some(adopted) => {
+            resume::discard(adopted);
+            (part_path, None)
+        }
+        None => (part_path, None),
+    };
     let Some(part_dir) = part_path.parent() else {
         return transfer_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3674,8 +3835,9 @@ async fn start_file_transfer_handler(
             "Receiver failed to write chunk".into(),
         );
     };
-    if tokio::fs::create_dir_all(part_dir).await.is_err()
-        || tokio::fs::File::create(&part_path).await.is_err()
+    if adopted.is_none()
+        && (tokio::fs::create_dir_all(part_dir).await.is_err()
+            || tokio::fs::File::create(&part_path).await.is_err())
     {
         dev_log_receiver_start_failure(
             &start.transfer_id,
@@ -3697,6 +3859,30 @@ async fn start_file_transfer_handler(
         .to_string();
     let now = Instant::now();
     let cancel_token = CancellationToken::new();
+    let sealed_offer = adopted
+        .as_ref()
+        .and_then(|adopted| resume::seal_offer(&session_key, &start.transfer_id, adopted));
+    let (transferred_bytes, expected_chunk_index, received_chunks, resume_state) = match adopted {
+        Some(adopted) => {
+            let held_chunks = adopted.held_chunks();
+            emit_transfer_log(format!(
+                "[pastey transfer][receiver][transfer_id={}][room_id={room_id}] event=resume_adopted held_chunks={held_chunks} held_bytes={}",
+                start.transfer_id, adopted.transferred_bytes
+            ));
+            let resume_state = resume_state.map(|mut resume_state| {
+                resume_state.held = adopted.received_chunks.clone();
+                resume_state.chunk_digests = adopted.chunk_digests;
+                resume_state
+            });
+            (
+                adopted.transferred_bytes,
+                held_chunks,
+                adopted.received_chunks,
+                resume_state,
+            )
+        }
+        None => (0, 0, vec![false; start.total_chunks as usize], resume_state),
+    };
     let transfer = ActiveFileTransfer {
         room_id: room_id.clone(),
         item_id: start.item_id.clone(),
@@ -3707,7 +3893,7 @@ async fn start_file_transfer_handler(
         total_chunks: start.total_chunks,
         started_at: now,
         last_report_at: now,
-        last_report_bytes: 0,
+        last_report_bytes: transferred_bytes,
         cancel_token,
         kind: ActiveFileTransferKind::Receiver {
             session_key,
@@ -3718,13 +3904,23 @@ async fn start_file_transfer_handler(
             native_v2_transfer,
             native_agent_workspace_transfer,
             created_at: start.created_at,
-            transferred_bytes: 0,
-            expected_chunk_index: 0,
-            received_chunks: vec![false; start.total_chunks as usize],
+            transferred_bytes,
+            expected_chunk_index,
+            received_chunks,
             timing: ReceiverTimingSummary::default(),
+            resume: resume_state,
         },
     };
-    emit_event(&ctx.state, &transfer, "pending", 0, 0.0, 0.0, None, None);
+    emit_event(
+        &ctx.state,
+        &transfer,
+        "pending",
+        transferred_bytes,
+        0.0,
+        0.0,
+        None,
+        None,
+    );
     let registered_transfer_id = start.transfer_id.clone();
     ctx.state
         .active_file_transfers
@@ -3736,7 +3932,11 @@ async fn start_file_transfer_handler(
         start.chunk_size,
         start.total_chunks,
     );
-    Json(file_transfer_start_response()).into_response()
+    Json(FileTransferStartResponse {
+        resume: sealed_offer,
+        ..file_transfer_start_response()
+    })
+    .into_response()
 }
 
 fn decode_received_chunk_upload(
@@ -3862,6 +4062,7 @@ fn file_transfer_start_response() -> FileTransferStartResponse {
             CHUNK_PROTOCOL_BINARY_V1.to_string(),
             CHUNK_PROTOCOL_JSON_V1.to_string(),
         ],
+        resume: None,
     }
 }
 
@@ -3995,6 +4196,7 @@ async fn receive_file_chunk_handler(
             transferred_bytes,
             received_chunks,
             timing,
+            resume,
             ..
         } = &mut transfer.kind
         else {
@@ -4024,7 +4226,17 @@ async fn receive_file_chunk_handler(
                 "Transfer metadata mismatch",
                 "chunk_larger_than_metadata_chunk_size",
             ))
-        } else if *received {
+        } else if *received
+            && !resume.as_ref().is_some_and(|resume| {
+                // Adopted from a partial and not yet rewritten: the sender
+                // sends it because it differs, so it is written again.
+                resume
+                    .held
+                    .get(chunk_index as usize)
+                    .copied()
+                    .unwrap_or(false)
+            })
+        {
             timing.duplicate_chunks += 1;
             let duplicate_written_bytes =
                 if chunk_index.checked_add(1) == Some(transfer.total_chunks) {
@@ -4141,6 +4353,7 @@ async fn receive_file_chunk_handler(
         );
     }
 
+    let chunk_digest = *blake3::hash(&plaintext).as_bytes();
     let write_started = Instant::now();
     if let Err(error) = write_receiver_chunk(&part_path, &plaintext, write_offset).await {
         dev_log_receiver_chunk_failure(
@@ -4190,6 +4403,7 @@ async fn receive_file_chunk_handler(
             transferred_bytes,
             expected_chunk_index,
             received_chunks,
+            resume,
             ..
         } = &mut transfer.kind
         else {
@@ -4210,6 +4424,15 @@ async fn receive_file_chunk_handler(
             *received = true;
             *transferred_bytes += plaintext_size;
             *expected_chunk_index += 1;
+        }
+        if let Some(resume) = resume.as_mut() {
+            let index = chunk_index as usize;
+            if let Some(held) = resume.held.get_mut(index) {
+                *held = false;
+            }
+            if let Some(digest) = resume.chunk_digests.get_mut(index) {
+                *digest = Some(chunk_digest);
+            }
         }
         let current = *transferred_bytes;
         let interval = now
@@ -4770,8 +4993,15 @@ async fn cancel_file_transfer_handler(
         return Json(TransferOkResponse { ok: true }).into_response();
     };
     transfer.cancel_token.cancel();
-    if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
-        let _ = tokio::fs::remove_file(part_path).await;
+    // An interrupted sender (not a cancel) leaves the partial for a resend.
+    let kept = request
+        .as_ref()
+        .is_some_and(|Json(request)| request.keep_partial)
+        && resume::keep(&ctx.state, &transfer, room_is_burned(&ctx.state, &room_id));
+    if !kept {
+        if let ActiveFileTransferKind::Receiver { part_path, .. } = &transfer.kind {
+            let _ = tokio::fs::remove_file(part_path).await;
+        }
     }
     let reason = request
         .as_ref()
@@ -4782,7 +5012,7 @@ async fn cancel_file_transfer_handler(
     let failure = request
         .as_ref()
         .is_some_and(|Json(request)| request.status.as_deref() == Some("failed"));
-    let remote_terminal = reason.as_deref().is_some_and(is_receiver_terminal_reason);
+    let remote_terminal = kept || reason.as_deref().is_some_and(is_receiver_terminal_reason);
     let status = if remote_terminal {
         "interrupted"
     } else if failure {
@@ -5725,6 +5955,29 @@ async fn notify_transfer_cancel(
     post_transfer_cancel(client, base_url, signer, transfer_id, None).await;
 }
 
+/// The transfer failed by interruption (timeout, departed or unreachable
+/// peer, lost session): the peer keeps its partial for a resend.
+async fn notify_transfer_interrupted(
+    client: &reqwest::Client,
+    base_url: &str,
+    signer: &crate::bridge_auth::PeerRequestSigner,
+    transfer_id: &str,
+    message: &str,
+) {
+    post_transfer_cancel(
+        client,
+        base_url,
+        signer,
+        transfer_id,
+        Some(serde_json::json!({
+            "status": "failed",
+            "message": message,
+            "keep_partial": true,
+        })),
+    )
+    .await;
+}
+
 async fn notify_transfer_failed(
     client: &reqwest::Client,
     base_url: &str,
@@ -6039,6 +6292,7 @@ mod tests {
                 expected_chunk_index: 0,
                 received_chunks: vec![false; 4],
                 timing: ReceiverTimingSummary::default(),
+                resume: None,
             },
         }
     }
@@ -7828,6 +8082,400 @@ mod join_authentication {
             "the rest of the chunk was never sent ({received} of {} bytes)",
             body.len()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Resuming an interrupted transfer (`resume`).
+    // -----------------------------------------------------------------
+
+    /// A paired sender and receiver, as in the end-to-end test above, with
+    /// the sending Host's room server key being the paired device's.
+    struct ResumePair {
+        receiver: HostFixture,
+        sender: HostFixture,
+        device: Joiner,
+    }
+
+    const RESUME_NAME: &str = "payload.bin";
+
+    fn resume_content(seed: usize) -> Vec<u8> {
+        (0..(DEFAULT_CHUNK_SIZE_BYTES as usize * 4 + 12_345))
+            .map(|index| ((index * 31 + seed * 7) % 251) as u8)
+            .collect()
+    }
+
+    impl ResumePair {
+        async fn new(label: &str) -> Self {
+            let receiver = HostFixture::new(&format!("{label}-receive")).await;
+            let sender = HostFixture::new(&format!("{label}-send")).await;
+            let secret = sender
+                .state
+                .active_servers
+                .lock()
+                .get(ROOM_ID)
+                .unwrap()
+                .transport_secret;
+            let device = Joiner {
+                secret,
+                identity: DeviceIdentity::generate_for_test(),
+                host_ref: sender.state.local_host_ref.as_str().to_string(),
+            };
+            device.pair(&receiver, CODE).await.expect("pairs");
+            Self {
+                receiver,
+                sender,
+                device,
+            }
+        }
+
+        fn inbox(&self) -> PathBuf {
+            self.receiver.root.join("inbox")
+        }
+
+        fn parts(&self) -> Vec<PathBuf> {
+            fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+                for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, found);
+                    } else if path.extension().is_some_and(|ext| ext == "part") {
+                        found.push(path);
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            walk(&self.receiver.root, &mut found);
+            found
+        }
+
+        /// Intact copies of `content` among the receiver's finished files.
+        fn copies(&self, content: &[u8]) -> usize {
+            files_under(&self.inbox())
+                .iter()
+                .filter(|bytes| bytes.as_slice() == content)
+                .count()
+        }
+
+        /// The production sender sends `content` as `RESUME_NAME`.
+        async fn send(&self, content: &[u8]) -> AppResult<()> {
+            let source = self
+                .sender
+                .root
+                .join(format!("source-{}", uuid::Uuid::new_v4()))
+                .join(RESUME_NAME);
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, content).unwrap();
+            let item = storage::create_outgoing_file_item_with_metadata(
+                &self.sender.state.paths,
+                &[41u8; 32],
+                ROOM_ID,
+                &source,
+                None,
+                None,
+            )
+            .unwrap();
+            send_room_file_to_bridge_peer_endpoint(
+                self.sender.state.clone(),
+                ROOM_ID,
+                &item.id,
+                &source,
+                None,
+                None,
+                BridgePeerTransferEndpoint {
+                    peer_session_id: "receiver".into(),
+                    host: "127.0.0.1".into(),
+                    port: self
+                        .receiver
+                        .base_url
+                        .trim_start_matches("http://127.0.0.1:")
+                        .split('/')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                    transport_public_key: self.receiver.server_public_key.clone(),
+                },
+            )
+            .await
+        }
+
+        /// A start request for `content`, as the sending device makes it.
+        fn start_request(
+            &self,
+            transfer_id: &str,
+            content: &[u8],
+            payload_key: &[u8; 32],
+            resumable: bool,
+        ) -> FileTransferStartRequest {
+            let receiver_key = crypto::decode_key(&self.receiver.server_public_key).unwrap();
+            let (wrapped_session_key, transport_nonce, sender_public_key) =
+                crypto::wrap_session_for_receiver(payload_key, &self.device.secret, &receiver_key)
+                    .unwrap();
+            FileTransferStartRequest {
+                transfer_id: transfer_id.into(),
+                item_id: transfer_id.into(),
+                display_name: Some(RESUME_NAME.into()),
+                mime_type: None,
+                size_bytes: content.len() as u64,
+                chunk_size: DEFAULT_CHUNK_SIZE_BYTES,
+                total_chunks: chunk_count(content.len() as u64, DEFAULT_CHUNK_SIZE_BYTES as usize),
+                created_at: storage::now_ts(),
+                wrapped_session_key,
+                transport_nonce,
+                sender_public_key,
+                preferred_chunk_protocol: Some(CHUNK_PROTOCOL_BINARY_V1.into()),
+                pipeline_handoff: None,
+                native_v2_transfer: None,
+                native_agent_workspace_transfer: None,
+                resumable,
+            }
+        }
+
+        async fn start(
+            &self,
+            transfer_id: &str,
+            content: &[u8],
+            payload_key: &[u8; 32],
+            resumable: bool,
+        ) -> String {
+            let response = reqwest::Client::new()
+                .post(format!("{}/transfers/start", self.receiver.base_url))
+                .json(&self.start_request(transfer_id, content, payload_key, resumable))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            response.text().await.unwrap()
+        }
+
+        /// Starts sending `content` by hand, delivers its first `chunks`
+        /// chunks, then ends it as an interrupted sender does
+        /// (`notify_transfer_interrupted`), or as a cancel when `cancel`.
+        async fn interrupted_after(&self, content: &[u8], chunks: u64, cancel: bool) {
+            let transfer_id = uuid::Uuid::new_v4().to_string();
+            let payload_key = crypto::generate_transport_secret();
+            self.start(&transfer_id, content, &payload_key, true).await;
+            let client = reqwest::Client::new();
+            let total = chunk_count(content.len() as u64, DEFAULT_CHUNK_SIZE_BYTES as usize);
+            for index in 0..chunks {
+                let start = (index * DEFAULT_CHUNK_SIZE_BYTES) as usize;
+                let end = (start + DEFAULT_CHUNK_SIZE_BYTES as usize).min(content.len());
+                let plaintext = &content[start..end];
+                let (ciphertext, nonce) = crypto::encrypt_bytes_with_aad(
+                    plaintext,
+                    &payload_key,
+                    &chunk_associated_data(
+                        &transfer_id,
+                        index,
+                        total,
+                        plaintext.len() as u64,
+                        index + 1 == total,
+                    ),
+                )
+                .unwrap();
+                send_chunk_with_retry(
+                    &client,
+                    &self.receiver.base_url,
+                    ROOM_ID,
+                    &transfer_id,
+                    index,
+                    total,
+                    plaintext.len(),
+                    &nonce,
+                    &ciphertext,
+                    &CancellationToken::new(),
+                    ChunkProtocol::BinaryV1,
+                )
+                .await
+                .expect("chunk accepted");
+            }
+            let signer = self.device.signer(&self.receiver);
+            if cancel {
+                notify_transfer_cancel(&client, &self.receiver.base_url, &signer, &transfer_id)
+                    .await;
+            } else {
+                notify_transfer_interrupted(
+                    &client,
+                    &self.receiver.base_url,
+                    &signer,
+                    &transfer_id,
+                    TRANSFER_INTERRUPTED_MESSAGE,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// An interrupted transfer keeps its partial; sending the same file again
+    /// completes it from there, intact, once, and leaves nothing behind.
+    #[tokio::test]
+    async fn an_interrupted_transfer_resumes_and_lands_once() {
+        let pair = ResumePair::new("resume").await;
+        let content = resume_content(1);
+        pair.interrupted_after(&content, 2, false).await;
+        assert_eq!(
+            resume::kept_count(&pair.receiver.state),
+            1,
+            "the partial is kept"
+        );
+        assert_eq!(pair.parts().len(), 1);
+
+        pair.send(&content).await.expect("the resend completes");
+        assert_eq!(pair.copies(&content), 1, "exactly one intact copy");
+        assert_eq!(resume::kept_count(&pair.receiver.state), 0, "adopted");
+        assert!(pair.parts().is_empty(), "no partial file left");
+    }
+
+    /// The sender skips the chunks the receiver holds when their digests
+    /// match what it reads; so a held chunk whose bytes were altered after
+    /// they were recorded is not sent again, and the whole-file digest
+    /// refuses the result: nothing is finalized and nothing is left.
+    #[tokio::test]
+    async fn held_chunks_are_skipped_and_still_checked_by_the_whole_file_digest() {
+        let pair = ResumePair::new("resume-tampered").await;
+        let content = resume_content(2);
+        pair.interrupted_after(&content, 2, false).await;
+        let part = pair.parts().pop().expect("a kept partial");
+        let mut bytes = std::fs::read(&part).unwrap();
+        bytes[..64].fill(0);
+        std::fs::write(&part, &bytes).unwrap();
+
+        assert!(
+            pair.send(&content).await.is_err(),
+            "the digest check refuses it"
+        );
+        assert_eq!(pair.copies(&content), 0);
+        assert!(files_under(&pair.inbox())
+            .iter()
+            .all(|file| file.len() != content.len()));
+        assert!(pair.parts().is_empty(), "no partial file left");
+        assert_eq!(resume::kept_count(&pair.receiver.state), 0);
+    }
+
+    /// Another file with the same name and size: no held chunk matches, so
+    /// every chunk is sent and overwrites what was held.
+    #[tokio::test]
+    async fn a_different_file_with_the_same_name_and_size_is_sent_whole() {
+        let pair = ResumePair::new("resume-other").await;
+        let first = resume_content(3);
+        let second = resume_content(4);
+        assert_eq!(first.len(), second.len());
+        pair.interrupted_after(&first, 3, false).await;
+        pair.send(&second).await.expect("completes");
+        assert_eq!(pair.copies(&second), 1);
+        assert_eq!(pair.copies(&first), 0);
+        assert!(pair.parts().is_empty());
+    }
+
+    /// The offer reaches only the sender: sealed under the new transfer's
+    /// session key and bound to its id, with no digest in the clear. A
+    /// sender that does not resume gets none, and the partial stays kept.
+    #[tokio::test]
+    async fn the_resume_offer_is_sealed_and_only_for_a_resuming_sender() {
+        let pair = ResumePair::new("resume-offer").await;
+        let content = resume_content(5);
+        pair.interrupted_after(&content, 2, false).await;
+        let chunk_digest = |index: usize| {
+            let start = index * DEFAULT_CHUNK_SIZE_BYTES as usize;
+            *blake3::hash(&content[start..start + DEFAULT_CHUNK_SIZE_BYTES as usize]).as_bytes()
+        };
+
+        let key = crypto::generate_transport_secret();
+        let plain = pair.start("old-sender", &content, &key, false).await;
+        let plain: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert!(plain.get("resume").is_none(), "no offer without resume");
+        assert_eq!(resume::kept_count(&pair.receiver.state), 1, "still kept");
+
+        let key = crypto::generate_transport_secret();
+        let body = pair.start("new-sender", &content, &key, true).await;
+        assert!(
+            !body.contains(&hex::encode(chunk_digest(0))),
+            "no digest in the clear"
+        );
+        let response: FileTransferStartResponse = serde_json::from_str(&body).unwrap();
+        let offer = response.resume.expect("an offer");
+        let total = chunk_count(content.len() as u64, DEFAULT_CHUNK_SIZE_BYTES as usize);
+        let held = resume::open_offer(&key, "new-sender", total, &offer).expect("opens");
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[&0], chunk_digest(0));
+        assert_eq!(held[&1], chunk_digest(1));
+        assert!(resume::open_offer(&key, "another-transfer", total, &offer).is_none());
+        let other_key = crypto::generate_transport_secret();
+        assert!(resume::open_offer(&other_key, "new-sender", total, &offer).is_none());
+        assert_eq!(resume::kept_count(&pair.receiver.state), 0, "adopted once");
+    }
+
+    /// Cancel, Burn and time each delete a partial; a session lost under a
+    /// receiver keeps it.
+    #[tokio::test]
+    async fn cancel_burn_and_time_delete_a_kept_partial() {
+        let pair = ResumePair::new("resume-cancel").await;
+        let content = resume_content(6);
+        pair.interrupted_after(&content, 1, true).await;
+        assert_eq!(
+            resume::kept_count(&pair.receiver.state),
+            0,
+            "a cancel keeps nothing"
+        );
+        assert!(pair.parts().is_empty());
+
+        pair.interrupted_after(&content, 1, false).await;
+        assert_eq!(pair.parts().len(), 1);
+        resume::age_all(&pair.receiver.state, resume::RESUMABLE_PARTIAL_TTL);
+        expire_resumable_partials(&pair.receiver.state);
+        assert_eq!(resume::kept_count(&pair.receiver.state), 0, "expired");
+        assert!(pair.parts().is_empty());
+
+        // The session ends under a receiving transfer: kept.
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let key = crypto::generate_transport_secret();
+        pair.start(&transfer_id, &content, &key, true).await;
+        let (ciphertext, nonce) = crypto::encrypt_bytes_with_aad(
+            &content[..DEFAULT_CHUNK_SIZE_BYTES as usize],
+            &key,
+            &chunk_associated_data(&transfer_id, 0, 5, DEFAULT_CHUNK_SIZE_BYTES, false),
+        )
+        .unwrap();
+        send_chunk_with_retry(
+            &reqwest::Client::new(),
+            &pair.receiver.base_url,
+            ROOM_ID,
+            &transfer_id,
+            0,
+            5,
+            DEFAULT_CHUNK_SIZE_BYTES as usize,
+            &nonce,
+            &ciphertext,
+            &CancellationToken::new(),
+            ChunkProtocol::BinaryV1,
+        )
+        .await
+        .unwrap();
+        cancel_room_transfers(
+            pair.receiver.state.clone(),
+            ROOM_ID,
+            TRANSFER_INTERRUPTED_MESSAGE,
+            false,
+            Some("peer_disconnected"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resume::kept_count(&pair.receiver.state),
+            1,
+            "kept on session loss"
+        );
+
+        crate::commands::burn_bridge_scope(pair.receiver.state.clone(), ROOM_ID, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            resume::kept_count(&pair.receiver.state),
+            0,
+            "Burn deletes it"
+        );
+        assert!(pair.parts().is_empty());
+        drop(pair.sender);
     }
 
     fn host_device_key(host: &HostFixture) -> [u8; 32] {

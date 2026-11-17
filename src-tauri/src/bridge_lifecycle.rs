@@ -401,6 +401,7 @@ async fn bootstrap_room_servers(state: Arc<AppState>) -> AppResult<()> {
 }
 
 async fn reconcile_once(state: Arc<AppState>) -> AppResult<()> {
+    crate::transfer::expire_resumable_partials(&state);
     invalidate_unreachable_sessions(state.clone()).await?;
     reconnect_preserved_bridges(state.clone()).await?;
     // Tell connected peers how to reach this device across the internet,

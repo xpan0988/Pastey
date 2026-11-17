@@ -291,7 +291,7 @@ What remains, by design or for later: across the internet the local tunnel forwa
 Limits of this evidence:
 
 - One machine and one process: no real NAT, relay distance, real loss pattern or competing traffic. Both Hosts share one scheduler, CPU and the process-wide log. It is not two app processes, the packaged app or the Tauri command layer. Transfers start from `send_room_file_to_bridge_peer_endpoint`, which `send_file_to_room` calls.
-- After a redial on the direct path, iroh leaves the shaper for the real loopback path; the `wan-bench` limitation still applies. So the transfer after the 45 s outage (1 MiB in 0.38 s against a 384 KiB/s limit) was not shaped. The reconnect itself is valid; post-reconnect throughput is not evidence.
+- After the 45 s outage the Bridge reconnects as the product does, trying the LAN and the internet at once; on one machine the LAN answer always wins, so the session continues over the LAN. The transfer after it (1 MiB in 0.38 s against a 384 KiB/s limit) therefore did not cross the emulated path. This was first put down to iroh leaving the shaper after a redial. A relay-only run later showed the same with no direct path available, so the LAN reconnect is the cause. The reconnect itself is valid; post-reconnect throughput is not evidence.
 - The relay hop shares one rate bucket per direction across both Hosts' relay connections, a simplification of two separate uplinks.
 - Each cell ran once, and the three deciding cells twice, with identical outcomes; no wider statistics.
 - Not covered: Windows, sleep/wake, a network change mid-transfer (as opposed to a blackout), a relay that drops or rate-limits per connection, and Burn while a Native Agent workspace movement is in flight.
@@ -332,7 +332,35 @@ Verdict: the setting is in place for trying on real networks, and it stays off. 
 
 Automated checks: a config test (stored and used only with Developer tools on; anything but `bbr3` is the default); a carrier test (a changed controller restarts the carrier with it, an unchanged one keeps it); the frontend integration tests; the full Rust suite.
 
-**Step 4 — resumable transfers (rank 4), its own design review.** Sketch: on an *interrupted* transfer (not a cancel, an integrity failure or a Burn) the receiver keeps the `.part` and its `received_chunks` for a bounded time; a new `transfers/start` for the same sender Host, file identity, size and chunk size is answered with the chunk indexes already held; the sender still reads and hashes the whole file but sends only the missing chunks; the final digest check is unchanged. Additive and negotiated in the start request and response, so an older Host on either side falls back to a full send. Open questions for the review: how the file identity is bound to the authenticated session, where partial files live and when they are deleted, and how this meets Burn and writer-lock rules. This is the only item that changes the transfer protocol, which is why it is last and separate.
+**Step 4 — resumable transfers (rank 4). Done; see the result below.** The original sketch: on an *interrupted* transfer (not a cancel, an integrity failure or a Burn) the receiver keeps the `.part` and its `received_chunks` for a bounded time; a new `transfers/start` for the same sender Host, file identity, size and chunk size is answered with the chunk indexes already held; the sender still reads and hashes the whole file but sends only the missing chunks; the final digest check is unchanged. Additive and negotiated in the start request and response, so an older Host on either side falls back to a full send. Open questions for the review: how the file identity is bound to the authenticated session, where partial files live and when they are deleted, and how this meets Burn and writer-lock rules. This is the only item that changes the transfer protocol, which is why it is last and separate.
+
+### Step 4 result (emulated)
+
+What was built, against the sketch's open questions:
+
+- **Which transfers.** Ordinary file transfers only. A Plan handoff, a managed (native-v2) Transfer and a Native Agent workspace movement never take part; they keep their own exactly-once and retry rules. Both Hosts must announce it: the sender with `resumable: true` in its start request, the receiver by answering with an offer. An older Host on either side gets a full send, and an older receiver deletes partials as before.
+- **When a partial is kept.** Only when the transfer is *interrupted*:
+  - the session ended under it (`stop_room_server` with `peer_disconnected`), on either side;
+  - or the sender reports a timeout, a departed or an unreachable peer, with `keep_partial` in its signed cancel.
+
+  It is never kept on a cancel by either user, a Burn, an expired room, an integrity or write failure or a digest mismatch, nor when nothing had arrived. Kept partials live in memory: at most 16 per Host, for 30 minutes, and Burn and room expiry delete them. A restart deletes them as before, since startup recovery removes every `.part` file.
+- **Binding.** A resend adopts a partial only on the same Bridge, from the same sending device: its HostRef as the Bridge records it, so a reconnect with new transport keys still matches. The file name, size and chunk size must also match. A receiver still waiting for an earlier session's sender (started under another transport key, so it can never finish) is taken over and ends as interrupted.
+- **What crosses.** The receiver answers the start with each held chunk's BLAKE3 digest, sealed under the new transfer's session key and bound to its id. Only the sender that wrapped that key can read it, and on a LAN nothing about the file is visible. The sender still reads and hashes the whole file, skips each held chunk whose digest matches what it reads now, and sends the rest. A held chunk it sends anyway (the file changed) overwrites the old one. The whole-file digest at finish is unchanged, so a partial altered on disk is refused, never finalized.
+- **Nothing is resent by itself.** The user sends the file again. The carrier contract's "nothing is resent or rerun" holds.
+
+Evidence:
+
+| Check | Result |
+| --- | --- |
+| Interrupted after 2 of 5 chunks, then sent again (production sender and receiver, loopback) | Adopted, completed, one intact copy, no partial left |
+| Same, with the kept partial's bytes altered on disk | The sender skips the held chunks, so the whole-file digest refuses the result: nothing finalized, nothing left. With skipping disabled the same test fails, which shows the skip happens |
+| Another file with the same name and size | No held chunk matches; every chunk is sent and overwrites; the new file lands |
+| The offer | Absent for a sender that does not resume (the partial stays kept); sealed, with no digest in the clear; opens only under that transfer's key and id |
+| Cancel, Burn, time, session loss | A cancel keeps nothing; expiry and Burn delete the file; a session lost under a receiver keeps it |
+| Two Hosts, 1 MiB/s relay, a 45 s outage ends both sessions, then the same 24 MiB file sent again | 8 MiB (2 chunks) kept; on the resend the receiver adopted 2 chunks, the sender skipped 2, only chunks from index 2 on were received; one intact copy, no partial left |
+| All other shaped scenarios on this build | Same outcomes as before; the long-outage scenario's failed transfer now leaves at most the one partial kept for a resend |
+
+Not shown: the resend crossing the emulated path. On one machine the reconnect's LAN answer wins, so the resend went over the LAN. The chunk counts above show what it sent, but its time and byte counts say nothing about a real WAN. Not tried: two real networks, Windows, a restart between the attempts (which deletes the partial, by design), and resuming from a third device.
 
 ## Reproducing
 

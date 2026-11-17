@@ -85,6 +85,9 @@ pub struct HostRuntime {
     /// peer transport key (`bridge_lifecycle::record_authenticated_traffic`).
     /// Process-local and never authority: liveness only.
     pub(crate) bridge_peer_traffic: Mutex<HashMap<(String, [u8; 32]), std::time::Instant>>,
+    /// Partial files kept from interrupted transfers, for a resend
+    /// (`transfer::resume`). In memory only.
+    pub(crate) resumable_receives: Mutex<Vec<crate::transfer::ResumablePartial>>,
     pub(crate) bridge_reconnect_rotations: Mutex<HashSet<String>>,
     /// Internet carrier state: its connections and loopback tunnels.
     /// Process-local, and never authority (`connectivity`).
@@ -217,6 +220,7 @@ impl HostRuntime {
             bridge_reconnect_attempts: Mutex::new(HashMap::new()),
             bridge_liveness_failures: Mutex::new(HashMap::new()),
             bridge_peer_traffic: Mutex::new(HashMap::new()),
+            resumable_receives: Mutex::new(Vec::new()),
             verified_peer_devices: Mutex::new(Vec::new()),
             bridge_reconnect_rotations: Mutex::new(HashSet::new()),
             connectivity: Default::default(),

@@ -637,6 +637,11 @@ pub struct FileTransferStartRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) native_agent_workspace_transfer:
         Option<crate::native_agent::NativeAgentWorkspaceTransferV1>,
+    /// The sender can resume: it reads a sealed resume offer in the start
+    /// response and skips the chunks the receiver already holds. Only on an
+    /// ordinary transfer; absent from older Hosts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resumable: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
