@@ -29,6 +29,9 @@ futures-util = "0.3"
 # the Bridge tunnel in `connectivity`. Never an authority; see
 # docs/layers/layer-4-bridge.md.
 iroh = { version = "1.3", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
+# BBRv3 for the internet carrier (iroh does not re-export the type); must be
+# the noq-proto that iroh uses, so it follows iroh's minor version.
+noq-proto = { version = "~1.3", default-features = false }
 hex = "0.4"
 hkdf = "0.12"
 ring = "0.17.14"

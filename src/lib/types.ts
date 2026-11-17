@@ -290,6 +290,10 @@ export interface AppConfig {
   save_received_files_to_inbox: boolean;
   save_received_images_to_inbox: boolean;
   transfer_window_override?: number | null;
+  /** Developer setting: the internet carrier's congestion controller.
+   * "bbr3" or null (iroh's default, Cubic); null unless Developer tools
+   * are on. */
+  internet_congestion_control?: "bbr3" | null;
   dev_tools_enabled: boolean;
   micro_flow_group_mode: "fixed" | "dynamic";
   shortcut: string;

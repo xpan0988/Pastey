@@ -298,7 +298,39 @@ Limits of this evidence:
 
 Run them with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey connectivity::wan_pair_tests -- --ignored --nocapture --test-threads 1`. They need local sockets, and take about 15 minutes plus 8 for the below-floor case. The quick harness check, `a_shaped_direct_path_carries_a_verified_transfer_between_two_hosts`, runs in the normal suite.
 
-**Step 3 — BBRv3 behind a developer setting (rank 3), default off.** Turn it on by default only after Step 0's matrix is repeated with it on real paths and shows no regression on direct LAN-like paths.
+**Step 3 — BBRv3 behind a developer setting (rank 3), default off. Done; see the result below.** Turn it on by default only after Step 0's matrix is repeated with it on real paths and shows no regression on direct LAN-like paths.
+
+### Step 3 result (emulated)
+
+Implemented as `config.internet_congestion_control` (`"bbr3"` or null), stored and used only while Developer tools are on, set in Settings → Advanced → Internet congestion control. `IrohCarrier` passes `noq_proto::congestion::Bbr3Config::default()` in the endpoint's `QuicTransportConfig` (`noq-proto ~1.3`, the version iroh uses, as a direct dependency). With the default nothing is passed, so iroh's configuration is exactly as before. A change of the effective controller restarts the carrier (`update_config` → `connectivity::apply_settings`). Each side's controller paces only its own sending: the devices need not match, and the wire is unchanged.
+
+Evidence: the two-Host production-path scenarios with both carriers on each controller (`PASTEY_WAN_PAIR_CC=bbr3`), one binary, plus repeats of the cases that differed. Also, a new test of the carrier alone on the same network: raw bytes, nothing above it (`shaped_net::raw_carrier`).
+
+| Case | Cubic (default) | BBRv3 |
+| --- | --- | --- |
+| Raw carrier, 100 ms, 1% loss, 16 MiB | 0.18 MiB/s | **4.26 MiB/s** |
+| Raw carrier, 100 ms, no loss | 6.88 MiB/s | 7.18 MiB/s |
+| Transfer, direct 50 ms, 64 MiB | 10.1 s | 9.2 s |
+| Transfer, relay 350 ms, 64 MiB | 18.2 s | 16.7 s |
+| Transfer, direct 100 ms, 1% loss, 16 MiB | 104–113 s (4 runs) | **6.7, 7.2, 7.3, 7.3, 65, 147, 221 s** (7 runs) |
+| Transfer, relay 384 KiB/s, 32 MiB: time / largest RTT | 97 s / 6.6 s | 103 s / 0.5 s |
+| Transfer, relay 128 KiB/s, 16 MiB: time / largest RTT | 147–161 s / 15–19 s | **187–192 s (4 runs)** / 0.2–0.5 s |
+| Transfer, relay 384 KiB/s, 10 s outage | 60 s | 61, 64, 64, 140 s |
+| Transfer beside a Codex continuation, 5 s outage | 54 s | 60, 71, 117, 122 s |
+| Direct 256 KiB/s, 350 ms; 15 s and 45 s outages; below the floor; Burn | Same outcomes as the Step 1+2 runs | Same outcomes |
+
+Every scenario passed its checks with both controllers: each file intact and exactly once, nothing left behind, sessions kept or ended as before, the continuation run once.
+
+Reading it:
+
+- **On the carrier, BBRv3 does what finding 4 said.** It is 24 times faster at 1% loss and equal without loss. It keeps a loaded relay path's queue down: the largest RTT was 0.2–0.9 s instead of 6–19 s.
+- **A Pastey transfer does not reliably get that gain.** At 1% loss, a transfer was either about 15 times faster than Cubic or much slower, by chance, while Cubic was steady. noq's BBRv3 treats a delivery sample as "in flight too high" when its losses exceed 2% of what was in flight when the packet left (`is_inflight_too_high`, `LOSS_THRESH`), and then caps its long-term in-flight at about 0.7× its target. A bulk stream keeps megabytes in flight, so random 1% loss rarely crosses that line. Pastey's transfer is 4 MiB HTTP requests with gaps between them, so samples with little in flight are common; one random drop crosses 2%, and recovery is slow. This is reasoning from the code and the spread of results, not a trace of the controller's state.
+- **On the emulated relay, a shorter queue did not make transfers faster.** BBRv3 was never faster there, about 25% slower at 128 KiB/s, and up to twice as slow after an outage. Step 2 already keeps those sessions alive, so the shorter queue buys nothing measurable here. The relay hop is one TCP rate limiter shared by both directions, a simplification that may not treat a paced sender like a real relay.
+- **The 22 MiB/s at 1% loss in finding 4 was `wan-bench`'s transfer emulation**, and it still reproduces there (7–9 MiB/s for 16 MiB today). The product's transfer above the same carrier is the difference. Neither `wan-bench` nor this harness explains every part of that gap.
+
+Verdict: the setting is in place for trying on real networks, and it stays off. These results do not support making BBRv3 the default. That needs Step 0's real-network evidence and a look at how chunked transfers interact with its loss response.
+
+Automated checks: a config test (stored and used only with Developer tools on; anything but `bbr3` is the default); a carrier test (a changed controller restarts the carrier with it, an unchanged one keeps it); the frontend integration tests; the full Rust suite.
 
 **Step 4 — resumable transfers (rank 4), its own design review.** Sketch: on an *interrupted* transfer (not a cancel, an integrity failure or a Burn) the receiver keeps the `.part` and its `received_chunks` for a bounded time; a new `transfers/start` for the same sender Host, file identity, size and chunk size is answered with the chunk indexes already held; the sender still reads and hashes the whole file but sends only the missing chunks; the final digest check is unchanged. Additive and negotiated in the start request and response, so an older Host on either side falls back to a full send. Open questions for the review: how the file identity is bound to the authenticated session, where partial files live and when they are deleted, and how this meets Burn and writer-lock rules. This is the only item that changes the transfer protocol, which is why it is last and separate.
 

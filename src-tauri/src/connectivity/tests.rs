@@ -714,3 +714,52 @@ async fn iroh_refuses_unpinned_keys_and_carries_pinned_ones() {
     client.close().await;
     server.close().await;
 }
+
+/// The developer setting reaches the production carrier: changing the
+/// effective controller restarts it with the new one, and an unchanged
+/// setting keeps the running carrier. (A custom relay that does not exist,
+/// so nothing leaves this machine; starting needs no relay.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_congestion_controller_restarts_the_carrier() {
+    use crate::config::CarrierCongestionControl;
+    let pair = RuntimePairV1::new().await;
+    let state = &pair.mac.runtime;
+    let started_with = || {
+        state
+            .connectivity
+            .started_with
+            .lock()
+            .as_ref()
+            .map(|(_, congestion)| *congestion)
+    };
+    let carrier = || state.connectivity.carrier().expect("the carrier runs");
+    {
+        let mut config = state.config.write();
+        config.internet = crate::config::InternetConfig {
+            enabled: true,
+            relay_url: Some("https://127.0.0.1:9".into()),
+        };
+    }
+    apply_settings(state).await.unwrap();
+    assert_eq!(started_with(), Some(CarrierCongestionControl::Default));
+    let first = carrier();
+
+    // Unchanged: the same carrier keeps running.
+    apply_settings(state).await.unwrap();
+    assert!(Arc::ptr_eq(&first, &carrier()));
+
+    // Stored but Developer tools off: still the default, no restart.
+    state.config.write().internet_congestion_control = Some("bbr3".into());
+    if !crate::dev_tools::effective_dev_tools_enabled(false) {
+        apply_settings(state).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &carrier()));
+    }
+
+    // Developer tools on: a new carrier with BBRv3.
+    state.config.write().dev_tools_enabled = true;
+    apply_settings(state).await.unwrap();
+    assert_eq!(started_with(), Some(CarrierCongestionControl::Bbr3));
+    assert!(!Arc::ptr_eq(&first, &carrier()));
+
+    stop_carrier(state).await;
+}

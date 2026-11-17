@@ -288,6 +288,8 @@ pub(crate) struct NetSpec {
     pub(crate) rtt_ms: u64,
     pub(crate) rate_kib: Option<u64>,
     pub(crate) loss: f64,
+    /// Both carriers' congestion controller.
+    pub(crate) congestion: crate::config::CarrierCongestionControl,
 }
 
 /// One emulated network joining two Hosts' carriers.
@@ -346,12 +348,24 @@ pub(crate) async fn start_pair(
     match spec.mode {
         PathMode::Direct => {
             let selector = Arc::new(ThroughHops::default());
-            let first = IrohCarrier::start_shaped(first_sink, None, true, Some(selector.clone()))
-                .await
-                .unwrap();
-            let second = IrohCarrier::start_shaped(second_sink, None, true, Some(selector.clone()))
-                .await
-                .unwrap();
+            let first = IrohCarrier::start_shaped(
+                first_sink,
+                None,
+                true,
+                Some(selector.clone()),
+                spec.congestion,
+            )
+            .await
+            .unwrap();
+            let second = IrohCarrier::start_shaped(
+                second_sink,
+                None,
+                true,
+                Some(selector.clone()),
+                spec.congestion,
+            )
+            .await
+            .unwrap();
             // One hop in front of each, so either may dial; the tests dial
             // from the first and the second reuses that connection.
             let to_first = udp_hop(loopback_v4(&first), shape.clone()).await.unwrap();
@@ -385,12 +399,19 @@ pub(crate) async fn start_pair(
             let hop = tcp_hop(upstream, shape.clone()).await.unwrap();
             let url: RelayUrl = format!("https://{hop}").parse().unwrap();
             let map = RelayMap::from(url.clone());
-            let first = IrohCarrier::start_shaped(first_sink, Some(map.clone()), false, None)
-                .await
-                .unwrap();
-            let second = IrohCarrier::start_shaped(second_sink, Some(map), false, None)
-                .await
-                .unwrap();
+            let first = IrohCarrier::start_shaped(
+                first_sink,
+                Some(map.clone()),
+                false,
+                None,
+                spec.congestion,
+            )
+            .await
+            .unwrap();
+            let second =
+                IrohCarrier::start_shaped(second_sink, Some(map), false, None, spec.congestion)
+                    .await
+                    .unwrap();
             for carrier in [&first, &second] {
                 tokio::time::timeout(Duration::from_secs(20), carrier.online())
                     .await
@@ -417,6 +438,104 @@ pub(crate) async fn start_pair(
                 }),
                 second_card,
             }
+        }
+    }
+}
+
+/// The carrier alone on the emulated network: one stream of raw bytes, no
+/// Bridge, HTTP or Transfer above it. Separates what the path and the
+/// congestion controller allow from what Pastey's layers above make of it.
+#[cfg(test)]
+mod raw_carrier {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{super::CarrierStream, *};
+    use crate::config::CarrierCongestionControl;
+
+    struct Sink {
+        streams: mpsc::UnboundedSender<CarrierStream>,
+    }
+
+    impl InboundSink for Sink {
+        fn admits(&self, _carrier: &str, _remote_id: &str) -> bool {
+            true
+        }
+        fn link(&self, _link: Arc<dyn CarrierLink>) {}
+        fn stream(
+            &self,
+            _carrier: &'static str,
+            _link: Arc<dyn CarrierLink>,
+            stream: CarrierStream,
+        ) {
+            let _ = self.streams.send(stream);
+        }
+    }
+
+    /// 16 MiB over 100 ms with 1% random loss each way, then without loss,
+    /// for each controller. Prints one `WAN_PAIR` line per case.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "long: raw carrier throughput"]
+    async fn raw_carrier_throughput_under_loss() {
+        const TOTAL: usize = 16 * 1024 * 1024;
+        for (congestion, loss) in [
+            (CarrierCongestionControl::Default, 0.01),
+            (CarrierCongestionControl::Bbr3, 0.01),
+            (CarrierCongestionControl::Default, 0.0),
+            (CarrierCongestionControl::Bbr3, 0.0),
+        ] {
+            let (unused, _) = mpsc::unbounded_channel();
+            let (arriving, mut arrived) = mpsc::unbounded_channel();
+            let spec = NetSpec {
+                mode: PathMode::Direct,
+                rtt_ms: 100,
+                rate_kib: None,
+                loss,
+                congestion,
+            };
+            let carriers = start_pair(
+                spec,
+                Arc::new(Sink { streams: unused }),
+                Arc::new(Sink { streams: arriving }),
+            )
+            .await;
+            let link = carriers.first.connect(&carriers.second_card).await.unwrap();
+            let started = Instant::now();
+            let mut stream = link.open_stream().await.unwrap();
+            let writing = tokio::spawn(async move {
+                let block = vec![1u8; 64 * 1024];
+                for _ in 0..TOTAL / block.len() {
+                    stream.writer.write_all(&block).await.unwrap();
+                }
+                stream.writer.shutdown().await.unwrap();
+                stream
+            });
+            let mut far = arrived.recv().await.unwrap();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut received = 0;
+            while received < TOTAL {
+                let read = far.reader.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                received += read;
+            }
+            let _ = writing.await;
+            let seconds = started.elapsed().as_secs_f64();
+            println!(
+                "WAN_PAIR {}",
+                serde_json::json!({
+                    "schema": "pastey-wan-pair-v1",
+                    "scenario": "raw_carrier_direct_100ms_16mib",
+                    "congestion_control": congestion.name(),
+                    "loss": loss,
+                    "seconds": (seconds * 100.0).round() / 100.0,
+                    "mib_per_s": ((received as f64 / 1_048_576.0 / seconds) * 100.0).round() / 100.0,
+                    "path": link.path_counters().map(|counters| counters.log_fields()),
+                })
+            );
+            assert_eq!(received, TOTAL);
+            carriers.first.close().await;
+            carriers.second.close().await;
         }
     }
 }

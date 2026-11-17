@@ -14,6 +14,9 @@
 //! - **Paths.** iroh prefers a direct path (hole punching, UPnP/NAT-PMP/PCP
 //!   port mapping) and falls back to its relay, which carries only
 //!   QUIC-encrypted bytes of an already Bridge-encrypted stream.
+//! - **Congestion control.** iroh's default (Cubic) unless the developer
+//!   setting asks for BBRv3 (`config::CarrierCongestionControl`). Each
+//!   side's controller paces only what it sends; the wire is unchanged.
 //! - **Relays.** n0's public relays by default ("development and hobby use"
 //!   under n0's terms), or one relay URL the user runs. With n0's relays the
 //!   endpoint also publishes its home relay as a record signed by its key
@@ -33,13 +36,30 @@ use super::{
     CARD_SCHEMA,
 };
 use crate::{
-    config::InternetConfig,
+    config::{CarrierCongestionControl, InternetConfig},
     error::{AppError, AppResult},
     storage::AppPaths,
 };
 
 pub(crate) const CARRIER: &str = "iroh";
 const ALPN: &[u8] = b"pastey/bridge-tunnel/1";
+
+/// The QUIC transport configuration for a controller. `None` leaves iroh's
+/// default configuration untouched.
+fn transport_config(
+    congestion: CarrierCongestionControl,
+) -> Option<iroh::endpoint::QuicTransportConfig> {
+    match congestion {
+        CarrierCongestionControl::Default => None,
+        CarrierCongestionControl::Bbr3 => Some(
+            iroh::endpoint::QuicTransportConfig::builder()
+                .congestion_controller_factory(Arc::new(
+                    noq_proto::congestion::Bbr3Config::default(),
+                ))
+                .build(),
+        ),
+    }
+}
 
 pub(crate) struct IrohCarrier {
     endpoint: Endpoint,
@@ -82,6 +102,7 @@ impl IrohCarrier {
         paths: &AppPaths,
         master_key: &[u8; 32],
         settings: &InternetConfig,
+        congestion: CarrierCongestionControl,
         sink: Arc<dyn InboundSink>,
     ) -> AppResult<Arc<dyn Carrier>> {
         let secret = load_or_create_key(paths, master_key)?;
@@ -89,6 +110,9 @@ impl IrohCarrier {
             .secret_key(secret)
             .alpns(vec![ALPN.to_vec()])
             .hooks(PinnedOnly { sink: sink.clone() });
+        if let Some(transport) = transport_config(congestion) {
+            builder = builder.transport_config(transport);
+        }
         builder = match settings.relay_url.as_deref() {
             Some(url) => {
                 let url = RelayUrl::from_str(url).map_err(|_| {
@@ -132,19 +156,23 @@ impl IrohCarrier {
     /// (`shaped_net`). Only how the endpoint finds its peer differs: a local
     /// relay (self-signed, so not verified) and/or a path pinned through a
     /// shaper. Hooks, accept loop, links, streams and the QUIC transport
-    /// configuration are the production ones.
+    /// configuration (for the controller given) are the production ones.
     #[cfg(test)]
     pub(crate) async fn start_shaped(
         sink: Arc<dyn InboundSink>,
         relay: Option<RelayMap>,
         ip: bool,
         path_selector: Option<Arc<dyn iroh::endpoint::transports::PathSelector>>,
+        congestion: CarrierCongestionControl,
     ) -> AppResult<Arc<Self>> {
         let mut builder = Endpoint::builder(presets::Minimal)
             .alpns(vec![ALPN.to_vec()])
             .hooks(PinnedOnly { sink: sink.clone() })
             .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
             .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
+        if let Some(transport) = transport_config(congestion) {
+            builder = builder.transport_config(transport);
+        }
         builder = match relay {
             Some(map) => builder.relay_mode(RelayMode::Custom(map)),
             None => builder.relay_mode(RelayMode::Disabled),

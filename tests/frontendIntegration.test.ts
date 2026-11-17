@@ -1591,6 +1591,8 @@ test("Device details, network tests and this device's diagnostics are reachable 
   assert.match(settings, /save\(\{ \.\.\.config, inbox_dir: null \}\)/);
   assert.match(settings, /micro_flow_group_mode: event\.target\.value/);
   assert.match(settings, /transfer_window_override: event\.target\.value === "auto" \? null : Number\(event\.target\.value\)/);
+  assert.match(settings, /internet_congestion_control: event\.target\.value === "bbr3" \? "bbr3" : null/);
+  assert.match(settings, /aria-label="Internet congestion control"/);
   assert.match(settings, /openLogsFolder\(\)/);
   assert.match(settings, /copyLastError\(\)/);
   assert.match(settings, /checkForUpdates\(\)/);

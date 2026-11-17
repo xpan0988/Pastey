@@ -6743,6 +6743,7 @@ mod join_authentication {
                 save_received_files_to_inbox: true,
                 save_received_images_to_inbox: true,
                 transfer_window_override: None,
+                internet_congestion_control: None,
                 dev_tools_enabled: false,
                 micro_flow_group_mode: "off".into(),
                 shortcut: "test".into(),

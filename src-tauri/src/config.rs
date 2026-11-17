@@ -22,6 +22,11 @@ pub struct StoredConfig {
     pub save_received_images_to_inbox: bool,
     #[serde(default)]
     pub transfer_window_override: Option<usize>,
+    /// Developer setting: the internet carrier's congestion controller
+    /// ("bbr3"); None is iroh's default (Cubic). Used only while Developer
+    /// tools are on.
+    #[serde(default)]
+    pub internet_congestion_control: Option<String>,
     #[serde(default = "dev_tools::default_dev_tools_enabled")]
     pub dev_tools_enabled: bool,
     #[serde(default = "default_micro_flow_group_mode")]
@@ -34,6 +39,58 @@ pub struct StoredConfig {
     /// user turns it on; a connection carrier only, never authority.
     #[serde(default)]
     pub internet: InternetConfig,
+}
+
+/// How the internet carrier paces what this device sends. Each side's
+/// controller governs only its own sending; nothing on the wire changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CarrierCongestionControl {
+    /// iroh's default (Cubic).
+    #[default]
+    Default,
+    /// BBRv3, experimental: a developer setting until measured on real
+    /// networks.
+    Bbr3,
+}
+
+impl CarrierCongestionControl {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Default => "cubic",
+            Self::Bbr3 => "bbr3",
+        }
+    }
+}
+
+const BBR3: &str = "bbr3";
+
+/// A stored or requested controller name: "bbr3" or nothing.
+fn normalize_internet_congestion_control(value: Option<&str>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| value == BBR3)
+}
+
+/// The controller the carrier should run: the developer setting while
+/// Developer tools are on, otherwise iroh's default.
+pub fn carrier_congestion_control(config: &StoredConfig) -> CarrierCongestionControl {
+    carrier_congestion_control_with_dev_tools(
+        config,
+        dev_tools::effective_dev_tools_enabled(config.dev_tools_enabled),
+    )
+}
+
+fn carrier_congestion_control_with_dev_tools(
+    config: &StoredConfig,
+    dev_tools_enabled: bool,
+) -> CarrierCongestionControl {
+    let stored =
+        normalize_internet_congestion_control(config.internet_congestion_control.as_deref());
+    if dev_tools_enabled && stored.is_some() {
+        CarrierCongestionControl::Bbr3
+    } else {
+        CarrierCongestionControl::Default
+    }
 }
 
 /// Internet connectivity for Bridges (`connectivity`).
@@ -80,6 +137,7 @@ pub fn load_or_create(paths: &AppPaths, shortcut: &str) -> AppResult<StoredConfi
         save_received_files_to_inbox: true,
         save_received_images_to_inbox: true,
         transfer_window_override: None,
+        internet_congestion_control: None,
         dev_tools_enabled: dev_tools::default_dev_tools_enabled(),
         micro_flow_group_mode: default_micro_flow_group_mode(),
         shortcut: shortcut.to_string(),
@@ -119,6 +177,11 @@ fn public_config_with_dev_tools(
         save_received_images_to_inbox: config.save_received_images_to_inbox,
         transfer_window_override: if dev_tools_enabled {
             transfer_tuning::normalize_transfer_window_override(config.transfer_window_override)
+        } else {
+            None
+        },
+        internet_congestion_control: if dev_tools_enabled {
+            normalize_internet_congestion_control(config.internet_congestion_control.as_deref())
         } else {
             None
         },
@@ -166,6 +229,12 @@ fn update_with_dev_tools_enabled(
     if dev_tools_enabled && (was_dev_tools_enabled || incoming.transfer_window_override.is_some()) {
         current.transfer_window_override =
             transfer_tuning::normalize_transfer_window_override(incoming.transfer_window_override);
+    }
+    if dev_tools_enabled
+        && (was_dev_tools_enabled || incoming.internet_congestion_control.is_some())
+    {
+        current.internet_congestion_control =
+            normalize_internet_congestion_control(incoming.internet_congestion_control.as_deref());
     }
     current.version = 5;
     save(paths, current)?;
@@ -336,6 +405,7 @@ mod tests {
             save_received_files_to_inbox: false,
             save_received_images_to_inbox: true,
             transfer_window_override: None,
+            internet_congestion_control: None,
             dev_tools_enabled: false,
             micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
@@ -380,6 +450,89 @@ mod tests {
         let _ = fs::remove_dir_all(paths.app_data_dir);
     }
 
+    /// BBRv3 is a developer setting: stored and used only while Developer
+    /// tools are on; anything but "bbr3" means iroh's default.
+    #[test]
+    fn carrier_congestion_control_is_a_developer_setting() {
+        let paths = test_paths();
+        let mut stored = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+        assert_eq!(stored.internet_congestion_control, None);
+        assert_eq!(
+            carrier_congestion_control_with_dev_tools(&stored, true),
+            CarrierCongestionControl::Default
+        );
+
+        // Developer tools off: a request is not stored.
+        let incoming = public_config_with_dev_tools(&paths, &stored, false);
+        update_with_dev_tools_enabled(
+            &paths,
+            &mut stored,
+            AppConfig {
+                internet_congestion_control: Some("bbr3".into()),
+                ..incoming
+            },
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(stored.internet_congestion_control, None);
+
+        // On: stored, normalized, and used.
+        let incoming = public_config_with_dev_tools(&paths, &stored, true);
+        let updated = update_with_dev_tools_enabled(
+            &paths,
+            &mut stored,
+            AppConfig {
+                internet_congestion_control: Some(" BBR3 ".into()),
+                ..incoming
+            },
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(updated.internet_congestion_control.as_deref(), Some("bbr3"));
+        let reloaded = load_or_create(&paths, "Ctrl+Shift+V").unwrap();
+        assert_eq!(
+            reloaded.internet_congestion_control.as_deref(),
+            Some("bbr3")
+        );
+        assert_eq!(
+            carrier_congestion_control_with_dev_tools(&reloaded, true),
+            CarrierCongestionControl::Bbr3
+        );
+
+        // Developer tools turned off again: kept, but neither shown nor used.
+        assert_eq!(
+            carrier_congestion_control_with_dev_tools(&reloaded, false),
+            CarrierCongestionControl::Default
+        );
+        assert_eq!(
+            public_config_with_dev_tools(&paths, &reloaded, false).internet_congestion_control,
+            None
+        );
+
+        // An unknown controller is iroh's default.
+        let incoming = public_config_with_dev_tools(&paths, &stored, true);
+        update_with_dev_tools_enabled(
+            &paths,
+            &mut stored,
+            AppConfig {
+                internet_congestion_control: Some("reno".into()),
+                ..incoming
+            },
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(stored.internet_congestion_control, None);
+        assert_eq!(
+            carrier_congestion_control_with_dev_tools(&stored, true),
+            CarrierCongestionControl::Default
+        );
+
+        let _ = fs::remove_dir_all(paths.app_data_dir);
+    }
+
     #[test]
     fn normal_public_config_hides_dev_transfer_window() {
         let paths = test_paths();
@@ -391,6 +544,7 @@ mod tests {
             save_received_files_to_inbox: true,
             save_received_images_to_inbox: true,
             transfer_window_override: Some(16),
+            internet_congestion_control: None,
             dev_tools_enabled: false,
             micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
@@ -418,6 +572,7 @@ mod tests {
             save_received_files_to_inbox: true,
             save_received_images_to_inbox: true,
             transfer_window_override: Some(8),
+            internet_congestion_control: None,
             dev_tools_enabled: true,
             micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
@@ -445,6 +600,7 @@ mod tests {
             save_received_files_to_inbox: true,
             save_received_images_to_inbox: true,
             transfer_window_override: None,
+            internet_congestion_control: None,
             dev_tools_enabled: false,
             micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
@@ -514,6 +670,7 @@ mod tests {
             save_received_files_to_inbox: true,
             save_received_images_to_inbox: true,
             transfer_window_override: Some(16),
+            internet_congestion_control: None,
             dev_tools_enabled: false,
             micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),
@@ -541,6 +698,7 @@ mod tests {
             save_received_files_to_inbox: true,
             save_received_images_to_inbox: true,
             transfer_window_override: None,
+            internet_congestion_control: None,
             dev_tools_enabled: true,
             micro_flow_group_mode: default_micro_flow_group_mode(),
             shortcut: "Ctrl+Shift+V".into(),

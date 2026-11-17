@@ -39,12 +39,20 @@ fn device_key(host: &PairHostV1) -> [u8; 32] {
         .public_key()
 }
 
+/// Both Hosts' carriers run iroh's default controller, or BBRv3 when
+/// `PASTEY_WAN_PAIR_CC=bbr3` (the developer setting's controller, set the
+/// way the product sets it).
 fn spec(mode: PathMode, rtt_ms: u64, rate_kib: Option<u64>, loss: f64) -> NetSpec {
+    let congestion = match std::env::var("PASTEY_WAN_PAIR_CC").as_deref() {
+        Ok("bbr3") => crate::config::CarrierCongestionControl::Bbr3,
+        _ => crate::config::CarrierCongestionControl::Default,
+    };
     NetSpec {
         mode,
         rtt_ms,
         rate_kib,
         loss,
+        congestion,
     }
 }
 
@@ -373,6 +381,7 @@ impl ShapedPair {
             "rtt_ms": self.net.spec.rtt_ms,
             "rate_kib": self.net.spec.rate_kib,
             "loss": self.net.spec.loss,
+            "congestion_control": self.net.spec.congestion.name(),
             "mib": payload.len as f64 / 1_048_576.0,
             "completed": error.is_none(),
             "error": error,
@@ -630,6 +639,36 @@ async fn wan_lossy_direct_link_completes() {
     let sending = pair.send(&file);
     let report = pair
         .report("lossy_direct_1pct_100ms_16mib", &file, sending, json!({}))
+        .await;
+    report.assert_delivered_once();
+    assert_eq!(report.invalidations, 0, "the session stays connected");
+}
+
+// ---------------------------------------------------------------------------
+// Clean, fast links: what a controller must not make worse.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: throughput on a clean link"]
+async fn wan_fast_direct_link_completes() {
+    let pair = ShapedPair::new(spec(PathMode::Direct, 50, None, 0.0)).await;
+    let file = payload(&pair, "fast-direct", 64);
+    let sending = pair.send(&file);
+    let report = pair
+        .report("fast_direct_50ms_64mib", &file, sending, json!({}))
+        .await;
+    report.assert_delivered_once();
+    assert_eq!(report.invalidations, 0, "the session stays connected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long: throughput on a clean link"]
+async fn wan_fast_relay_link_completes() {
+    let pair = ShapedPair::new(spec(PathMode::Relay, 350, None, 0.0)).await;
+    let file = payload(&pair, "fast-relay", 64);
+    let sending = pair.send(&file);
+    let report = pair
+        .report("fast_relay_350ms_64mib", &file, sending, json!({}))
         .await;
     report.assert_delivered_once();
     assert_eq!(report.invalidations, 0, "the session stays connected");

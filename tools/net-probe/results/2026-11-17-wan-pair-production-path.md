@@ -77,3 +77,64 @@ Builds: before = 2214d79 (neither step), step1 = 19621ac, step1+2 = 77607a9, ste
 | short_outage_10s_relay_384k_16mib | step1+2+abort | yes | 60.46 | 34.91 | 34.91 | 1 | 0 | 0/0 | 0 | 14744.76 | {"outage_at_s": 10.0, "outage_s": 10.0} |
 | short_outage_15s_direct_384k_16mib | step1+2+abort | yes | 66.59 | 42.51 | 42.51 | 1 | 0 | 0/0 | 0 | 354.75 | {"outage_at_s": 10.0, "outage_s": 15.0} |
 | slow_direct_256k_350ms_32mib | step1+2+abort | yes | 143.33 | 35.42 | 35.42 | 1 | 0 | 0/0 | 0 | 808.68 |  |
+
+## Run 4: Step 3, Cubic and BBRv3 (both carriers), same binary
+
+| scenario | controller | done | s | first progress s | copies | .part | invalidations | max RTT ms |
+|---|---|---|---|---|---|---|---|---|
+| below_floor_direct_64k_16mib | bbr3 | NO | 483.78 | – | 0 | 0 | 0 | 369.25 |
+| below_floor_direct_64k_16mib | cubic | NO | 483.93 | – | 0 | 0 | 0 | 413.31 |
+| congested_relay_128k_150ms_16mib | bbr3 | yes | 191.93 | 97.56 | 1 | 0 | 0 | 241.98 |
+| congested_relay_128k_150ms_16mib | cubic | yes | 146.88 | 72.53 | 1 | 0 | 0 | 18717.11 |
+| congested_relay_384k_150ms_32mib | bbr3 | yes | 103.22 | 25.92 | 1 | 0 | 0 | 499.92 |
+| congested_relay_384k_150ms_32mib | cubic | yes | 97.16 | 25.11 | 1 | 0 | 0 | 6594.6 |
+| continuation_beside_relay_384k_transfer_16mib | bbr3 | yes | 122.26 | 95.97 | 1 | 0 | 0 | 591.83 |
+| continuation_beside_relay_384k_transfer_16mib | cubic | yes | 54.45 | 25.12 | 1 | 0 | 0 | 6426.98 |
+| fast_direct_50ms_64mib | bbr3 | yes | 9.21 | 1.63 | 1 | 0 | 0 | 243.2 |
+| fast_direct_50ms_64mib | cubic | yes | 10.13 | 1.73 | 1 | 0 | 0 | 336.04 |
+| fast_relay_350ms_64mib | bbr3 | yes | 16.73 | 5.22 | 1 | 0 | 0 | 715.36 |
+| fast_relay_350ms_64mib | cubic | yes | 18.16 | 6.01 | 1 | 0 | 0 | 634.62 |
+| long_outage_45s_direct_384k_16mib | bbr3 | NO | 38.36 | – | 0 | 0 | 2 | 200.76 |
+| long_outage_45s_direct_384k_16mib | cubic | NO | 38.38 | – | 0 | 0 | 1 | 345.52 |
+| long_outage_after_reconnect_1mib | bbr3 | yes | 0.19 | 0.17 | 1 | 0 | 2 | 200.76 |
+| long_outage_after_reconnect_1mib | cubic | yes | 0.23 | 0.2 | 1 | 0 | 2 | 345.52 |
+| lossy_direct_1pct_100ms_16mib | bbr3 | yes | 147.3 | 102.01 | 1 | 0 | 0 | 115.55 |
+| lossy_direct_1pct_100ms_16mib | cubic | yes | 108.71 | 53.45 | 1 | 0 | 0 | 154.57 |
+| receiver_burn_at_20s_direct_256k_32mib | bbr3 | NO | 34.55 | – | 0 | 0 | 1 | 321.1 |
+| receiver_burn_at_20s_direct_256k_32mib | cubic | NO | 34.12 | – | 0 | 0 | 0 | 398.67 |
+| sender_burn_at_20s_direct_256k_32mib | bbr3 | NO | 20.02 | – | 0 | 0 | 0 | 301.33 |
+| sender_burn_at_20s_direct_256k_32mib | cubic | NO | 20.02 | – | 0 | 0 | 1 | 397.94 |
+| short_outage_10s_relay_384k_16mib | bbr3 | yes | 61.51 | 35.4 | 1 | 0 | 0 | 896.24 |
+| short_outage_10s_relay_384k_16mib | cubic | yes | 60.34 | 34.71 | 1 | 0 | 0 | 14515.43 |
+| short_outage_15s_direct_384k_16mib | bbr3 | yes | 66.95 | 41.76 | 1 | 0 | 0 | 204.93 |
+| short_outage_15s_direct_384k_16mib | cubic | yes | 66.63 | 42.54 | 1 | 0 | 0 | 388.03 |
+| slow_direct_256k_350ms_32mib | bbr3 | yes | 151.78 | 37.29 | 1 | 0 | 0 | 721.97 |
+| slow_direct_256k_350ms_32mib | cubic | yes | 142.83 | 35.52 | 1 | 0 | 0 | 665.23 |
+
+## Run 5: BBRv3 repeats on the relay
+
+| scenario | s | first progress s | max RTT ms |
+|---|---|---|---|
+| congested_relay_128k_150ms_16mib | 188.62 | 96.15 | 473.02 |
+| congested_relay_128k_150ms_16mib | 191.95 | 96.22 | 389.57 |
+| congested_relay_128k_150ms_16mib | 186.75 | 95.04 | 317.89 |
+| continuation_beside_relay_384k_transfer_16mib | 70.92 | 43.05 | 2942.23 |
+| continuation_beside_relay_384k_transfer_16mib | 117.49 | 90.19 | 890.93 |
+| continuation_beside_relay_384k_transfer_16mib | 59.84 | 32.1 | 1361.07 |
+| short_outage_10s_relay_384k_16mib | 64.34 | 36.73 | 6754.87 |
+| short_outage_10s_relay_384k_16mib | 139.85 | 101.41 | 3302.92 |
+| short_outage_10s_relay_384k_16mib | 64.61 | 36.74 | 9845.59 |
+
+## Lossy transfer repeats (direct 100 ms, 1% loss, 16 MiB; seconds only)
+
+- Cubic: 108.7, 109.7, 103.6, 113.3
+- BBRv3: 147.3, 7.2, 7.3, 65.0, 7.3, 6.7, 220.6 (and 99.3 with both lifecycle loops off)
+
+## Run 6: the carrier alone (raw bytes, direct 100 ms, 16 MiB)
+
+| controller | loss | MiB/s | s |
+|---|---|---|---|
+| cubic | 0.01 | 0.18 | 89.36 |
+| bbr3 | 0.01 | 4.26 | 3.76 |
+| cubic | 0.0 | 6.88 | 2.32 |
+| bbr3 | 0.0 | 7.18 | 2.23 |

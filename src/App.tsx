@@ -101,6 +101,7 @@ const BROWSER_PREVIEW_CONFIG: AppConfig = {
   save_received_files_to_inbox: true,
   save_received_images_to_inbox: true,
   transfer_window_override: null,
+  internet_congestion_control: null,
   dev_tools_enabled: false,
   micro_flow_group_mode: "dynamic",
   shortcut: "Unavailable in browser preview",

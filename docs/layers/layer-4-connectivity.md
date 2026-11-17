@@ -43,6 +43,7 @@ What this means for Agents ([Layer 5](layer-5-agent.md)): executor Review, write
 5. **The endpoint.** The Bridge stores `127.0.0.1:<forwarder port>` as the peer's endpoint. On the receiving side, `join_handler` recognises a join that came through a tunnel (by its loopback source port) and records its own forwarder toward the joining device, refusing the join unless that device is the one the tunnel's key is pinned to.
 6. **Liveness.** A session through a tunnel is probed with a 5 s bound and ends after 4 failed probes (LAN: 1.8 s, 3), so relay latency and a path change of a few seconds do not rotate its keys. A failed probe does not count while this device's room server accepted a signed request from the same peer key in the last 8 s: on a tunnel loaded by a transfer the probe's reply can queue for longer than its bound while the peer's own requests keep arriving. A session that is really gone still ends within about half a minute (36 s at most).
 7. **Status.** Bridge details and Device details → Connection show whether the internet path is in use and whether it is direct or through a relay.
+8. **Congestion control.** The carrier uses iroh's default controller (Cubic). With Developer tools on, Settings → Advanced → Internet congestion control can switch this device's carrier to BBRv3 (experimental); changing it restarts the carrier, which interrupts transfers across the internet. Each side's controller paces only what that side sends, so the two devices need not match and nothing on the wire changes.
 
 ## Overlay address
 

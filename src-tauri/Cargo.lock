@@ -4334,6 +4334,7 @@ dependencies = [
  "iroh",
  "libc",
  "mime_guess",
+ "noq-proto",
  "parking_lot",
  "portable-pty",
  "rand 0.8.6",

@@ -261,8 +261,14 @@ struct TunnelSource {
 #[derive(Default)]
 pub(crate) struct ConnectivityService {
     carrier: Mutex<Option<Arc<dyn Carrier>>>,
-    /// The relay setting the current carrier was started with.
-    started_with: Mutex<Option<crate::config::InternetConfig>>,
+    /// The setting and congestion controller the current carrier was
+    /// started with.
+    started_with: Mutex<
+        Option<(
+            crate::config::InternetConfig,
+            crate::config::CarrierCongestionControl,
+        )>,
+    >,
     links: Mutex<HashMap<String, Arc<dyn CarrierLink>>>,
     /// Loopback forwarders toward one peer of one Bridge, by
     /// (Bridge, carrier key).
@@ -320,9 +326,18 @@ impl InboundSink for Inbound {
 pub(crate) async fn apply_settings(state: &Arc<AppState>) -> AppResult<()> {
     let service = &state.connectivity;
     let _starting = service.starting.lock().await;
-    let wanted = state.config.read().internet.clone();
+    let (wanted, congestion) = {
+        let config = state.config.read();
+        (
+            config.internet.clone(),
+            crate::config::carrier_congestion_control(&config),
+        )
+    };
     let running = service.started_with.lock().clone();
-    if wanted.enabled && running.as_ref() == Some(&wanted) && service.carrier().is_some() {
+    if wanted.enabled
+        && running.as_ref() == Some(&(wanted.clone(), congestion))
+        && service.carrier().is_some()
+    {
         return Ok(());
     }
     stop_carrier(state).await;
@@ -337,10 +352,14 @@ pub(crate) async fn apply_settings(state: &Arc<AppState>) -> AppResult<()> {
         crate::config::master_key(&config)?
     };
     let carrier =
-        iroh_carrier::IrohCarrier::start(&state.paths, &master_key, &wanted, sink).await?;
+        iroh_carrier::IrohCarrier::start(&state.paths, &master_key, &wanted, congestion, sink)
+            .await?;
     *service.carrier.lock() = Some(carrier);
-    *service.started_with.lock() = Some(wanted);
-    logging::write_transfer_line("[pastey connectivity] event=carrier_started carrier=iroh");
+    *service.started_with.lock() = Some((wanted, congestion));
+    logging::write_transfer_line(&format!(
+        "[pastey connectivity] event=carrier_started carrier=iroh congestion_control={}",
+        congestion.name()
+    ));
     Ok(())
 }
 

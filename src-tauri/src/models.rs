@@ -266,6 +266,9 @@ pub struct AppConfig {
     pub save_received_images_to_inbox: bool,
     #[serde(default)]
     pub transfer_window_override: Option<usize>,
+    /// "bbr3" while Developer tools are on and it is set; otherwise None.
+    #[serde(default)]
+    pub internet_congestion_control: Option<String>,
     #[serde(default)]
     pub dev_tools_enabled: bool,
     #[serde(default = "default_micro_flow_group_mode")]

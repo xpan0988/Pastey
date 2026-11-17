@@ -7441,14 +7441,33 @@ pub fn get_last_benchmark_results(
 }
 
 #[tauri::command]
-pub fn update_config(
+pub async fn update_config(
     // The frontend must invoke this as `configValue`; Tauri maps that camel-case
     // argument onto this Rust `config_value` parameter.
     config_value: AppConfig,
     state: State<'_, Arc<AppState>>,
 ) -> Result<AppConfig, String> {
-    let mut guard = state.config.write();
-    config::update(&state.paths, &mut guard, config_value).map_err(|error| error.message())
+    let (updated, congestion_changed) = {
+        let mut guard = state.config.write();
+        let before = config::carrier_congestion_control(&guard);
+        let updated = config::update(&state.paths, &mut guard, config_value)
+            .map_err(|error| error.message())?;
+        (
+            updated,
+            config::carrier_congestion_control(&guard) != before,
+        )
+    };
+    // The carrier takes its congestion controller when it starts: restart
+    // it (if it runs) so the new one applies. Its connections are re-made.
+    if congestion_changed {
+        if let Err(error) = crate::connectivity::apply_settings(state.inner()).await {
+            logging::write_transfer_line(&format!(
+                "[pastey connectivity] event=carrier_restart_failed reason={:?}",
+                error.message()
+            ));
+        }
+    }
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -7780,6 +7799,7 @@ mod tests {
             save_received_files_to_inbox: true,
             save_received_images_to_inbox: true,
             transfer_window_override: None,
+            internet_congestion_control: None,
             dev_tools_enabled: false,
             micro_flow_group_mode: "off".into(),
             shortcut: "test".into(),
