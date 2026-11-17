@@ -1888,19 +1888,39 @@ async fn send_chunk_with_retry(
         }
 
         let attempt_started_at = Instant::now();
-        let result = send_chunk_once(
-            client,
-            base_url,
-            room_id,
-            transfer_id,
-            chunk_index,
-            total_chunks,
-            plaintext_size,
-            nonce,
-            encrypted_bytes,
-            protocol,
-        )
-        .await;
+        // Cancel, Burn and a lost session end an upload already under way:
+        // dropping the request closes its connection, so no more of the
+        // chunk leaves this device and the receiver never gets a whole body.
+        let result = tokio::select! {
+            biased;
+            () = cancel_token.cancelled() => {
+                dev_log_sender_chunk_attempt(
+                    transfer_id,
+                    room_id,
+                    chunk_index,
+                    retry_count,
+                    "cancelled_in_flight",
+                    attempt_started_at.elapsed(),
+                );
+                return Err(ChunkSendFailure {
+                    message: TRANSFER_CANCELLED_MESSAGE.into(),
+                    kind: ChunkSendFailureKind::Cancelled,
+                    retryable: false,
+                });
+            }
+            result = send_chunk_once(
+                client,
+                base_url,
+                room_id,
+                transfer_id,
+                chunk_index,
+                total_chunks,
+                plaintext_size,
+                nonce,
+                encrypted_bytes,
+                protocol,
+            ) => result,
+        };
         let elapsed = attempt_started_at.elapsed();
 
         match result {
@@ -7737,6 +7757,76 @@ mod join_authentication {
         assert!(files_under(&receiver.root.join("inbox"))
             .iter()
             .any(|bytes| *bytes == content));
+    }
+
+    /// Cancel (and Burn, and a lost session, which cancel the same way)
+    /// ends a chunk upload already under way: the call returns at once and
+    /// the connection closes before the rest of the chunk is sent.
+    #[tokio::test]
+    async fn cancelling_ends_a_chunk_upload_already_in_flight() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A receiver on a slow link: it reads 16 KiB every 50 ms and never
+        // answers. Once the sender cancels it reads as fast as it can (what
+        // already sits in the sockets' kernel buffers is not the sender's to
+        // take back) and reports how much arrived in all.
+        let cancel = CancellationToken::new();
+        let seen_by_receiver = cancel.clone();
+        let receiver = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut received = 0usize;
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => return received,
+                    Ok(read) => received += read,
+                }
+                if !seen_by_receiver.is_cancelled() {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        });
+
+        let body = vec![7u8; DEFAULT_CHUNK_SIZE_BYTES as usize];
+        let cancelling = cancel.clone();
+        let cancelled_at = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            cancelling.cancel();
+            Instant::now()
+        });
+        let client = reqwest::Client::new();
+        let result = send_chunk_with_retry(
+            &client,
+            &format!("http://127.0.0.1:{port}/rooms/{ROOM_ID}"),
+            ROOM_ID,
+            "in-flight",
+            0,
+            2,
+            body.len(),
+            &[0u8; 12],
+            &body,
+            &cancel,
+            ChunkProtocol::BinaryV1,
+        )
+        .await;
+        let returned_at = Instant::now();
+        let cancelled_at = cancelled_at.await.unwrap();
+
+        let error = result.expect_err("a cancelled upload does not complete");
+        assert_eq!(error.kind, ChunkSendFailureKind::Cancelled);
+        assert!(returned_at - cancelled_at < Duration::from_secs(1));
+        let received = tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .expect("the connection closes once the sender cancels")
+            .unwrap();
+        assert!(
+            received < body.len(),
+            "the rest of the chunk was never sent ({received} of {} bytes)",
+            body.len()
+        );
     }
 
     fn host_device_key(host: &HostFixture) -> [u8; 32] {

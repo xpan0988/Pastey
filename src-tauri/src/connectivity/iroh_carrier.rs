@@ -128,6 +128,49 @@ impl IrohCarrier {
         Ok(carrier)
     }
 
+    /// Tests: the production carrier on an emulated network
+    /// (`shaped_net`). Only how the endpoint finds its peer differs: a local
+    /// relay (self-signed, so not verified) and/or a path pinned through a
+    /// shaper. Hooks, accept loop, links, streams and the QUIC transport
+    /// configuration are the production ones.
+    #[cfg(test)]
+    pub(crate) async fn start_shaped(
+        sink: Arc<dyn InboundSink>,
+        relay: Option<RelayMap>,
+        ip: bool,
+        path_selector: Option<Arc<dyn iroh::endpoint::transports::PathSelector>>,
+    ) -> AppResult<Arc<Self>> {
+        let mut builder = Endpoint::builder(presets::Minimal)
+            .alpns(vec![ALPN.to_vec()])
+            .hooks(PinnedOnly { sink: sink.clone() })
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
+        builder = match relay {
+            Some(map) => builder.relay_mode(RelayMode::Custom(map)),
+            None => builder.relay_mode(RelayMode::Disabled),
+        };
+        if !ip {
+            builder = builder.clear_ip_transports();
+        }
+        if let Some(selector) = path_selector {
+            builder = builder.path_selector(selector);
+        }
+        let endpoint = builder
+            .bind()
+            .await
+            .map_err(|error| AppError::Network(error.to_string()))?;
+        let carrier = Arc::new(Self { endpoint, sink });
+        let accepting = carrier.clone();
+        tokio::spawn(async move { accepting.accept_loop().await });
+        Ok(carrier)
+    }
+
+    /// Tests: waits until the endpoint is connected to its home relay.
+    #[cfg(test)]
+    pub(crate) async fn online(&self) {
+        self.endpoint.online().await
+    }
+
     /// Tests: this endpoint's IPv4 socket, as reached on loopback.
     #[cfg(test)]
     pub(crate) fn bound_addrs(&self) -> Vec<String> {

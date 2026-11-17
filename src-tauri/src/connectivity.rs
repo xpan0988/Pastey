@@ -45,7 +45,11 @@ pub(crate) mod iroh_carrier;
 #[cfg(test)]
 pub(crate) mod memory_carrier;
 #[cfg(test)]
+mod shaped_net;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod wan_pair_tests;
 
 use std::{
     collections::HashMap,
@@ -374,6 +378,15 @@ pub(crate) fn use_carrier(
         state: Arc::downgrade(state),
     });
     *state.connectivity.carrier.lock() = Some(make(sink));
+}
+
+/// Tests: this Host's production inbound sink, for a carrier that needs it
+/// before `use_carrier` (one started asynchronously).
+#[cfg(test)]
+pub(crate) fn inbound_sink(state: &Arc<AppState>) -> Arc<dyn InboundSink> {
+    Arc::new(Inbound {
+        state: Arc::downgrade(state),
+    })
 }
 
 /// This device's current card, if the carrier runs.

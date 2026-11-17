@@ -23,10 +23,26 @@ use crate::{
 
 pub(crate) const ROOM: &str = "room-control-pair";
 
-struct SilentEvents;
+/// Keeps only Transfer progress events, with when each was emitted, for
+/// tests that check what a user would see during a transfer.
+#[derive(Default)]
+pub(crate) struct PairEvents {
+    transfer: parking_lot::Mutex<Vec<(std::time::Instant, serde_json::Value)>>,
+}
 
-impl HostEventSink for SilentEvents {
-    fn emit(&self, _event: HostEvent) -> AppResult<()> {
+impl PairEvents {
+    pub(crate) fn transfer_events(&self) -> Vec<(std::time::Instant, serde_json::Value)> {
+        self.transfer.lock().clone()
+    }
+}
+
+impl HostEventSink for PairEvents {
+    fn emit(&self, event: HostEvent) -> AppResult<()> {
+        if event.name == "pastey://transfer-progress" {
+            self.transfer
+                .lock()
+                .push((std::time::Instant::now(), event.payload));
+        }
         Ok(())
     }
 }
@@ -42,6 +58,7 @@ impl RuntimeTaskSpawner for TokioSpawner {
 
 pub(crate) struct PairHostV1 {
     pub(crate) runtime: Arc<HostRuntime>,
+    pub(crate) events: Arc<PairEvents>,
     pub(crate) name: &'static str,
     pub(crate) port: u16,
     secret: [u8; 32],
@@ -95,9 +112,11 @@ async fn start_host(root: &Path, name: &'static str) -> PairHostV1 {
     let paths = AppPaths::new(root.join(name), root.join(format!("{name}-logs")));
     paths.ensure_directories().unwrap();
     storage::init_database(&paths).unwrap();
+    // Wrapped by this Host's own master key, as the app does, so payloads
+    // of the Bridge (a received file) can be stored and read.
     storage::create_room(
         &paths,
-        &[5u8; 32],
+        &crate::config::master_key(&config(name)).unwrap(),
         "12345678",
         60,
         LocalRole::Creator,
@@ -106,17 +125,13 @@ async fn start_host(root: &Path, name: &'static str) -> PairHostV1 {
     )
     .unwrap();
     storage::set_room_status(&paths, ROOM, crate::models::RoomStatus::Active).unwrap();
+    let events = Arc::new(PairEvents::default());
     let runtime = Arc::new(
-        HostRuntime::new(
-            paths,
-            config(name),
-            Arc::new(SilentEvents),
-            Arc::new(TokioSpawner),
-        )
-        .unwrap(),
+        HostRuntime::new(paths, config(name), events.clone(), Arc::new(TokioSpawner)).unwrap(),
     );
     let mut host = PairHostV1 {
         runtime,
+        events,
         name,
         port: 0,
         secret: [0; 32],

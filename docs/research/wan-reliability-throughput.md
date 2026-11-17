@@ -223,7 +223,7 @@ Implemented as `transfer_tuning.rs::TunnelWindow`, used by `send_binary_chunks_p
 
 What it costs: on a fast, high-latency link the first six chunks ramp from 2 to 8 in flight, about 1–3 s on files of tens of MiB. What it does not fix: the floor is now about 70 KiB/s instead of 270 (a timeout does not shrink the window, because only acknowledged chunks are observed); liveness on a slow relay path (Step 2); resumption (Step 4). The 50 ms relay pair in group K (fixed 8.0 s, adaptive 4.3 s) ran while a build was using the machine and is not a comparison.
 
-Automated checks: four unit tests of the controller in `transfer_tuning.rs`; the `transfer` (104) and `connectivity` (13) Rust suites pass. Not exercised: a real Pastey transfer through a real tunnel, on any network.
+Automated checks: four unit tests of the controller in `transfer_tuning.rs`; the `transfer` (104) and `connectivity` (13) Rust suites pass. Not exercised then: a real Pastey transfer through a real tunnel. Since done on an emulated network (see the production-path results below); still not on a real network.
 
 **Step 2 — traffic counts as liveness (rank 2). Done; see the result below.** In `bridge_lifecycle.rs`. Acceptance: a peer that stops answering is still invalidated within the current bound; a loaded but working tunnel is not.
 
@@ -246,7 +246,57 @@ The harness has one probing side, so it cannot run the rule itself. Group L reco
 
 Reading it: the requests do keep arriving while their replies time out, which is the premise. The gaps are longer than the 8 s window, so single failed rounds still count; ending the session takes four in a row, which needs roughly 29 s or more without one arrival (8 s of credit, then three more rounds and the next probe's bound). The longest observed gap is 23 s. So, **by arithmetic on these runs, not by running the rule**, none of these sessions would now be invalidated, including the two that were before. The other direction (the receiver's probes reaching the sender) travels against the data and was not modelled; it should queue less.
 
-Not done: the rule was not run end to end with two Hosts on a loaded tunnel, in emulation or on a real network. Automated checks: three unit tests in `bridge_lifecycle.rs` (the decision, the bound, the per-Bridge-and-key record); the `bridge_lifecycle` (21), `transfer` (104), `connectivity` (13), `room_control` (58) and `bridge_auth` (6) Rust suites pass. If real paths show gaps beyond about 29 s, the remaining lever is the queue itself (rank 3, BBRv3), not a longer window.
+Not done at the time: the rule was not run end to end with two Hosts on a loaded tunnel. It has since run in emulation (see below), not yet on a real network. Automated checks: three unit tests in `bridge_lifecycle.rs` (the decision, the bound, the per-Bridge-and-key record); the `bridge_lifecycle` (21), `transfer` (104), `connectivity` (13), `room_control` (58) and `bridge_auth` (6) Rust suites pass. If real paths show gaps beyond about 29 s, the remaining lever is the queue itself (rank 3, BBRv3), not a longer window.
+
+### Steps 1 and 2 on the production path (2026-11-17, emulated network)
+
+Unlike `wan-bench`, this runs the product's own code end to end. Two independent Hosts in one test process: the Room Control pair harness, with separate data directories, SQLite databases, device and transport keys and room servers. Each runs the production `IrohCarrier` (its handshake hook, links, streams and default QUIC configuration), its own tunnel forwarder, room server, Transfer sender or receiver, and its Bridge lifecycle loop (liveness, invalidation, reconnect) on the real 2 s schedule. Only the network is emulated (`connectivity/shaped_net.rs`, the `wan-bench` shaper). Direct: a UDP hop with delay, rate, loss and blackouts, with iroh pinned to it. Relay: an in-process iroh relay behind a TCP hop, both endpoints relay-only. The same test files ran against three builds: `before` (2214d79, neither step), `step1` (19621ac) and `step1+2` (77607a9). No product timeout or assertion was changed for this. Results: `tools/net-probe/results/2026-11-17-wan-pair-production-path.{jsonl,md}`.
+
+Each scenario checks five things: the file is intact on the receiver, exactly once (SHA-256 over the receiver's whole data directory); no `.part` is left; no active transfer state is left on either side; progress events never go backwards; and when either Host's session left `Connected`.
+
+| Scenario | before | step1 | step1+2 |
+| --- | --- | --- | --- |
+| Direct 256 KiB/s, 350 ms, 32 MiB | **Fails** after 489 s, 0 bytes (×2) | 147–149 s, first progress at 36 s (×2) | Same as step1 (×2) |
+| Relay 384 KiB/s, 150 ms, 32 MiB | **Cancelled**: both sessions invalidated at 60–78 s (×2) | 106 s, first progress at 26 s, no invalidation (×2) | Same (×2) |
+| Relay 128 KiB/s, 150 ms, 16 MiB | **Cancelled**: invalidated at 37 s (×2) | **Cancelled**: invalidated at 34–41 s (×2) | 154–161 s, no invalidation; first progress only at 78–86 s (×2) |
+| Direct, 1% loss, 100 ms, 16 MiB | 106 s; first progress at 105 s | 121 s; 64 s | 98 s; 42 s |
+| 15 s outage, direct 384 KiB/s | Completes, session kept | Completes, kept | Completes, kept |
+| 10 s outage, loaded relay 384 KiB/s | Completes, session kept | Completes, kept | Completes, kept |
+| 45 s outage, direct 384 KiB/s | Invalidated about 29 s into the silence; transfer cancelled, nothing left; reconnected 0.2 s after the network returned; a new 1 MiB file arrived once | Same | Same, invalidated about 31 s in (within the 36 s bound) |
+| Direct 64 KiB/s, 16 MiB (below the floor) | Fails at 488 s, nothing left, session kept | Fails at 485 s, same | Fails at 485 s, same |
+| Receiver Burns at 22 s | Sender returns 103 s after the Burn; nothing left; carrier pin and room server gone | Returns 12 s after | Returns 12 s after |
+| Sender Burns at 22 s | Sender returns 105 s after the Burn; nothing left in the end | 15 s; receiver clean at the same moment | 15 s; same (0.05 s after the fix below) |
+| Codex continuation beside a relay 384 KiB/s transfer, 5 s outage during Review | Review before any run; Accept is one-shot; runs once; Completed; file once | Same | Same |
+
+Reading it:
+
+- **Step 1 is necessary and sufficient for the slow direct link.** The 256 KiB/s case fails deterministically without it and completes at link rate with it.
+- **On a loaded relay, liveness ended the session and so the transfer, before either step.** With the production lifecycle running, the before build's 384 KiB/s relay transfer was cancelled by invalidation (the session's room server is stopped, which cancels its transfers). `wan-bench` could not show this because it only counted probes. Step 1 alone fixes the 384 KiB/s case: less in flight, less queue. At 128 KiB/s the relay RTT still reached 15–19 s, and only Step 2 kept the session: there it is the deciding change.
+- **Step 2 did not keep a dead session.** After a real 45 s silence both Hosts still invalidated, inside the documented 36 s bound, and reconnected at once when the network returned.
+- **Exactly once held everywhere.** No scenario left two copies or a partial file. The Agent continuation ran once in every build, despite congestion and an outage during Review.
+- **Burn ends in a clean state in all builds, but not promptly** (finding below).
+
+New finding, not caused by either step (all builds): **Burn does not abort chunk uploads already in flight.** After the sender Burns, its in-flight chunk requests keep uploading. The receiver still decrypts, writes and acknowledges them (about 12 s after the Burn in the step1+2 run). Only then does the sender stop and the receiver delete the partial file. The same happens when the receiver Burns: its room server shuts down gracefully and finishes requests already accepted. The delay is bounded by the in-flight chunks: 103–105 s with the old window of eight 4 MiB chunks, 12–15 s with Step 1 at this rate, and in the worst case up to one chunk timeout (120 s). The test's own expectation, that the sender stops within 5 s of its Burn, fails in all three builds and was left as written.
+
+**Fixed afterwards (same day): in-flight uploads end on cancel and Burn.** `send_chunk_with_retry` now races each attempt against the transfer's cancel token. A cancel, a Burn and a lost session (which cancels a Bridge's transfers) drop the request and close its connection; no change to the protocol or the receiver. A unit test (`cancelling_ends_a_chunk_upload_already_in_flight`) holds it, and fails without the change. All shaped scenarios were rerun on the fixed build (`step1+2+abort` in the results), and all 11 pass:
+
+| Scenario | step1+2 | step1+2+abort |
+| --- | --- | --- |
+| Sender Burns at 22 s | Sender returns 15 s after the Burn; the receiver wrote and acknowledged two chunks meanwhile | Returns **0.05 s** after; the receiver completes no chunk (no `chunk_received` after the Burn) and is clean 17 s after |
+| Receiver Burns at 22 s | Sender returns 12 s after | 13 s after (the sender is not told; its uploads end on their own) |
+| Every other scenario | – | Same outcomes as step1+2 |
+
+What remains, by design or for later: across the internet the local tunnel forwarder has already handed part of each chunk to QUIC. Those bytes still cross the link, and the receiver discards them as an incomplete request. At 256 KiB/s that took about 17 s before the receiver got the cancel and cleared its partial file. Ending them would need the forwarder to reset the QUIC stream, which it cannot tell apart from an ordinary close without a tunnel protocol change. When the receiver Burns, its room server still finishes reading requests it has accepted; it writes nothing, but the sender learns of the Burn only when they end.
+
+Limits of this evidence:
+
+- One machine and one process: no real NAT, relay distance, real loss pattern or competing traffic. Both Hosts share one scheduler, CPU and the process-wide log. It is not two app processes, the packaged app or the Tauri command layer. Transfers start from `send_room_file_to_bridge_peer_endpoint`, which `send_file_to_room` calls.
+- After a redial on the direct path, iroh leaves the shaper for the real loopback path; the `wan-bench` limitation still applies. So the transfer after the 45 s outage (1 MiB in 0.38 s against a 384 KiB/s limit) was not shaped. The reconnect itself is valid; post-reconnect throughput is not evidence.
+- The relay hop shares one rate bucket per direction across both Hosts' relay connections, a simplification of two separate uplinks.
+- Each cell ran once, and the three deciding cells twice, with identical outcomes; no wider statistics.
+- Not covered: Windows, sleep/wake, a network change mid-transfer (as opposed to a blackout), a relay that drops or rate-limits per connection, and Burn while a Native Agent workspace movement is in flight.
+
+Run them with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey connectivity::wan_pair_tests -- --ignored --nocapture --test-threads 1`. They need local sockets, and take about 15 minutes plus 8 for the below-floor case. The quick harness check, `a_shaped_direct_path_carries_a_verified_transfer_between_two_hosts`, runs in the normal suite.
 
 **Step 3 — BBRv3 behind a developer setting (rank 3), default off.** Turn it on by default only after Step 0's matrix is repeated with it on real paths and shows no regression on direct LAN-like paths.
 
