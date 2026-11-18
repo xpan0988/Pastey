@@ -746,3 +746,5 @@ Distributed delivery failure remains unable to prove remote native-process termi
 | Bounded non-secret product/Worker status events and authoritative lifecycle presentation, including Native Agent reconciliation/Stop/Return repair | Result content projection or Native Agent history/task browsing |
 
 Subagents, Headless Host, Worker network, Developer Terminal conversion, task-specific patch/document engines, and task/command allowlists are absent from the Generic Managed Worker subsystem. Physical acceptance covers Workspace Movement, Return and Apply, and locked-screen Full Access. See [development](../development.md#automated-local-and-physical-evidence) for the evidence boundaries and the deterministic harness.
+
+Messages between native Agent sessions that the user links, delivered only when a turn ends, have an approved design that is not yet built: [Collaboration Links](../research/agent-collaboration-links.md). Nothing described in this layer implements it.
