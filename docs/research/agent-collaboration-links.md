@@ -12,6 +12,8 @@ M1a, which tests this revision's collaboration note, was measured on macOS the s
 
 - **Repository facts** come from the code at `bc92b02`, named by file and function.
 - **Codex facts** come from the JSON schema that `codex app-server generate-json-schema` produces for 0.163.0 (stable and `--experimental`), from `codex app-server --help`, and from Codex's official MCP configuration docs.
+  - They were rechecked against 0.170.0's schema on 2026-11-18. The `thread/start`, `thread/resume` and `turn/start` parameters and the server requests are unchanged.
+  - `dynamicTools` is still experimental only.
 - **Claude Code facts** come from its official docs (cross-session messaging, permissions, MCP), checked against the installed 2.1.318.
 
 Nothing in this document was measured in Pastey itself. The M0 results come from [`tools/collab-probe`](../../tools/collab-probe/README.md), which launches each Agent the way Pastey's adapters do. Each native fact below is marked with one of four labels:
@@ -668,7 +670,11 @@ Per-run facts, without reply text, are in [`2026-11-18-macos-m1a.jsonl`](../../t
 ### Conditions
 
 - **Effort:** the lowest each CLI offers: Claude `--effort low`, and `effort: "low"` on Codex's `turn/start`. M0 used each CLI's default, so the two sets of results are not directly comparable.
-- **Codex model:** pinned to `gpt-6.1-sol`, M0's model, on each turn. The Codex configuration on this Mac had switched to `gpt-6.2-sol`, which the account cannot use; the configuration was not changed.
+- **Codex model:** pinned to `gpt-6.1-sol`, M0's model, on each turn.
+  - The shared Codex configuration on this Mac had switched to `gpt-6.2-sol`. The Homebrew Codex 0.163.0, which the probe and Pastey launch, cannot use that model with this account.
+  - The Codex GUI's bundled 0.169.0-alpha.11.1 can; one turn was checked.
+  - The configuration was not changed.
+  - After M1a, the Homebrew Codex was updated to 0.170.0, which runs `gpt-6.2-sol` (one turn checked). M1a's results are for `gpt-6.1-sol` only.
 - **Run order:** first two smoke runs per case and provider, then the rest, one turn at a time. A batch stops at the first failed call or empty reply. The smoke runs count toward the totals, since the code and conditions were the same.
 - **Failed calls are triaged out before any reply is classified** (`triage` in the probe), so a failed model or API call is never counted as the Agent's behavior. None occurred in these 70 runs.
 
@@ -717,11 +723,13 @@ These figures cover the 70 valid runs. None failed fast.
 
 The first attempt ran before the triage existed, two at a time per provider. It produced no usable data:
 - **Claude** hit the account's 5-hour usage limit after 2 runs; both of those met the bars. The other 68 returned the limit message in about 2 s each. The probe shares that limit with the user's other Claude sessions.
-- **Codex** rejected all 70 turns. Its configured model, `gpt-6.2-sol`, is "not supported when using Codex with a ChatGPT account" (`model_not_found`).
+- **Codex** rejected all 70 turns. On Codex 0.163.0, its configured model `gpt-6.2-sol` is "not supported when using Codex with a ChatGPT account" (`model_not_found`). The Codex GUI's bundled 0.169.0-alpha.11.1 ran the same model, with the same account and configuration.
 
 Two design consequences are now in [Failure handling](#failure-handling):
 - A turn that fails at once for account or model reasons pauses the member, rather than using budget or retrying.
 - Automatic turns draw on the same provider quota as the user's own sessions.
+
+A third consequence reaches beyond collaboration. A newer Codex GUI can switch the shared `~/.codex/config.toml` to a model that an older Codex CLI cannot run. Pastey launches the `codex` on `PATH`, so every Pastey Codex turn then fails at once. That lasts until the CLI is updated or a model is chosen for the turn.
 
 ## What still prevents unbounded autonomy
 
