@@ -61,3 +61,24 @@ The probe checks each final reply against the design's block rules:
 - at most 3 blocks.
 
 Claude runs pass `--no-session-persistence`, and Codex threads are `ephemeral`, so they don't add to the user's history.
+
+```bash
+python3 -I -B tools/collab-probe/probe.py collab codex warranted 2 --model gpt-6.1-sol
+python3 -I -B tools/collab-probe/probe.py collab claude reply 8 --first 3
+```
+
+Runs go one at a time. A batch stops at the first run whose call failed (model, quota, sign-in, process) or whose reply is empty. Such runs are recorded as failures, never as the Agent's behavior.
+
+`--model` pins Codex's model for each turn without touching its configuration. `--first` continues the numbering after earlier runs. The probe records token use per run: for Codex also the account's rate-limit snapshot, and for Claude its cost estimate.
+
+M1a tests the revised design's collaboration note. The Agent is the member `api`; the other members are `web` (another provider, on another device) and `user`. The note carries the message and summary block formats and two rules: never acknowledge, and summarize only when a stage ends.
+
+Runs use the lowest effort both CLIs offer (`low`): Claude's `--effort low`, and `effort` on Codex's `turn/start`. M0 used each CLI's default effort.
+
+The variants:
+- `warranted`: M0's task. A message to `web` and a summary are expected.
+- `unwarranted`: M0's task. Neither is expected.
+- `reply`: Pastey delivers a message from `web` that needs nothing back. No message is expected.
+- `question`: the delivered message asks something `api/orders.py` answers. A reply to `web` is expected.
+
+In `reply` and `question`, `web/` is not in the folder, because it lives on `web`'s own device.

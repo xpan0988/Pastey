@@ -6,7 +6,7 @@ Status: design, revised after M0. The direction was approved on 2026-11-18 as "C
 - The user follows progress, reads summaries and answers what needs them from that Journal.
 - A member who joins later starts with a **briefing** compiled from it.
 
-None of it is implemented. Windows is not measured, and five product decisions are still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
+M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). None of it is implemented. Windows is not measured, and five product decisions are still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
 
 ## What kind of evidence this is
 
@@ -146,7 +146,7 @@ A fifth piece is optional: a file manifest at turn boundaries.
   - its provider;
   - that device's pinned key and the Bridge id.
 - **Each member has an alias** (`api`, `web`) **and a role line the user writes,** such as "owns web/; does not touch api/". Who is responsible for what is the context Agents infer least reliably, and it costs the user one line.
-- **The user is a member,** with the alias `you`. Messages the user writes are delivered the same way as an Agent's.
+- **The user is a member,** with the alias `user`. In a prompt, "you" reads as the Agent itself, so the alias is not `you` (M1a used `user`). Messages the user writes are delivered the same way as an Agent's.
 - **A collaboration has a one-line goal the user writes.**
 - **Adding a member** needs the consent of that member's device, if it is another device, and is recorded as a `member` entry. Removing a member ends its grant, and messages still waiting for it become undeliverable.
 
@@ -190,7 +190,7 @@ All values are proposals.
 **What starts a turn:**
 - **Only a message addressed to an Agent member can start a turn.**
   - M0 showed that whether an Agent addresses a member is reliable, and that `kind` is not ([M0](#message-blocks)).
-  - Messages to `you` go to Needs you.
+  - Messages to `user` go to Needs you.
   - Summaries never start a turn.
 - **No acknowledgements.** The collaboration note asks Agents not to send them. Pastey's own `turn` entries already tell the sender what happened. This removes most back-and-forth by construction, and the budget catches the rest.
 
@@ -217,7 +217,7 @@ GET /v2/orders no longer accepts `offset`. It returns `nextCursor`; pass it as
 ```
 ~~~
 
-- `to` must be a member alias, or `you`.
+- `to` must be a member alias, or `user`.
 - `subject` is one line of at most 200 characters.
 - The body is at most 8 KiB and must pass the faithful-rendering check. That is `renders_faithfully`, now private in `capability/codex.rs`; it moves to shared code.
 - Blocks count only at the end of the final reply, at most 3 per turn.
@@ -300,7 +300,7 @@ Neither tool is in V1.
 | `turn` | Pastey | Member, task id, start and end, outcome, changed files, runtime counts (commands, failures) | Pastey fact; runtime report |
 | `message` | Pastey, from a block | From, to, subject, body, delivery state | The content is an Agent statement; its delivery is a Pastey fact |
 | `summary` | Pastey, from a block | done, decisions, open, next | Agent statement |
-| `attention` | Pastey | A native approval waiting; held by another client; history changed outside the collaboration; budget used up; undeliverable; a message to `you` | Pastey fact |
+| `attention` | Pastey | A native approval waiting; held by another client; history changed outside the collaboration; budget used up; undeliverable; a turn that failed for account or model reasons; a message to `user` | Pastey fact |
 | `user` | The user | A message, pause or resume, confirming or rejecting a decision, editing the goal or a role | User |
 | `member` | Pastey | Joined, left, role changed, grant changed | Pastey fact |
 
@@ -408,6 +408,7 @@ At most one scheduled turn exists per member. Pastey never detects semantic comp
 | Busy in the Codex app or a Claude terminal | Waits ("held by…") and the member pauses; slow re-check. If its history moved meanwhile, it needs one click | Same |
 | Idle | Scheduled at once, if budget allows | The card appears at once |
 | Unavailable (CLI missing or signed out) | Waits with the reason; re-checked when availability changes | Same |
+| Failing at once for account or model reasons (usage limit, unavailable model) | Pauses after the first such failure, with the reason under Needs you; no budget used, no retry | Same |
 | Gone (session deleted) | Undeliverable; the member pauses | Same |
 | On a disconnected device | Nothing reaches it; the sender's outbox holds the message until reconnect or expiry | Same |
 | Already running a collaboration turn | Waits, then batched into its next turn | Same, one click per batch |
@@ -431,6 +432,7 @@ What remains is already documented: Claude Code keeps no writer lock, so a clien
 | Unknown outcome | Never retried |
 | Burn, forget device, re-pair with another key | Memberships and entries for that Bridge deleted; running collaboration turns asked to stop |
 | Budget used up or grant expired | The member falls back to `ask` |
+| A turn fails at once for account or model reasons: the provider's usage limit, a model the account cannot use, a sign-in that expired (all seen in M1a's first attempt) | The member pauses; the reason goes under Needs you; the failed turn uses no budget and is not retried |
 
 ## Visibility and control
 
@@ -498,7 +500,7 @@ A member who joins gets a briefing as its first turn's prompt. Pastey compiles i
 Scope, safety and depth:
 - **Scope:** the briefing holds only entries the new member's device may see, under the disclosure rules above.
 - **Safety:** other Agents' statements are quoted and labelled, because they are an injection path into the new member. The new member's own native permissions apply.
-- **More detail:** later, a read-only `journal` MCP tool ([Later: MCP tools](#later-mcp-tools)). Until then, a member that needs more asks a member or `you` with a message.
+- **More detail:** later, a read-only `journal` MCP tool ([Later: MCP tools](#later-mcp-tools)). Until then, a member that needs more asks a member or `user` with a message.
 
 ## Native integration
 
@@ -508,7 +510,7 @@ Scope, safety and depth:
 | Another holder | Writer lock (macOS); `thread/resume` refusal | `claude agents --json` (on Windows it must be readable) | verified; Codex lock on Windows unknown |
 | Delivery as a new turn | `turn/start`, `thread/resume` | `-p --resume` (headless); `--bg --resume -- <prompt>` | verified, existing paths |
 | Sending via trailer block | No native support needed | No native support needed | **measured (M0):** 20 of 20 when warranted and 0 of 20 when not, for each Agent; `kind` is unreliable for Codex |
-| Summary block | No native support needed | No native support needed | assumed (M1a) |
+| Summary block | No native support needed | No native support needed | **measured (M1a):** 10 of 10 when a stage ends and 0 of 10 when nothing does, for each Agent, at the lowest effort |
 | Sending via MCP tool | `app-server -c key=value` (in `--help`); `mcp_servers.*`, `enabled_tools`, `default_tools_approval_mode` (`auto`, `prompt`, `writes`, `approve`) | `--mcp-config`, `--strict-mcp-config`, `mcp__<server>__<tool>` allow rules. A stdio server gets `CLAUDE_PROJECT_DIR`; no session id is documented | **measured (M0):** Codex runs the tool without a prompt when the mode is unset, `auto` or `approve`. Claude needs `--allowedTools` and keeps the session on `--resume`, and its server also receives `CLAUDE_CODE_SESSION_ID` (undocumented). Not possible on `--bg` (verified) |
 | Progress during a turn | `item/*`, `turn/plan/updated`, `turn/diff/updated` | stream-json `tool_use` and `tool_result`; transcript entries | Codex documented; Claude measured (M0) |
 | Instructions for one thread or run | `developerInstructions`, untyped `config` on `thread/start` and `thread/resume` (stable) | `--append-system-prompt` (`-p` only) | documented; effect assumed |
@@ -546,7 +548,7 @@ Scope, safety and depth:
    - It starts a contained headless `claude -p --resume` with `refuse`, carrying the envelope and the digest of what changed since `web`'s last turn. The budget drops to 2.
 6. **`web` acts.** Claude migrates `OrdersTable`, and a test command ends with exit 0 (runtime report). It writes a summary and no message, because nothing needs `api`.
    - The Mac sees a `turn` entry for `web` and its summary, and no acknowledgement round trip.
-7. **Needs you.** Claude asks a question with `to=you`: "keep the old offset UI behind a flag?" It shows in the sidebar count. The user answers with a message to `web`, which is delivered at its next boundary.
+7. **Needs you.** Claude asks a question with `to=user`: "keep the old offset UI behind a flag?" It shows in the sidebar count. The user answers with a message to `web`, which is delivered at its next boundary.
 8. **A third Agent joins.**
    - The user adds `qa`, a DeepSeek session on the Mac (hypothetical adapter), with the role "writes integration tests; edits neither api/ nor web/".
    - Its first prompt is the briefing: the goal and roles, open items (the user's answer to `web`), both members' latest summaries, and the decision "cursors are URL-safe base64".
@@ -567,10 +569,10 @@ Variations:
    - **Claude MCP.** Whether `--mcp-config` with `--allowedTools` on `-p --resume` keeps the same session id (it does).
    - **Codex MCP.** Which `default_tools_approval_mode` lets a tool on `codex app-server -c mcp_servers.…` run without a prompt (unset, `auto` and `approve`).
    - **Windows.** The rows that need a Windows machine stay not measured until one is used.
-2. **M1a, measurements.** No product code. Extend `tools/collab-probe`. Acceptance, per provider:
-   - **Summary blocks:** with the note, at least 18 of 20 stage-ending turns write a valid summary block; turns that end nothing write none.
-   - **Message blocks:** with the revised note (addressing decides; no acknowledgements), message blocks still reach 18 of 20 and 0 of 20.
-   - **Replies:** a reply turn sends no acknowledgement in at least 18 of 20 runs.
+2. **M1a, measurements.** Done on macOS on 2026-11-18 ([M1a results](#m1a-results-macos-2026-11-18)); Windows is not measured. No product code. At the user's request the runs were cut to 10 per case (5 for the question case), so the bars scale from 18 of 20 to 9 of 10. Acceptance, per provider, all met by both:
+   - **Summary blocks:** with the note, at least 9 of 10 stage-ending turns write a valid summary block; turns that end nothing write none.
+   - **Message blocks:** with the revised note (addressing decides; no acknowledgements), message blocks still reach 9 of 10 and 0 of 10.
+   - **Replies:** a reply turn sends no acknowledgement in at least 9 of 10 runs, and a real question still gets an answer.
 3. **M1, a local collaboration, `ask` only.** Two or more members on one device; useful on its own. It delivers:
    - the Journal with all six entry types;
    - message and summary extraction, with addressing as the trigger;
@@ -586,7 +588,8 @@ Variations:
    - Two fake adapters that always reply with a message stop exactly at the budget.
    - The hop limit holds across three members.
    - Stop pauses a member.
-   - Summaries and messages to `you` never start a turn.
+   - Summaries and messages to `user` never start a turn.
+   - A turn that fails at once for account or model reasons pauses the member, with no budget used.
    - The live card updates during a long turn with no extra model call.
 5. **M3, joining.** Roles and goal, the briefing, and the file manifest. Acceptance:
    - A member added mid-collaboration (Codex or Claude standing in for DeepSeek) lists, in its first reply, the open items and who owns what, matching the Journal in at least 18 of 20 runs, without messaging anyone.
@@ -653,11 +656,78 @@ A `claude -p` run like Pastey's received one `SendMessage` from a second `claude
 - A peer message can also add a turn after a `result`. Pastey's completion rule waits for the process to exit, so that extra turn becomes part of its task.
 - A per-run `refuse` on `-p` closes both. Collaboration members always run that way ([Delivery](#delivery)); the `--bg` path still cannot.
 
+## M1a results (macOS, 2026-11-18)
+
+Measured with `tools/collab-probe` (`collab`), using this revision's collaboration note:
+- the Agent is member `api`, and the other members are `web` and `user`;
+- message and summary blocks;
+- "never acknowledge" and "summarize only when a stage ends".
+
+Per-run facts, without reply text, are in [`2026-11-18-macos-m1a.jsonl`](../../tools/collab-probe/results/2026-11-18-macos-m1a.jsonl).
+
+### Conditions
+
+- **Effort:** the lowest each CLI offers: Claude `--effort low`, and `effort: "low"` on Codex's `turn/start`. M0 used each CLI's default, so the two sets of results are not directly comparable.
+- **Codex model:** pinned to `gpt-6.1-sol`, M0's model, on each turn. The Codex configuration on this Mac had switched to `gpt-6.2-sol`, which the account cannot use; the configuration was not changed.
+- **Run order:** first two smoke runs per case and provider, then the rest, one turn at a time. A batch stops at the first failed call or empty reply. The smoke runs count toward the totals, since the code and conditions were the same.
+- **Failed calls are triaged out before any reply is classified** (`triage` in the probe), so a failed model or API call is never counted as the Agent's behavior. None occurred in these 70 runs.
+
+### Results
+
+| Case | Expected | Codex (`gpt-6.1-sol`) | Claude Code (`claude-opus-5-5`) |
+| --- | --- | --- | --- |
+| warranted (10 runs) | A message to `web` and a summary | 10/10 message, 10/10 summary | 10/10 message, 10/10 summary |
+| unwarranted (10 runs) | Neither | 0/10 message, 0/10 summary | 0/10 message, 0/10 summary |
+| reply (10 runs): `web` reports it is done | No acknowledgement | 0/10 acknowledgements. 5/10 messaged `web` with a substantive warning, and 5/10 asked `user` | 0/10 acknowledgements. 0/10 messaged `web`, and 8/10 asked `user` |
+| question (5 runs): `web` asks what `api/orders.py` answers | An answer to `web` | 5/5 answered, all correctly (`nextCursor: null`) | 5/5 answered |
+
+Every block was at the end of the reply, and no block broke a rule.
+
+### Findings
+
+- **Both Agents met every M1a bar.** The note's two new rules work at the lowest effort on this fixture.
+- **"No acknowledgement" is not "no message".**
+  - Codex messaged `web` in 5 of 10 reply runs. Every time it carried the same warning: the API is still a stub, so `web`'s passing tests do not prove the integration.
+  - Read by hand, none of them is an acknowledgement.
+  - Under `auto`, such a message would start `web`'s turn. M2's loop tests should include this case.
+- **`user` works as the escalation path.**
+  - 13 of the 20 reply runs asked `user` where the orders data comes from, because the fixture's `list_orders` is a stub with no data layer. A real project would raise fewer such questions.
+  - The probe called the user `user` rather than the design's earlier `you`, and the design now uses `user`.
+- **Summaries after answering a peer are borderline.** In the question case, Claude wrote one 5 times in 5 and Codex 3 times in 5. Summaries never start a turn, so this only adds Journal entries. Whether answering a question ends a stage is a wording question for M1.
+- **Not tested:**
+  - long agentic turns and larger projects;
+  - default or higher effort;
+  - other models, including `gpt-6.2-sol`;
+  - Windows.
+
+### Quota
+
+These figures cover the 70 valid runs. None failed fast.
+
+- **Codex:**
+  - The account's 5-hour window went from 49% to 57% used, and its weekly window from 52% to 53%.
+  - 3.09M input tokens (2.52M cached), 10.7k output and 0.5k reasoning: about 88k input tokens per turn.
+  - 11.5 minutes of turns in total.
+- **Claude Code:**
+  - 31k output tokens. Nearly all input came from cache: 1.71M read, 568k written and 186 fresh.
+  - Claude Code's own estimate is $5.51 of API-equivalent usage. On a subscription that is quota, not a charge.
+  - 8.2 minutes of turns in total.
+
+### The first attempt, not used
+
+The first attempt ran before the triage existed, two at a time per provider. It produced no usable data:
+- **Claude** hit the account's 5-hour usage limit after 2 runs; both of those met the bars. The other 68 returned the limit message in about 2 s each. The probe shares that limit with the user's other Claude sessions.
+- **Codex** rejected all 70 turns. Its configured model, `gpt-6.2-sol`, is "not supported when using Codex with a ChatGPT account" (`model_not_found`).
+
+Two design consequences are now in [Failure handling](#failure-handling):
+- A turn that fails at once for account or model reasons pauses the member, rather than using budget or retrying.
+- Automatic turns draw on the same provider quota as the user's own sessions.
+
 ## What still prevents unbounded autonomy
 
 1. Delivered text arrives as the user's turn, and no supported interface marks it as third-party.
 2. Claude Code has no writer lock, so an unattended turn can collide with a person opening the same session.
-3. Sending depends on instruction following until a stable per-run tool is measured or ships. M0 found it reliable for both Agents, but only on a small fixture with short turns.
+3. Sending depends on instruction following until a stable per-run tool is measured or ships. M0 and M1a found it reliable for both Agents, including at the lowest effort, but only on a small fixture with short turns.
 4. Sessions driven outside Pastey (the Codex app, a Claude terminal) cannot send or summarize. They can receive only once idle and unchanged.
 5. Native approvals stay with a person, so autonomous turns pause on them by design.
 6. Budgets count turns, not tokens.
@@ -673,6 +743,8 @@ A `claude -p` run like Pastey's received one `SendMessage` from a second `claude
 5. **The Journal keeps content Agents publish to it** (changing the capability matrix's "Native Agent history/task browsing" non-goal), and how long it keeps it.
 
 Design questions for M1:
+- Should a turn that only answers a peer write a summary? In M1a, Claude did 5 times in 5 and Codex 3 times in 5.
+- An unprompted warning to a peer starts that peer's turn under `auto`. Codex sent one in 5 of 10 reply runs. M2's loop tests should cover it.
 - Should `kind` stay at all, now that it decides nothing?
 - Should a turn started by a collaboration be a distinct task owner, or `Local` with the collaboration id recorded on the envelope?
 - The default budgets and limits proposed above, the digest's size, and the manifest's bounds.
