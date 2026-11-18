@@ -1,6 +1,6 @@
 # Agent collaboration: Collaboration Links design (2026-11-18)
 
-Status: design. The direction was approved on 2026-11-18. None of it is implemented yet. The M0 measurements have not been run, and four product decisions are still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
+Status: design. The direction was approved on 2026-11-18, and M0 was measured on macOS the same day ([M0 results](#m0-results-macos-2026-11-18)). None of it is implemented yet. The Windows measurements have not been run, and four product decisions are still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
 
 ## What kind of evidence this is
 
@@ -8,10 +8,11 @@ Status: design. The direction was approved on 2026-11-18. None of it is implemen
 - **Codex facts** come from the JSON schema that `codex app-server generate-json-schema` produces for 0.163.0 (stable and `--experimental`), from `codex app-server --help`, and from Codex's official MCP configuration docs.
 - **Claude Code facts** come from its official docs (cross-session messaging, permissions, MCP), checked against the installed 2.1.318.
 
-Nothing in this document was measured in Pastey. Each native fact below is marked with one of three labels:
+Nothing in this document was measured in Pastey itself. The M0 results come from [`tools/collab-probe`](../../tools/collab-probe/README.md), which launches each Agent the way Pastey's adapters do. Each native fact below is marked with one of four labels:
 - **verified:** Pastey already measured it and relies on it.
+- **measured (M0):** the probe measured it on macOS on 2026-11-18.
 - **documented:** official docs or the schema say so; not measured here.
-- **assumed:** needs a measurement (M0).
+- **assumed:** not measured.
 
 ## Goal
 
@@ -299,8 +300,8 @@ An optional review before sending ("Ready to send · Send · Discard") is cheap 
 | End of a Pastey turn | `turn/completed` | Echo + success + exit 0 | verified |
 | Another holder | Writer lock (macOS); `thread/resume` refusal | `claude agents --json` (on Windows it must be readable) | verified; Codex lock on Windows unknown |
 | Delivery as a new turn | `turn/start`, `thread/resume` | `--bg --resume -- <prompt>`, `-p --resume` | verified, existing paths |
-| Sending via trailer block | No native support needed | No native support needed | **assumed:** reliability of instruction following |
-| Sending via MCP tool | `app-server -c key=value` (in `--help`); `mcp_servers.*`, `enabled_tools`, `default_tools_approval_mode` (`auto`, `prompt`, `writes`, `approve`) | `--mcp-config`, `--strict-mcp-config`, `mcp__<server>__<tool>` allow rules. A stdio server gets `CLAUDE_PROJECT_DIR`; no session id is documented | documented. **assumed:** the approval modes' meaning, and whether `--mcp-config` with `--resume` keeps the session. Not possible on `--bg` (verified) |
+| Sending via trailer block | No native support needed | No native support needed | **measured (M0):** 20 of 20 when warranted and 0 of 20 when not, for each Agent; `kind` is unreliable for Codex |
+| Sending via MCP tool | `app-server -c key=value` (in `--help`); `mcp_servers.*`, `enabled_tools`, `default_tools_approval_mode` (`auto`, `prompt`, `writes`, `approve`) | `--mcp-config`, `--strict-mcp-config`, `mcp__<server>__<tool>` allow rules. A stdio server gets `CLAUDE_PROJECT_DIR`; no session id is documented | **measured (M0):** Codex runs the tool without a prompt when the mode is unset, `auto` or `approve`. Claude needs `--allowedTools` and keeps the session on `--resume`, and its server also receives `CLAUDE_CODE_SESSION_ID` (undocumented). Not possible on `--bg` (verified) |
 | Instructions for one thread or run | `developerInstructions`, untyped `config` on `thread/start` and `thread/resume` (stable) | `--append-system-prompt` (`-p` only) | documented; effect assumed |
 | Tools registered by the client | `dynamicTools` experimental only; `item/tool/call` (with `threadId`, `turnId`) is stable | none | deferred |
 | Marking input as third-party | `turnTrigger`: source classification, model effect unknown | Only for its own peer messages | unavailable to Pastey |
@@ -311,8 +312,8 @@ An optional review before sending ("Ready to send · Send · Discard") is cheap 
 - **Claude↔Claude:** native messaging already works, but it delivers mid-turn and relays across machines through Anthropic. Links add turn-boundary timing, budgets, a Pastey-to-Pastey path and pinned device identity.
 - **Across devices:** only Links over the Bridge cover every pairing.
 
-**Existing exposure (documented, not measured).** Per Claude Code's docs, a `claude -p` run binds an inbox socket. The user's other Claude sessions can deliver into it between tool calls, by default, unless a `crossSessionInbound` setting says otherwise. Pastey's adapter passes no settings (`capability/claude_code/conversation.rs`), so Pastey cannot promise "no mid-turn delivery" for its own Claude runs today.
-- On `-p` runs, a per-run `--settings '{"crossSessionInbound":"refuse"}'` would close it (open decision 4).
+**Existing exposure (measured in M0).** A `claude -p` run binds an inbox socket. By default, the user's other Claude sessions can deliver into it between tool calls, inside the running turn. While the process stays alive after a `result`, an arriving message starts another turn in it ([M0](#cross-session-messages-into-claude--p)). Pastey's adapter passes no settings (`capability/claude_code/conversation.rs`), so Pastey cannot promise "no mid-turn delivery" for its own Claude runs today.
+- On `-p` runs, a per-run `--settings '{"crossSessionInbound":"refuse"}'` closes it (measured in M0; open decision 4).
 - On `--bg` runs nothing can.
 
 **Doc mismatch to fix before adding a second stored admission.** `full_access.rs` says Full Access "never runs a capability that is local to this Host (Claude Code continuation)". But Layer 5's capability matrix and `commands.rs::continue_remote_native_session` admit a peer's Claude Code continuation under Full Access.
@@ -349,12 +350,12 @@ Variations:
 
 ## Milestones and acceptance tests
 
-1. **M0, measurements.** No product code. Results are recorded as in [development](../development.md); each provider gets a choice between the trailer block and the MCP tool. Checks:
-   - **Trailer reliability, per provider.** Instructed to end with a block, at least 18 of 20 turns produce one that parses; with no link note, none of 20 do.
-   - **Cross-session messages.** Whether a `claude -p` run like Pastey's accepts cross-session messages, and whether a per-run `--settings` refuse closes it.
-   - **Claude MCP.** Whether `--mcp-config` with `--allowedTools` on `-p --resume` keeps the same session id.
-   - **Codex MCP.** Which `default_tools_approval_mode` lets a tool on `codex app-server -c mcp_servers.…` run without a prompt.
-   - **Windows.** The rows that need a Windows machine are recorded as not measured until one is used.
+1. **M0, measurements.** Done on macOS on 2026-11-18 ([M0 results](#m0-results-macos-2026-11-18)); Windows is not measured. No product code. Each provider got a choice between the trailer block and the MCP tool. Checks:
+   - **Trailer reliability, per provider.** When the peer must act, at least 18 of 20 turns end with a block that parses. In a linked session with nothing to send, none of 20 do. Both Agents met this.
+   - **Cross-session messages.** Whether a `claude -p` run like Pastey's accepts cross-session messages (it does), and whether a per-run `--settings` refuse closes it (it does).
+   - **Claude MCP.** Whether `--mcp-config` with `--allowedTools` on `-p --resume` keeps the same session id (it does).
+   - **Codex MCP.** Which `default_tools_approval_mode` lets a tool on `codex app-server -c mcp_servers.…` run without a prompt (unset, `auto` and `approve`).
+   - **Windows.** The rows that need a Windows machine stay not measured until one is used.
 2. **M1, local link, `ask` only.** Codex↔Claude on one device; useful on its own. Acceptance:
    - A block is extracted only from tasks in linked sessions.
    - A block over 8 KiB is refused, with its size.
@@ -378,11 +379,66 @@ Variations:
 5. **M4, cross-device `auto`.** M2's tests across two devices. Ending a link stops a running collaboration turn.
 6. **M5 (optional).** A per-run MCP tool where M0 showed it is safe, and `info` notes shown alongside the user's next prompt.
 
+## M0 results (macOS, 2026-11-18)
+
+Measured with [`tools/collab-probe`](../../tools/collab-probe/README.md) on one Mac (macOS 26.5.2, Apple silicon). The Agents were Codex 0.163.0 (`gpt-6.1-sol`) and Claude Code 2.1.318 (`claude-opus-5-5`), each with the user's own configuration and sign-in. Per-run facts, without reply text, are in [`2026-11-18-macos-trailer.jsonl`](../../tools/collab-probe/results/2026-11-18-macos-trailer.jsonl). Windows was not measured.
+
+### Message blocks
+
+Each turn read a four-file fixture, with the link note Pastey would add.
+- In *warranted* runs, the API had removed a parameter that the peer's client still sends.
+- In *unwarranted* runs, the task concerned nothing the peer owns.
+
+| | Warranted: valid block at the end | Unwarranted: any block | Warranted labelled `request` | Median turn (warranted / unwarranted) |
+| --- | --- | --- | --- | --- |
+| Codex | 20 of 20 | 0 of 20 | 8 of 20 (12 `info`) | 44 s / 13 s |
+| Claude Code | 20 of 20 | 0 of 20 | 20 of 20 | 20 s / 6 s |
+
+- **Both Agents pass M0's bar.** The trailer block is enough for V1 on both providers, so the MCP tool stays optional (M5).
+- **`kind` is not a reliable trigger.** Codex wrote the same finding as `info` when it framed its work as a report-only review, and as `request` when it phrased the finding as an instruction. Under the rule that `info` never starts a turn, 12 of Codex's 20 needed changes would not have started the peer's turn. That is safe, but loses most of the autonomy. It is now a design question for M1.
+- **The control changed.** It differs from the one first planned ("no link note"). Pastey extracts blocks only in linked sessions, so the false positive that matters is a linked session with nothing to send.
+- **Not tested:** long agentic turns, other models, and larger or messier tasks. The fixture was small and read-only, and the turns were short. Codex threads were `ephemeral` and Claude runs used `--no-session-persistence`, so the user's history was left alone. No Codex run asked for an approval.
+
+### Claude Code MCP tool on a resumed session
+
+- **The session is kept.** `claude -p --resume <id> --mcp-config <file>` kept the same session id in `init` and `result`, with one transcript.
+- **`--allowedTools` is required.** With `--allowedTools mcp__pastey__send` the call reached the server. Without it, `-p` denied the call (`permission_denials`).
+- **The server can see the session.** Its environment held `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_SOCKET` and `CLAUDE_CODE_MESSAGING_TOKEN`, besides the documented `CLAUDE_PROJECT_DIR`. So a server could tell which session called it, but nothing documents this.
+- **The user's own servers also loaded.** The `-p` runs also loaded the user's plugin MCP servers. `--strict-mcp-config` would load only Pastey's, but would also remove the user's own servers from that turn, so it is not a neutral choice.
+- **Settings untouched.** The user's settings files were unchanged.
+
+### Codex MCP tool per process
+
+The probe started `codex app-server -c mcp_servers.pastey.command=… -c mcp_servers.pastey.args=[…]` and ran one turn per `default_tools_approval_mode`:
+
+| Mode | Result |
+| --- | --- |
+| unset, `auto`, `approve` | The tool ran, and Codex sent the client no request |
+| `prompt`, `writes` | Codex sent `mcpServer/elicitation/request`, which Pastey never answers, so the turn would wait for a person |
+
+- `~/.codex/config.toml` was unchanged.
+- The server got no `CODEX*` or `CLAUDE*` variables, so no thread id. What ties a call to Pastey's turn is that each app-server runs its own server, with its own spool.
+- The unset result depends on the user's own approval policy. Pastey would set `approve` explicitly.
+
+### Cross-session messages into `claude -p`
+
+A `claude -p` run like Pastey's received one `SendMessage` from a second `claude -p` session. Its only extra flag was `--allowedTools "Bash(python3 -c *)"`, to keep it busy.
+
+- **Default.** The message was queued while a 40 s foreground command ran. It was then sent with the next model request: between tool calls, inside the running turn. The Agent quoted it in that turn's reply.
+- **Process alive between turns.** In a first attempt, Claude Code blocked a standalone `sleep 40` and ran it in the background instead. The turn ended early, but the process stayed up. The message then started a new turn in that process (`origin.kind: "peer"`), and the background task's notification started one more.
+- **`--settings '{"crossSessionInbound":"refuse"}'`.** Nothing reached the receiver.
+- **The sender can't tell the difference.** In every case it was told that the message had reached the inbox.
+
+**Consequences:**
+- Pastey's Claude runs accept peer messages mid-turn today.
+- A peer message can also add a turn after a `result`. Pastey's completion rule waits for the process to exit, so that extra turn becomes part of its task.
+- A per-run `refuse` on `-p` closes both (open decision 4). The `--bg` path still cannot.
+
 ## What still prevents unbounded autonomy
 
 1. Delivered text arrives as the user's turn, and no supported interface marks it as third-party.
 2. Claude Code has no writer lock, so an unattended turn can collide with a person opening the same session.
-3. Sending depends on instruction following until a stable per-run tool is measured or ships.
+3. Sending depends on instruction following until a stable per-run tool is measured or ships. M0 found it reliable for both Agents, but only on a small fixture with short turns.
 4. Sessions driven outside Pastey (the Codex app, a Claude terminal) cannot send. They can receive only once idle and unchanged.
 5. Native approvals stay with a person, so autonomous turns pause on them by design.
 6. Budgets count turns, not tokens.
@@ -393,9 +449,13 @@ Variations:
 1. A second stored admission (the auto grant) beside Full Access.
 2. A sender outbox as an exception to "Nothing is queued for a device that cannot be reached".
 3. A visible link note in prompts sent to linked sessions, or Codex `developerInstructions` where that works.
-4. Whether Pastey refuses Claude Code's cross-session messages for its own `-p` runs (a per-run `--settings`), which touches native configuration.
+4. Whether Pastey refuses Claude Code's cross-session messages for its own `-p` runs (a per-run `--settings`), which touches native configuration. M0 measured both the exposure and that `refuse` closes it.
 
 Design questions for M1:
+- **What decides whether a message starts a turn.** M0 found Codex labelling a needed change `info` 12 times in 20. The choices:
+  - define `kind` concretely in the link note and measure again;
+  - let the receiving device's policy decide whether `info` starts a turn;
+  - drop `kind`.
 - Should a turn started by a link be a distinct task owner, or `Local` with the link id recorded on the envelope?
 - The default budgets and limits proposed above.
 
