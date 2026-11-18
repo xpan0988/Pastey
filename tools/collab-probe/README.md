@@ -1,6 +1,6 @@
 # collab-probe
 
-The M0 measurements for [Collaboration Links](../../docs/research/agent-collaboration-links.md). These are research tools and nothing here is part of the Pastey app.
+The M0 measurements for [Agent collaboration](../../docs/research/agent-collaboration-links.md). These are research tools and nothing here is part of the Pastey app.
 
 The probe drives the user's own `codex` and `claude` the way Pastey's adapters do. Pastey's own choices stay out, apart from the per-run flags an experiment exists to measure. Every run uses a new temporary folder. The probe gives each child a clean environment (`HOME`, `USER`, `PATH`, `TMPDIR` and locale only).
 

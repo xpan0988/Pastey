@@ -1,4 +1,4 @@
-"""M0 measurements for Collaboration Links
+"""M0 measurements for Agent collaboration
 (docs/research/agent-collaboration-links.md).
 
 Research only; nothing here is part of the Pastey app. It drives the user's

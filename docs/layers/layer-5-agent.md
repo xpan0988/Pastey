@@ -18,7 +18,7 @@ provider/auth, model selection, input interpretation, workspace behavior,
 tools, sandbox, reasoning, subagents, safety, and persistent conversation
 remain Host-private and opaque to Pastey. Pastey only shows the model and
 reasoning effort an Agent itself reports, read only
-([native model configuration](#native-model-configuration-read-only)).
+([native model configuration](#native-model-configuration)).
 
 The default local path is intentionally direct:
 
@@ -747,4 +747,4 @@ Distributed delivery failure remains unable to prove remote native-process termi
 
 Subagents, Headless Host, Worker network, Developer Terminal conversion, task-specific patch/document engines, and task/command allowlists are absent from the Generic Managed Worker subsystem. Physical acceptance covers Workspace Movement, Return and Apply, and locked-screen Full Access. See [development](../development.md#automated-local-and-physical-evidence) for the evidence boundaries and the deterministic harness.
 
-Messages between native Agent sessions that the user links, delivered only when a turn ends, have an approved design that is not yet built: [Collaboration Links](../research/agent-collaboration-links.md). Nothing described in this layer implements it.
+Collaboration between native Agent sessions the user groups together has an approved design that is not yet built: [Agent collaboration](../research/agent-collaboration-links.md). It covers messages delivered only when a turn ends, a Journal of facts and Agent statements, and a briefing for a member who joins later. Nothing described in this layer implements it.
