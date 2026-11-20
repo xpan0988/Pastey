@@ -332,6 +332,25 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             updated_at INTEGER NOT NULL
         );
 
+        -- Agent collaborations on this device (`crate::collaboration`): the
+        -- collaboration with its members, and its append-only Journal. An
+        -- entry's JSON carries its delivery state, the only part that changes.
+        CREATE TABLE IF NOT EXISTS collaborations (
+            id TEXT PRIMARY KEY,
+            record_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS collaboration_entries (
+            id TEXT PRIMARY KEY,
+            collaboration_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            entry_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_collaboration_entries
+            ON collaboration_entries(collaboration_id, seq);
         CREATE INDEX IF NOT EXISTS idx_rooms_code_hash ON rooms(room_code_hash);
         CREATE INDEX IF NOT EXISTS idx_rooms_expires_at ON rooms(expires_at);
         CREATE INDEX IF NOT EXISTS idx_room_items_room_id ON room_items(room_id, created_at);
@@ -1717,6 +1736,81 @@ pub(crate) fn delete_bridge_native_agent_conversations(
         [bridge_id],
     )?;
     Ok(keys)
+}
+
+/// One collaboration's record, inserted or replaced.
+pub(crate) fn save_collaboration(paths: &AppPaths, id: &str, record_json: &str) -> AppResult<()> {
+    connection(paths)?.execute(
+        r#"
+        INSERT INTO collaborations (id, record_json, updated_at) VALUES (?1, ?2, ?3)
+        ON CONFLICT(id) DO UPDATE SET
+            record_json = excluded.record_json,
+            updated_at = excluded.updated_at
+        "#,
+        params![id, record_json, now_ts()],
+    )?;
+    Ok(())
+}
+
+/// Every collaboration's record JSON.
+pub(crate) fn load_collaborations(paths: &AppPaths) -> AppResult<Vec<String>> {
+    let conn = connection(paths)?;
+    let records = conn
+        .prepare("SELECT record_json FROM collaborations ORDER BY id")?
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(records)
+}
+
+/// One Journal entry, inserted or (its delivery state changed) replaced.
+pub(crate) fn save_collaboration_entry(
+    paths: &AppPaths,
+    id: &str,
+    collaboration_id: &str,
+    seq: i64,
+    entry_json: &str,
+) -> AppResult<()> {
+    connection(paths)?.execute(
+        r#"
+        INSERT INTO collaboration_entries (id, collaboration_id, seq, entry_json, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(id) DO UPDATE SET
+            entry_json = excluded.entry_json,
+            updated_at = excluded.updated_at
+        "#,
+        params![id, collaboration_id, seq, entry_json, now_ts()],
+    )?;
+    Ok(())
+}
+
+/// One collaboration's Journal, oldest first.
+pub(crate) fn load_collaboration_entries(
+    paths: &AppPaths,
+    collaboration_id: &str,
+) -> AppResult<Vec<String>> {
+    let conn = connection(paths)?;
+    let entries = conn
+        .prepare(
+            "SELECT entry_json FROM collaboration_entries
+             WHERE collaboration_id = ?1 ORDER BY seq",
+        )?
+        .query_map([collaboration_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+    Ok(entries)
+}
+
+/// Deletes a collaboration and its whole Journal. The members' native
+/// conversations are untouched.
+pub(crate) fn delete_collaboration(paths: &AppPaths, id: &str) -> AppResult<()> {
+    let mut conn = connection(paths)?;
+    let transaction = conn.transaction()?;
+    transaction.execute(
+        "DELETE FROM collaboration_entries WHERE collaboration_id = ?1",
+        [id],
+    )?;
+    transaction.execute("DELETE FROM collaborations WHERE id = ?1", [id])?;
+    transaction.commit()?;
+    Ok(())
 }
 
 pub(crate) fn delete_native_agent_envelope(paths: &AppPaths, task_id: &str) -> AppResult<bool> {

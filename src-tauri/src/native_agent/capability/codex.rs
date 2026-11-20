@@ -2120,33 +2120,8 @@ fn unix_now() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs() as i64)
 }
 
-/// Text that renders as exactly what it says: no control characters other
-/// than line breaks and tabs, no bidirectional overrides that could reorder
-/// what a reviewer reads, and no invisible format, separator or filler
-/// characters that could make two different strings look the same.
-fn renders_faithfully(text: &str) -> bool {
-    !text.chars().any(|character| {
-        (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
-            || matches!(
-                character,
-                // Soft hyphen, combining grapheme joiner, Arabic letter mark,
-                // Syriac abbreviation mark, Mongolian vowel separator.
-                '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{070f}' | '\u{180e}'
-                // Zero-width space and joiners, direction marks, line and
-                // paragraph separators, embeddings and overrides.
-                | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
-                // Word joiner, invisible operators, isolates and deprecated
-                // format characters.
-                | '\u{2060}'..='\u{206f}'
-                // Hangul fillers render as blank space.
-                | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}'
-                // Byte order mark, interlinear annotation, musical format
-                // characters and tag characters.
-                | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0000}'..='\u{e007f}'
-            )
-    })
-}
+// `renders_faithfully` is shared with collaboration blocks (`super`).
+use super::renders_faithfully;
 
 fn optional_text(value: Option<&Value>) -> Result<Option<String>, ()> {
     match value {

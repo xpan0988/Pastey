@@ -176,7 +176,7 @@ Each session carries:
 - `resume`: `verdict` (`safe`, `unsafe` or `unknown`) and `reasons`;
 - `agentConfig`: what the session recorded (below).
 
-`NativeAgentConfigV1` (`src-tauri/src/native_agent/agent_config.rs`; [semantics](layers/layer-5-agent.md#native-model-configuration-read-only)): `agent` (`codex` or `claude_code`), `scope` (`native_default` or `session`), optional `modelProvider`, `model` and `reasoningEffort` (identifiers of 1–96 characters from `[A-Za-z0-9-._:/@+[]]`, not starting with `/`, `.`, `~` or a drive letter, without `//`), optional `modelOrigin` and `reasoningEffortOrigin` (`user`, `project`, `managed`, `session_flags`, `packaged_default` or `other`), `source` (at most 120 characters), optional `note` (at most 400), `observedAtMs`. Unknown fields are refused. Codex `config/read` has 5 s.
+`NativeAgentConfigV1` (`src-tauri/src/native_agent/agent_config.rs`; [semantics](layers/layer-5-agent.md#native-model-configuration)): `agent` (`codex` or `claude_code`), `scope` (`native_default` or `session`), optional `modelProvider`, `model` and `reasoningEffort` (identifiers of 1–96 characters from `[A-Za-z0-9-._:/@+[]]`, not starting with `/`, `.`, `~` or a drive letter, without `//`), optional `modelOrigin` and `reasoningEffortOrigin` (`user`, `project`, `managed`, `session_flags`, `packaged_default` or `other`), `source` (at most 120 characters), optional `note` (at most 400), `observedAtMs`. Unknown fields are refused. Codex `config/read` has 5 s.
 
 A snapshot adds:
 - `activity`: user turns, agent replies, tool calls, commands and failed commands, up to 20 changed files, errors;
@@ -229,6 +229,19 @@ A requester asks one exact current Bridge Host about its native sessions with `n
 
 The requester's commands are `discover_remote_native_sessions(roomId, targetHostRef, provider?, text?, activeWithinSecs?, scopeRef?)`, `inspect_remote_native_session(roomId, targetHostRef, provider, sessionId)` and `open_remote_folder(roomId, targetHostRef, folder)`. Each waits up to 30 s.
 
+### Agent collaboration facts
+
+On this device only (M1 of [Agent collaboration](research/agent-collaboration-links.md)); nothing crosses a Bridge.
+
+- **Members:** 2–6 Pastey conversations, one per provider per canonical folder (`codex` → `agent.coding.codex`, `claude_code` → `agent.coding.claude_code_conversation`). A conversation is a member of at most one collaboration that has not ended. Aliases use `[a-z0-9_-]{1,32}`; `user` is the user's own alias and cannot be a member's.
+- **Note:** every turn Pastey starts in a member conversation (`start_native_codex_task`, `start_native_claude_code_task`, and turns the collaboration starts) begins with the collaboration note (goal, members and roles, block formats, rules).
+- **Claude members** run headless with `--settings '{"crossSessionInbound":"refuse"}'` for that run only (`start_claude_code_member_task`; input field `refusePeerMessages`, local only: a peer's input cannot carry it and its resolved input never sets it).
+- **Blocks** (`capability/published.rs`): only fenced `pastey-message to=<alias>` and `pastey-summary` blocks that end the final reply count. At most 3 messages (subject at most 200 characters, body at most 4 KiB) and 1 summary (at most 2 KiB, fields `done`, `decisions`, `open`, `next`). Text that does not render faithfully is refused. `kind=` is accepted and ignored. When a reply exceeds the 16 KiB output bound, the prose before the blocks is cut, never the blocks.
+- **Journal** (`collaborations`, `collaboration_entries`): entries `turn`, `message`, `summary`, `attention`, `user`, `member`, each with a basis `fact`, `claim` (an Agent's statement) or `user`. Kept until the collaboration is deleted.
+- **Delivery:** a member's message to another member waits for approval (`waiting`). A message the user writes needs none. An approved message is put in the recipient's next turn once its folder is free and no turn the collaboration started for it is unseen to end (`scheduled` → `included`), with the user's messages first, within 15 KiB. A definite non-start (`native_agent_start_failed`, `native_agent_conversation_unavailable`, or a refusal to start) returns it; after 3 it is `undeliverable`. A message to `user` is `open` until the user marks it done. Hop limit 4; at most 20 messages waiting per member.
+- **Pausing:** a collaboration turn that fails, is interrupted or is stopped pauses that member until the user resumes it. After a restart, a scheduled turn whose task ended is recorded then; one whose task is unknown is sent again.
+- **Commands:** `list_collaborations`, `get_collaboration`, `create_collaboration`, `set_collaboration_state` (`active`, `paused`, `ended`), `delete_collaboration`, `send_collaboration_message`, `approve_collaboration_messages`, `dismiss_collaboration_entry`, `resume_collaboration_member`, `collaboration_needs_you_count`.
+
 ### Native Agent source map
 
 | Boundary | Primary source |
@@ -249,6 +262,7 @@ The requester's commands are `discover_remote_native_sessions(roomId, targetHost
 | Durable conflict table and retained-result validation | `src-tauri/src/storage.rs` |
 | Renderer lifecycle/review controls | `src/features/workspace/AgentTaskLifecycle.tsx`, `src/features/workspace/BridgeWorkspace.tsx`; executor Agent-request Accept/Deny banner in `src/features/workspace/WorkspaceV2.tsx` |
 | TypeScript status types and Tauri invocations | `src/lib/tauri.ts` |
+| Agent collaboration: members, Journal, scheduling at turn ends, collaboration note | `src-tauri/src/collaboration.rs` (turn listener: `NativeAgentServiceV1::set_turn_listener`); blocks in `src-tauri/src/native_agent/capability/published.rs`; UI in `src/lib/collaboration.ts`, `src/features/workspace/CollaborationScreens.tsx` |
 
 ## Host and managed authority source map
 

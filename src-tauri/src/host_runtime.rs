@@ -139,6 +139,9 @@ pub struct HostRuntime {
     /// Native mature Agents are Host capabilities, outside managed Worker
     /// execution and managed-object lifecycle.
     pub(crate) native_agents: Mutex<crate::native_agent::NativeAgentServiceV1>,
+    /// Agent collaborations on this device and their Journals
+    /// (`crate::collaboration`). Never locked while `native_agents` is held.
+    pub(crate) collaborations: Mutex<crate::collaboration::CollaborationServiceV1>,
     /// Process-local model cancellation state for the one-step Worker Harness.
     /// It is not a Core grant or a durable authority record.
     pub(crate) worker_harness_runs:
@@ -259,6 +262,9 @@ impl HostRuntime {
             native_agents: Mutex::new(crate::native_agent::NativeAgentServiceV1::with_paths(
                 paths.clone(),
             )?),
+            collaborations: Mutex::new(crate::collaboration::CollaborationServiceV1::new(Some(
+                paths.clone(),
+            ))?),
             worker_harness_runs: Mutex::new(HashMap::new()),
             managed_completion_lock: Mutex::new(()),
             managed_worker_process_specs: Mutex::new(HashMap::new()),

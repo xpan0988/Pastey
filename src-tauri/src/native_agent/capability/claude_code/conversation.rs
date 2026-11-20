@@ -2,7 +2,10 @@
 //! this Host, through Claude Code's headless interface (`claude -p`, with
 //! stream-json in and out), the user's own installation, sign-in, model,
 //! settings and tools. Pastey passes the prompt and the session, nothing
-//! else: no model, permission mode, settings, tool list or `--bare`.
+//! else: no model, permission mode, settings, tool list or `--bare`. The one
+//! exception is a collaboration member's turn, which passes `--settings`
+//! refusing messages from the user's other Claude Code sessions for that
+//! run (`refuse_peer_messages`).
 //!
 //! Headless behavior measured on macOS with Claude Code 2.1.317:
 //! - The session is Pastey's choice (`--session-id`) and is continued
@@ -86,6 +89,9 @@ use crate::native_agent::{
     NativeTurnOutcomeV1, MAX_TASK_BYTES, OPTIONS_INVOKE_PROTOCOLS,
 };
 
+/// Per-run settings for a collaboration member's turn; the user's own
+/// settings files are never changed.
+const REFUSE_PEER_MESSAGES_SETTINGS: &str = r#"{"crossSessionInbound":"refuse"}"#;
 pub(in crate::native_agent) const CLAUDE_CODE_CONVERSATION_ID: &str =
     "agent.coding.claude_code_conversation";
 /// The oldest Claude Code whose signed-in headless behavior was verified
@@ -136,6 +142,12 @@ struct ConversationInputV1 {
     /// chose them. Absent: Claude Code's own configuration decides.
     #[serde(default)]
     options: NativeSessionOptionsV1,
+    /// A collaboration member's turn: Claude Code refuses messages from the
+    /// user's other Claude Code sessions for this run, so nothing reaches
+    /// the turn outside the collaboration. Local only: a peer's input has no
+    /// such field, and its resolved input never sets it.
+    #[serde(default)]
+    refuse_peer_messages: bool,
 }
 
 /// What a Bridge peer sends: the folder only as the reference of a folder
@@ -204,7 +216,7 @@ fn resolve_peer_input(
             "This device may not ask to run agents in that folder.".into(),
         ));
     };
-    conversation_input(workspace, &peer.task, peer.resume, &peer.options)
+    conversation_input(workspace, &peer.task, peer.resume, &peer.options, false)
 }
 
 /// What continuing a conversation takes: its Claude Code session.
@@ -237,15 +249,21 @@ pub(in crate::native_agent) fn conversation_input(
     task: &str,
     resume: bool,
     options: &NativeSessionOptionsV1,
+    refuse_peer_messages: bool,
 ) -> AppResult<OpaqueCapabilityPayloadV1> {
-    let input = OpaqueCapabilityPayloadV1::new(with_options(
+    let mut value = with_options(
         json!({
             "workspace": workspace.to_string_lossy(),
             "task": task,
             "resume": resume,
         }),
         options,
-    )?);
+    )?;
+    // Present only when set, so every other input is exactly as before.
+    if refuse_peer_messages {
+        value["refusePeerMessages"] = json!(true);
+    }
+    let input = OpaqueCapabilityPayloadV1::new(value);
     input.validate()?;
     parse(&input)?;
     Ok(input)
@@ -846,6 +864,7 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
                 // turns; an effort is this turn's.
                 options: parsed.options,
                 existing: None,
+                refuse_peer_messages: parsed.refuse_peer_messages,
             }),
         })
     }
@@ -1010,6 +1029,7 @@ impl HeadlessContinuationV1 {
             existing: Some(ExistingSessionV1 {
                 expected_marker: turn.expected_marker,
             }),
+            refuse_peer_messages: false,
         }))
     }
 
@@ -1099,6 +1119,9 @@ struct ConversationRunV1 {
     /// Set when the run continues an existing session its user chose (not a
     /// conversation Pastey began): what that user saw of it.
     existing: Option<ExistingSessionV1>,
+    /// Passes `--settings` refusing the user's other sessions' messages
+    /// (a collaboration member's turn).
+    refuse_peer_messages: bool,
 }
 
 /// An existing session a run continues, as its user chose it.
@@ -1142,6 +1165,12 @@ impl ConversationRunV1 {
         }
         if let Some(effort) = self.options.effort.as_deref() {
             args.extend(["--effort", effort]);
+        }
+        // Measured with 2.1.318 (tools/collab-probe): with this a `-p` run
+        // takes no message from the user's other Claude Code sessions;
+        // without it one arrives between tool calls of the running turn.
+        if self.refuse_peer_messages {
+            args.extend(["--settings", REFUSE_PEER_MESSAGES_SETTINGS]);
         }
         match &self.launcher {
             #[cfg(unix)]

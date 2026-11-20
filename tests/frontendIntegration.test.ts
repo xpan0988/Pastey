@@ -8,6 +8,10 @@ import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
 import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
 import {
+  journalCount, journalEntries, memberStateLabel, needsUser, statusLabel, suggestAlias, turnOutcomeLabel, validAlias,
+  waitingByRecipient, type CollaborationEntry,
+} from "../src/lib/collaboration";
+import {
   CLAUDE_CODE_AGENT_ID,
   CODEX_AGENT_ID,
   conversationAgent,
@@ -2337,4 +2341,42 @@ test("a folder's native defaults come from its newest read only, and a change is
   assert.equal(unreported.defaults.codex, undefined);
   // An older Host's answer without defaults reads as before.
   assert.deepEqual(mergeSessionRead(null, scope, { providers: READABLE, sessions: [], at: 4_000 }).defaults, {});
+});
+
+test("a collaboration's Journal reads three ways, and only open items need the user", () => {
+  const entry = (seq: number, body: CollaborationEntry["body"], status?: CollaborationEntry["status"], basis: CollaborationEntry["basis"] = "fact"): CollaborationEntry =>
+    ({ id: `entry:${seq}`, seq, at: 1_700_000_000 + seq, basis, body, status });
+  const entries: CollaborationEntry[] = [
+    entry(1, { type: "user", action: { type: "created", name: "orders-v2", goal: "" } }, undefined, "user"),
+    entry(2, { type: "turn", taskId: "t1", origin: "user", state: "completed" }),
+    entry(3, { type: "message", from: "api", to: "web", subject: "Cursors", body: "OrdersTable sends offset.", hop: 1 }, { state: "waiting" }, "claim"),
+    entry(4, { type: "message", from: "api", to: "user", subject: "Data source?", body: "Where are orders stored?", hop: 1 }, { state: "open" }, "claim"),
+    entry(5, { type: "summary", summary: { done: "reviewed pagination" } }, undefined, "claim"),
+    entry(6, { type: "message", from: "api", to: "web", subject: "Old", body: "x", hop: 1 }, { state: "included", taskId: "t2" }, "claim"),
+    entry(7, { type: "attention", text: "A block was refused." }, { state: "resolved" }),
+  ];
+  assert.deepEqual(journalEntries(entries, "activity").map((item) => item.seq), [7, 6, 5, 4, 3, 2, 1], "newest first");
+  assert.deepEqual(journalEntries(entries, "summaries").map((item) => item.seq), [5]);
+  assert.deepEqual(journalEntries(entries, "needs-you").map((item) => item.seq), [4, 3]);
+  assert.equal(journalCount(entries, "needs-you"), 2);
+  assert.equal(needsUser(entries[6]), false, "a resolved item no longer needs the user");
+  assert.deepEqual(waitingByRecipient(entries), { web: ["entry:3"] });
+  assert.equal(statusLabel({ state: "waiting" }), "Waiting for your approval");
+  assert.equal(statusLabel({ state: "undeliverable", reason: "there is no member \"x\"" }), "Not delivered: there is no member \"x\"");
+  assert.equal(statusLabel(undefined), null);
+  assert.equal(turnOutcomeLabel("failed", "native_agent_start_failed"), "did not start");
+  assert.equal(turnOutcomeLabel("cancelled"), "stopped");
+  assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: false, busy: false, waiting: 2 }), "2 waiting");
+  assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: true, busy: true, waiting: 0 }), "Paused");
+});
+
+test("a member alias is suggested from its folder and never collides with another or with the user", () => {
+  assert.equal(suggestAlias("/Users/me/Shop API", []), "shop-api");
+  assert.equal(suggestAlias("C:\\work\\web", ["web"]), "web-2");
+  assert.equal(suggestAlias("/home/me/user", []), "member");
+  assert.equal(suggestAlias("/", []), "agent");
+  assert.equal(validAlias("web"), true);
+  assert.equal(validAlias("user"), false);
+  assert.equal(validAlias("Web Team"), false);
+  assert.equal(validAlias("x".repeat(33)), false);
 });

@@ -6,6 +6,7 @@ mod capability_acquisition_confirmation;
 mod capability_probe;
 mod chunk_frame;
 mod cleanup;
+mod collaboration;
 mod commands;
 mod config;
 mod connectivity;
@@ -114,6 +115,9 @@ use crate::{
         send_developer_terminal_input, send_file_to_room, send_text_to_room,
         set_bridge_peer_address, set_internet_connectivity, share_bridge_workspace,
         start_bridge_plan_attempt, start_native_claude_code_task, start_native_codex_task,
+        list_collaborations, get_collaboration, create_collaboration, set_collaboration_state,
+        delete_collaboration, send_collaboration_message, approve_collaboration_messages,
+        dismiss_collaboration_entry, resume_collaboration_member, collaboration_needs_you_count,
         start_native_v2_plan_attempt, start_remote_native_capability_task,
         start_remote_native_claude_code_task, start_remote_native_codex_task,
         stop_bridge_native_agent_task, stop_sharing_workspace, trust_peer_device, update_config,
@@ -175,6 +179,8 @@ fn main() {
 
             app.manage(state.clone());
             logging::install_crash_reporting(env!("CARGO_PKG_VERSION"));
+            // Agent collaborations: deliver at turn boundaries from now on.
+            collaboration::start_scheduler(&state);
             let antenna_state = state.clone();
             state.spawn(async move {
                 if discovery::ensure_service(antenna_state.clone())
@@ -288,6 +294,16 @@ fn main() {
             list_remote_native_agent_capabilities,
             start_native_codex_task,
             start_native_claude_code_task,
+            list_collaborations,
+            get_collaboration,
+            create_collaboration,
+            set_collaboration_state,
+            delete_collaboration,
+            send_collaboration_message,
+            approve_collaboration_messages,
+            dismiss_collaboration_entry,
+            resume_collaboration_member,
+            collaboration_needs_you_count,
             get_native_agent_task_session,
             get_native_agent_task_status,
             cancel_native_agent_task,

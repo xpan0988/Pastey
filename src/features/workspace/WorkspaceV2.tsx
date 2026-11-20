@@ -9,6 +9,8 @@ import { SettingsScreen, type SettingsRoute } from "./SettingsScreens";
 import { Icon, Notice } from "./ui";
 import { BridgeNavigation } from "./WorkspaceChrome";
 import { InboxScreen, NewBridgeScreen } from "./WorkspaceScreens";
+import { CollaborationsScreen } from "./CollaborationScreens";
+import { collaborationNeedsYouCount } from "../../lib/collaboration";
 import { type WorkspaceRoute, type WorkspaceV2Props } from "./workspaceTypes";
 import { bridgeCode, roomMembers } from "./workspaceViewModel";
 
@@ -38,6 +40,14 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
   const roomIdsKey = props.rooms.filter((room) => room.status !== "burned").map((room) => room.id).sort().join(":");
 
   const inboxCount = props.activityItems.filter((item) => item.direction === "incoming").length;
+  const [collaborationCount, setCollaborationCount] = useState(0);
+  useEffect(() => {
+    let live = true;
+    const read = () => { collaborationNeedsYouCount().then((count) => { if (live) setCollaborationCount(count); }).catch(() => undefined); };
+    read();
+    const timer = window.setInterval(read, 5000);
+    return () => { live = false; window.clearInterval(timer); };
+  }, []);
 
   useEffect(() => {
     if (!activeRoom) task.closeRevision();
@@ -226,7 +236,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
 
   return (
     <div className={`app${navOpen ? " nav-open" : ""}`}>
-      <BridgeNavigation route={route} rooms={props.rooms} activeRoom={activeRoom} inboxCount={inboxCount} appVersion={props.config.app_version} onNavigate={navigate} onOpenBridge={openBridge} />
+      <BridgeNavigation route={route} rooms={props.rooms} activeRoom={activeRoom} inboxCount={inboxCount} collaborationCount={collaborationCount} appVersion={props.config.app_version} onNavigate={navigate} onOpenBridge={openBridge} />
       {navOpen ? <div className="scrim" onClick={() => setNavOpen(false)} /> : null}
       <main className="main">
         {pendingAdmission && admissionRoom || pendingReview && reviewRoom ? <div className="request-stack">
@@ -236,6 +246,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
         {message ? <div className="main-message"><Notice tone="bad">{message}</Notice></div> : null}
         {route === "bridge" ? <BridgeWorkspace room={activeRoom} items={props.roomItems} queueItems={props.queueItems} transfers={props.transfers} task={task} developerMode={bridgeMode === "developer"} developerSession={activeRoom ? developerSessions[activeRoom.id] ?? null : null} developerWorkspace={activeRoom ? developerWorkspaces[activeRoom.id] ?? { pendingRequests: [], sessions: [] } : { pendingRequests: [], sessions: [] }} onDeveloperSession={(session) => setDeveloperSessions((current) => ({ ...current, [session.roomId]: session }))} onRefreshDeveloper={refreshDeveloperWorkspaces} onNewBridge={() => navigate("new-bridge")} onRefresh={props.onRefreshBridge} onDeveloper={() => setBridgeMode((current) => current === "normal" ? "developer" : "normal")} onBurn={props.onBurnBridge} onEnqueue={props.onEnqueueTransferInputs} onRevealInFolder={props.onRevealInFolder} onOpenSettings={(next) => navigate(next ?? "settings-permissions")} menuButton={menuButton} /> : null}
         {route === "new-bridge" ? <NewBridgeScreen onCreate={createBridge} onJoin={joinBridge} onListNearby={props.onListNearbyDevices} onJoinNearby={joinNearbyDevice} onCompleteNearby={completeNearbyJoin} nearbyDiscoveryAvailable={props.nearbyDiscoveryAvailable} menuButton={menuButton} /> : null}
+        {route === "collaborations" ? <CollaborationsScreen menuButton={menuButton} /> : null}
         {route === "inbox" ? <InboxScreen items={props.activityItems} rooms={props.rooms} inboxDir={props.config.inbox_dir} onRevealInFolder={props.onRevealInFolder} menuButton={menuButton} /> : null}
         {route.startsWith("settings") ? <SettingsScreen route={route as SettingsRoute} config={props.config} onNavigate={navigate} onConfigChange={props.onConfigChange} menuButton={menuButton} /> : null}
       </main>

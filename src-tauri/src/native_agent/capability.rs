@@ -28,6 +28,7 @@ pub(super) mod claude_code;
 pub(super) mod codex;
 #[cfg(test)]
 pub(super) mod fake_longjob;
+pub(crate) mod published;
 
 /// Bound for one invocation input or terminal output. It keeps either well
 /// inside one Room Control event.
@@ -66,7 +67,9 @@ impl OpaqueCapabilityPayloadV1 {
 
     /// User-facing text in the shared text output shape, cut at a character
     /// boundary so the whole payload stays within its bound. Blank text is
-    /// no output.
+    /// no output. When a reply that ends with collaboration blocks must be
+    /// cut, the prose before them is shortened instead, so the blocks the
+    /// Agent published survive whole (`published`).
     fn text_output(text: &str) -> Option<Self> {
         if text.trim().is_empty() {
             return None;
@@ -80,23 +83,90 @@ impl OpaqueCapabilityPayloadV1 {
         };
         let overhead = serde_json::to_vec(&envelope("", true)).ok()?.len();
         let budget = MAX_CAPABILITY_PAYLOAD_BYTES.checked_sub(overhead)?;
-        let mut used = 0;
-        let mut end = text.len();
-        for (index, character) in text.char_indices() {
-            used += json_escaped_len(character);
-            if used > budget {
-                end = index;
-                break;
+        let cost = |text: &str| text.chars().map(json_escaped_len).sum::<usize>();
+        // The longest prefix of `text` that costs at most `limit`.
+        let prefix = |text: &str, limit: usize| {
+            let mut used = 0;
+            for (index, character) in text.char_indices() {
+                used += json_escaped_len(character);
+                if used > limit {
+                    return index;
+                }
+            }
+            text.len()
+        };
+        if cost(text) <= budget {
+            let output = Self(envelope(text, false));
+            output.validate().ok()?;
+            return Some(output);
+        }
+        const GAP: &str = "\n\n…\n\n";
+        if let Some(start) = published::trailing_blocks_start(text) {
+            let tail = &text[start..];
+            if let Some(room) = budget.checked_sub(cost(tail) + cost(GAP)) {
+                let head = &text[..start];
+                let kept = format!("{}{GAP}{tail}", &head[..prefix(head, room)]);
+                let output = Self(envelope(&kept, true));
+                output.validate().ok()?;
+                return Some(output);
             }
         }
-        let output = Self(envelope(&text[..end], end < text.len()));
+        let end = prefix(text, budget);
+        let output = Self(envelope(&text[..end], true));
         output.validate().ok()?;
         Some(output)
+    }
+
+    /// Tests: the text output an adapter would report for `text`.
+    #[cfg(test)]
+    pub(crate) fn text_for_tests(text: &str) -> Self {
+        Self::text_output(text).expect("non-blank text")
+    }
+
+    /// The collaboration blocks that end this output's text, if it is the
+    /// shared text output shape and its text ends with any (or carries one
+    /// that broke a rule). Read here, inside the capability seam, so Core
+    /// never parses an Agent's reply itself.
+    pub(crate) fn published_blocks(&self) -> Option<published::PublishedBlocksV1> {
+        if self.0.get("schemaVersion").and_then(Value::as_str) != Some(NATIVE_TEXT_OUTPUT_SCHEMA) {
+            return None;
+        }
+        let text = self.0.get("text").and_then(Value::as_str)?;
+        let blocks = published::extract(text);
+        (!blocks.is_empty()).then_some(blocks)
     }
 
     pub(in crate::native_agent) fn value(&self) -> &Value {
         &self.0
     }
+}
+
+/// Text that renders as exactly what it says: no control characters other
+/// than line breaks and tabs, no bidirectional overrides that could reorder
+/// what a reviewer reads, and no invisible format, separator or filler
+/// characters that could make two different strings look the same.
+fn renders_faithfully(text: &str) -> bool {
+    !text.chars().any(|character| {
+        (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+            || matches!(
+                character,
+                // Soft hyphen, combining grapheme joiner, Arabic letter mark,
+                // Syriac abbreviation mark, Mongolian vowel separator.
+                '\u{00ad}' | '\u{034f}' | '\u{061c}' | '\u{070f}' | '\u{180e}'
+                // Zero-width space and joiners, direction marks, line and
+                // paragraph separators, embeddings and overrides.
+                | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+                // Word joiner, invisible operators, isolates and deprecated
+                // format characters.
+                | '\u{2060}'..='\u{206f}'
+                // Hangul fillers render as blank space.
+                | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}'
+                // Byte order mark, interlinear annotation, musical format
+                // characters and tag characters.
+                | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e007f}'
+            )
+    })
 }
 
 /// Bytes serde_json writes for one character inside a JSON string.

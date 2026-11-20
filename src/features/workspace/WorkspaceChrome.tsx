@@ -9,14 +9,16 @@ interface BridgeNavigationProps {
   rooms: RoomInfo[];
   activeRoom: RoomInfo | null;
   inboxCount: number;
+  /** Items in this device's Agent collaborations that wait for the user. */
+  collaborationCount: number;
   appVersion: string;
   onNavigate: NavigateWorkspace;
   onOpenBridge: (room: RoomInfo) => void;
 }
 
-/** Global navigation: what is device-wide (Inbox, Settings) and the list
+/** Global navigation: what is device-wide (Inbox, Collaborations, Settings) and the list
  * of Bridges. Everything about one Bridge lives inside that Bridge. */
-export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, appVersion, onNavigate, onOpenBridge }: BridgeNavigationProps) {
+export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, collaborationCount, appVersion, onNavigate, onOpenBridge }: BridgeNavigationProps) {
   const activeRooms = rooms.filter((room) => room.status !== "burned");
   return (
     <aside className="sidebar" aria-label="Navigation">
@@ -24,6 +26,9 @@ export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, appVers
       <button type="button" className={`nav-item primary${route === "new-bridge" ? " active" : ""}`} onClick={() => onNavigate("new-bridge")}><Icon name="plus" />New Bridge</button>
       <button type="button" className={`nav-item${route === "inbox" ? " active" : ""}`} onClick={() => onNavigate("inbox")}>
         <Icon name="inbox" />Inbox{inboxCount > 0 ? <span className="count">{inboxCount}</span> : null}
+      </button>
+      <button type="button" className={`nav-item${route === "collaborations" ? " active" : ""}`} onClick={() => onNavigate("collaborations")}>
+        <Icon name="agent" />Collaborations{collaborationCount > 0 ? <span className="count" title="Waiting for you">{collaborationCount}</span> : null}
       </button>
       <p className="nav-label">Bridges</p>
       <div className="nav-list">

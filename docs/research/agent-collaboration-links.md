@@ -6,7 +6,7 @@ Status: design, revised after M0. The direction was approved on 2026-11-18 as "C
 - The user follows progress, reads summaries and answers what needs them from that Journal.
 - A member who joins later starts with a **briefing** compiled from it.
 
-M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). None of it is implemented. Windows is not measured, and five product decisions are still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
+M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). M1 is built: a collaboration on one device, with every delivery between Agents approved by the user ([M1](#milestones-and-acceptance-tests); [reference](../reference.md#agent-collaboration-facts)). Nothing beyond M1 is built. Windows is not measured. Three of the five product decisions were made for M1, and two are still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
 
 ## What kind of evidence this is
 
@@ -185,7 +185,7 @@ All values are proposals.
 **Budgets and limits:**
 - a turn budget per member on each device, and an expiry;
 - a **hop limit of 4**: a message's hop is one more than the highest hop its sending turn received;
-- at most 3 message blocks and 1 summary block per turn; messages at most 8 KiB, summaries at most 4 KiB;
+- at most 3 message blocks and 1 summary block per turn; message bodies at most 4 KiB and summaries at most 2 KiB, so every block a turn publishes fits one task output (16 KiB). M0 and M1a's blocks were all under 1 KiB;
 - at most 20 messages waiting per member; further ones are refused visibly;
 - at most 30 automatic turns per hour on one device, across all collaborations.
 
@@ -221,7 +221,7 @@ GET /v2/orders no longer accepts `offset`. It returns `nextCursor`; pass it as
 
 - `to` must be a member alias, or `user`.
 - `subject` is one line of at most 200 characters.
-- The body is at most 8 KiB and must pass the faithful-rendering check. That is `renders_faithfully`, now private in `capability/codex.rs`; it moves to shared code.
+- The body is at most 4 KiB and must pass the faithful-rendering check (`renders_faithfully`, shared by the capability seam since M1).
 - Blocks count only at the end of the final reply, at most 3 per turn.
 - `kind=request|info` is accepted and shown, but never decides anything.
 - A block that breaks a rule is refused visibly on the sender's device, and nothing is sent.
@@ -237,7 +237,7 @@ next: none until web confirms
 ```
 ~~~
 
-- Each field is optional. A summary is at most 4 KiB, one per turn, and must render faithfully.
+- Each field is optional. A summary is at most 2 KiB, one per turn, and must render faithfully.
 - It is recorded in the Journal as an Agent statement. It is never delivered and never starts a turn.
 - **Its reliability is not measured yet** (M1a).
 
@@ -483,8 +483,8 @@ Today an adapter's progress channel carries only native decisions and the conver
 
 ### Where it appears
 
-- **The collaboration view lives in the Agents workspace,** with three filters over the one Journal: **Activity**, **Summaries** and **Needs you**.
-- **Needs you is the only surface that interrupts:** a count in the sidebar.
+- **Collaborations is a device-wide item in the sidebar** (since M1), because a collaboration belongs to no Bridge. Each collaboration's view reads its one Journal three ways: **Activity**, **Summaries** and **Needs you**.
+- **Needs you is the only surface that interrupts:** the count on that sidebar item.
 - **Naming.** It is not called "Inbox": the sidebar's Inbox already holds received files and text ([UX](../ux-information-architecture.md#navigation)). It does not bring back the global Activity route that was deliberately removed.
 
 ## Joining: the briefing
@@ -575,17 +575,32 @@ Variations:
    - **Summary blocks:** with the note, at least 9 of 10 stage-ending turns write a valid summary block; turns that end nothing write none.
    - **Message blocks:** with the revised note (addressing decides; no acknowledgements), message blocks still reach 9 of 10 and 0 of 10.
    - **Replies:** a reply turn sends no acknowledgement in at least 9 of 10 runs, and a real question still gets an answer.
-3. **M1, a local collaboration, `ask` only.** Two or more members on one device; useful on its own. It delivers:
+3. **M1, a local collaboration, `ask` only.** Built on 2026-11-18. Two to six members on one device; useful on its own. It delivers:
    - the Journal with all six entry types;
    - message and summary extraction, with addressing as the trigger;
    - Needs you, pause, and user messages;
    - Claude members run headless with `refuse`.
 
-   Acceptance:
-   - Entries come only from members' Pastey turns, and survive a restart.
-   - A forced restart between *scheduled* and start produces at most one task.
-   - Every view line shows its basis.
-   - No native configuration is touched except the per-run `refuse`.
+   Acceptance, as tested:
+   - Entries come only from members' Pastey turns, once per turn, and survive a reload from storage (`collaboration::tests`).
+   - After a restart, a scheduled turn whose task ended is recorded, and one whose task is unknown is sent again; the native service's replay rejection keeps a started task from running twice.
+   - Every Journal line shows its basis (Pastey, Agent's statement, You).
+   - Only the Claude member turn carries `--settings`, and a peer cannot set it (`claude_code::conversation::tests`, fixture `claude`).
+   - A member turn's real output reaches the scheduler with its blocks, once its folder is free (fixture `claude`).
+
+   M1's differences from the design above:
+   - Members are Pastey conversations only. A discovered session is not a member.
+   - Basis is fact, claim or user. Runtime reports come with progress (M2).
+   - There is no "since your last turn" digest yet; it comes with M2.
+
+   Live run (macOS, 2026-11-18, `installed_codex_and_claude_code_exchange_an_approved_collaboration_message`, Codex 0.170.0 and Claude Code 2.1.318 at effort `low`, 39 s):
+   - The user's turn in `api` (Codex, with the note) sent `web` a correct, specific message and a summary.
+   - Once approved, the collaboration started `web`'s turn (Claude Code, headless with `refuse`) with the message in its prompt. The message became `included`, and the turn was recorded with origin `collaboration`, completed.
+   - Claude Code's attempt to write `OrdersTable.js` was declined: a headless `-p` turn declines anything that needs approval, and Pastey never answers native approvals. It then asked `user` for permission (hop 2, under Needs you) and summarized what was open.
+
+   So a Claude Code member can change files only as far as its own permission settings already allow. Anything else comes back as a question for the user. This limit should be explained where members are added.
+
+   Not yet verified: the collaboration view rendered with real data (the list and the create dialog were checked in a browser without the backend), and Windows.
 4. **M2, bounded `auto`, and progress.** Acceptance:
    - Two fake adapters that always reply with a message stop exactly at the budget.
    - The hop limit holds across three members.
@@ -744,13 +759,17 @@ A third consequence reaches beyond collaboration. A newer Codex GUI can switch t
 
 ## Open product decisions
 
-1. **A second stored admission** (the auto grant) beside Full Access.
-2. **A sender outbox,** as an exception to "Nothing is queued for a device that cannot be reached".
-3. **A visible collaboration note** in prompts sent to members, or Codex `developerInstructions` where that works.
-4. **Claude members run headless with `crossSessionInbound` set to `refuse`,** never `--bg`. Recommended on M0's evidence, though it touches native configuration for each run. Whether Pastey's Claude runs outside a collaboration should also refuse is a separate question.
-5. **The Journal keeps content Agents publish to it** (changing the capability matrix's "Native Agent history/task browsing" non-goal), and how long it keeps it.
+Still open:
+1. **A second stored admission** (the auto grant) beside Full Access. Needed for M2.
+2. **A sender outbox,** as an exception to "Nothing is queued for a device that cannot be reached". Needed for M4.
 
-Design questions for M1:
+Decided by the user on 2026-11-18, for M1:
+3. **A visible collaboration note on every member turn,** including turns the user types in the ordinary conversation view.
+4. **Claude members run headless with `crossSessionInbound` set to `refuse`,** for that run only. Whether Pastey's Claude runs outside a collaboration should also refuse is a separate question.
+5. **The Journal keeps content Agents publish to it until the collaboration is deleted.** Layer 5's "Native Agent history/task browsing" non-goal now names this one exception.
+6. **Members are Pastey conversations** in M1; discovered sessions are not.
+
+Design questions:
 - Should a turn that only answers a peer write a summary? In M1a, Claude did 5 times in 5 and Codex 3 times in 5.
 - An unprompted warning to a peer starts that peer's turn under `auto`. Codex sent one in 5 of 10 reply runs. M2's loop tests should cover it.
 - Should `kind` stay at all, now that it decides nothing?

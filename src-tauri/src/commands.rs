@@ -1295,6 +1295,12 @@ pub fn start_native_codex_task(
     options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    // A collaboration member's turn carries the collaboration note.
+    let note = state.collaborations.lock().note_for(
+        crate::collaboration::ProviderV1::Codex,
+        std::path::Path::new(&workspace),
+    );
+    let task = crate::collaboration::with_note(note, &task);
     state
         .native_agents
         .lock()
@@ -1319,16 +1325,174 @@ pub fn start_native_claude_code_task(
     options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    // A collaboration member's turn carries the collaboration note, and
+    // Claude Code refuses other sessions' messages for it.
+    let note = state.collaborations.lock().note_for(
+        crate::collaboration::ProviderV1::ClaudeCode,
+        std::path::Path::new(&workspace),
+    );
+    let member = note.is_some();
+    let task = crate::collaboration::with_note(note, &task);
+    let mut natives = state.native_agents.lock();
+    let workspace = std::path::Path::new(&workspace);
+    let new_conversation = new_conversation.unwrap_or(false);
+    let options = options.unwrap_or_default();
+    if member {
+        natives.start_claude_code_member_task(workspace, &task, new_conversation, &options)
+    } else {
+        natives.start_claude_code_conversation_task(workspace, &task, new_conversation, &options)
+    }
+    .map_err(|error| error.message())
+}
+
+// --- Agent collaborations (`crate::collaboration`) ---------------------------
+
+fn collaboration_view(
+    state: &AppState,
+    collaboration_id: &str,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    let busy = crate::collaboration::busy_check(state);
     state
-        .native_agents
+        .collaborations
         .lock()
-        .start_claude_code_conversation_task(
-            std::path::Path::new(&workspace),
-            &task,
-            new_conversation.unwrap_or(false),
-            &options.unwrap_or_default(),
-        )
+        .view(collaboration_id, busy)
         .map_err(|error| error.message())
+}
+
+/// Starts, off the command thread, whatever the change made possible.
+fn drive_collaborations(state: &Arc<AppState>) {
+    let runtime = state.clone();
+    std::thread::spawn(move || crate::collaboration::drive(&runtime));
+}
+
+#[tauri::command]
+pub fn list_collaborations(
+    state: State<'_, Arc<AppState>>,
+) -> Vec<crate::collaboration::CollaborationSummaryV1> {
+    let busy = crate::collaboration::busy_check(&state);
+    state.collaborations.lock().list(busy)
+}
+
+#[tauri::command]
+pub fn get_collaboration(
+    collaboration_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Groups Pastey conversations of this device (one per provider per
+/// folder) into a collaboration.
+#[tauri::command]
+pub fn create_collaboration(
+    name: String,
+    goal: String,
+    members: Vec<crate::collaboration::MemberInputV1>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    let id = state
+        .collaborations
+        .lock()
+        .create(&name, &goal, members)
+        .map_err(|error| error.message())?;
+    collaboration_view(&state, &id)
+}
+
+#[tauri::command]
+pub fn set_collaboration_state(
+    collaboration_id: String,
+    collaboration_state: crate::collaboration::CollaborationStateV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .set_state(&collaboration_id, collaboration_state)
+        .map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Deletes a collaboration and its Journal; its members' conversations stay.
+#[tauri::command]
+pub fn delete_collaboration(
+    collaboration_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state
+        .collaborations
+        .lock()
+        .delete(&collaboration_id)
+        .map_err(|error| error.message())
+}
+
+/// A message this device's user writes to a member: delivered at the
+/// member's next turn boundary, without another approval.
+#[tauri::command]
+pub fn send_collaboration_message(
+    collaboration_id: String,
+    to: String,
+    text: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .user_message(&collaboration_id, &to, &text)
+        .map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Approves messages between members that wait for this device's user.
+#[tauri::command]
+pub fn approve_collaboration_messages(
+    collaboration_id: String,
+    entry_ids: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .approve(&collaboration_id, &entry_ids)
+        .map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+#[tauri::command]
+pub fn dismiss_collaboration_entry(
+    collaboration_id: String,
+    entry_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .dismiss(&collaboration_id, &entry_id)
+        .map_err(|error| error.message())?;
+    collaboration_view(&state, &collaboration_id)
+}
+
+#[tauri::command]
+pub fn resume_collaboration_member(
+    collaboration_id: String,
+    alias: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .resume_member(&collaboration_id, &alias)
+        .map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Items in every collaboration that wait for this device's user.
+#[tauri::command]
+pub fn collaboration_needs_you_count(state: State<'_, Arc<AppState>>) -> usize {
+    state.collaborations.lock().needs_you_total()
 }
 
 /// The native session (provider and id, as session discovery names it) a

@@ -80,14 +80,16 @@ Developer Mode is an elevated, rare action: Bridge **⋯ → Developer Mode** re
 Sidebar (device-wide)          Bridge (one pairing)                      Bridge details (inspector)
   New Bridge                     Header: device name → Device Details      Connection and pairing
   Inbox (received, all Bridges)  Tabs: Share | Agents                      Reach it on another network
-  Bridges                        ⋯ Developer Mode                          Devices → Device Details
-  Settings                                                                 Allowed on this device (Revoke)
-                                                                           Let the other device trust this one
+  Collaborations (this device)   ⋯ Developer Mode                          Devices → Device Details
+  Bridges                                                                  Allowed on this device (Revoke)
+  Settings                                                                 Let the other device trust this one
                                                                            Burn this Bridge…
 
 Device Details (one device of a Bridge): Overview · Connection · Performance (Test connection) ·
   Agents · Trust & permissions (both directions) · Advanced (managed self-check)
 ```
+
+**Collaborations** is device-wide because a collaboration belongs to no Bridge: it groups this device's Codex and Claude Code conversations ([Agent collaboration](research/agent-collaboration-links.md)). Its count is what waits for the user (messages to approve, questions, problems). It is not an activity feed: each collaboration shows its own Journal, read as Activity, Summaries or Needs you.
 
 The old global **Devices** and **Activity** routes and the always-on right context panel are gone: devices belong to one Bridge (its details), in-flight transfers show in the Share thread with progress, and received items are in the Inbox. The right panel no longer squeezes the Bridge in the default 760 px window; Bridge details open on demand (docked above 1080 px, overlay below).
 

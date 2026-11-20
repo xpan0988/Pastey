@@ -7,6 +7,7 @@ export type WorkspaceRoute =
   | "bridge"
   | "new-bridge"
   | "inbox"
+  | "collaborations"
   | "settings"
   | "settings-this-device"
   | "settings-devices"

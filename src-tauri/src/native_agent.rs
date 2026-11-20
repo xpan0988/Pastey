@@ -36,6 +36,9 @@ use admission::{
 use capability::codex::codex_compatibility_at;
 pub(crate) use capability::NativeSessionRefV1 as LocalNativeSessionRefV1;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
+pub(crate) use capability::published::{
+    PublishedMessageV1, PublishedSummaryV1, MAX_MESSAGE_BODY_BYTES,
+};
 use capability::{
     codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1,
     NativeInvocationOutcomeV1, NativeInvocationProgressV1, NativeInvocationRunV1,
@@ -774,6 +777,19 @@ pub(crate) struct NativeAgentRecoveryProjectionV1 {
     pub(crate) target_host_ref: Option<String>,
 }
 
+/// A task's native turn ended and the task let go of its folder: what the
+/// observer tells a turn listener (`set_turn_listener`). `output` is still
+/// opaque; only the capability seam reads it (`published_blocks`).
+#[derive(Clone, Debug)]
+pub(crate) struct TurnEndedV1 {
+    pub(crate) task_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) state: NativeAgentTaskStateV1,
+    pub(crate) code: Option<String>,
+    pub(crate) output: Option<OpaqueCapabilityPayloadV1>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NativeAgentTaskStateV1 {
@@ -1383,6 +1399,9 @@ pub(crate) struct NativeAgentServiceV1 {
     task_requesters: HashMap<String, NativeTaskRequesterV1>,
     workspace_movements: HashMap<String, WorkspaceMovementRecordV1>,
     durable_paths: Option<crate::storage::AppPaths>,
+    /// Told when a task's native turn has ended and the task has let go of
+    /// its folder (the collaboration scheduler, `crate::collaboration`).
+    turn_listener: Option<std::sync::mpsc::Sender<TurnEndedV1>>,
     #[cfg(test)]
     fail_post_start_persist_once: bool,
 }
@@ -1445,6 +1464,7 @@ impl NativeAgentServiceV1 {
             task_requesters: HashMap::new(),
             workspace_movements: HashMap::new(),
             durable_paths: None,
+            turn_listener: None,
             #[cfg(test)]
             fail_post_start_persist_once: false,
         }
@@ -4312,6 +4332,30 @@ impl NativeAgentServiceV1 {
         new_conversation: bool,
         options: &NativeSessionOptionsV1,
     ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_claude_code_conversation_turn(workspace, task, new_conversation, options, false)
+    }
+
+    /// A collaboration member's turn in its Claude Code conversation: as
+    /// `start_claude_code_conversation_task`, and Claude Code refuses
+    /// messages from the user's other Claude Code sessions for this run.
+    pub(crate) fn start_claude_code_member_task(
+        &mut self,
+        workspace: &Path,
+        task: &str,
+        new_conversation: bool,
+        options: &NativeSessionOptionsV1,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_claude_code_conversation_turn(workspace, task, new_conversation, options, true)
+    }
+
+    fn start_claude_code_conversation_turn(
+        &mut self,
+        workspace: &Path,
+        task: &str,
+        new_conversation: bool,
+        options: &NativeSessionOptionsV1,
+        refuse_peer_messages: bool,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
             return invalid("Native Agent task is empty or exceeds its bound.");
         }
@@ -4326,6 +4370,7 @@ impl NativeAgentServiceV1 {
             task,
             !new_conversation,
             options,
+            refuse_peer_messages,
         )?;
         self.start_local_invocation(
             capability::claude_code::conversation::CLAUDE_CODE_CONVERSATION_ID,
@@ -5318,6 +5363,8 @@ impl NativeAgentServiceV1 {
         let durable_paths = self.durable_paths.clone();
         let active_exclusivity = self.active_exclusivity.clone();
         let observed_tasks = self.observed_tasks.clone();
+        let turn_listener = self.turn_listener.clone();
+        let task_workspace = self.task_workspaces.get(&task_id).cloned();
         thread::spawn(move || {
             let NativeInvocationOutcomeV1 {
                 kind: outcome,
@@ -5427,8 +5474,31 @@ impl NativeAgentServiceV1 {
                 .lock()
                 .ok()
                 .map(|mut observed| observed.remove(&task_id));
+            // Last: the folder is free, so a listener may start the next turn.
+            if let (Some(listener), Some(status)) = (turn_listener, persisted_status) {
+                let _ = listener.send(TurnEndedV1 {
+                    task_id: task_id.clone(),
+                    capability_id: status.agent_id.clone(),
+                    workspace: task_workspace,
+                    state: status.state.clone(),
+                    code: status.code.clone(),
+                    output: status.output.clone(),
+                });
+            }
         });
         Ok(())
+    }
+
+    /// Tells `listener` about every native turn that ends from now on.
+    pub(crate) fn set_turn_listener(&mut self, listener: std::sync::mpsc::Sender<TurnEndedV1>) {
+        self.turn_listener = Some(listener);
+    }
+
+    /// Whether a task, movement or unresolved outcome holds `workspace`
+    /// (or a folder inside or around it) now. Unreadable counts as held.
+    pub(crate) fn workspace_in_use(&self, workspace: &Path) -> bool {
+        self.workspace_has_authoritative_owner(workspace, None, None)
+            .unwrap_or(true)
     }
 
     /// Workspace movement's occupancy check for one canonical workspace.

@@ -76,6 +76,8 @@ drain() { while IFS= read -r _; do :; done; }
 finish() { printf '[]' > "$ROOT/registry.json"; exit "${1:-0}"; }
 case "$mode" in
   complete|listed|interloper) reply "Reply for Pastey"; result success false 1 "Reply for Pastey"; drain; finish ;;
+  published) text='Found it.\n\n```pastey-message to=web\nsubject: Orders API now uses cursors\n\nOrdersTable still sends offset.\n```\n\n```pastey-summary\ndone: reviewed pagination\n```'
+    reply "$text"; result success false 1 "$text"; drain; finish ;;
   denied) reply "Done anyway"; result success false 2 "Done anyway" '[{"tool_name":"Write"}]'; drain; finish ;;
   error) result success true 1 "Failed to authenticate"; drain; finish 1 ;;
   no-turn) result success false 0 ""; drain; finish ;;
@@ -313,6 +315,81 @@ fn session_after(run: &str, flag: &str) -> String {
 }
 
 #[test]
+fn a_member_turns_published_blocks_reach_the_turn_listener_once_its_folder_is_free() {
+    let fixture = FixtureV1::new("published");
+    let (mut service, _) = fixture.service();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    service.set_turn_listener(sender);
+    let started = service
+        .start_claude_code_member_task(
+            &fixture.workspace,
+            "Review the pagination change",
+            true,
+            &NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+    let ended = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the turn ended");
+    assert_eq!(ended.task_id, started.task_id);
+    assert_eq!(ended.capability_id, CLAUDE_CODE_CONVERSATION_ID);
+    assert_eq!(ended.workspace.as_deref(), Some(fixture.workspace.as_path()));
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Completed);
+    // The listener hears only once the folder is free for the next turn.
+    assert!(!service.workspace_in_use(&fixture.workspace));
+    let published = ended
+        .output
+        .as_ref()
+        .and_then(|output| output.published_blocks())
+        .expect("blocks");
+    assert_eq!(published.messages.len(), 1);
+    assert_eq!(published.messages[0].to, "web");
+    assert_eq!(
+        published.summary.and_then(|summary| summary.done).as_deref(),
+        Some("reviewed pagination")
+    );
+}
+
+#[test]
+fn only_a_collaboration_member_turn_refuses_other_sessions_messages() {
+    let fixture = FixtureV1::new("complete");
+    let (mut service, _) = fixture.service();
+    let ordinary = service
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+    wait_terminal(&service, &ordinary.task_id);
+    wait_released(&service, &fixture.workspace);
+    let member = service
+        .start_claude_code_member_task(
+            &fixture.workspace,
+            "Do the next task",
+            false,
+            &NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+    let status = wait_terminal(&service, &member.task_id);
+    assert_eq!(status.state, NativeAgentTaskStateV1::Completed, "{status:?}");
+    let runs = fixture.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(!runs[0].contains("--settings"), "{}", runs[0]);
+    assert!(
+        runs[1].contains(r#"--settings {"crossSessionInbound":"refuse"}"#),
+        "{}",
+        runs[1]
+    );
+    // The member turn continues the same conversation.
+    assert_eq!(
+        session_after(&runs[1], "--resume "),
+        session_after(&runs[0], "--session-id ")
+    );
+}
+
+#[test]
 fn a_conversation_carries_its_users_model_and_effort_into_the_same_session() {
     let fixture = FixtureV1::new("complete");
     let (mut service, _) = fixture.service();
@@ -383,6 +460,7 @@ fn a_conversation_input_names_options_only_when_its_user_chose_some() {
         "x",
         true,
         &NativeSessionOptionsV1::default(),
+        false,
     )
     .unwrap();
     assert!(
@@ -394,6 +472,7 @@ fn a_conversation_input_names_options_only_when_its_user_chose_some() {
         "x",
         true,
         &options(Some("opus"), Some("high")),
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -889,12 +968,21 @@ fn bridge_peers_see_it_and_name_its_folder_only_by_a_share_reference() {
         "scopeRef": "scope:0123456789abcdef", "task": "x", "resume": false, "workspace": "/etc"
     }));
     assert!(adapter.resolve_peer_input(&with_path, &shared).is_err());
+    // A peer cannot ask for a collaboration member's settings either, and
+    // the input it resolves to never carries them.
+    let with_refusal = OpaqueCapabilityPayloadV1::new(json!({
+        "scopeRef": "scope:0123456789abcdef", "task": "x", "resume": false,
+        "refusePeerMessages": true
+    }));
+    assert!(adapter.resolve_peer_input(&with_refusal, &shared).is_err());
+    assert!(resolved.value().get("refusePeerMessages").is_none());
     // Host form from a peer is refused too: only a reference is accepted.
     let host_form = conversation_input(
         &fixture.workspace,
         "x",
         false,
         &crate::native_agent::NativeSessionOptionsV1::default(),
+        false,
     )
     .unwrap();
     assert!(adapter.resolve_peer_input(&host_form, &shared).is_err());
@@ -1816,4 +1904,114 @@ fn installed_claude_code_conversation_ends_when_pastey_is_killed() {
         .sum();
     assert_eq!(prompts, 1, "sent once, never again");
     let _ = fs::remove_dir_all(root);
+}
+
+/// M1 live: the installed Codex and Claude Code, as members of one
+/// collaboration, exchange one message the user approves. Codex's turn is
+/// the user's own (with the collaboration note); Claude Code's is the one the
+/// collaboration starts with the message in its prompt. Both at effort low.
+#[test]
+#[ignore = "uses the installed, signed-in Codex and Claude Code and their quota"]
+fn installed_codex_and_claude_code_exchange_an_approved_collaboration_message() {
+    use crate::collaboration::{
+        with_note, CollaborationServiceV1, EntryBodyV1, MemberInputV1, ProviderV1, StatusV1,
+    };
+    let api = live_workspace("collab-live-api");
+    let web = live_workspace("collab-live-web");
+    fs::write(
+        api.join("orders.py"),
+        "# 2026-11-18: GET /v2/orders switched from offset to cursor pagination.\n\
+         # It returns {\"orders\": [...], \"nextCursor\": <opaque or None>}; a request\n\
+         # that sends `offset` is rejected with 400.\n\
+         def list_orders(cursor=None, limit=50):\n    raise NotImplementedError\n",
+    )
+    .unwrap();
+    fs::write(
+        web.join("OrdersTable.js"),
+        "export async function loadPage(page, pageSize = 50) {\n  const offset = page * pageSize;\n  const response = await fetch(`/v2/orders?offset=${offset}&limit=${pageSize}`);\n  return (await response.json()).orders;\n}\n",
+    )
+    .unwrap();
+    let root = std::env::temp_dir().join(format!("pastey-collab-live-{}", Uuid::new_v4()));
+    let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
+    paths.ensure_directories().unwrap();
+    crate::storage::init_database(&paths).unwrap();
+    let claude = Arc::new(ClaudeCodeConversationAdapterV1::default());
+    claude.use_lifeline_helper(&built_pastey());
+    let codex = Arc::new(super::super::super::codex::CodexNativeAdapterV1::default());
+    let mut service =
+        NativeAgentServiceV1::with_paths_and_adapters(paths.clone(), vec![claude, codex]).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    service.set_turn_listener(sender);
+    let mut collaborations = CollaborationServiceV1::new(Some(paths)).unwrap();
+    let id = collaborations
+        .create(
+            "orders-v2",
+            "Move GET /v2/orders to cursor pagination",
+            vec![
+                MemberInputV1 {
+                    alias: "api".into(),
+                    provider: ProviderV1::Codex,
+                    workspace: api.to_string_lossy().into(),
+                    role: "owns the API (this folder)".into(),
+                },
+                MemberInputV1 {
+                    alias: "web".into(),
+                    provider: ProviderV1::ClaudeCode,
+                    workspace: web.to_string_lossy().into(),
+                    role: "owns the web client (OrdersTable.js)".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let low = options(None, Some("low"));
+    let journal = |collaborations: &CollaborationServiceV1| {
+        collaborations.view(&id, |_| false).unwrap().entries
+    };
+
+    // 1. The user's own turn in api's conversation, with the note.
+    let task = with_note(
+        collaborations.note_for(ProviderV1::Codex, &api),
+        "Read orders.py. The web client (member web, on another device) still sends ?offset=. \
+         Do not modify any files. Tell web what it must change.",
+    );
+    let first = service.start_codex_conversation_task(&api, &task, true, &low).unwrap();
+    let ended = receiver.recv_timeout(Duration::from_secs(300)).expect("api's turn ended");
+    assert_eq!(ended.task_id, first.task_id);
+    eprintln!("api turn: {:?} {:?}", ended.state, ended.code);
+    assert!(collaborations.turn_ended(&ended).unwrap());
+    let waiting: Vec<String> = journal(&collaborations)
+        .into_iter()
+        .filter(|entry| entry.status == Some(StatusV1::Waiting))
+        .map(|entry| {
+            if let EntryBodyV1::Message { to, subject, body, .. } = &entry.body {
+                eprintln!("api -> {to}: {subject}\n{body}\n");
+            }
+            entry.id
+        })
+        .collect();
+    assert!(!waiting.is_empty(), "api messaged web: {:#?}", journal(&collaborations));
+
+    // 2. The user approves; web's next turn starts with the message.
+    collaborations.approve(&id, &waiting).unwrap();
+    let plans = collaborations.plan_starts(|workspace| service.workspace_in_use(workspace));
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].alias, "web");
+    let second = service
+        .start_claude_code_member_task(&web, &plans[0].prompt, true, &low)
+        .unwrap();
+    collaborations.started(&plans[0], &second.task_id).unwrap();
+    let ended = receiver.recv_timeout(Duration::from_secs(300)).expect("web's turn ended");
+    assert_eq!(ended.task_id, second.task_id);
+    eprintln!("web turn: {:?} {:?}", ended.state, ended.code);
+    assert!(collaborations.turn_ended(&ended).unwrap());
+
+    let entries = journal(&collaborations);
+    for entry in &entries {
+        eprintln!("#{} {:?} {:?} {:?}", entry.seq, entry.basis, entry.body, entry.status);
+    }
+    assert!(entries.iter().any(|entry| entry.status == Some(StatusV1::Included { task_id: second.task_id.clone() })));
+    assert!(entries.iter().any(|entry| matches!(
+        &entry.body,
+        EntryBodyV1::Turn { task_id, state: NativeAgentTaskStateV1::Completed, .. } if *task_id == second.task_id
+    )));
 }
