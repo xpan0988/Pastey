@@ -1351,11 +1351,16 @@ fn collaboration_view(
     state: &AppState,
     collaboration_id: &str,
 ) -> Result<crate::collaboration::CollaborationViewV1, String> {
-    let busy = crate::collaboration::busy_check(state);
+    // A grant that expired shows as ended, even before the scheduler's tick.
+    let _ = state
+        .collaborations
+        .lock()
+        .settle_grants(crate::storage::now_ts());
+    let runtime = crate::collaboration::member_runtime(state);
     state
         .collaborations
         .lock()
-        .view(collaboration_id, busy)
+        .view(collaboration_id, runtime)
         .map_err(|error| error.message())
 }
 
@@ -1369,8 +1374,8 @@ fn drive_collaborations(state: &Arc<AppState>) {
 pub fn list_collaborations(
     state: State<'_, Arc<AppState>>,
 ) -> Vec<crate::collaboration::CollaborationSummaryV1> {
-    let busy = crate::collaboration::busy_check(&state);
-    state.collaborations.lock().list(busy)
+    let runtime = crate::collaboration::member_runtime(&state);
+    state.collaborations.lock().list(runtime)
 }
 
 #[tauri::command]
@@ -1486,6 +1491,41 @@ pub fn resume_collaboration_member(
         .resume_member(&collaboration_id, &alias)
         .map_err(|error| error.message())?;
     drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Lets a member take up to `turns` turns within `hours` without an
+/// approval, using this device's provider account and the conversation's own
+/// native permissions. A local command only: nothing a peer sends grants it.
+#[tauri::command]
+pub fn set_collaboration_grant(
+    collaboration_id: String,
+    alias: String,
+    turns: u8,
+    hours: u8,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .set_grant(&collaboration_id, &alias, turns, hours, crate::storage::now_ts())
+        .map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Withdraws a member's auto grant: its messages wait for approval again.
+#[tauri::command]
+pub fn withdraw_collaboration_grant(
+    collaboration_id: String,
+    alias: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .withdraw_grant(&collaboration_id, &alias)
+        .map_err(|error| error.message())?;
     collaboration_view(&state, &collaboration_id)
 }
 

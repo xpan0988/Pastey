@@ -36,6 +36,9 @@ use admission::{
 use capability::codex::codex_compatibility_at;
 pub(crate) use capability::NativeSessionRefV1 as LocalNativeSessionRefV1;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
+pub(crate) use capability::activity::TaskActivityV1;
+#[cfg(test)]
+pub(crate) use capability::activity::NativeActivityV1;
 pub(crate) use capability::published::{
     PublishedMessageV1, PublishedSummaryV1, MAX_MESSAGE_BODY_BYTES,
 };
@@ -788,6 +791,18 @@ pub(crate) struct TurnEndedV1 {
     pub(crate) state: NativeAgentTaskStateV1,
     pub(crate) code: Option<String>,
     pub(crate) output: Option<OpaqueCapabilityPayloadV1>,
+    /// What the turn did, as its harness reported it (Host-private).
+    pub(crate) activity: Option<TaskActivityV1>,
+}
+
+/// A task running in a folder now, and what it has done so far: the live
+/// card of a collaboration member. Host-private.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunningTurnV1 {
+    pub(crate) task_id: String,
+    pub(crate) capability_id: String,
+    pub(crate) activity: Option<TaskActivityV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1124,7 +1139,14 @@ struct ObservedTaskProgressV1 {
     /// For a conversation of this Host's own user: the adapter that names
     /// its native session, and where Core keeps that name per task.
     local_session: Option<(Arc<dyn NativeCapabilityAdapterV1>, LocalTaskSessionsV1)>,
+    /// Where Core keeps each running task's activity, and this task's folder
+    /// (to show changed paths relative to it).
+    activity: TaskActivitiesV1,
+    workspace: Option<PathBuf>,
 }
+
+/// Each running task's reported activity. Host-private and process-local.
+type TaskActivitiesV1 = Arc<Mutex<HashMap<String, TaskActivityV1>>>;
 
 /// The native session each of this Host's own user's tasks runs in, as its
 /// adapter named it once the conversation was confirmed. Process-local and
@@ -1132,6 +1154,25 @@ struct ObservedTaskProgressV1 {
 type LocalTaskSessionsV1 = Arc<Mutex<HashMap<String, NativeSessionRefV1>>>;
 
 impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
+    fn activity(&self, activity: capability::activity::NativeActivityV1) {
+        // Only a running task gathers activity; a late report after its end
+        // or its cancellation is dropped.
+        let running = self.tasks.lock().ok().is_some_and(|tasks| {
+            tasks
+                .get(&self.task_id)
+                .is_some_and(|status| status.state == NativeAgentTaskStateV1::Running)
+        });
+        if !running {
+            return;
+        }
+        if let Ok(mut activities) = self.activity.lock() {
+            activities
+                .entry(self.task_id.clone())
+                .or_insert_with(|| TaskActivityV1::new(crate::storage::now_ts()))
+                .apply(activity, self.workspace.as_deref());
+        }
+    }
+
     fn awaiting_native_decision(&self, waiting: bool) {
         let Ok(mut tasks) = self.tasks.lock() else {
             return;
@@ -1402,6 +1443,8 @@ pub(crate) struct NativeAgentServiceV1 {
     /// Told when a task's native turn has ended and the task has let go of
     /// its folder (the collaboration scheduler, `crate::collaboration`).
     turn_listener: Option<std::sync::mpsc::Sender<TurnEndedV1>>,
+    /// What each running task's harness reported it doing.
+    task_activity: TaskActivitiesV1,
     #[cfg(test)]
     fail_post_start_persist_once: bool,
 }
@@ -1465,6 +1508,7 @@ impl NativeAgentServiceV1 {
             workspace_movements: HashMap::new(),
             durable_paths: None,
             turn_listener: None,
+            task_activity: Arc::default(),
             #[cfg(test)]
             fail_post_start_persist_once: false,
         }
@@ -2033,6 +2077,8 @@ impl NativeAgentServiceV1 {
             conversation: None,
             durable_paths: self.durable_paths.clone(),
             local_session: None,
+            activity: self.task_activity.clone(),
+            workspace: self.task_workspaces.get(task_id).cloned(),
         };
         let held_key = self.task_exclusivity.get(task_id).cloned();
         if let Err(error) = self.observe_invocation(task_id.to_owned(), run, held_key, progress) {
@@ -5330,6 +5376,8 @@ impl NativeAgentServiceV1 {
             conversation: conversation.map(|(binding, _)| binding),
             durable_paths: self.durable_paths.clone(),
             local_session,
+            activity: self.task_activity.clone(),
+            workspace: prepared.host_workspace.clone(),
         };
         self.observe_invocation(task_id, started.run, prepared.exclusivity, progress)?;
         Ok(status)
@@ -5365,6 +5413,7 @@ impl NativeAgentServiceV1 {
         let observed_tasks = self.observed_tasks.clone();
         let turn_listener = self.turn_listener.clone();
         let task_workspace = self.task_workspaces.get(&task_id).cloned();
+        let task_activity = self.task_activity.clone();
         thread::spawn(move || {
             let NativeInvocationOutcomeV1 {
                 kind: outcome,
@@ -5474,6 +5523,10 @@ impl NativeAgentServiceV1 {
                 .lock()
                 .ok()
                 .map(|mut observed| observed.remove(&task_id));
+            let activity = task_activity
+                .lock()
+                .ok()
+                .and_then(|mut activities| activities.remove(&task_id));
             // Last: the folder is free, so a listener may start the next turn.
             if let (Some(listener), Some(status)) = (turn_listener, persisted_status) {
                 let _ = listener.send(TurnEndedV1 {
@@ -5483,10 +5536,37 @@ impl NativeAgentServiceV1 {
                     state: status.state.clone(),
                     code: status.code.clone(),
                     output: status.output.clone(),
+                    activity,
                 });
             }
         });
         Ok(())
+    }
+
+    /// The task running in exactly `workspace` now, if any, with what its
+    /// harness reported so far. For this Host's own views only.
+    pub(crate) fn running_turn(&self, workspace: &Path) -> Option<RunningTurnV1> {
+        let tasks = self.tasks.lock().ok()?;
+        let (task_id, status) = self
+            .task_workspaces
+            .iter()
+            .filter(|(_, folder)| folder.as_path() == workspace)
+            .find_map(|(task_id, _)| {
+                tasks
+                    .get(task_id)
+                    .filter(|status| status.state == NativeAgentTaskStateV1::Running)
+                    .map(|status| (task_id.clone(), status))
+            })?;
+        let activity = self
+            .task_activity
+            .lock()
+            .ok()
+            .and_then(|activities| activities.get(&task_id).cloned());
+        Some(RunningTurnV1 {
+            capability_id: status.agent_id.clone(),
+            task_id,
+            activity,
+        })
     }
 
     /// Tells `listener` about every native turn that ends from now on.

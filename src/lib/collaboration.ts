@@ -2,8 +2,10 @@ import { invoke } from "@tauri-apps/api/core";
 
 /** Agent collaborations on this device (`src-tauri/src/collaboration.rs`).
  * Members are Pastey conversations, one per provider per folder. A message
- * between members waits for this device's user to approve it; the user's own
- * messages need no approval. Delivery always happens at a turn boundary. */
+ * between members waits for this device's user to approve it, unless the
+ * user gave its recipient an auto grant (a few turns within a few hours); the
+ * user's own messages need no approval. Delivery always happens at a turn
+ * boundary. */
 
 export type CollaborationProvider = "codex" | "claude_code";
 export type CollaborationState = "active" | "paused" | "ended";
@@ -12,16 +14,59 @@ export type CollaborationTaskState = "queued" | "running" | "completed" | "faile
  * statement (what it said, not proof of it), or this device's user. */
 export type CollaborationBasis = "fact" | "claim" | "user";
 
+/** Bounds of the auto grant (`collaboration.rs`). */
+export const MAX_AUTO_TURNS = 20;
+export const MAX_AUTO_HOURS = 24;
+export const DEFAULT_AUTO_TURNS = 3;
+export const DEFAULT_AUTO_HOURS = 2;
+
+/** This device's user lets the member take `turns` turns until `expiresAt`
+ * (seconds) without an approval. */
+export interface AutoGrant {
+  turns: number;
+  used: number;
+  grantedAt: number;
+  expiresAt: number;
+}
+
+export type PlanStepState = "pending" | "in_progress" | "completed";
+export type ActionState = "running" | "done" | "failed";
+
+/** What a running turn's harness reported so far (runtime reports; the
+ * plan is the Agent's own statement). */
+export interface TaskActivity {
+  since: number;
+  actions: number;
+  commands: number;
+  failedCommands: number;
+  files: string[];
+  filesChanged: number;
+  plan: Array<{ text: string; state: PlanStepState }>;
+  recent: Array<{ label: string; state: ActionState }>;
+}
+
+export interface RunningTurn {
+  taskId: string;
+  capabilityId: string;
+  activity?: TaskActivity | null;
+}
+
 export interface CollaborationMember {
   alias: string;
   provider: CollaborationProvider;
   workspace: string;
   role: string;
   paused: boolean;
+  grant?: AutoGrant;
+  /** The automatic turn running now. */
+  autoTask?: string;
   /** A task, movement or unresolved outcome holds its folder now. */
   busy: boolean;
-  /** Messages for it that wait for approval or are approved. */
+  /** Messages for it that wait for approval, are approved, or wait for its
+   * automatic turn. */
   waiting: number;
+  /** The turn running in its folder, with what it has done so far. */
+  live?: RunningTurn;
 }
 
 export interface CollaborationSummary {
@@ -48,18 +93,32 @@ export type CollaborationUserAction =
   | { type: "ended" }
   | { type: "member_resumed"; alias: string };
 
+/** What the Journal keeps of a turn's reported activity. */
+export interface TurnActivity {
+  actions: number;
+  commands: number;
+  failedCommands: number;
+  filesChanged: number;
+  files?: string[];
+}
+
+export type GrantEnd = "used_up" | "expired" | "withdrawn" | "collaboration_ended";
+
 export type CollaborationEntryBody =
-  | { type: "turn"; taskId: string; origin: "collaboration" | "user"; state: CollaborationTaskState; code?: string }
+  | { type: "turn"; taskId: string; origin: "collaboration" | "user"; state: CollaborationTaskState; code?: string; automatic?: boolean; activity?: TurnActivity }
   | { type: "message"; from: string; to: string; subject: string; body: string; hop: number }
   | { type: "summary"; summary: PublishedSummary }
   | { type: "attention"; text: string }
   | { type: "user"; action: CollaborationUserAction }
-  | { type: "member"; alias: string; provider: CollaborationProvider; role: string };
+  | { type: "member"; alias: string; provider: CollaborationProvider; role: string }
+  | { type: "grant"; alias: string; change: "granted"; turns: number; expiresAt: number }
+  | { type: "grant"; alias: string; change: "ended"; reason: GrantEnd };
 
 export type CollaborationEntryStatus =
   | { state: "waiting" }
+  | { state: "auto"; attempts: number }
   | { state: "approved"; attempts: number }
-  | { state: "scheduled"; taskId: string; attempts: number }
+  | { state: "scheduled"; taskId: string; attempts: number; auto?: boolean }
   | { state: "included"; taskId: string }
   | { state: "dismissed" }
   | { state: "undeliverable"; reason: string }
@@ -129,6 +188,17 @@ export function resumeCollaborationMember(collaborationId: string, alias: string
   return invoke("resume_collaboration_member", { collaborationId, alias });
 }
 
+/** Lets a member take up to `turns` turns within `hours` without an
+ * approval, on this device's provider account and the conversation's own
+ * native permissions. */
+export function setCollaborationGrant(collaborationId: string, alias: string, turns: number, hours: number): Promise<CollaborationView> {
+  return invoke("set_collaboration_grant", { collaborationId, alias, turns, hours });
+}
+
+export function withdrawCollaborationGrant(collaborationId: string, alias: string): Promise<CollaborationView> {
+  return invoke("withdraw_collaboration_grant", { collaborationId, alias });
+}
+
 export function collaborationNeedsYouCount(): Promise<number> {
   return invoke("collaboration_needs_you_count");
 }
@@ -187,8 +257,9 @@ export function turnOutcomeLabel(state: CollaborationTaskState, code?: string): 
 export function statusLabel(status: CollaborationEntryStatus | undefined): string | null {
   switch (status?.state) {
     case "waiting": return "Waiting for your approval";
+    case "auto": return status.attempts > 0 ? `Starts its next automatic turn · retry ${status.attempts}` : "Starts its next automatic turn";
     case "approved": return status.attempts > 0 ? `Approved · retry ${status.attempts}` : "Approved · delivered at the next turn";
-    case "scheduled": return "In a turn that started";
+    case "scheduled": return status.auto ? "In an automatic turn that started" : "In a turn that started";
     case "included": return "Delivered";
     case "dismissed": return "Dismissed";
     case "undeliverable": return `Not delivered: ${status.reason}`;
@@ -196,6 +267,52 @@ export function statusLabel(status: CollaborationEntryStatus | undefined): strin
     case "resolved": return "Done";
     default: return null;
   }
+}
+
+/** Whether a grant can still start a turn at `now` (seconds). */
+export function grantUsable(grant: AutoGrant | undefined, now: number): grant is AutoGrant {
+  return !!grant && grant.used < grant.turns && now < grant.expiresAt;
+}
+
+/** "Automatic · 2 of 3 turns left · until 16:40", or "Asks you". */
+export function policyLabel(member: CollaborationMember, now: number, formatTime: (seconds: number) => string): string {
+  const grant = member.grant;
+  if (!grantUsable(grant, now)) return "Asks you before each turn";
+  const left = grant.turns - grant.used;
+  return `Automatic · ${left} of ${grant.turns} turn${grant.turns === 1 ? "" : "s"} left · until ${formatTime(grant.expiresAt)}`;
+}
+
+export function grantEndLabel(reason: GrantEnd): string {
+  switch (reason) {
+    case "used_up": return "its automatic turns are used up";
+    case "expired": return "its automatic turns expired";
+    case "withdrawn": return "you withdrew its automatic turns";
+    case "collaboration_ended": return "the collaboration ended";
+  }
+}
+
+/** The step the Agent says it is on: the first in progress, else the first
+ * pending. */
+export function currentStep(activity: TaskActivity | null | undefined): string | null {
+  const plan = activity?.plan ?? [];
+  return (plan.find((step) => step.state === "in_progress") ?? plan.find((step) => step.state === "pending"))?.text ?? null;
+}
+
+/** "3 commands (1 failed) · 2 files changed", from reported counts. */
+export function activityCounts(activity: { commands: number; failedCommands: number; filesChanged: number } | null | undefined): string | null {
+  if (!activity) return null;
+  const parts: string[] = [];
+  if (activity.commands > 0) parts.push(`${activity.commands} command${activity.commands === 1 ? "" : "s"}${activity.failedCommands > 0 ? ` (${activity.failedCommands} failed)` : ""}`);
+  if (activity.filesChanged > 0) parts.push(`${activity.filesChanged} file${activity.filesChanged === 1 ? "" : "s"} changed`);
+  return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/** "4 m 05 s" from whole seconds. */
+export function elapsedLabel(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  return minutes > 0 ? `${minutes} m ${String(rest).padStart(2, "0")} s` : `${rest} s`;
 }
 
 export function memberStateLabel(member: CollaborationMember): string {

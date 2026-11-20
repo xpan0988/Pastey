@@ -6,7 +6,7 @@ Status: design, revised after M0. The direction was approved on 2026-11-18 as "C
 - The user follows progress, reads summaries and answers what needs them from that Journal.
 - A member who joins later starts with a **briefing** compiled from it.
 
-M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). M1 is built: a collaboration on one device, with every delivery between Agents approved by the user ([M1](#milestones-and-acceptance-tests); [reference](../reference.md#agent-collaboration-facts)). Nothing beyond M1 is built. Windows is not measured. Three of the five product decisions were made for M1, and two are still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
+M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). M1 is built: a collaboration on one device, with every delivery between Agents approved by the user ([M1](#milestones-and-acceptance-tests); [reference](../reference.md#agent-collaboration-facts)). M2 is built on 2026-11-20: a bounded auto grant per member, live progress during a turn, and the "since your last turn" digest. Nothing beyond M2 is built. Windows is not measured. Four of the five product decisions are made, and one is still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
 
 ## What kind of evidence this is
 
@@ -163,10 +163,10 @@ A fifth piece is optional: a file manifest at turn boundaries.
   - A member on another device requires its folder to be shared with the inviting device, with Sessions and Agent requests on. Turning either switch off pauses that member.
 - **The auto grant** covers:
   - exactly one local session, in exactly one collaboration;
-  - N turns: proposed default 3, maximum 20;
-  - an expiry: proposed default 2 h, maximum 24 h.
+  - N turns: default 3, maximum 20;
+  - an expiry: default 2 h, maximum 24 h.
 
-  The dialog says that these turns use the provider account on this device, and run with the session's own native permissions.
+  The dialog says that these turns use the provider account on this device, and run with the session's own native permissions. The user decided on 2026-11-20 that the grant is stored with the collaboration and survives a restart until it is used up or expires, with these bounds and at most 30 automatic turns per hour on a device.
 - **The turn runs as this device's own work.** It is admitted by its user's approval or grant, not as a remote invocation, so the two-minute in-memory executor Review is not involved. No device invokes another device's member.
 - **Messages grant nothing.** Native permissions apply unchanged. A native approval request pauses the turn and appears under Needs you.
 - **Full Access is neither required nor sufficient.** A Full Access device still needs membership, and Full Access does not widen a member's budget.
@@ -601,13 +601,34 @@ Variations:
    So a Claude Code member can change files only as far as its own permission settings already allow. Anything else comes back as a question for the user. This limit should be explained where members are added.
 
    Not yet verified: the collaboration view rendered with real data (the list and the create dialog were checked in a browser without the backend), and Windows.
-4. **M2, bounded `auto`, and progress.** Acceptance:
-   - Two fake adapters that always reply with a message stop exactly at the budget.
-   - The hop limit holds across three members.
-   - Stop pauses a member.
-   - Summaries and messages to `user` never start a turn.
-   - A turn that fails at once for account or model reasons pauses the member, with no budget used.
-   - The live card updates during a long turn with no extra model call.
+4. **M2, bounded `auto`, and progress.** Built on 2026-11-20. It delivers:
+   - the auto grant, stored on the member: a message from another member waits for the member's automatic turn (`auto`) instead of the user, and starts it when the folder is free, while turns and time remain and the device has started fewer than 30 automatic turns in the last hour; approving such a message spares the grant; the grant ends, visibly, when used up, expired, withdrawn or the collaboration ends, and what waited for it waits for the user again;
+   - a turn that fails before its harness reported any action gives its turn back and pauses the member, with the likely reasons (usage limit, sign-in, model) under Needs you;
+   - progress: a bounded `activity` callback on `NativeInvocationProgressV1`, fed by the Codex and Claude Code adapters from events they already receive, kept per running task (Host-private), shown on the member's live card and summarized on the turn's Journal entry as a runtime report;
+   - the "since your last turn" digest in every prompt the collaboration writes.
+
+   Acceptance, as tested (`collaboration::tests`, `activity::tests`, `codex::tests`, fixture `claude`):
+   - Two members that always reply with a message stop exactly at the budget (grants of 2 and 1: three automatic turns, then the last message waits for the user, and both grants end as used up).
+   - The hop limit holds across three members with 20-turn grants: hops 1 to 4 start turns, hop 5 is refused. This covers the unprompted warning M1a saw from Codex: under `auto` it starts the peer's turn, and the budget and hop limit bound it.
+   - Stop pauses a member; its turn counts.
+   - Summaries and messages to `user` never start a turn, with grants on both members.
+   - A turn that fails at once pauses the member and uses no budget; one that failed after an action uses its turn.
+   - The live card updates during a long turn: fixture `claude` reports a plan, a failed command, a successful edit and a declined write while the turn waits; `running_turn` shows them (the declined write is not a changed file), the listener receives them at the end, and `claude` ran once.
+   - The grant survives a restart; an automatic turn whose task is unknown after a restart gives its turn back; expiry, withdrawal and ending the collaboration return messages to approval; the device's hourly bound holds.
+
+   M2's differences from the design above:
+   - "Fails at once for account or model reasons" is recognized as failing before the harness reported any action, not by reading provider error codes. It is the same for both adapters and needs no message text.
+   - Runtime reports are a field of the `turn` entry (labelled "reported by the Agent's harness"), not a separate basis.
+   - Codex's `turn/diff/updated` and reasoning summaries are not used; file changes come from completed `fileChange` items.
+   - Claude Code's plan is read only from `TodoWrite`.
+
+   Live run (macOS, 2026-11-20, `installed_codex_and_claude_code_take_automatic_turns_within_their_grants`, Codex 0.170.0 and Claude Code 2.1.318 at effort `low`, 35 s; grants of 1 turn each, no approvals):
+   - The user's turn in `api` (Codex) sent `web` a specific message asking for a reply. It waited for `web`'s automatic turn, not the user.
+   - `web`'s turn (Claude Code) started on that message alone, with "Since this collaboration started:" and `api`'s summary in its prompt. Its live card showed the command it ran 3.6 s in, and kept reporting activity for the rest of the 16 s turn (49 of 49 polls). Its write to `OrdersTable.js` was declined, as in M1, and is shown as a failed action, not a changed file. It replied to `api` with its plan, and its grant ended as used up.
+   - `api`'s automatic turn (Codex) had "Since your last turn:" in its prompt. It checked the plan against `orders.py` without running anything (no activity reported; 3 s), recorded a summary and sent no acknowledgement. Its grant ended as used up and nothing else started.
+   - Codex reported its first command as reading its own memory file under the home folder. Action labels can name paths outside the member's folder, which is why the live card stays Host-private.
+
+   Not yet verified: the collaboration view (live card, grant dialog) in the running app with real data, a turn that fails at once with a real provider error, and Windows.
 5. **M3, joining.** Roles and goal, the briefing, and the file manifest. Acceptance:
    - A member added mid-collaboration (Codex or Claude standing in for DeepSeek) lists, in its first reply, the open items and who owns what, matching the Journal in at least 18 of 20 runs, without messaging anyone.
    - A shell-made change appears in file state.
@@ -760,8 +781,10 @@ A third consequence reaches beyond collaboration. A newer Codex GUI can switch t
 ## Open product decisions
 
 Still open:
-1. **A second stored admission** (the auto grant) beside Full Access. Needed for M2.
 2. **A sender outbox,** as an exception to "Nothing is queued for a device that cannot be reached". Needed for M4.
+
+Decided by the user on 2026-11-20, for M2:
+1. **A second stored admission** (the auto grant) beside Full Access: stored with the collaboration, surviving restarts until used up or expired; default 3 turns within 2 h, at most 20 within 24 h; at most 30 automatic turns per hour on a device.
 
 Decided by the user on 2026-11-18, for M1:
 3. **A visible collaboration note on every member turn,** including turns the user types in the ordinary conversation view.
@@ -771,10 +794,10 @@ Decided by the user on 2026-11-18, for M1:
 
 Design questions:
 - Should a turn that only answers a peer write a summary? In M1a, Claude did 5 times in 5 and Codex 3 times in 5.
-- An unprompted warning to a peer starts that peer's turn under `auto`. Codex sent one in 5 of 10 reply runs. M2's loop tests should cover it.
+- An unprompted warning to a peer starts that peer's turn under `auto`. Codex sent one in 5 of 10 reply runs. M2's loop tests cover a member that always messages: the budget and the hop limit stop it. How often it happens with real Agents under `auto` is not measured.
 - Should `kind` stay at all, now that it decides nothing?
 - Should a turn started by a collaboration be a distinct task owner, or `Local` with the collaboration id recorded on the envelope?
-- The default budgets and limits proposed above, the digest's size, and the manifest's bounds.
+- The manifest's bounds. (The budgets and limits were decided for M2; the digest is at most 2 KiB.)
 
 ## Code this would touch
 

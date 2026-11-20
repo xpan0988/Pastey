@@ -1,11 +1,13 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
-  approveCollaborationMessages, basisLabel, createCollaboration, deleteCollaboration, dismissCollaborationEntry, folderName,
-  getCollaboration, journalCount, journalEntries, listCollaborations, memberStateLabel, providerLabel, resumeCollaborationMember,
-  sendCollaborationMessage, setCollaborationState, statusLabel, suggestAlias, turnOutcomeLabel, USER_ALIAS, validAlias,
-  waitingByRecipient, type CollaborationEntry, type CollaborationMember, type CollaborationMemberInput, type CollaborationProvider,
-  type CollaborationSummary, type CollaborationView, type JournalFilter,
+  activityCounts, approveCollaborationMessages, basisLabel, createCollaboration, currentStep, DEFAULT_AUTO_HOURS, DEFAULT_AUTO_TURNS,
+  deleteCollaboration, dismissCollaborationEntry, elapsedLabel, folderName, getCollaboration, grantEndLabel, grantUsable, journalCount,
+  journalEntries, listCollaborations, MAX_AUTO_HOURS, MAX_AUTO_TURNS, memberStateLabel, policyLabel, providerLabel,
+  resumeCollaborationMember, sendCollaborationMessage, setCollaborationGrant, setCollaborationState, statusLabel, suggestAlias,
+  turnOutcomeLabel, USER_ALIAS, validAlias, waitingByRecipient, withdrawCollaborationGrant, type CollaborationEntry,
+  type CollaborationMember, type CollaborationMemberInput, type CollaborationProvider, type CollaborationSummary, type CollaborationView,
+  type JournalFilter, type RunningTurn,
 } from "../../lib/collaboration";
 import { formatTimestamp } from "../../lib/format";
 import { Badge, Dialog, Dot, EmptyState, errorText, Field, Icon, ListRow, MenuButton, Notice, Segmented } from "./ui";
@@ -28,7 +30,7 @@ export function CollaborationsScreen({ menuButton }: { menuButton?: ReactNode })
   if (selected) return <CollaborationDetail id={selected} menuButton={menuButton} onBack={() => setSelected(null)} />;
   return (
     <section className="page">
-      <header className="page-header">{menuButton}<div className="page-header-main"><h1>Collaborations</h1><p>Agents on this device that leave each other messages. Nothing reaches an Agent mid-turn, and a message between Agents waits for your approval.</p></div>
+      <header className="page-header">{menuButton}<div className="page-header-main"><h1>Collaborations</h1><p>Agents on this device that leave each other messages. Nothing reaches an Agent mid-turn, and a message between Agents waits for your approval unless you allowed its recipient a few automatic turns.</p></div>
         <div className="page-header-actions"><button type="button" className="btn btn-sm btn-primary" onClick={() => setCreating(true)}><Icon name="plus" small />New collaboration</button></div></header>
       <div className="page-body"><div className="content stack-lg">
         {error ? <Notice tone="bad">{error}</Notice> : null}
@@ -56,6 +58,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [confirming, setConfirming] = useState<"end" | "delete" | null>(null);
+  const [granting, setGranting] = useState<CollaborationMember | null>(null);
   const refresh = useCallback(async () => {
     try { setView(await getCollaboration(id)); setError(null); } catch (cause) { setError(errorText(cause, "This collaboration could not be read.")); }
   }, [id]);
@@ -97,7 +100,9 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
         <div className="row row-wrap" style={{ gap: 12, alignItems: "stretch" }}>
           {view.members.map((member) => <MemberCard key={member.alias} member={member} waiting={waiting[member.alias] ?? []} disabled={pending || ended}
             onApprove={(ids) => void act(() => approveCollaborationMessages(id, ids))}
-            onResume={() => void act(() => resumeCollaborationMember(id, member.alias))} />)}
+            onResume={() => void act(() => resumeCollaborationMember(id, member.alias))}
+            onGrant={() => setGranting(member)}
+            onWithdraw={() => void act(() => withdrawCollaborationGrant(id, member.alias))} />)}
         </div>
         {!ended ? <Composer members={view.members} disabled={pending} onSend={(to, text) => act(() => sendCollaborationMessage(id, to, text))} /> : null}
         <Segmented label="Show" value={filter} onChange={setFilter} options={filters} />
@@ -109,6 +114,8 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
             onDismiss={() => void act(() => dismissCollaborationEntry(id, entry.id))} />)}
         </div>}
       </div></div>
+      {granting ? <GrantDialog member={granting} pending={pending} onClose={() => setGranting(null)}
+        onGrant={(turns, hours) => { const alias = granting.alias; setGranting(null); void act(() => setCollaborationGrant(id, alias, turns, hours)); }} /> : null}
       {confirming ? <Dialog title={confirming === "end" ? `End ${view.name}?` : `Delete ${view.name}?`} onClose={() => setConfirming(null)}
         description={confirming === "end" ? "Waiting messages are dismissed and no member turn starts. Its members become ordinary conversations again; the Journal stays." : "The collaboration and its Journal are removed from this device. The members' conversations are not changed."}
         footer={<><button type="button" className="btn btn-sm" onClick={() => setConfirming(null)}>Cancel</button>
@@ -125,18 +132,69 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   );
 }
 
-function MemberCard({ member, waiting, disabled, onApprove, onResume }: { member: CollaborationMember; waiting: string[]; disabled: boolean; onApprove: (ids: string[]) => void; onResume: () => void }) {
+function timeOfDay(seconds: number): string {
+  return new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function MemberCard({ member, waiting, disabled, onApprove, onResume, onGrant, onWithdraw }: {
+  member: CollaborationMember; waiting: string[]; disabled: boolean; onApprove: (ids: string[]) => void; onResume: () => void; onGrant: () => void; onWithdraw: () => void;
+}) {
   const tone = member.paused ? "warn" : member.busy ? "live" : "neutral";
-  return <div className="card" style={{ flex: "1 1 220px", minWidth: 220 }}><div className="card-body stack" style={{ gap: 6 }}>
+  const now = Date.now() / 1000;
+  const automatic = grantUsable(member.grant, now);
+  return <div className="card" style={{ flex: "1 1 260px", minWidth: 240 }}><div className="card-body stack" style={{ gap: 6 }}>
     <div className="row" style={{ gap: 8 }}><Dot tone={tone} pulse={member.busy && !member.paused} /><strong>{member.alias}</strong><span className="small muted">{providerLabel(member.provider)}</span></div>
     <span className="xsmall subtle mono" title={member.workspace}>{folderName(member.workspace)}</span>
     {member.role ? <span className="small">{member.role}</span> : null}
     <span className="small muted">{memberStateLabel(member)}</span>
+    <span className="xsmall subtle">{policyLabel(member, now, timeOfDay)}</span>
+    {member.live ? <LiveTurn live={member.live} automatic={member.autoTask === member.live.taskId} now={now} /> : null}
     <div className="row row-wrap" style={{ gap: 6 }}>
       {waiting.length > 0 ? <button type="button" className="btn btn-sm btn-primary" disabled={disabled} onClick={() => onApprove(waiting)}>Approve {waiting.length} for {member.alias}</button> : null}
       {member.paused ? <button type="button" className="btn btn-sm" disabled={disabled} onClick={onResume}>Resume {member.alias}</button> : null}
+      {automatic
+        ? <button type="button" className="btn btn-sm btn-ghost" disabled={disabled} onClick={onWithdraw}>Stop automatic turns</button>
+        : <button type="button" className="btn btn-sm btn-ghost" disabled={disabled} onClick={onGrant}>Allow automatic turns…</button>}
     </div>
   </div></div>;
+}
+
+/** The live card: what the running turn's harness reported so far. No
+ * model is asked anything for it. */
+function LiveTurn({ live, automatic, now }: { live: RunningTurn; automatic: boolean; now: number }) {
+  const activity = live.activity ?? null;
+  const step = currentStep(activity);
+  const counts = activityCounts(activity);
+  return <div className="stack" style={{ gap: 4, borderLeft: "2px solid var(--border-strong)", paddingLeft: 8 }}>
+    <span className="xsmall subtle">{automatic ? "Automatic turn" : "Turn"} running{activity ? ` · ${elapsedLabel(now - activity.since)}` : ""}</span>
+    {step ? <span className="small" title="The Agent's own plan (its statement)"><span className="muted">Step: </span>{step}</span> : null}
+    {activity && activity.recent.length > 0 ? <ul className="xsmall mono" style={{ margin: 0, paddingLeft: 16 }} title="Reported by the Agent's harness">
+      {activity.recent.map((action, index) => <li key={index} style={action.state === "failed" ? { color: "var(--danger)" } : undefined}>{action.label}{action.state === "running" ? " …" : action.state === "failed" ? " (failed)" : ""}</li>)}
+    </ul> : <span className="xsmall subtle">Nothing reported yet.</span>}
+    {counts ? <span className="xsmall subtle" title="Reported by the Agent's harness">{counts}</span> : null}
+    {activity && activity.files.length > 0 ? <span className="xsmall subtle mono" title={activity.files.join("\n")}>{activity.files.slice(0, 3).join(", ")}{activity.filesChanged > 3 ? ` +${activity.filesChanged - 3}` : ""}</span> : null}
+  </div>;
+}
+
+function GrantDialog({ member, pending, onClose, onGrant }: { member: CollaborationMember; pending: boolean; onClose: () => void; onGrant: (turns: number, hours: number) => void }) {
+  const [turns, setTurns] = useState(DEFAULT_AUTO_TURNS);
+  const [hours, setHours] = useState(DEFAULT_AUTO_HOURS);
+  return <Dialog title={`Allow ${member.alias} automatic turns?`} onClose={onClose}
+    description={`A message from another member then starts ${member.alias}'s next turn without asking you, until its turns are used or the time runs out. Messages waiting for it now count too.`}
+    footer={<><button type="button" className="btn btn-sm" onClick={onClose}>Cancel</button>
+      <button type="button" className="btn btn-sm btn-primary" disabled={pending} onClick={() => onGrant(turns, hours)}>Allow {turns} turn{turns === 1 ? "" : "s"}</button></>}>
+    <div className="stack-lg">
+      <div className="row row-wrap" style={{ gap: 12 }}>
+        <Field label="Turns" htmlFor="grant-turns"><select id="grant-turns" className="select select-sm" value={turns} onChange={(event) => setTurns(Number(event.target.value))}>
+          {Array.from({ length: MAX_AUTO_TURNS }, (_, index) => index + 1).map((value) => <option key={value} value={value}>{value}</option>)}
+        </select></Field>
+        <Field label="Within" htmlFor="grant-hours"><select id="grant-hours" className="select select-sm" value={hours} onChange={(event) => setHours(Number(event.target.value))}>
+          {Array.from({ length: MAX_AUTO_HOURS }, (_, index) => index + 1).map((value) => <option key={value} value={value}>{value} hour{value === 1 ? "" : "s"}</option>)}
+        </select></Field>
+      </div>
+      <Notice tone="info">These turns use the {providerLabel(member.provider)} account on this device and run with the conversation's own permissions; a message grants nothing more. A turn stops on any approval {providerLabel(member.provider)} would ask for{member.provider === "claude_code" ? ", which a Claude Code member declines: it then asks you under Needs you" : ""}. Stop, Pause or a turn that fails pauses {member.alias}. At most 30 automatic turns start per hour on this device.</Notice>
+    </div>
+  </Dialog>;
 }
 
 function Composer({ members, disabled, onSend }: { members: CollaborationMember[]; disabled: boolean; onSend: (to: string, text: string) => Promise<void> }) {
@@ -171,10 +229,15 @@ function EntryCard({ entry, members, disabled, onApprove, onDismiss }: { entry: 
     : entry.status?.state === "open" ? <div className="row"><button type="button" className="btn btn-sm" disabled={disabled} onClick={onDismiss}>Done</button></div> : null;
   const body = entry.body;
   switch (body.type) {
-    case "turn":
+    case "turn": {
+      const counts = activityCounts(body.activity);
+      const kind = body.automatic ? "automatic turn" : body.origin === "collaboration" ? "turn with messages" : "turn";
       return <div className="stack" style={{ gap: 2 }}>
-        <span className="small"><strong>{entry.member}</strong> · {body.origin === "collaboration" ? "turn with messages" : "turn"} {turnOutcomeLabel(body.state, body.code)}</span>{meta}
+        <span className="small"><strong>{entry.member}</strong> · {kind} {turnOutcomeLabel(body.state, body.code)}</span>
+        {counts ? <span className="xsmall subtle" title={body.activity?.files?.join("\n")}>{counts} · reported by the Agent's harness</span> : null}
+        {meta}
       </div>;
+    }
     case "message": {
       const fromProvider = provider(body.from);
       return <div className="card"><div className="card-body stack" style={{ gap: 6 }}>
@@ -198,6 +261,10 @@ function EntryCard({ entry, members, disabled, onApprove, onDismiss }: { entry: 
     }
     case "member":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong> joined ({providerLabel(body.provider)}){body.role ? ` · ${body.role}` : ""}</span>{meta}</div>;
+    case "grant":
+      return <div className="stack" style={{ gap: 2 }}><span className="small">{body.change === "granted"
+        ? <>You allowed <strong>{body.alias}</strong> {body.turns} automatic turn{body.turns === 1 ? "" : "s"} until {timeOfDay(body.expiresAt)}</>
+        : <><strong>{body.alias}</strong> asks you again: {grantEndLabel(body.reason)}</>}</span>{meta}</div>;
   }
 }
 

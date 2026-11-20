@@ -46,6 +46,7 @@ use super::{
 use crate::error::{AppError, AppResult};
 use crate::native_agent::sessions::PROVIDER_CODEX as PROVIDER_CODEX_SESSIONS;
 use crate::native_agent::NativeSessionOptionsV1;
+use super::activity::{NativeActivityV1, NativePlanStepV1, PlanStepStateV1};
 use crate::native_agent::{
     invalid, native_decision_content_digest, NativeAgentCapabilityStateV1, NativeAgentServiceV1,
     NativeConversationContinuityV1, NativeDecisionContentV1, NativeDecisionKindV1,
@@ -2072,6 +2073,98 @@ fn observe_stdout(stdout: impl Read, sender: mpsc::SyncSender<ObservedLineV1>) {
 }
 
 /// Exact correlation of an item notification to this Pastey-owned turn.
+/// The activity one Codex notification of the observed turn reports:
+/// commands with their exit, file changes with their paths, tool calls, and
+/// the Agent's plan. Anything else reports nothing.
+fn codex_activity(method: &str, message: &Value) -> Vec<NativeActivityV1> {
+    if method == "turn/plan/updated" {
+        let steps = message
+            .pointer("/params/plan")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|step| {
+                let text = step.get("step").and_then(Value::as_str)?;
+                let state = match step.get("status").and_then(Value::as_str)? {
+                    "completed" => PlanStepStateV1::Completed,
+                    "inProgress" => PlanStepStateV1::InProgress,
+                    _ => PlanStepStateV1::Pending,
+                };
+                Some(NativePlanStepV1 { text: text.to_owned(), state })
+            })
+            .collect();
+        return vec![NativeActivityV1::Plan(steps)];
+    }
+    let started = method == "item/started";
+    if !started && method != "item/completed" {
+        return Vec::new();
+    }
+    let Some(item) = message.pointer("/params/item") else {
+        return Vec::new();
+    };
+    let Some(id) = item.get("id").and_then(Value::as_str).map(str::to_owned) else {
+        return Vec::new();
+    };
+    let text = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
+    let status = text("status");
+    let paths: Vec<PathBuf> = item
+        .get("changes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|change| change.get("path").and_then(Value::as_str))
+        .map(PathBuf::from)
+        .collect();
+    let (label, command, failed) = match text("type") {
+        "commandExecution" => (
+            text("command").to_owned(),
+            true,
+            matches!(status, "failed" | "declined")
+                || item
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|code| code != 0),
+        ),
+        "fileChange" => (
+            match paths.as_slice() {
+                [] => "Edit files".to_owned(),
+                [one] => format!("Edit {}", one.file_name().map_or_else(|| one.to_string_lossy(), |name| name.to_string_lossy())),
+                [first, rest @ ..] => format!(
+                    "Edit {} and {} more",
+                    first.file_name().map_or_else(|| first.to_string_lossy(), |name| name.to_string_lossy()),
+                    rest.len()
+                ),
+            },
+            false,
+            matches!(status, "failed" | "declined"),
+        ),
+        "mcpToolCall" => (
+            format!("{} · {}", text("server"), text("tool")),
+            false,
+            status == "failed" || item.get("error").is_some_and(|error| !error.is_null()),
+        ),
+        "dynamicToolCall" => (
+            text("tool").to_owned(),
+            false,
+            status == "failed" || item.get("success").and_then(Value::as_bool) == Some(false),
+        ),
+        "webSearch" => (format!("Web search: {}", text("query")), false, false),
+        _ => return Vec::new(),
+    };
+    let mut activity = vec![NativeActivityV1::Started {
+        id: id.clone(),
+        label,
+        command,
+    }];
+    if !started {
+        activity.push(NativeActivityV1::Finished { id, failed });
+        if text("type") == "fileChange" && status == "completed" && !paths.is_empty() {
+            activity.push(NativeActivityV1::FilesChanged(paths));
+        }
+    }
+    activity
+}
+
 fn names_exact_turn(message: &Value, thread_id: &str, turn_id: &str) -> bool {
     message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
         && message.pointer("/params/turnId").and_then(Value::as_str) == Some(turn_id)
@@ -2646,6 +2739,15 @@ impl CodexAppServerV1 {
             };
             let method = message.get("method").and_then(Value::as_str);
             let request_id = message.get("id").filter(|id| !id.is_null());
+            // What the turn is doing, for the live card: facts Codex
+            // already sends, passed on as they come.
+            if let (Some(method), None) = (method, request_id) {
+                if names_exact_turn(&message, thread_id, &turn_id) {
+                    for activity in codex_activity(method, &message) {
+                        progress.activity(activity);
+                    }
+                }
+            }
             match (method, request_id) {
                 (Some(method), Some(request_id)) => {
                     if NATIVE_DECISION_REQUESTS.contains(&method) {
@@ -4245,5 +4347,41 @@ mod tests {
             super::drain_stderr(std::io::Cursor::new(noisy.clone())),
             noisy.len() as u64
         );
+    }
+
+    #[test]
+    fn codex_events_report_commands_edits_tools_and_the_plan() {
+        let item = |method: &str, item: Value| json!({"method": method, "params": {"threadId": "t", "turnId": "u", "item": item}});
+        let command = json!({"type": "commandExecution", "id": "c1", "command": "npm test", "status": "inProgress", "exitCode": null});
+        assert_eq!(
+            codex_activity("item/started", &item("item/started", command)),
+            vec![NativeActivityV1::Started { id: "c1".into(), label: "npm test".into(), command: true }]
+        );
+        let finished = json!({"type": "commandExecution", "id": "c1", "command": "npm test", "status": "completed", "exitCode": 1});
+        assert_eq!(
+            codex_activity("item/completed", &item("item/completed", finished))[1],
+            NativeActivityV1::Finished { id: "c1".into(), failed: true }
+        );
+        let edit = json!({"type": "fileChange", "id": "f1", "status": "completed", "changes": [{"path": "/w/a.js", "kind": {"type": "update"}, "diff": ""}, {"path": "/w/b.js", "kind": {"type": "add"}, "diff": ""}]});
+        let reported = codex_activity("item/completed", &item("item/completed", edit));
+        assert!(matches!(&reported[0], NativeActivityV1::Started { label, command: false, .. } if label == "Edit a.js and 1 more"));
+        assert_eq!(reported[2], NativeActivityV1::FilesChanged(vec![PathBuf::from("/w/a.js"), PathBuf::from("/w/b.js")]));
+        // A declined edit changed nothing.
+        let declined = json!({"type": "fileChange", "id": "f2", "status": "declined", "changes": [{"path": "/w/c.js", "kind": {"type": "update"}, "diff": ""}]});
+        let reported = codex_activity("item/completed", &item("item/completed", declined));
+        assert_eq!(reported.len(), 2);
+        assert_eq!(reported[1], NativeActivityV1::Finished { id: "f2".into(), failed: true });
+        // The reply itself and reasoning are not activity.
+        assert!(codex_activity("item/completed", &item("item/completed", json!({"type": "agentMessage", "id": "m", "text": "hi"}))).is_empty());
+        assert!(codex_activity("item/completed", &item("item/completed", json!({"type": "reasoning", "id": "r"}))).is_empty());
+        let plan = json!({"method": "turn/plan/updated", "params": {"threadId": "t", "turnId": "u", "plan": [{"step": "read", "status": "completed"}, {"step": "edit", "status": "inProgress"}]}});
+        assert_eq!(
+            codex_activity("turn/plan/updated", &plan),
+            vec![NativeActivityV1::Plan(vec![
+                NativePlanStepV1 { text: "read".into(), state: PlanStepStateV1::Completed },
+                NativePlanStepV1 { text: "edit".into(), state: PlanStepStateV1::InProgress },
+            ])]
+        );
+        assert!(codex_activity("turn/diff/updated", &plan).is_empty());
     }
 }

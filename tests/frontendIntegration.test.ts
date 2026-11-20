@@ -8,8 +8,8 @@ import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
 import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
 import {
-  journalCount, journalEntries, memberStateLabel, needsUser, statusLabel, suggestAlias, turnOutcomeLabel, validAlias,
-  waitingByRecipient, type CollaborationEntry,
+  activityCounts, currentStep, elapsedLabel, grantUsable, journalCount, journalEntries, memberStateLabel, needsUser, policyLabel,
+  statusLabel, suggestAlias, turnOutcomeLabel, validAlias, waitingByRecipient, type CollaborationEntry, type CollaborationMember,
 } from "../src/lib/collaboration";
 import {
   CLAUDE_CODE_AGENT_ID,
@@ -2368,6 +2368,31 @@ test("a collaboration's Journal reads three ways, and only open items need the u
   assert.equal(turnOutcomeLabel("cancelled"), "stopped");
   assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: false, busy: false, waiting: 2 }), "2 waiting");
   assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: true, busy: true, waiting: 0 }), "Paused");
+});
+
+test("an auto grant shows its turns left until it is used up or expires, and a live turn reads from reported facts", () => {
+  const member: CollaborationMember = { alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: false, busy: false, waiting: 0,
+    grant: { turns: 3, used: 1, grantedAt: 1_000, expiresAt: 8_200 } };
+  const time = (seconds: number) => `t${seconds}`;
+  assert.equal(policyLabel(member, 2_000, time), "Automatic · 2 of 3 turns left · until t8200");
+  assert.equal(policyLabel(member, 8_200, time), "Asks you before each turn", "expired");
+  assert.equal(policyLabel({ ...member, grant: { ...member.grant!, used: 3 } }, 2_000, time), "Asks you before each turn", "used up");
+  assert.equal(policyLabel({ ...member, grant: undefined }, 2_000, time), "Asks you before each turn");
+  assert.equal(grantUsable(member.grant, 2_000), true);
+  // An item waiting for an automatic turn does not need the user.
+  assert.equal(needsUser({ id: "e", seq: 1, at: 1, basis: "claim", body: { type: "message", from: "api", to: "web", subject: "", body: "x", hop: 1 }, status: { state: "auto", attempts: 0 } }), false);
+  assert.equal(statusLabel({ state: "auto", attempts: 0 }), "Starts its next automatic turn");
+  assert.equal(statusLabel({ state: "scheduled", taskId: "t", attempts: 0, auto: true }), "In an automatic turn that started");
+  const activity = { since: 0, actions: 4, commands: 3, failedCommands: 1, files: ["a.js", "b.js"], filesChanged: 2,
+    plan: [{ text: "read", state: "completed" as const }, { text: "edit", state: "in_progress" as const }, { text: "test", state: "pending" as const }],
+    recent: [{ label: "npm test", state: "failed" as const }] };
+  assert.equal(currentStep(activity), "edit");
+  assert.equal(currentStep({ ...activity, plan: [{ text: "test", state: "pending" }] }), "test");
+  assert.equal(currentStep(null), null);
+  assert.equal(activityCounts(activity), "3 commands (1 failed) · 2 files changed");
+  assert.equal(activityCounts({ commands: 0, failedCommands: 0, filesChanged: 0 }), null);
+  assert.equal(elapsedLabel(245), "4 m 05 s");
+  assert.equal(elapsedLabel(9), "9 s");
 });
 
 test("a member alias is suggested from its folder and never collides with another or with the user", () => {

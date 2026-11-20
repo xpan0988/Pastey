@@ -85,6 +85,16 @@ case "$mode" in
   extra-turn) reply "First"; result success false 1 "First"; drain; sleep 0.3
     reply "Later reply"; result success false 1 "Later reply"; finish ;;
   crash) finish 137 ;;
+  working)
+    printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[{"content":"Read the table","status":"completed"},{"content":"Switch to cursors","status":"in_progress"}]}}]}}\n'
+    printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"npm test"}}]}}\n'
+    printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true}]}}\n'
+    printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Edit","input":{"file_path":"%s/src/OrdersTable.js"}}]}}\n' "$WS"
+    printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t3"}]}}\n'
+    printf '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t4","name":"Write","input":{"file_path":"%s/src/new.js"}}]}}\n' "$WS"
+    printf '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t4","is_error":true}]}}\n'
+    while [ ! -f "$ROOT/finish" ]; do sleep 0.02; done
+    reply "Done"; result success false 3 "Done"; drain; finish ;;
   hang|manual)
     trap 'printf "{\"type\":\"user\",\"cwd\":\"%s\",\"timestamp\":\"%s\",\"message\":{\"role\":\"user\",\"content\":\"[Request interrupted by user]\"}}\n" "$WS" "$(now)" >> "$T"; result error_during_execution true 1 ""; finish 0' INT
     while [ ! -f "$ROOT/finish" ]; do sleep 0.02; done
@@ -348,6 +358,51 @@ fn a_member_turns_published_blocks_reach_the_turn_listener_once_its_folder_is_fr
         published.summary.and_then(|summary| summary.done).as_deref(),
         Some("reviewed pagination")
     );
+}
+
+#[test]
+fn a_long_turns_activity_shows_while_it_runs_and_reaches_the_listener_without_another_run() {
+    let fixture = FixtureV1::new("working");
+    let (mut service, _) = fixture.service();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    service.set_turn_listener(sender);
+    let started = service
+        .start_claude_code_member_task(
+            &fixture.workspace,
+            "Move the table to cursors",
+            true,
+            &NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+    // While the turn runs: the plan, the last actions, counts and the
+    // edit that succeeded (the declined write changed nothing).
+    wait_until(
+        || {
+            service
+                .running_turn(&fixture.workspace)
+                .and_then(|running| running.activity)
+                .is_some_and(|activity| activity.actions == 3)
+        },
+        "the activity arrived",
+    );
+    let running = service.running_turn(&fixture.workspace).unwrap();
+    assert_eq!(running.task_id, started.task_id);
+    let activity = running.activity.unwrap();
+    assert_eq!(activity.current_step(), Some("Switch to cursors"));
+    assert_eq!((activity.commands, activity.failed_commands), (1, 1));
+    assert_eq!(activity.files, vec!["src/OrdersTable.js"]);
+    let recent: Vec<_> = activity.recent.iter().map(|action| action.label.as_str()).collect();
+    assert_eq!(recent, vec!["npm test", "Edit OrdersTable.js", "Write new.js"]);
+    fs::write(fixture.root.join("finish"), "").unwrap();
+    let ended = receiver
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the turn ended");
+    assert_eq!(ended.state, NativeAgentTaskStateV1::Completed);
+    let activity = ended.activity.expect("the turn's activity");
+    assert_eq!(activity.files_changed, 1);
+    assert!(service.running_turn(&fixture.workspace).is_none());
+    // Progress came from the one run's own stream: nothing else was asked.
+    assert_eq!(fixture.runs().len(), 1);
 }
 
 #[test]
@@ -1965,7 +2020,7 @@ fn installed_codex_and_claude_code_exchange_an_approved_collaboration_message() 
         .unwrap();
     let low = options(None, Some("low"));
     let journal = |collaborations: &CollaborationServiceV1| {
-        collaborations.view(&id, |_| false).unwrap().entries
+        collaborations.view(&id, |_| Default::default()).unwrap().entries
     };
 
     // 1. The user's own turn in api's conversation, with the note.
@@ -2014,4 +2069,161 @@ fn installed_codex_and_claude_code_exchange_an_approved_collaboration_message() 
         &entry.body,
         EntryBodyV1::Turn { task_id, state: NativeAgentTaskStateV1::Completed, .. } if *task_id == second.task_id
     )));
+}
+
+/// M2 live: the same pair with auto grants (api 1 turn, web 1 turn). The
+/// user's own turn in api leaves web a message; web's turn starts with no
+/// approval, with the digest in its prompt; the live card shows reported
+/// activity while it runs; the turns stop when the grants are used up. Both
+/// at effort low. What the Agents choose to say is printed, not asserted.
+#[test]
+#[ignore = "uses the installed, signed-in Codex and Claude Code and their quota"]
+fn installed_codex_and_claude_code_take_automatic_turns_within_their_grants() {
+    use crate::collaboration::{
+        with_note, CollaborationServiceV1, EntryBodyV1, GrantChangeV1, GrantEndV1, MemberInputV1,
+        ProviderV1, StatusV1,
+    };
+    let api = live_workspace("collab-auto-api");
+    let web = live_workspace("collab-auto-web");
+    fs::write(
+        api.join("orders.py"),
+        "# 2026-11-18: GET /v2/orders switched from offset to cursor pagination.\n\
+         # It returns {\"orders\": [...], \"nextCursor\": <opaque or None>}; a request\n\
+         # that sends `offset` is rejected with 400.\n\
+         def list_orders(cursor=None, limit=50):\n    raise NotImplementedError\n",
+    )
+    .unwrap();
+    fs::write(
+        web.join("OrdersTable.js"),
+        "export async function loadPage(page, pageSize = 50) {\n  const offset = page * pageSize;\n  const response = await fetch(`/v2/orders?offset=${offset}&limit=${pageSize}`);\n  return (await response.json()).orders;\n}\n",
+    )
+    .unwrap();
+    let root = std::env::temp_dir().join(format!("pastey-collab-auto-{}", Uuid::new_v4()));
+    let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
+    paths.ensure_directories().unwrap();
+    crate::storage::init_database(&paths).unwrap();
+    let claude = Arc::new(ClaudeCodeConversationAdapterV1::default());
+    claude.use_lifeline_helper(&built_pastey());
+    let codex = Arc::new(super::super::super::codex::CodexNativeAdapterV1::default());
+    let mut service =
+        NativeAgentServiceV1::with_paths_and_adapters(paths.clone(), vec![claude, codex]).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    service.set_turn_listener(sender);
+    let mut collaborations = CollaborationServiceV1::new(Some(paths)).unwrap();
+    let id = collaborations
+        .create(
+            "orders-v2",
+            "Move GET /v2/orders to cursor pagination",
+            vec![
+                MemberInputV1 {
+                    alias: "api".into(),
+                    provider: ProviderV1::Codex,
+                    workspace: api.to_string_lossy().into(),
+                    role: "owns the API (this folder)".into(),
+                },
+                MemberInputV1 {
+                    alias: "web".into(),
+                    provider: ProviderV1::ClaudeCode,
+                    workspace: web.to_string_lossy().into(),
+                    role: "owns the web client (OrdersTable.js)".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let wall = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    };
+    collaborations.set_grant(&id, "api", 1, 2, wall()).unwrap();
+    collaborations.set_grant(&id, "web", 1, 2, wall()).unwrap();
+    let low = options(None, Some("low"));
+    let journal = |collaborations: &CollaborationServiceV1| {
+        collaborations.view(&id, |_| Default::default()).unwrap().entries
+    };
+
+    // 1. The user's own turn in api's conversation, with the note.
+    let task = with_note(
+        collaborations.note_for(ProviderV1::Codex, &api),
+        "Read orders.py. The web client (member web) still sends ?offset=. Do not modify any \
+         files. Tell web exactly what it must change, and ask web to reply to you with the \
+         function it will change and how it will pass the cursor.",
+    );
+    let first = service.start_codex_conversation_task(&api, &task, true, &low).unwrap();
+    let ended = receiver.recv_timeout(Duration::from_secs(300)).expect("api's turn ended");
+    assert_eq!(ended.task_id, first.task_id);
+    eprintln!("api (user's turn): {:?} {:?} activity {:?}", ended.state, ended.code, ended.activity);
+    assert!(collaborations.turn_ended(&ended).unwrap());
+    let auto: Vec<_> = journal(&collaborations)
+        .into_iter()
+        .filter(|entry| matches!(entry.status, Some(StatusV1::Auto { .. })))
+        .collect();
+    assert!(!auto.is_empty(), "api's message to web waits for no one: {:#?}", journal(&collaborations));
+
+    // 2. No approvals from here on: start whatever the grants allow.
+    let mut automatic = Vec::new();
+    let mut live_seen = Vec::new();
+    for _ in 0..4 {
+        let plans = collaborations.plan_starts(|workspace| service.workspace_in_use(workspace));
+        let Some(plan) = plans.into_iter().next() else { break };
+        assert!(plan.automatic, "{} started without approval", plan.alias);
+        eprintln!("--- {}'s automatic prompt ---\n{}\n---", plan.alias, plan.prompt);
+        assert!(
+            plan.prompt.contains("Since your last turn:") || plan.prompt.contains("Since this collaboration started:"),
+            "the digest is in the prompt"
+        );
+        let status = match plan.provider {
+            ProviderV1::Codex => service.start_codex_conversation_task(&plan.workspace, &plan.prompt, false, &low),
+            ProviderV1::ClaudeCode => service.start_claude_code_member_task(&plan.workspace, &plan.prompt, false, &low),
+        }
+        .unwrap();
+        collaborations.started(&plan, &status.task_id).unwrap();
+        let started = std::time::Instant::now();
+        let mut polls_with_activity = 0;
+        let ended = loop {
+            match receiver.recv_timeout(Duration::from_millis(250)) {
+                Ok(ended) => break ended,
+                Err(_) => {
+                    assert!(started.elapsed() < Duration::from_secs(300), "{}'s turn ended", plan.alias);
+                    if let Some(activity) = service.running_turn(&plan.workspace).and_then(|turn| turn.activity) {
+                        if activity.actions > 0 || !activity.plan.is_empty() {
+                            polls_with_activity += 1;
+                            if polls_with_activity == 1 {
+                                eprintln!("{} live after {:?}: {:?}", plan.alias, started.elapsed(), activity);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        assert_eq!(ended.task_id, status.task_id);
+        eprintln!(
+            "{} (automatic): {:?} {:?} after {:?}, {polls_with_activity} live polls with activity, at end {:?}",
+            plan.alias, ended.state, ended.code, started.elapsed(), ended.activity
+        );
+        live_seen.push((plan.alias.clone(), polls_with_activity));
+        automatic.push(plan.alias.clone());
+        assert!(collaborations.turn_ended(&ended).unwrap());
+    }
+
+    let entries = journal(&collaborations);
+    for entry in &entries {
+        eprintln!("#{} {:?} {:?} {:?}", entry.seq, entry.basis, entry.body, entry.status);
+    }
+    eprintln!("automatic turns: {automatic:?}; live polls: {live_seen:?}");
+    // web's turn ran on api's message alone, and the budget held.
+    assert_eq!(automatic.first().map(String::as_str), Some("web"));
+    assert!(automatic.len() <= 2, "each member had one automatic turn");
+    assert!(collaborations.plan_starts(|_| false).is_empty(), "nothing else starts");
+    assert!(entries.iter().any(|entry| matches!(
+        &entry.body,
+        EntryBodyV1::Turn { automatic: true, state: NativeAgentTaskStateV1::Completed, activity: Some(activity), .. }
+            if activity.actions > 0
+    )), "web's automatic turn completed, with its reported activity kept");
+    assert!(entries.iter().any(|entry| matches!(
+        &entry.body,
+        EntryBodyV1::Grant { alias, change: GrantChangeV1::Ended { reason: GrantEndV1::UsedUp } } if alias == "web"
+    )), "web's grant ended used up");
+    assert!(live_seen.iter().any(|(alias, polls)| alias == "web" && *polls > 0), "web's live card showed activity while it ran");
 }

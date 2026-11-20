@@ -28,6 +28,7 @@ pub(super) mod claude_code;
 pub(super) mod codex;
 #[cfg(test)]
 pub(super) mod fake_longjob;
+pub(crate) mod activity;
 pub(crate) mod published;
 
 /// Bound for one invocation input or terminal output. It keeps either well
@@ -270,6 +271,10 @@ pub(crate) trait NativeInvocationProgressV1: Send + Sync {
         continuity: NativeConversationContinuityV1,
         continuation: OpaqueCapabilityPayloadV1,
     );
+    /// What the turn is doing, as the native harness reported it (a plan
+    /// step, a command, a tool call, changed files). Bounded and Host-private
+    /// in Core; never a decision or an outcome.
+    fn activity(&self, _activity: activity::NativeActivityV1) {}
 }
 
 /// One started invocation, observed on a Core-owned thread.

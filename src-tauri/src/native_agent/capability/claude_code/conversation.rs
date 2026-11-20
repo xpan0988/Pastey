@@ -77,6 +77,7 @@ use super::super::{
     StartedInvocationV1,
 };
 use super::{claude_command, outcome, run_probe, ClaudeCodeNativeAdapterV1, RecoveryV1};
+use super::super::activity::{NativeActivityV1, NativePlanStepV1, PlanStepStateV1};
 use crate::error::{AppError, AppResult};
 use crate::native_agent::sessions::claude::{
     claude_config_dir, find_cli, live_status, project_dir,
@@ -1139,6 +1140,106 @@ struct ObservedV1 {
     /// Claude Code echoed exactly this prompt.
     accepted: bool,
     last_result: Option<ResultV1>,
+    /// Edits Claude Code asked for, by tool call, until their result shows
+    /// whether they happened.
+    pending_edits: HashMap<String, Vec<PathBuf>>,
+}
+
+/// Bound on edits awaiting their result.
+const MAX_PENDING_EDITS: usize = 256;
+
+fn file_name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_owned(), |name| name.to_string_lossy().into_owned())
+}
+
+/// The activity one stream-json event reports: each tool call as it is
+/// asked for and when its result comes back, the Agent's to-do list as its
+/// plan, and an edit's file once its result shows it succeeded (a declined
+/// write changed nothing).
+fn claude_activity(event: &Value, pending_edits: &mut HashMap<String, Vec<PathBuf>>) -> Vec<NativeActivityV1> {
+    let mut activity = Vec::new();
+    let kind = event.get("type").and_then(Value::as_str);
+    if !matches!(kind, Some("assistant") | Some("user"))
+        || event.get("isReplay").and_then(Value::as_bool) == Some(true)
+    {
+        return activity;
+    }
+    let blocks = event
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    for block in blocks {
+        match (kind, block.get("type").and_then(Value::as_str)) {
+            (Some("assistant"), Some("tool_use")) => {
+                let (Some(id), Some(name)) = (
+                    block.get("id").and_then(Value::as_str),
+                    block.get("name").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                let input = block.get("input").unwrap_or(&Value::Null);
+                let field = |key: &str| input.get(key).and_then(Value::as_str);
+                if name == "TodoWrite" {
+                    let steps = input
+                        .get("todos")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|todo| {
+                            let text = todo.get("content").and_then(Value::as_str)?;
+                            let state = match todo.get("status").and_then(Value::as_str) {
+                                Some("completed") => PlanStepStateV1::Completed,
+                                Some("in_progress") => PlanStepStateV1::InProgress,
+                                _ => PlanStepStateV1::Pending,
+                            };
+                            Some(NativePlanStepV1 { text: text.to_owned(), state })
+                        })
+                        .collect();
+                    activity.push(NativeActivityV1::Plan(steps));
+                    continue;
+                }
+                let edited = field("file_path").or_else(|| field("notebook_path"));
+                let label = match name {
+                    "Bash" => field("command").unwrap_or("a command").to_owned(),
+                    "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => {
+                        format!("{name} {}", edited.map(file_name_of).unwrap_or_default())
+                    }
+                    "Read" => format!("Read {}", field("file_path").map(file_name_of).unwrap_or_default()),
+                    "Grep" | "Glob" => format!("Search {}", field("pattern").unwrap_or("")),
+                    other => other.to_owned(),
+                };
+                if matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit")
+                    && pending_edits.len() < MAX_PENDING_EDITS
+                {
+                    if let Some(path) = edited {
+                        pending_edits.insert(id.to_owned(), vec![PathBuf::from(path)]);
+                    }
+                }
+                activity.push(NativeActivityV1::Started {
+                    id: id.to_owned(),
+                    label,
+                    command: name == "Bash",
+                });
+            }
+            (Some("user"), Some("tool_result")) => {
+                let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let failed = block.get("is_error").and_then(Value::as_bool) == Some(true);
+                activity.push(NativeActivityV1::Finished { id: id.to_owned(), failed });
+                if let Some(paths) = pending_edits.remove(id) {
+                    if !failed {
+                        activity.push(NativeActivityV1::FilesChanged(paths));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    activity
 }
 
 impl ConversationRunV1 {
@@ -1364,6 +1465,9 @@ impl ConversationRunV1 {
         let Ok(event) = serde_json::from_slice::<Value>(line) else {
             return;
         };
+        for activity in claude_activity(&event, &mut observed.pending_edits) {
+            progress.activity(activity);
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("system") if event.get("subtype").and_then(Value::as_str) == Some("init") => {
                 if observed.init_session.is_none() {
