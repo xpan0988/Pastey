@@ -9,8 +9,8 @@ import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
 import {
   activityCounts, changedPaths, currentStep, elapsedLabel, fileChangesLabel, fileStateLabel, grantUsable, journalCount, journalEntries,
-  memberStateLabel, needsUser, policyLabel, statusLabel, suggestAlias, summaryDecision, turnOutcomeLabel, validAlias, waitingByRecipient,
-  type CollaborationEntry, type CollaborationMember,
+  memberStateLabel, needsUser, originLabel, outboxLabel, policyLabel, statusLabel, suggestAlias, summaryDecision, turnOutcomeLabel, validAlias,
+  waitingByRecipient, type CollaborationEntry, type CollaborationMember,
 } from "../src/lib/collaboration";
 import {
   CLAUDE_CODE_AGENT_ID,
@@ -2409,6 +2409,25 @@ test("decisions show the user's latest choice, and file state reads from Pastey'
   assert.equal(fileChangesLabel({ total: 0 }), "no files changed");
   assert.equal(fileStateLabel({ state: "observed", changed: ["a.py"], total: 1 }), "1 file changed: a.py");
   assert.equal(fileStateLabel({ state: "unavailable", reason: "it has more than 50000 files" }), "file state unavailable: it has more than 50000 files");
+});
+
+test("entries from the linked device say so, and what it has not stored yet is shown as waiting for it", () => {
+  const link = { deviceLabel: "Windows-PC", home: true, unsent: 1 };
+  const local: CollaborationEntry = { id: "a", seq: 1, at: 1, basis: "claim", body: { type: "attention", text: "x" }, outbox: { state: "pending" } };
+  const peer: CollaborationEntry = { id: "b", seq: 2, at: 2, basis: "claim", host: "host-windows", body: { type: "attention", text: "y" } };
+  const peerUser: CollaborationEntry = { ...peer, id: "c", basis: "user" };
+  assert.equal(originLabel(local, link), "Agent's statement");
+  assert.equal(originLabel(peer, link), "Agent's statement · on Windows-PC");
+  assert.equal(originLabel(peerUser, link), "Its user, on Windows-PC");
+  assert.equal(outboxLabel(local, link), "Waiting for Windows-PC");
+  assert.equal(outboxLabel({ ...local, outbox: { state: "delivered", at: 3 } }, link), null);
+  assert.equal(outboxLabel(local, undefined), null);
+  assert.equal(statusLabel({ state: "elsewhere" }), "Its device decides when it runs");
+  assert.equal(needsUser({ ...local, status: { state: "elsewhere" } }), false);
+  const remote: CollaborationMember = { alias: "web", provider: "claude_code", workspace: "", role: "", paused: false, busy: false, waiting: 0, remote: true };
+  assert.equal(memberStateLabel(remote), "On the other device");
+  assert.equal(memberStateLabel({ ...remote, invite: { scopeRef: "scope:0123456789abcdef", sent: false } }), "Invited · not yet sent");
+  assert.equal(memberStateLabel({ ...remote, invite: { scopeRef: "scope:0123456789abcdef", sent: true } }), "Invited · waiting for its device's user");
 });
 
 test("a member alias is suggested from its folder and never collides with another or with the user", () => {

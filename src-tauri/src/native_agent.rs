@@ -6664,6 +6664,19 @@ impl NativeAgentServiceV1 {
     /// `native_agent_full_access_revoked`, or `..._cancel_delivery_uncertain`
     /// when the interrupt could not be delivered. A task whose outcome is
     /// already unknown keeps Stop's own rules. Returns what each task now says.
+    /// Asks the given tasks to stop with `code` (an Agent collaboration
+    /// whose link to another device ended). Returns those it reached.
+    pub(crate) fn stop_tasks_with_code(&mut self, task_ids: &[String], code: &str) -> Vec<NativeAgentTaskStatusV1> {
+        task_ids
+            .iter()
+            .filter_map(|task_id| {
+                let status = self.cancel_task_with_code(task_id, code).ok()?;
+                log_native_lifecycle("collaboration_link_ended_stop", task_id, status.code.as_deref().unwrap_or(""));
+                Some(status)
+            })
+            .collect()
+    }
+
     pub(crate) fn stop_full_access_tasks(
         &mut self,
         bridge_id: &str,

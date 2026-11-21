@@ -206,6 +206,7 @@ impl HostRuntime {
         let worker_provider_configs =
             WorkerProviderConfigServiceV1::new(paths.clone(), config::master_key(&config)?)?;
         let managed_runtime_configs = ManagedRuntimeConfigServiceV1::new(paths.clone())?;
+        let master_key = config::master_key(&config)?;
         Ok(Self {
             paths: paths.clone(),
             local_host_ref: local_host_ref.clone(),
@@ -262,9 +263,10 @@ impl HostRuntime {
             native_agents: Mutex::new(crate::native_agent::NativeAgentServiceV1::with_paths(
                 paths.clone(),
             )?),
-            collaborations: Mutex::new(crate::collaboration::CollaborationServiceV1::new(Some(
-                paths.clone(),
-            ))?),
+            collaborations: Mutex::new(crate::collaboration::CollaborationServiceV1::new_with_key(
+                Some(paths.clone()),
+                Some(master_key),
+            )?),
             worker_harness_runs: Mutex::new(HashMap::new()),
             managed_completion_lock: Mutex::new(()),
             managed_worker_process_specs: Mutex::new(HashMap::new()),

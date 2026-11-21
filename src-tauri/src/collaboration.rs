@@ -46,11 +46,15 @@ use crate::native_agent::{
 use crate::storage::{self, AppPaths};
 
 pub(crate) mod manifest;
+pub(crate) mod remote;
 
 use manifest::{FileChangesV1, FileStateV1, ManifestV1, ScanV1};
 
 const SCHEMA_VERSION: &str = "pastey-collaboration-v1";
+/// Members a collaboration keeps; one may start it, with the others added
+/// here later or invited on a linked device.
 const MIN_MEMBERS: usize = 2;
+const MIN_MEMBERS_TO_CREATE: usize = 1;
 const MAX_MEMBERS: usize = 6;
 const MAX_NAME_CHARS: usize = 80;
 const MAX_GOAL_CHARS: usize = 300;
@@ -151,6 +155,14 @@ pub(crate) struct MemberV1 {
     /// turn after this carries the briefing.
     #[serde(default)]
     pub(crate) joined_seq: i64,
+    /// It runs on the linked device: this device never starts its turns
+    /// and knows no folder of it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) remote: bool,
+    /// Invited on the linked device, not yet accepted there (on the device
+    /// that invited it only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) invite: Option<remote::MemberInviteV1>,
 }
 
 /// The auto grant: `turns` automatic turns until `expires_at` (seconds).
@@ -249,6 +261,9 @@ pub(crate) struct CollaborationRecordV1 {
     pub(crate) state: CollaborationStateV1,
     pub(crate) created_at: i64,
     pub(crate) members: Vec<MemberV1>,
+    /// The other device it spans (M4: at most one), over one Bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) link: Option<remote::BridgeLinkV1>,
 }
 
 /// Where an entry's content comes from.
@@ -284,6 +299,8 @@ pub(crate) enum UserActionV1 {
     RoleChanged { alias: String, role: String },
     /// The user confirmed or rejected the decisions of the summary `entry`.
     Decided { entry: String, confirmed: bool },
+    /// This device's user accepted the invitation for `alias`.
+    Accepted { alias: String },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -292,6 +309,10 @@ pub(crate) enum MemberChangeV1 {
     #[default]
     Joined,
     Left,
+    /// Invited on the linked device.
+    Invited,
+    /// The linked device's user declined the invitation.
+    Declined,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -383,6 +404,8 @@ pub(crate) enum StatusV1 {
     },
     Dismissed,
     Undeliverable { reason: String },
+    /// For a member on the linked device: its delivery is decided there.
+    Elsewhere,
     /// Needs the user (a message to `user`, a problem).
     Open,
     Resolved,
@@ -400,6 +423,13 @@ pub(crate) struct EntryV1 {
     pub(crate) body: EntryBodyV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) status: Option<StatusV1>,
+    /// Written on the linked device (its HostRef); absent when written here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<String>,
+    /// For an entry written here in a linked collaboration: whether the
+    /// linked device has stored it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) outbox: Option<remote::OutboxV1>,
 }
 
 impl EntryV1 {
@@ -448,6 +478,17 @@ pub(crate) struct MemberViewV1 {
     pub(crate) live: Option<RunningTurnV1>,
 }
 
+/// The linked device, as views show it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct LinkViewV1 {
+    pub(crate) device_label: String,
+    /// This device created the collaboration.
+    pub(crate) home: bool,
+    /// Entries written here that device has not stored yet.
+    pub(crate) unsent: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CollaborationSummaryV1 {
@@ -456,6 +497,8 @@ pub(crate) struct CollaborationSummaryV1 {
     pub(crate) goal: String,
     pub(crate) state: CollaborationStateV1,
     pub(crate) members: Vec<MemberViewV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) link: Option<LinkViewV1>,
     pub(crate) needs_you: usize,
     pub(crate) last_activity_at: i64,
 }
@@ -521,6 +564,16 @@ pub(crate) struct CollaborationServiceV1 {
     /// Each member's folder when its current turn started (in memory: a
     /// restart loses it, and that turn's file state is unavailable).
     start_scans: HashMap<(String, String), ScanV1>,
+    /// Seals a linked collaboration's records at rest (`remote`).
+    master_key: Option<[u8; 32]>,
+    sealing_keys: std::cell::RefCell<HashMap<String, Option<[u8; 32]>>>,
+    /// Invitations from linked devices this user has not answered, by
+    /// collaboration and alias.
+    invitations: BTreeMap<(String, String), remote::InvitationV1>,
+    /// Declines to send: Bridge, peer HostRef, payload.
+    declines: Vec<(String, String, serde_json::Value)>,
+    /// One outbox pass at a time on this Host (`remote::sync`).
+    pub(crate) syncing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn now() -> i64 {
@@ -559,8 +612,14 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
         } else {
             format!(": {}", other.role.trim())
         };
+        // A member on the linked device runs there, in its own folder.
+        let place = match (&record.link, other.remote) {
+            (Some(link), true) if other.invite.is_some() => format!(" on {} (invited, not yet joined)", link.device_label),
+            (Some(link), true) => format!(" on {}", link.device_label),
+            _ => String::new(),
+        };
         members.push_str(&format!(
-            "- {}{you}, a {} session{role}\n",
+            "- {}{you}, a {} session{place}{role}\n",
             other.alias,
             other.provider.label()
         ));
@@ -597,30 +656,64 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
 
 impl CollaborationServiceV1 {
     /// Loads every collaboration (none without `paths`, for tests).
+    #[cfg(test)]
     pub(crate) fn new(paths: Option<AppPaths>) -> AppResult<Self> {
-        let mut items = BTreeMap::new();
-        if let Some(paths) = paths.as_ref() {
-            for record_json in storage::load_collaborations(paths)? {
-                // One unreadable record never keeps Pastey from starting.
-                let Ok(record) = serde_json::from_str::<CollaborationRecordV1>(&record_json) else {
-                    crate::logging::write_error_line(
-                        "[pastey collaboration] event=load error_code=unreadable_record",
-                    );
-                    continue;
-                };
-                let entries = storage::load_collaboration_entries(paths, &record.id)?
-                    .iter()
-                    .filter_map(|json| serde_json::from_str::<EntryV1>(json).ok())
-                    .collect();
-                items.insert(record.id.clone(), CollaborationV1 { record, entries });
-            }
-        }
-        Ok(Self {
+        Self::new_with_key(paths, None)
+    }
+
+    /// Loads every collaboration; `master_key` opens those sealed with a
+    /// Bridge's key (a collaboration that spans another device).
+    pub(crate) fn new_with_key(paths: Option<AppPaths>, master_key: Option<[u8; 32]>) -> AppResult<Self> {
+        let mut service = Self {
             paths,
-            items,
+            items: BTreeMap::new(),
             last_manifests: HashMap::new(),
             start_scans: HashMap::new(),
-        })
+            master_key,
+            sealing_keys: Default::default(),
+            invitations: BTreeMap::new(),
+            declines: Vec::new(),
+            syncing: Arc::default(),
+        };
+        let Some(paths) = service.paths.clone() else {
+            return Ok(service);
+        };
+        for stored in storage::load_collaborations(&paths)? {
+            // A sealed record whose Bridge key is gone (Burn) is deleted; one
+            // unreadable for another reason never keeps Pastey from starting.
+            let record = service
+                .open(&stored)
+                .and_then(|json| serde_json::from_str::<CollaborationRecordV1>(&json).ok());
+            let Some(record) = record else {
+                crate::logging::write_error_line(
+                    "[pastey collaboration] event=load error_code=unreadable_record",
+                );
+                continue;
+            };
+            if record.link.as_ref().is_some_and(|link| service.sealing_key_for(&link.bridge_id).is_none()) {
+                let _ = storage::delete_collaboration(&paths, &record.id);
+                continue;
+            }
+            let entries = storage::load_collaboration_entries(&paths, &record.id)?
+                .iter()
+                .filter_map(|stored| service.open(stored))
+                .filter_map(|json| serde_json::from_str::<EntryV1>(&json).ok())
+                .collect();
+            service
+                .items
+                .insert(record.id.clone(), CollaborationV1 { record, entries });
+        }
+        service.load_invitations();
+        Ok(service)
+    }
+
+    /// Whether a linked record can be kept: always without a master key
+    /// (tests), else only while its Bridge key exists.
+    fn sealing_key_for(&self, bridge_id: &str) -> Option<()> {
+        if self.master_key.is_none() {
+            return Some(());
+        }
+        self.sealing_key(bridge_id).map(|_| ())
     }
 
     fn manifest_file(&self, id: &str, alias: &str) -> Option<PathBuf> {
@@ -666,22 +759,27 @@ impl CollaborationServiceV1 {
         self.start_scans.remove(&(id.to_owned(), alias.to_owned()));
     }
 
+    /// `json` as stored for collaboration `id`: sealed with its Bridge's
+    /// key when it spans another device.
+    fn at_rest(&self, id: &str, json: String) -> AppResult<String> {
+        match self.items.get(id).and_then(|item| item.record.link.as_ref()) {
+            Some(link) => self.seal(&link.bridge_id, json),
+            None => Ok(json),
+        }
+    }
+
     fn save_record(&self, id: &str) -> AppResult<()> {
         if let (Some(paths), Some(item)) = (self.paths.as_ref(), self.items.get(id)) {
-            storage::save_collaboration(paths, id, &serde_json::to_string(&item.record)?)?;
+            let json = self.at_rest(id, serde_json::to_string(&item.record)?)?;
+            storage::save_collaboration(paths, id, &json)?;
         }
         Ok(())
     }
 
     fn save_entry(&self, id: &str, entry: &EntryV1) -> AppResult<()> {
         if let Some(paths) = self.paths.as_ref() {
-            storage::save_collaboration_entry(
-                paths,
-                &entry.id,
-                id,
-                entry.seq,
-                &serde_json::to_string(entry)?,
-            )?;
+            let json = self.at_rest(id, serde_json::to_string(entry)?)?;
+            storage::save_collaboration_entry(paths, &entry.id, id, entry.seq, &json)?;
         }
         Ok(())
     }
@@ -707,6 +805,14 @@ impl CollaborationServiceV1 {
         status: Option<StatusV1>,
     ) -> AppResult<String> {
         let item = self.item_mut(id)?;
+        // Written here in a collaboration that spans another device: it goes
+        // there too.
+        let outbox = item
+            .record
+            .link
+            .as_ref()
+            .filter(|link| link.accepted)
+            .map(|_| remote::OutboxV1::Pending);
         let entry = EntryV1 {
             id: format!("entry:{}", Uuid::new_v4()),
             seq: item.entries.last().map_or(1, |last| last.seq + 1),
@@ -715,6 +821,8 @@ impl CollaborationServiceV1 {
             basis,
             body,
             status,
+            host: None,
+            outbox,
         };
         let entry_id = entry.id.clone();
         item.entries.push(entry.clone());
@@ -808,6 +916,8 @@ impl CollaborationServiceV1 {
             auto_task: None,
             auto_starts: Vec::new(),
             joined_seq: 0,
+            remote: false,
+            invite: None,
         })
     }
 
@@ -843,8 +953,8 @@ impl CollaborationServiceV1 {
         if goal.chars().count() > MAX_GOAL_CHARS {
             return invalid(format!("The goal is over {MAX_GOAL_CHARS} characters."));
         }
-        if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&members.len()) {
-            return invalid(format!("A collaboration has {MIN_MEMBERS} to {MAX_MEMBERS} members."));
+        if !(MIN_MEMBERS_TO_CREATE..=MAX_MEMBERS).contains(&members.len()) {
+            return invalid(format!("A collaboration has {MIN_MEMBERS_TO_CREATE} to {MAX_MEMBERS} members."));
         }
         let mut accepted: Vec<MemberV1> = Vec::new();
         for input in members {
@@ -860,6 +970,7 @@ impl CollaborationServiceV1 {
             state: CollaborationStateV1::Active,
             created_at: now(),
             members: accepted.clone(),
+            link: None,
         };
         self.items.insert(
             id.clone(),
@@ -905,6 +1016,13 @@ impl CollaborationServiceV1 {
     }
 
     pub(crate) fn set_state(&mut self, id: &str, state: CollaborationStateV1) -> AppResult<()> {
+        if state == CollaborationStateV1::Ended
+            && self.item(id)?.record.link.as_ref().is_some_and(|link| !link.home)
+            && self.item(id)?.record.state != CollaborationStateV1::Ended
+        {
+            // Here, ending a collaboration another device created is leaving it.
+            return self.leave(id);
+        }
         let item = self.item_mut(id)?;
         if item.record.state == state {
             return Ok(());
@@ -955,9 +1073,13 @@ impl CollaborationServiceV1 {
 
     pub(crate) fn resume_member(&mut self, id: &str, alias: &str) -> AppResult<()> {
         let item = self.item_mut(id)?;
+        let device = Self::device_of(&item.record).to_owned();
         let Some(member) = item.member_mut(alias) else {
             return invalid("That member no longer exists.");
         };
+        if member.remote {
+            return invalid(format!("{alias} runs on {device}: it is resumed there."));
+        }
         if !member.paused {
             return Ok(());
         }
@@ -990,6 +1112,9 @@ impl CollaborationServiceV1 {
         }
         if item.record.members.len() >= MAX_MEMBERS {
             return invalid(format!("A collaboration has at most {MAX_MEMBERS} members."));
+        }
+        if let Some(link) = item.record.link.as_ref().filter(|link| !link.home) {
+            return invalid(format!("{} created this collaboration: members are added there.", link.device_label));
         }
         let first_message = first_message.map(str::trim).filter(|text| !text.is_empty());
         if first_message.is_some_and(|text| text.len() > MAX_MESSAGE_BODY_BYTES) {
@@ -1033,6 +1158,12 @@ impl CollaborationServiceV1 {
         let Some(member) = item.member(alias) else {
             return invalid("That member no longer exists.");
         };
+        if item.record.link.as_ref().is_some_and(|link| !link.home) {
+            return invalid(format!(
+                "{} created this collaboration: members are removed there. Leave it to take this device's members out.",
+                Self::device_of(&item.record)
+            ));
+        }
         if item.record.members.len() <= MIN_MEMBERS {
             return invalid(format!("A collaboration keeps at least {MIN_MEMBERS} members."));
         }
@@ -1040,6 +1171,25 @@ impl CollaborationServiceV1 {
             return invalid(format!("{alias} has a turn running: stop it or wait for it to end first."));
         }
         let (provider, role) = (member.provider, member.role.clone());
+        if member.remote {
+            // A member of the linked device: its leaving is written here and
+            // reaches that device, which ends its copy.
+            let invited = member.invite.is_some();
+            self.append(
+                id,
+                Some(alias),
+                BasisV1::User,
+                EntryBodyV1::Member {
+                    alias: alias.into(),
+                    provider,
+                    role,
+                    change: MemberChangeV1::Left,
+                },
+                None,
+            )?;
+            let reason = if invited { format!("{alias}'s invitation was withdrawn") } else { format!("{alias} left the collaboration") };
+            return self.drop_remote_member(id, alias, &reason);
+        }
         self.end_grant(id, alias, GrantEndV1::Withdrawn)?;
         let pending: Vec<String> = self
             .item(id)?
@@ -1091,6 +1241,9 @@ impl CollaborationServiceV1 {
         if item.record.state == CollaborationStateV1::Ended {
             return invalid("This collaboration has ended.");
         }
+        if let Some(link) = item.record.link.as_ref().filter(|link| !link.home) {
+            return invalid(format!("{} created this collaboration: its goal is edited there.", link.device_label));
+        }
         if item.record.goal == goal {
             return Ok(());
         }
@@ -1118,9 +1271,13 @@ impl CollaborationServiceV1 {
         if item.record.state == CollaborationStateV1::Ended {
             return invalid("This collaboration has ended.");
         }
+        let peer_copy = item.record.link.as_ref().is_some_and(|link| !link.home);
         let Some(member) = item.member_mut(alias) else {
             return invalid("That member no longer exists.");
         };
+        if peer_copy && member.remote {
+            return invalid(format!("{alias} runs on the device that created this collaboration: its role is edited there."));
+        }
         if member.role == role {
             return Ok(());
         }
@@ -1172,6 +1329,18 @@ impl CollaborationServiceV1 {
     }
 
     pub(crate) fn delete(&mut self, id: &str) -> AppResult<()> {
+        let item = self.item(id)?;
+        if item.record.link.is_some() && item.record.state != CollaborationStateV1::Ended {
+            return invalid(format!(
+                "This collaboration spans {}: end it first, so that device is told.",
+                Self::device_of(&item.record)
+            ));
+        }
+        self.remove_collaboration(id)
+    }
+
+    /// Removes a collaboration, its Journal and its members' scans.
+    fn remove_collaboration(&mut self, id: &str) -> AppResult<()> {
         let aliases: Vec<String> = self.item(id)?.record.members.iter().map(|member| member.alias.clone()).collect();
         for alias in aliases {
             self.forget_manifests(id, &alias);
@@ -1197,6 +1366,13 @@ impl CollaborationServiceV1 {
         if text.is_empty() || text.len() > MAX_MESSAGE_BODY_BYTES {
             return invalid(format!("A message is 1 to {MAX_MESSAGE_BODY_BYTES} bytes."));
         }
+        // To a member on the linked device: that device's user (or its own
+        // grant) decides when it runs.
+        let status = if item.member(to).is_some_and(|member| member.remote) {
+            StatusV1::Elsewhere
+        } else {
+            StatusV1::Approved { attempts: 0 }
+        };
         self.append(
             id,
             Some(to),
@@ -1208,7 +1384,7 @@ impl CollaborationServiceV1 {
                 body: text.into(),
                 hop: 0,
             },
-            Some(StatusV1::Approved { attempts: 0 }),
+            Some(status),
         )
         .map(|_| ())
     }
@@ -1262,9 +1438,13 @@ impl CollaborationServiceV1 {
         if item.record.state == CollaborationStateV1::Ended {
             return invalid("This collaboration has ended.");
         }
+        let device = Self::device_of(&item.record).to_owned();
         let Some(member) = item.member_mut(alias) else {
             return invalid("That member no longer exists.");
         };
+        if member.remote {
+            return invalid(format!("{alias} runs on {device}: only that device's user can allow it automatic turns."));
+        }
         let expires_at = now + i64::from(hours) * HOUR;
         member.grant = Some(AutoGrantV1 {
             turns,
@@ -1585,22 +1765,17 @@ impl CollaborationServiceV1 {
         Ok(true)
     }
 
-    fn publish_message(
-        &mut self,
-        id: &str,
-        from: &str,
-        message: crate::native_agent::PublishedMessageV1,
-        hop: u8,
-    ) -> AppResult<()> {
+    /// How a message from `from` to `to` at `hop` is held here.
+    fn delivery_status(&self, id: &str, from: &str, to: &str, hop: u8) -> AppResult<StatusV1> {
         let item = self.item(id)?;
-        let to = message.to.clone();
-        let status = if to == USER_ALIAS {
+        let recipient = item.member(to);
+        Ok(if to == USER_ALIAS {
             StatusV1::Open
         } else if to == from {
             StatusV1::Undeliverable {
                 reason: "a member cannot message itself".into(),
             }
-        } else if item.member(&to).is_none() {
+        } else if recipient.is_none() {
             StatusV1::Undeliverable {
                 reason: format!("there is no member \"{to}\""),
             }
@@ -1608,19 +1783,31 @@ impl CollaborationServiceV1 {
             StatusV1::Undeliverable {
                 reason: format!("it is {hop} messages deep, over the limit of {HOP_LIMIT}"),
             }
-        } else if item.waiting_for(&to) >= MAX_WAITING_PER_MEMBER {
+        } else if recipient.is_some_and(|member| member.remote) {
+            StatusV1::Elsewhere
+        } else if item.waiting_for(to) >= MAX_WAITING_PER_MEMBER {
             StatusV1::Undeliverable {
                 reason: format!("{to} already has {MAX_WAITING_PER_MEMBER} messages waiting"),
             }
-        } else if item
-            .member(&to)
+        } else if recipient
             .and_then(|member| member.grant.as_ref())
             .is_some_and(|grant| grant.usable(now()))
         {
             StatusV1::Auto { attempts: 0 }
         } else {
             StatusV1::Waiting
-        };
+        })
+    }
+
+    fn publish_message(
+        &mut self,
+        id: &str,
+        from: &str,
+        message: crate::native_agent::PublishedMessageV1,
+        hop: u8,
+    ) -> AppResult<()> {
+        let to = message.to.clone();
+        let status = self.delivery_status(id, from, &to, hop)?;
         let refused = match &status {
             StatusV1::Undeliverable { reason } => Some(reason.clone()),
             _ => None,
@@ -1662,7 +1849,7 @@ impl CollaborationServiceV1 {
                 continue;
             }
             for member in &item.record.members {
-                if member.paused || item.scheduled_for(&member.alias) || member.auto_task.is_some() {
+                if member.remote || member.paused || item.scheduled_for(&member.alias) || member.auto_task.is_some() {
                     continue;
                 }
                 let automatic_allowed = auto_left > 0
@@ -1909,6 +2096,15 @@ impl CollaborationServiceV1 {
                     }
                 })
                 .collect(),
+            link: item.record.link.as_ref().map(|link| LinkViewV1 {
+                device_label: link.device_label.clone(),
+                home: link.home,
+                unsent: item
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.outbox == Some(remote::OutboxV1::Pending))
+                    .count(),
+            }),
             needs_you: item.entries.iter().filter(|entry| entry.needs_user()).count(),
             last_activity_at: item.last_activity_at(),
         }
@@ -1933,7 +2129,13 @@ impl CollaborationServiceV1 {
     pub(crate) fn member_workspaces(&self) -> Vec<PathBuf> {
         self.items
             .values()
-            .flat_map(|item| item.record.members.iter().map(|member| PathBuf::from(&member.workspace)))
+            .flat_map(|item| {
+                item.record
+                    .members
+                    .iter()
+                    .filter(|member| !member.remote)
+                    .map(|member| PathBuf::from(&member.workspace))
+            })
             .collect()
     }
 }
@@ -1947,7 +2149,11 @@ fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], now: 
         let EntryBodyV1::Message { from, subject, body, hop, .. } = &entry.body else {
             return None;
         };
-        Some(if from == USER_ALIAS {
+        Some(if from == USER_ALIAS && entry.host.is_some() {
+            // The user of the linked device; this device's user let it run.
+            let device = record.link.as_ref().map_or("the other device", |link| link.device_label.as_str());
+            (format!("From: {USER_ALIAS} on {device} (the person working on that device)\n\n{body}\n"), false)
+        } else if from == USER_ALIAS {
             (format!("From: {USER_ALIAS} (the person you work for)\n\n{body}\n"), false)
         } else {
             let provider = record
@@ -2539,6 +2745,9 @@ pub(crate) fn start_scheduler(runtime: &Arc<HostRuntime>) {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let Some(runtime) = weak.upgrade() else { break };
+        // Entries for a linked device: sent now if it is reachable, and on
+        // every tick until it stores them.
+        remote::sync_soon(&runtime);
         let relevant = match ended {
             Some(ended) => {
                 // The folder is scanned with no lock held.
@@ -2562,6 +2771,10 @@ pub(crate) fn start_scheduler(runtime: &Arc<HostRuntime>) {
 /// at a time (collaborations, then the native service), never nested the
 /// other way.
 pub(crate) fn drive(runtime: &HostRuntime) {
+    // A link whose pin changed ends before anything starts; a member whose
+    // folder is no longer shared with the device that created it pauses.
+    remote::settle(runtime);
+    remote::pause_unshared(runtime);
     let plans = {
         let mut collaborations = runtime.collaborations.lock();
         let _ = collaborations.settle_grants(now());

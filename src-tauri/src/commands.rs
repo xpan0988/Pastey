@@ -1353,6 +1353,8 @@ fn collaboration_view(
     state: &AppState,
     collaboration_id: &str,
 ) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    // A link whose Bridge pin changed (forgotten, re-paired) ends at once.
+    crate::collaboration::remote::settle(state);
     // A grant that expired shows as ended, even before the scheduler's tick.
     let _ = state
         .collaborations
@@ -1366,10 +1368,12 @@ fn collaboration_view(
         .map_err(|error| error.message())
 }
 
-/// Starts, off the command thread, whatever the change made possible.
+/// Starts, off the command thread, whatever the change made possible, and
+/// sends what a linked device should now know.
 fn drive_collaborations(state: &Arc<AppState>) {
     let runtime = state.clone();
     std::thread::spawn(move || crate::collaboration::drive(&runtime));
+    crate::collaboration::remote::sync_soon(state);
 }
 
 #[tauri::command]
@@ -1528,6 +1532,7 @@ pub fn withdraw_collaboration_grant(
         .lock()
         .withdraw_grant(&collaboration_id, &alias)
         .map_err(|error| error.message())?;
+    crate::collaboration::remote::sync_soon(&state);
     collaboration_view(&state, &collaboration_id)
 }
 
@@ -7139,6 +7144,11 @@ pub(crate) fn purge_bridge_runtime_authority(
         .lock()
         .purge_bridge_authority(room_id)
         .err();
+    // Agent collaborations that span that device lose it (and a copy of one
+    // it created is deleted); their running turns are asked to stop.
+    if let Err(error) = crate::collaboration::remote::purge(state, room_id) {
+        first_error.get_or_insert(error);
+    }
     state.room_control.lock().purge_room(room_id);
     state.bridge_auth.lock().purge_room(room_id);
     state.purge_room(room_id);
@@ -9640,6 +9650,7 @@ pub fn remove_collaboration_member(
         .lock()
         .remove_member(&collaboration_id, &alias)
         .map_err(|error| error.message())?;
+    crate::collaboration::remote::sync_soon(&state);
     collaboration_view(&state, &collaboration_id)
 }
 
@@ -9655,6 +9666,7 @@ pub fn set_collaboration_goal(
         .lock()
         .set_goal(&collaboration_id, &goal)
         .map_err(|error| error.message())?;
+    crate::collaboration::remote::sync_soon(&state);
     collaboration_view(&state, &collaboration_id)
 }
 
@@ -9671,6 +9683,7 @@ pub fn set_collaboration_role(
         .lock()
         .set_role(&collaboration_id, &alias, &role)
         .map_err(|error| error.message())?;
+    crate::collaboration::remote::sync_soon(&state);
     collaboration_view(&state, &collaboration_id)
 }
 
@@ -9687,5 +9700,58 @@ pub fn decide_collaboration_summary(
         .lock()
         .decide(&collaboration_id, &entry_id, confirmed)
         .map_err(|error| error.message())?;
+    crate::collaboration::remote::sync_soon(&state);
     collaboration_view(&state, &collaboration_id)
+}
+
+/// Invites a conversation on the device a Bridge is paired with, in a
+/// folder that device shares with this one (Sessions and Agent requests
+/// on). That device's user accepts or declines; until then nothing runs
+/// there. The collaboration's Journal so far goes there once accepted.
+#[tauri::command]
+pub fn invite_collaboration_member(
+    collaboration_id: String,
+    room_id: String,
+    member: crate::collaboration::remote::RemoteMemberInputV1,
+    first_message: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    let link = crate::collaboration::remote::link_for(&state.paths, &room_id).map_err(|error| error.message())?;
+    state
+        .collaborations
+        .lock()
+        .invite_member(&collaboration_id, link, member, first_message.as_deref())
+        .map_err(|error| error.message())?;
+    crate::collaboration::remote::sync_soon(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Invitations from linked devices this device's user has not answered.
+#[tauri::command]
+pub fn list_collaboration_invitations(
+    state: State<'_, Arc<AppState>>,
+) -> Vec<crate::collaboration::remote::InvitationViewV1> {
+    crate::collaboration::remote::settle(&state);
+    state
+        .collaborations
+        .lock()
+        .invitations()
+        .iter()
+        .map(crate::collaboration::remote::InvitationViewV1::from)
+        .collect()
+}
+
+/// Accepts or declines an invitation. Accepting needs the folder still
+/// shared with that device as it was, and the Bridge still paired with the
+/// same key.
+#[tauri::command]
+pub fn answer_collaboration_invitation(
+    collaboration_id: String,
+    alias: String,
+    accept: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    crate::collaboration::remote::answer(&state, &collaboration_id, &alias, accept).map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    Ok(())
 }

@@ -7,7 +7,9 @@ import { invoke } from "@tauri-apps/api/core";
  * user's own messages need no approval. Delivery always happens at a turn
  * boundary. A member's first turn carries a briefing compiled from the
  * Journal, and Pastey scans each member's folder at its turns' start and end
- * for file state (paths only). */
+ * for file state (paths only). A collaboration may span one other device
+ * paired by code: its members there run there, admitted by that device's
+ * user, and each device sends the other the entries it writes. */
 
 export type CollaborationProvider = "codex" | "claude_code";
 export type CollaborationState = "active" | "paused" | "ended";
@@ -69,6 +71,19 @@ export interface CollaborationMember {
   waiting: number;
   /** The turn running in its folder, with what it has done so far. */
   live?: RunningTurn;
+  /** It runs on the linked device; this device knows no folder of it. */
+  remote?: boolean;
+  /** Invited on the linked device, not yet accepted there. */
+  invite?: { scopeRef: string; sent: boolean };
+}
+
+/** The other device a collaboration spans. */
+export interface CollaborationLink {
+  deviceLabel: string;
+  /** This device created the collaboration. */
+  home: boolean;
+  /** Entries written here that device has not stored yet. */
+  unsent: number;
 }
 
 export interface CollaborationSummary {
@@ -77,6 +92,7 @@ export interface CollaborationSummary {
   goal: string;
   state: CollaborationState;
   members: CollaborationMember[];
+  link?: CollaborationLink;
   needsYou: number;
   lastActivityAt: number;
 }
@@ -97,7 +113,9 @@ export type CollaborationUserAction =
   | { type: "goal_changed"; goal: string }
   | { type: "role_changed"; alias: string; role: string }
   /** The user confirmed or rejected the decisions of summary `entry`. */
-  | { type: "decided"; entry: string; confirmed: boolean };
+  | { type: "decided"; entry: string; confirmed: boolean }
+  /** This device's user accepted the invitation for `alias`. */
+  | { type: "accepted"; alias: string };
 
 /** Paths that differ between two scans of a member's folder (each list at
  * most 20; `total` counts all). */
@@ -130,7 +148,7 @@ export type CollaborationEntryBody =
   | { type: "summary"; summary: PublishedSummary }
   | { type: "attention"; text: string }
   | { type: "user"; action: CollaborationUserAction }
-  | { type: "member"; alias: string; provider: CollaborationProvider; role: string; change?: "joined" | "left" }
+  | { type: "member"; alias: string; provider: CollaborationProvider; role: string; change?: "joined" | "left" | "invited" | "declined" }
   /** A member's folder changed between its turns. */
   | ({ type: "files_outside"; alias: string } & FileChanges)
   | { type: "grant"; alias: string; change: "granted"; turns: number; expiresAt: number }
@@ -144,6 +162,8 @@ export type CollaborationEntryStatus =
   | { state: "included"; taskId: string }
   | { state: "dismissed" }
   | { state: "undeliverable"; reason: string }
+  /** For a member on the linked device: delivered (or not) there. */
+  | { state: "elsewhere" }
   | { state: "open" }
   | { state: "resolved" };
 
@@ -155,6 +175,34 @@ export interface CollaborationEntry {
   basis: CollaborationBasis;
   body: CollaborationEntryBody;
   status?: CollaborationEntryStatus;
+  /** Written on the linked device (its HostRef). */
+  host?: string;
+  /** For an entry written here in a linked collaboration. */
+  outbox?: { state: "pending" } | { state: "delivered"; at: number };
+}
+
+/** A member of a linked device, invited from here: the folder is the one
+ * that device shares with this one (`scopeRef`). */
+export interface RemoteMemberInput {
+  alias: string;
+  provider: CollaborationProvider;
+  role: string;
+  scopeRef: string;
+}
+
+/** An invitation from a linked device, waiting for this device's user. */
+export interface CollaborationInvitation {
+  collaborationId: string;
+  bridgeId: string;
+  deviceLabel: string;
+  displayFingerprint: string;
+  name: string;
+  goal: string;
+  members: Array<{ alias: string; provider: CollaborationProvider; role: string }>;
+  member: { alias: string; provider: CollaborationProvider; role: string };
+  /** This device's own folder. */
+  workspace: string;
+  receivedAt: number;
 }
 
 export interface CollaborationView extends CollaborationSummary {
@@ -245,6 +293,21 @@ export function decideCollaborationSummary(collaborationId: string, entryId: str
   return invoke("decide_collaboration_summary", { collaborationId, entryId, confirmed });
 }
 
+/** Invites a conversation on the device a Bridge is paired with, in a
+ * folder it shares with this one (Sessions and Agent requests on). Its user
+ * accepts or declines there. */
+export function inviteCollaborationMember(collaborationId: string, roomId: string, member: RemoteMemberInput, firstMessage?: string): Promise<CollaborationView> {
+  return invoke("invite_collaboration_member", { collaborationId, roomId, member, firstMessage: firstMessage?.trim() || null });
+}
+
+export function listCollaborationInvitations(): Promise<CollaborationInvitation[]> {
+  return invoke("list_collaboration_invitations");
+}
+
+export function answerCollaborationInvitation(collaborationId: string, alias: string, accept: boolean): Promise<void> {
+  return invoke("answer_collaboration_invitation", { collaborationId, alias, accept });
+}
+
 export function collaborationNeedsYouCount(): Promise<number> {
   return invoke("collaboration_needs_you_count");
 }
@@ -309,6 +372,7 @@ export function statusLabel(status: CollaborationEntryStatus | undefined): strin
     case "included": return "Delivered";
     case "dismissed": return "Dismissed";
     case "undeliverable": return `Not delivered: ${status.reason}`;
+    case "elsewhere": return "Its device decides when it runs";
     case "open": return "Needs you";
     case "resolved": return "Done";
     default: return null;
@@ -387,7 +451,23 @@ export function elapsedLabel(seconds: number): string {
   return minutes > 0 ? `${minutes} m ${String(rest).padStart(2, "0")} s` : `${rest} s`;
 }
 
+/** Where an entry comes from: "Pastey", "Agent's statement" or "You", and
+ * on which device when it is the linked one. */
+export function originLabel(entry: CollaborationEntry, link: CollaborationLink | undefined): string {
+  if (!entry.host) return basisLabel(entry.basis);
+  const device = link?.deviceLabel ?? "the other device";
+  return entry.basis === "user" ? `Its user, on ${device}` : `${basisLabel(entry.basis)} · on ${device}`;
+}
+
+/** Whether the linked device has stored an entry written here, for display. */
+export function outboxLabel(entry: CollaborationEntry, link: CollaborationLink | undefined): string | null {
+  if (!entry.outbox || !link) return null;
+  return entry.outbox.state === "pending" ? `Waiting for ${link.deviceLabel}` : null;
+}
+
 export function memberStateLabel(member: CollaborationMember): string {
+  if (member.invite) return member.invite.sent ? "Invited · waiting for its device's user" : "Invited · not yet sent";
+  if (member.remote) return member.waiting > 0 ? `${member.waiting} waiting` : "On the other device";
   if (member.paused) return "Paused";
   if (member.busy) return "Working";
   return member.waiting > 0 ? `${member.waiting} waiting` : "Idle";

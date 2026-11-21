@@ -3359,6 +3359,32 @@ pub fn migrate_bridge_payload_keys(paths: &AppPaths, master_key: &[u8; 32]) -> A
     Ok(())
 }
 
+/// The key that seals data this device keeps for one Bridge (an Agent
+/// collaboration's Journal shared with that device): the Bridge's payload
+/// key, created when missing. None once the Bridge is burned or gone, so
+/// sealed data is unreadable after Burn, which deletes this key.
+pub(crate) fn bridge_sealing_key(
+    paths: &AppPaths,
+    master_key: &[u8; 32],
+    room_id: &str,
+) -> AppResult<Option<[u8; 32]>> {
+    if is_burned_bridge(paths, room_id)? {
+        return Ok(None);
+    }
+    match read_bridge_payload_key(paths, room_id, master_key) {
+        Ok(key) => Ok(Some(key)),
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            match get_room_by_id(paths, room_id) {
+                Ok(room) if room.status == RoomStatus::Active => {
+                    ensure_bridge_payload_key(paths, master_key, room_id).map(Some)
+                }
+                _ => Ok(None),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn ensure_bridge_payload_key(
     paths: &AppPaths,
     master_key: &[u8; 32],

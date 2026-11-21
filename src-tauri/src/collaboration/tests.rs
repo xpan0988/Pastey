@@ -90,9 +90,7 @@ fn entries(service: &CollaborationServiceV1, id: &str) -> Vec<EntryV1> {
 fn a_collaboration_needs_distinct_valid_members() {
     let fixture = FixtureV1::new("create");
     let mut service = CollaborationServiceV1::new(None).unwrap();
-    let mut one = fixture.members();
-    one.truncate(1);
-    assert!(service.create("x", "", one).is_err());
+    assert!(service.create("x", "", Vec::new()).is_err());
     let mut same_alias = fixture.members();
     same_alias[1].alias = "api".into();
     assert!(service.create("x", "", same_alias).is_err());

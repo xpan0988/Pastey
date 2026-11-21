@@ -6,7 +6,7 @@ Status: design, revised after M0. The direction was approved on 2026-11-18 as "C
 - The user follows progress, reads summaries and answers what needs them from that Journal.
 - A member who joins later starts with a **briefing** compiled from it.
 
-M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). M1 is built: a collaboration on one device, with every delivery between Agents approved by the user ([M1](#milestones-and-acceptance-tests); [reference](../reference.md#agent-collaboration-facts)). M2 is built on 2026-11-20: a bounded auto grant per member, live progress during a turn, and the "since your last turn" digest. M3 is built on 2026-11-21: adding and removing members, editing the goal and roles, the briefing on a member's first turn, confirming decisions, and file state from scans of each member's folder. Nothing beyond M3 is built. Windows is not measured. Four of the five product decisions are made, and one is still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
+M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). M1 is built: a collaboration on one device, with every delivery between Agents approved by the user ([M1](#milestones-and-acceptance-tests); [reference](../reference.md#agent-collaboration-facts)). M2 is built on 2026-11-20: a bounded auto grant per member, live progress during a turn, and the "since your last turn" digest. M3 is built on 2026-11-21: adding and removing members, editing the goal and roles, the briefing on a member's first turn, confirming decisions, and file state from scans of each member's folder. M4 is built on 2026-11-21: a collaboration may span one other device paired by code, with invitations its user accepts, entries replicated with receipts and an outbox, and the link ending with Burn, forgetting the device or re-pairing. Nothing beyond M4 is built. Windows is not measured. All five product decisions are made ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
 
 ## What kind of evidence this is
 
@@ -657,6 +657,41 @@ Variations:
    - Burn, forgetting the device and re-pairing with another key each delete memberships and entries. As in the resume tests, a freshly paired device inherits nothing.
    - An entry from a device whose key differs from the pin is refused.
    - Review and Full Access behave as before for everything outside a collaboration.
+
+   Built on 2026-11-21 (`collaboration/remote.rs`). It delivers:
+   - a collaboration spanning this device and one other paired by code: the device that created it invites a conversation in a folder the other device shares with it (Sessions and Agent requests on), and that device's user accepts or declines;
+   - each device's own copy, written only by its own Host, with every entry it writes sent to the other over Room Control (`native_agent.collab_entries`) once a member there accepted, the history first; a wire form with no task id, no folder and no status; each entry checked on arrival (bounds, no absolute path, authorship) and stored once;
+   - the sender outbox (the user decided on 2026-11-21: kept until the membership or collaboration ends), resent every 30 s, after each change and after each turn ends, settled by the Room Control receipt, which the receiver returns only after storing;
+   - executor-side authority: a message for a member on the other device waits there for that device's user or its own grant, including the other user's messages; grants, pausing and resuming stay per device; a member whose folder stops being shared is paused;
+   - the link ending when the pin is gone or differs (Burn, forgetting the device, re-pairing with another key): the creating device removes the other's members and entries; the invited device deletes its copy and asks its running turns to stop;
+   - records sealed at rest with the Bridge's payload key, which Burn deletes;
+   - UI: invitations with Accept and Decline on the Collaborations list, Invite from another device, members shown on their device, entries labelled with their device, and what is waiting for that device.
+
+   Acceptance, as tested (two real Hosts over the production room router, `room_control/collaboration_pair_tests.rs`):
+   - A member on another device joins only with its user's consent, receives the history, and messages cross both ways with receipts; each entry is stored once however often it is sent; a message from the other device's user waits for this user's approval; the creating device cannot grant the other device's member automatic turns; no folder of one device appears in the other's records.
+   - An entry from a device whose key differs from the pin is refused and stays in the sender's outbox; the link ends on that side; pairing the right key again restores nothing (a freshly paired device inherits nothing).
+   - Forgetting the device deletes the copy, its invitations and its rows on disk; Burn deletes the copy on the invited device and the other device's members and entries on the creating one, whose own collaboration stays and is unsealed; both copies were sealed at rest before.
+   - Only a folder shared with Sessions and Agent requests on can be invited; declining tells the inviter.
+   - Review and Full Access behave as before: the existing Full Access, remote session and Review pair tests pass unchanged.
+
+   M4's differences from the design above:
+   - A collaboration spans at most one other device, so every entry comes straight from the device that wrote it and nothing is relayed.
+   - Two event kinds, not three: the Room Control receipt, returned only after the receiver stored the batch, is the receipt; `collab_member` carries invite and decline only; leaving, ending, pausing and role changes are entries.
+   - Only the device that created the collaboration invites members and edits the goal; the invited device edits only its own members' roles.
+   - A question to `user` from either device needs an answer on both devices' Needs you; each user marks it done for their own device.
+   - The sender knows an entry was stored, not what the receiver did with it, until that device's own turn entries arrive.
+   - No retention period: the Journal stays until deleted (decision 5); a linked collaboration must be ended before it is deleted, so the other device is told.
+
+   Not yet verified: two real devices (steps below), the invitation and invite dialogs in the running app, and Windows.
+
+   Live check on two devices, when you have them at hand (each step on the device named):
+   1. Pair the Mac and the other device by code (both show the same fingerprint).
+   2. On the other device, share a folder with the Mac with Sessions and Agent requests on.
+   3. On the Mac, create a collaboration with one local member, then More → Invite from another device: choose the device, the shared folder, the Agent, an alias, and a first message.
+   4. On the other device, Collaborations shows the invitation: Accept. The Mac's member card shows the member joined; the other device's Journal shows the Mac's history, and the first message waiting for approval.
+   5. On the other device, approve it: its first turn runs there, with the briefing. Its reply's blocks reach the Mac, where a message to the Mac's member waits for approval.
+   6. Take the other device offline, send a message from the Mac, and see "waiting for" it; bring it back and see it delivered within 30 s.
+   7. Burn the Bridge on one device: the other device's members and entries disappear on both sides, and the invited device's copy is gone.
 7. **Later.** A read-only `journal` MCP tool; a per-run `send` tool where it helps; a DeepSeek adapter, which needs only the base adapter and an M1a-style measurement.
 
 ## M0 results (macOS, 2026-11-18)
@@ -800,8 +835,8 @@ A third consequence reaches beyond collaboration. A newer Codex GUI can switch t
 
 ## Open product decisions
 
-Still open:
-2. **A sender outbox,** as an exception to "Nothing is queued for a device that cannot be reached". Needed for M4.
+Decided by the user on 2026-11-21, for M4:
+2. **A sender outbox,** as an exception to "Nothing is queued for a device that cannot be reached": kept until the membership or the collaboration ends, resent when the device is reachable, stored once by the receiver.
 
 Decided by the user on 2026-11-21, for M3:
 - **A new member's first turn:** the add dialog takes an optional first message, which starts that turn after the briefing. Without one, the briefing goes on whichever turn reaches the member first.

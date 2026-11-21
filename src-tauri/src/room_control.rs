@@ -177,6 +177,8 @@ const ALLOWED_EVENT_KINDS: &[&str] = &[
     "native_agent.decision",
     "native_agent.session_query",
     "native_agent.session_response",
+    "native_agent.collab_member",
+    "native_agent.collab_entries",
 ];
 const BRIDGE_PLAN_PROTOCOL_FAMILY: &str = "bridge_plan";
 const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
@@ -2804,6 +2806,51 @@ pub async fn receive_room_control_event_handler(
                     .await;
                 });
             }
+            "native_agent.collab_member" | "native_agent.collab_entries" => {
+                // Agent collaboration across devices: stored (or refused)
+                // here, before the receipt, which tells the sender this
+                // device keeps it. Only from the device that proved the
+                // Bridge's pinned key in exactly this session; what it makes
+                // possible starts afterwards, under this device's own rules.
+                let binding = match crate::host_runtime::current_host_session_binding(
+                    &ctx.state,
+                    &room_id,
+                    &inbound_peer.peer_session_id,
+                ) {
+                    Ok(binding) => binding,
+                    Err(_) => {
+                        return control_error(
+                            StatusCode::FORBIDDEN,
+                            "host_mismatch",
+                            "Collaboration event has no bound peer Host.",
+                        )
+                    }
+                };
+                match crate::collaboration::remote::receive(&ctx.state, &validated.kind, payload, &binding) {
+                    Ok(()) => {
+                        let runtime = ctx.state.clone();
+                        std::thread::spawn(move || crate::collaboration::drive(&runtime));
+                    }
+                    Err(crate::collaboration::remote::RefusedV1::Identity) => {
+                        return control_error(
+                            StatusCode::FORBIDDEN,
+                            "identity_unverified",
+                            "The device did not prove the Bridge's pinned key in this session.",
+                        )
+                    }
+                    Err(crate::collaboration::remote::RefusedV1::Invalid(reason)) => {
+                        crate::logging::write_error_line(&format!(
+                            "[pastey collaboration] event=refused_from_peer reason_bytes={}",
+                            reason.len()
+                        ));
+                        return control_error(
+                            StatusCode::CONFLICT,
+                            "collaboration_refused",
+                            "The collaboration event was refused.",
+                        )
+                    }
+                }
+            }
             _ => {
                 return control_error(
                     StatusCode::BAD_REQUEST,
@@ -3658,6 +3705,9 @@ fn validate_control_event(
                 .map_err(AppError::from)?;
                 crate::native_agent::sessions::remote::validate_response(&response)?;
                 format!("native-session-response:{}", response.request_id)
+            }
+            "native_agent.collab_member" | "native_agent.collab_entries" => {
+                crate::collaboration::remote::replay_id(&kind, &Value::Object(payload.clone()))?
             }
             _ => {
                 return Err(AppError::InvalidInput(
@@ -5429,6 +5479,10 @@ mod tests {
                 "native_agent.decision",
                 "native_agent.session_query",
                 "native_agent.session_response",
+                // Core's Agent collaboration across two devices, shared by
+                // every capability and specific to none.
+                "native_agent.collab_member",
+                "native_agent.collab_entries",
             ]
         );
     }
@@ -6146,6 +6200,8 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod collaboration_pair_tests;
 #[cfg(all(test, unix))]
 mod full_access_pair_tests;
 #[cfg(all(test, unix))]
