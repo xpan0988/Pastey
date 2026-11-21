@@ -64,6 +64,9 @@ uuid = { version = "1", features = ["serde", "v4"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 [dev-dependencies]
+# Tests only: Tauri's mock runtime, to dispatch real IPC into the app's own
+# commands (`collaboration/ui_bridge.rs`).
+tauri = { version = "2", features = ["tray-icon", "test"] }
 # Tests only: an in-process relay and path pinning for the shaped two-Host
 # WAN tests (`connectivity/shaped_net.rs`). Not in a normal build.
 iroh = { version = "1.3", default-features = false, features = ["tls-ring", "test-utils", "unstable-custom-transports"] }

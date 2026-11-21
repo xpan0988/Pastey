@@ -47,12 +47,14 @@ impl HostEventSink for PairEvents {
     }
 }
 
-/// Background work runs for real, as in the product.
-struct TokioSpawner;
+/// Background work runs for real, as in the product, on the test's runtime
+/// from any thread (as the product's Tauri runtime does): the collaboration
+/// scheduler spawns from its own thread.
+struct TokioSpawner(tokio::runtime::Handle);
 
 impl RuntimeTaskSpawner for TokioSpawner {
     fn spawn(&self, task: RuntimeTask) {
-        tokio::spawn(task);
+        self.0.spawn(task);
     }
 }
 
@@ -128,7 +130,7 @@ async fn start_host(root: &Path, name: &'static str) -> PairHostV1 {
     storage::set_room_status(&paths, ROOM, crate::models::RoomStatus::Active).unwrap();
     let events = Arc::new(PairEvents::default());
     let runtime = Arc::new(
-        HostRuntime::new(paths, config(name), events.clone(), Arc::new(TokioSpawner)).unwrap(),
+        HostRuntime::new(paths, config(name), events.clone(), Arc::new(TokioSpawner(tokio::runtime::Handle::current()))).unwrap(),
     );
     let mut host = PairHostV1 {
         runtime,

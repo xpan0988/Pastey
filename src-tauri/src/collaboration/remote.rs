@@ -1371,11 +1371,25 @@ fn pin_of(paths: &crate::storage::AppPaths, bridge_id: &str) -> Option<PinV1> {
         })
 }
 
-/// The label this device's user knows the device by.
+/// The label this device's user knows the device by: as trusted, as paired
+/// by code, as the Bridge shows its peer, or as the Bridge names it.
 pub(crate) fn device_label(paths: &crate::storage::AppPaths, bridge_id: &str, fingerprint: &str) -> String {
+    let pin = crate::storage::bridge_peer_pin(paths, bridge_id).ok().flatten();
     crate::storage::list_trusted_devices(paths)
         .ok()
         .and_then(|devices| devices.into_iter().find(|device| device.fingerprint == fingerprint).map(|device| device.label))
+        .or_else(|| {
+            let pin = pin.as_ref()?;
+            crate::storage::known_device(paths, &pin.peer_device_public_key).ok().flatten().map(|device| device.label)
+        })
+        .or_else(|| {
+            let pin = pin.as_ref()?;
+            crate::storage::list_bridge_peer_endpoints(paths, bridge_id)
+                .ok()?
+                .into_iter()
+                .find(|peer| peer.logical_host_ref.as_deref() == Some(pin.peer_host_ref.as_str()))
+                .and_then(|peer| peer.display_name)
+        })
         .or_else(|| {
             crate::storage::get_room_by_id(paths, bridge_id)
                 .ok()

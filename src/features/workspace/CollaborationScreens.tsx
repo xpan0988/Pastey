@@ -7,7 +7,7 @@ import {
   answerCollaborationInvitation, inviteCollaborationMember, listCollaborationInvitations, originLabel, outboxLabel,
   type CollaborationInvitation, type CollaborationLink,
   activityCounts, addCollaborationMember, approveCollaborationMessages, decideCollaborationSummary, fileChangesLabel, fileStateLabel,
-  removeCollaborationMember, setCollaborationGoal, setCollaborationRole, summaryDecision, basisLabel, createCollaboration, currentStep, DEFAULT_AUTO_HOURS, DEFAULT_AUTO_TURNS,
+  removeCollaborationMember, setCollaborationGoal, setCollaborationRole, summaryDecider, summaryDecision, basisLabel, createCollaboration, currentStep, DEFAULT_AUTO_HOURS, DEFAULT_AUTO_TURNS,
   deleteCollaboration, dismissCollaborationEntry, elapsedLabel, folderName, getCollaboration, grantEndLabel, grantUsable, journalCount,
   journalEntries, listCollaborations, MAX_AUTO_HOURS, MAX_AUTO_TURNS, memberStateLabel, policyLabel, providerLabel,
   resumeCollaborationMember, sendCollaborationMessage, setCollaborationGrant, setCollaborationState, statusLabel, suggestAlias,
@@ -49,14 +49,14 @@ export function CollaborationsScreen({ menuButton }: { menuButton?: ReactNode })
   if (selected) return <CollaborationDetail id={selected} menuButton={menuButton} onBack={() => setSelected(null)} />;
   return (
     <section className="page">
-      <header className="page-header">{menuButton}<div className="page-header-main"><h1>Collaborations</h1><p>Agents on this device that leave each other messages. Nothing reaches an Agent mid-turn, and a message between Agents waits for your approval unless you allowed its recipient a few automatic turns.</p></div>
+      <header className="page-header">{menuButton}<div className="page-header-main"><h1>Collaborations</h1><p>Agents that leave each other messages, on this device and one paired with it. Nothing reaches an Agent mid-turn, and a message for an Agent waits for the approval of its device's user unless they allowed it a few automatic turns.</p></div>
         <div className="page-header-actions"><button type="button" className="btn btn-sm btn-primary" onClick={() => setCreating(true)}><Icon name="plus" small />New collaboration</button></div></header>
       <div className="page-body"><div className="content stack-lg">
         {error ? <Notice tone="bad">{error}</Notice> : null}
         {invitations.map((invitation) => <InvitationCard key={`${invitation.collaborationId}/${invitation.member.alias}`} invitation={invitation} pending={answering}
           onAnswer={(accept) => void answer(invitation, accept)} />)}
         {list.length === 0 ? <EmptyState title="No collaborations yet" actions={<button type="button" className="btn btn-sm" onClick={() => setCreating(true)}><Icon name="plus" small />New collaboration</button>}>
-          Group two or more Codex or Claude Code conversations of this device. Each Agent can then leave the others a message when its turn ends.
+          Start with a Codex or Claude Code conversation of this device, then add others here or invite one from a device paired with this one. Each Agent can then leave the others a message when its turn ends.
         </EmptyState> : <div className="list">
           {list.map((item) => <ListRow key={item.id} title={item.name}
             meta={<span>{item.members.map((member) => `${member.alias} (${providerLabel(member.provider)})`).join(" · ")}{item.link ? ` · with ${item.link.deviceLabel}` : ""}</span>}
@@ -138,7 +138,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
             onEditRole={() => setEditing({ kind: "role", member })}
             onRemove={view.members.length > 2 ? () => setRemoving(member) : undefined} />)}
         </div>
-        {!ended ? <Composer members={view.members} disabled={pending} onSend={(to, text) => act(() => sendCollaborationMessage(id, to, text))} /> : null}
+        {!ended ? <Composer members={view.members} link={link} disabled={pending} onSend={(to, text) => act(() => sendCollaborationMessage(id, to, text))} /> : null}
         <Segmented label="Show" value={filter} onChange={setFilter} options={filters} />
         {shown.length === 0 ? <EmptyState title={filter === "needs-you" ? "Nothing needs you" : "Nothing yet"}>
           {filter === "summaries" ? "An Agent writes a summary when its turn finishes a stage, makes a decision or gets blocked." : "Turns, messages and summaries appear here as they happen."}
@@ -273,7 +273,7 @@ function GrantDialog({ member, pending, onClose, onGrant }: { member: Collaborat
   </Dialog>;
 }
 
-function Composer({ members, disabled, onSend }: { members: CollaborationMember[]; disabled: boolean; onSend: (to: string, text: string) => Promise<void> }) {
+function Composer({ members, link, disabled, onSend }: { members: CollaborationMember[]; link?: CollaborationLink; disabled: boolean; onSend: (to: string, text: string) => Promise<void> }) {
   const [to, setTo] = useState(members[0]?.alias ?? "");
   const [text, setText] = useState("");
   const send = async () => {
@@ -287,7 +287,9 @@ function Composer({ members, disabled, onSend }: { members: CollaborationMember[
       <select id="collaboration-to" className="select select-sm" value={to} disabled={disabled} onChange={(event) => setTo(event.target.value)}>
         {members.map((member) => <option key={member.alias} value={member.alias}>{member.alias} ({providerLabel(member.provider)})</option>)}
       </select>
-      <span className="xsmall subtle">Delivered when its current turn ends. Your messages need no approval.</span>
+      <span className="xsmall subtle">{members.find((member) => member.alias === to)?.remote
+        ? `Waits on ${link?.deviceLabel ?? "the other device"} until its user (or its automatic turns there) lets it run.`
+        : "Delivered when its current turn ends. Your messages need no approval."}</span>
     </div>
     <textarea className="textarea" rows={3} maxLength={4096} value={text} disabled={disabled} placeholder={`Write to ${to || "a member"}…`}
       onChange={(event) => setText(event.target.value)}
@@ -328,12 +330,13 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
     }
     case "summary": {
       const decision = body.summary.decisions ? summaryDecision(entries, entry.id) : null;
+      const decider = decision !== null && summaryDecider(entries, entry.id) ? `The user on ${link?.deviceLabel ?? "the other device"}` : "You";
       return <div className="card"><div className="card-body stack" style={{ gap: 4 }}>
         <span className="small"><strong>{entry.member}</strong> · stage summary</span>
         {(["done", "decisions", "open", "next"] as const).map((field) => body.summary[field] ? <div key={field} className="small" style={{ whiteSpace: "pre-wrap" }}><span className="muted">{field}: </span>{body.summary[field]}</div> : null)}
         {meta}
         {body.summary.decisions ? <div className="row row-wrap" style={{ gap: 6, alignItems: "center" }}>
-          {decision !== null ? <Badge tone={decision ? "ok" : "warn"}>{decision ? "You confirmed these decisions" : "You rejected these decisions"}</Badge> : <span className="xsmall subtle">Members joining later see whether you confirmed these decisions.</span>}
+          {decision !== null ? <Badge tone={decision ? "ok" : "warn"}>{`${decider} ${decision ? "confirmed" : "rejected"} these decisions`}</Badge> : <span className="xsmall subtle">Members joining later see whether you confirmed these decisions.</span>}
           {decision !== true ? <button type="button" className="btn btn-sm" disabled={disabled} onClick={() => onDecide(true)}>Confirm decisions</button> : null}
           {decision !== false ? <button type="button" className="btn btn-sm btn-ghost" disabled={disabled} onClick={() => onDecide(false)}>Reject</button> : null}
         </div> : null}
@@ -357,7 +360,7 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
       return <div className="stack" style={{ gap: 2 }}><span className="small">{who}</span>{meta}</div>;
     }
     case "member":
-      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong> {body.change === "left" ? "left" : body.change === "invited" ? `was invited on ${link?.deviceLabel ?? "the other device"}` : body.change === "declined" ? "was declined by its device's user" : "joined"} ({providerLabel(body.provider)}){body.role && body.change !== "left" ? ` · ${body.role}` : ""}</span>{meta}</div>;
+      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong> {body.change === "left" ? "left" : body.change === "invited" ? (entry.host ? `was invited from ${link?.deviceLabel ?? "the other device"}` : `was invited on ${link?.deviceLabel ?? "the other device"}`) : body.change === "declined" ? "was declined by its device's user" : "joined"} ({providerLabel(body.provider)}){body.role && body.change !== "left" ? ` · ${body.role}` : ""}</span>{meta}</div>;
     case "files_outside":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong>'s folder changed between its turns</span>
         <span className="xsmall subtle mono" title="From Pastey's scans: by you, another app, or another client of its conversation">{fileChangesLabel(body)}</span>{meta}</div>;
@@ -459,14 +462,14 @@ function AddMemberDialog({ view, onClose, onAdd }: { view: CollaborationView; on
     footer={<><button type="button" className="btn btn-sm" onClick={onClose}>Cancel</button>
       <button type="button" className="btn btn-sm btn-primary" disabled={pending || !!problem} onClick={() => void add()}>{firstMessage.trim() ? "Add and start" : "Add"}</button></>}>
     <div className="stack-lg">
-      <div className="row row-wrap" style={{ gap: 8 }}>
-        <select className="select select-sm" aria-label="New member's Agent" value={member.provider} onChange={(event) => setMember({ ...member, provider: event.target.value as CollaborationProvider })}>
+      <div className="row row-wrap" style={{ gap: 12, alignItems: "flex-end" }}>
+        <Field label="Agent" htmlFor="add-agent"><select id="add-agent" className="select select-sm" value={member.provider} onChange={(event) => setMember({ ...member, provider: event.target.value as CollaborationProvider })}>
           <option value="codex">Codex</option><option value="claude_code">Claude Code</option>
-        </select>
-        <button type="button" className="btn btn-sm" onClick={() => void choose()}><Icon name="folder" small />{member.workspace ? folderName(member.workspace) : "Choose folder…"}</button>
-        <input className="input input-sm" aria-label="New member's alias" maxLength={32} value={member.alias} placeholder="alias" onChange={(event) => setMember({ ...member, alias: event.target.value.toLowerCase() })} />
+        </select></Field>
+        <Field label="Folder" htmlFor="add-folder"><button id="add-folder" type="button" className="btn btn-sm" onClick={() => void choose()}><Icon name="folder" small />{member.workspace ? folderName(member.workspace) : "Choose folder…"}</button></Field>
+        <Field label="Alias" htmlFor="add-alias"><input id="add-alias" className="input input-sm" maxLength={32} value={member.alias} placeholder="alias" onChange={(event) => setMember({ ...member, alias: event.target.value.toLowerCase() })} /></Field>
       </div>
-      <input className="input input-sm" aria-label="New member's role" maxLength={200} value={member.role} placeholder="Role, e.g. owns docs/; does not edit api/" onChange={(event) => setMember({ ...member, role: event.target.value })} />
+      <Field label="Role" htmlFor="add-role"><input id="add-role" className="input input-sm" maxLength={200} value={member.role} placeholder="e.g. owns docs/; does not edit api/" onChange={(event) => setMember({ ...member, role: event.target.value })} /></Field>
       <Field label="First message (optional)" hint="Starts its first turn now, after the briefing. Leave it empty and the briefing goes with whatever reaches it first." htmlFor="first-message">
         <textarea id="first-message" className="textarea" rows={3} maxLength={4096} value={firstMessage} onChange={(event) => setFirstMessage(event.target.value)}
           placeholder="Read the briefing, then tell me what is open and who owns what." />
@@ -565,16 +568,16 @@ function InviteMemberDialog({ view, onClose, onInvite }: {
           </select></Field>}
       {device && folders === null ? <span className="small muted">Asking {device.label} which folders it shares…</span> : null}
       {device && folders && folders.length === 0 ? <Notice tone="warn">{device.label} shares no folder with this device with Sessions and Agent requests on. Share one there first.</Notice> : null}
-      {folders && folders.length > 0 ? <div className="row row-wrap" style={{ gap: 8 }}>
-        <select className="select select-sm" aria-label="Folder there" value={scopeRef} onChange={(event) => setScopeRef(event.target.value)}>
+      {folders && folders.length > 0 ? <div className="row row-wrap" style={{ gap: 12, alignItems: "flex-end" }}>
+        <Field label="Folder there" htmlFor="invite-folder"><select id="invite-folder" className="select select-sm" value={scopeRef} onChange={(event) => setScopeRef(event.target.value)}>
           {folders.map((folder) => <option key={folder.scopeRef} value={folder.scopeRef}>{folder.label}</option>)}
-        </select>
-        <select className="select select-sm" aria-label="Its Agent" value={provider} onChange={(event) => setProvider(event.target.value as CollaborationProvider)}>
+        </select></Field>
+        <Field label="Agent" htmlFor="invite-agent"><select id="invite-agent" className="select select-sm" value={provider} onChange={(event) => setProvider(event.target.value as CollaborationProvider)}>
           <option value="codex">Codex</option><option value="claude_code">Claude Code</option>
-        </select>
-        <input className="input input-sm" aria-label="Its alias" maxLength={32} value={alias} placeholder="alias" onChange={(event) => setAlias(event.target.value.toLowerCase())} />
+        </select></Field>
+        <Field label="Alias" htmlFor="invite-alias"><input id="invite-alias" className="input input-sm" maxLength={32} value={alias} placeholder="alias" onChange={(event) => setAlias(event.target.value.toLowerCase())} /></Field>
       </div> : null}
-      <input className="input input-sm" aria-label="Its role" maxLength={200} value={role} placeholder="Role, e.g. owns web/; does not edit api/" onChange={(event) => setRole(event.target.value)} />
+      <Field label="Role" htmlFor="invite-role"><input id="invite-role" className="input input-sm" maxLength={200} value={role} placeholder="e.g. owns web/; does not edit api/" onChange={(event) => setRole(event.target.value)} /></Field>
       <Field label="First message (optional)" hint="Waits there with the briefing until that device's user lets its first turn run." htmlFor="invite-first-message">
         <textarea id="invite-first-message" className="textarea" rows={3} maxLength={4096} value={firstMessage} onChange={(event) => setFirstMessage(event.target.value)} />
       </Field>

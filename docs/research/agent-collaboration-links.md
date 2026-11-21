@@ -600,7 +600,7 @@ Variations:
 
    So a Claude Code member can change files only as far as its own permission settings already allow. Anything else comes back as a question for the user. This limit should be explained where members are added.
 
-   Not yet verified: the collaboration view rendered with real data (the list and the create dialog were checked in a browser without the backend), and Windows.
+   Checked on 2026-11-21 in the browser bridge (M4 below): the collaboration view with real data, approvals and the composer. Not yet verified: Windows.
 4. **M2, bounded `auto`, and progress.** Built on 2026-11-20. It delivers:
    - the auto grant, stored on the member: a message from another member waits for the member's automatic turn (`auto`) instead of the user, and starts it when the folder is free, while turns and time remain and the device has started fewer than 30 automatic turns in the last hour; approving such a message spares the grant; the grant ends, visibly, when used up, expired, withdrawn or the collaboration ends, and what waited for it waits for the user again;
    - a turn that fails before its harness reported any action gives its turn back and pauses the member, with the likely reasons (usage limit, sign-in, model) under Needs you;
@@ -628,7 +628,7 @@ Variations:
    - `api`'s automatic turn (Codex) had "Since your last turn:" in its prompt. It checked the plan against `orders.py` without running anything (no activity reported; 3 s), recorded a summary and sent no acknowledgement. Its grant ended as used up and nothing else started.
    - Codex reported its first command as reading its own memory file under the home folder. Action labels can name paths outside the member's folder, which is why the live card stays Host-private.
 
-   Not yet verified: the collaboration view (live card, grant dialog) in the running app with real data, a turn that fails at once with a real provider error, and Windows.
+   Checked on 2026-11-21 in the browser bridge (M4 below): the grant dialog, and the live card during a real Claude Code turn and a real Codex turn. Not yet verified: a turn that fails at once with a real provider error, and Windows.
 5. **M3, joining.** Roles and goal, the briefing, and the file manifest. Acceptance:
    - A member added mid-collaboration (Codex or Claude standing in for DeepSeek) lists, in its first reply, the open items and who owns what, matching the Journal in at least 18 of 20 runs, without messaging anyone.
    - A shell-made change appears in file state.
@@ -652,7 +652,7 @@ Variations:
    - A turn the user types is scanned in the start command itself, so a very large folder can hold that command for up to 2 s.
    - Removing a member is refused while Pastey runs a turn for it; nothing stops that turn.
 
-   Not yet verified: the add-member, edit and decision dialogs in the running app with real data, file state with real turns in the running app, and Windows.
+   Checked on 2026-11-21 in the browser bridge (M4 below): Confirm on a real summary's decisions, file state from a real Codex edit and from a hand edit between turns, and the add-member dialog. Not yet verified: Windows.
 6. **M4, across devices.** Replicating published entries with the disclosure rules; executor-side grants; pinned keys. Acceptance:
    - Burn, forgetting the device and re-pairing with another key each delete memberships and entries. As in the resume tests, a freshly paired device inherits nothing.
    - An entry from a device whose key differs from the pin is refused.
@@ -682,7 +682,20 @@ Variations:
    - The sender knows an entry was stored, not what the receiver did with it, until that device's own turn entries arrive.
    - No retention period: the Journal stays until deleted (decision 5); a linked collaboration must be ended before it is deleted, so the other device is told.
 
-   Not yet verified: two real devices (steps below), the invitation and invite dialogs in the running app, and Windows.
+   Checked on 2026-11-21 in a browser bridge (`tools/ui-bridge`): the app's frontend in a browser, driving two real Hosts of the pair harness through the app's own Tauri commands (Tauri's mock runtime), with the installed Codex 0.170.0 and Claude Code 2.1.318 at effort `low`.
+   - The flow, by hand in the UI: create with one member; invite from the paired device; accept there; the Mac user's first message waits for approval on the other device; a 1-turn grant there starts Claude Code's turn (live card, then "1 command, no files changed"); its message to `api` waits for approval on the Mac; Codex answers with a message and a summary with decisions; Confirm; a hand edit between turns is recorded as outside the turns, and Codex's edit as "1 file changed: orders.py". Every entry crossed both ways and was stored once.
+   - It found and fixed:
+     - the other device was named "the other device" when this device had not trusted it (now from the code pairing or the Bridge's peer);
+     - after accepting, the history waited for the next 30 s tick (it is now sent on receipt);
+     - the composer said messages to a member on the other device "need no approval";
+     - a decision confirmed on the other device read "You confirmed";
+     - an invitation from the other device read "invited on" it;
+     - the policy line read "Asks you" while the last automatic turn ran;
+     - the invite and add dialogs had unlabelled fields;
+     - the Collaborations page still said "this device" and "two or more".
+   - It also found two gaps in the test harness only: its task spawner panicked outside a Tokio thread (the product's Tauri runtime does not), and test builds leave the installed Claude Code out unless registered.
+
+   Not yet verified: two real devices (steps below), the native window (WKWebView), and Windows.
 
    Live check on two devices, when you have them at hand (each step on the device named):
    1. Pair the Mac and the other device by code (both show the same fingerprint).

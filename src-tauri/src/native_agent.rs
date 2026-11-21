@@ -1567,6 +1567,17 @@ impl NativeAgentServiceV1 {
         self.adapters.push(Arc::new(adapter));
     }
 
+    /// Tests that use the installed, signed-in Claude Code on purpose (live
+    /// checks and the collaboration UI bridge): registers its conversation
+    /// adapter, which the product registers and tests otherwise leave out,
+    /// with `helper` as its lifeline (the built `pastey`).
+    #[cfg(test)]
+    pub(crate) fn add_installed_claude_code_conversation_for_test(&mut self, helper: &Path) {
+        let adapter = capability::claude_code::conversation::ClaudeCodeConversationAdapterV1::default();
+        adapter.use_lifeline_helper(helper);
+        self.adapters.push(Arc::new(adapter));
+    }
+
     /// Tests: registers one more adapter, as the product registers its own.
     #[cfg(test)]
     pub(crate) fn add_adapter_for_test(&mut self, adapter: Arc<dyn NativeCapabilityAdapterV1>) {

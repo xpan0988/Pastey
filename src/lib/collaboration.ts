@@ -387,6 +387,7 @@ export function grantUsable(grant: AutoGrant | undefined, now: number): grant is
 /** "Automatic · 2 of 3 turns left · until 16:40", or "Asks you". */
 export function policyLabel(member: CollaborationMember, now: number, formatTime: (seconds: number) => string): string {
   const grant = member.grant;
+  if (grant && member.autoTask && grant.used >= grant.turns) return "Automatic · its last automatic turn is running";
   if (!grantUsable(grant, now)) return "Asks you before each turn";
   const left = grant.turns - grant.used;
   return `Automatic · ${left} of ${grant.turns} turn${grant.turns === 1 ? "" : "s"} left · until ${formatTime(grant.expiresAt)}`;
@@ -424,6 +425,16 @@ export function summaryDecision(entries: CollaborationEntry[], entryId: string):
     if (body.type === "user" && body.action.type === "decided" && body.action.entry === entryId) return body.action.confirmed;
   }
   return null;
+}
+
+/** The device whose user made the latest choice on a summary's decisions:
+ * undefined for this device's user (or when nobody chose). */
+export function summaryDecider(entries: CollaborationEntry[], entryId: string): string | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.body.type === "user" && entry.body.action.type === "decided" && entry.body.action.entry === entryId) return entry.host;
+  }
+  return undefined;
 }
 
 /** Listed paths of a change, added first. */

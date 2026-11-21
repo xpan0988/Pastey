@@ -9,7 +9,7 @@ import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
 import {
   activityCounts, changedPaths, currentStep, elapsedLabel, fileChangesLabel, fileStateLabel, grantUsable, journalCount, journalEntries,
-  memberStateLabel, needsUser, originLabel, outboxLabel, policyLabel, statusLabel, suggestAlias, summaryDecision, turnOutcomeLabel, validAlias,
+  memberStateLabel, needsUser, originLabel, outboxLabel, policyLabel, statusLabel, suggestAlias, summaryDecider, summaryDecision, turnOutcomeLabel, validAlias,
   waitingByRecipient, type CollaborationEntry, type CollaborationMember,
 } from "../src/lib/collaboration";
 import {
@@ -2379,6 +2379,8 @@ test("an auto grant shows its turns left until it is used up or expires, and a l
   assert.equal(policyLabel(member, 8_200, time), "Asks you before each turn", "expired");
   assert.equal(policyLabel({ ...member, grant: { ...member.grant!, used: 3 } }, 2_000, time), "Asks you before each turn", "used up");
   assert.equal(policyLabel({ ...member, grant: undefined }, 2_000, time), "Asks you before each turn");
+  // Its last automatic turn, still running.
+  assert.equal(policyLabel({ ...member, autoTask: "t", grant: { ...member.grant!, used: 3 } }, 2_000, time), "Automatic · its last automatic turn is running");
   assert.equal(grantUsable(member.grant, 2_000), true);
   // An item waiting for an automatic turn does not need the user.
   assert.equal(needsUser({ id: "e", seq: 1, at: 1, basis: "claim", body: { type: "message", from: "api", to: "web", subject: "", body: "x", hop: 1 }, status: { state: "auto", attempts: 0 } }), false);
@@ -2403,6 +2405,9 @@ test("decisions show the user's latest choice, and file state reads from Pastey'
   assert.equal(summaryDecision([summary, decided(2, true)], "s1"), true);
   assert.equal(summaryDecision([summary, decided(2, true), decided(3, false)], "s1"), false, "the latest choice counts");
   assert.equal(summaryDecision([summary, decided(2, true)], "other"), null);
+  // Whose choice it was: this device's user, or the linked device's.
+  assert.equal(summaryDecider([summary, decided(2, true)], "s1"), undefined);
+  assert.equal(summaryDecider([summary, decided(2, true), { ...decided(3, false), host: "host-mac" }], "s1"), "host-mac");
   const changes = { added: ["test_orders.py"], changed: ["orders.py"], removed: ["old.py", "older.py"], total: 6 };
   assert.deepEqual(changedPaths(changes), ["test_orders.py", "orders.py", "old.py", "older.py"]);
   assert.equal(fileChangesLabel(changes), "6 files changed: test_orders.py, orders.py, old.py +3");

@@ -2830,6 +2830,9 @@ pub async fn receive_room_control_event_handler(
                     Ok(()) => {
                         let runtime = ctx.state.clone();
                         std::thread::spawn(move || crate::collaboration::drive(&runtime));
+                        // What this device owes back (its history, once a
+                        // member there accepted) goes now, not at the tick.
+                        crate::collaboration::remote::sync_soon(&ctx.state);
                     }
                     Err(crate::collaboration::remote::RefusedV1::Identity) => {
                         return control_error(

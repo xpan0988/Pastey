@@ -2790,13 +2790,13 @@ pub(crate) fn drive(runtime: &HostRuntime) {
                     &plan.workspace,
                     &plan.prompt,
                     false,
-                    &NativeSessionOptionsV1::default(),
+                    &turn_options(),
                 ),
                 ProviderV1::ClaudeCode => natives.start_claude_code_member_task(
                     &plan.workspace,
                     &plan.prompt,
                     false,
-                    &NativeSessionOptionsV1::default(),
+                    &turn_options(),
                 ),
             }
         };
@@ -2853,3 +2853,17 @@ pub(crate) fn member_runtime(runtime: &HostRuntime) -> impl Fn(&Path) -> MemberR
 
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, unix))]
+mod ui_bridge;
+
+/// Tests only: the options turns the collaboration starts use.
+#[cfg(test)]
+pub(crate) static TURN_OPTIONS_FOR_TESTS: std::sync::Mutex<Option<NativeSessionOptionsV1>> = std::sync::Mutex::new(None);
+
+fn turn_options() -> NativeSessionOptionsV1 {
+    #[cfg(test)]
+    if let Some(options) = TURN_OPTIONS_FOR_TESTS.lock().ok().and_then(|options| options.clone()) {
+        return options;
+    }
+    NativeSessionOptionsV1::default()
+}
