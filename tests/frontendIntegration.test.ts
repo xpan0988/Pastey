@@ -8,8 +8,9 @@ import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
 import { mergeTransferEvent } from "../src/lib/transferState";
 import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
 import {
-  activityCounts, currentStep, elapsedLabel, grantUsable, journalCount, journalEntries, memberStateLabel, needsUser, policyLabel,
-  statusLabel, suggestAlias, turnOutcomeLabel, validAlias, waitingByRecipient, type CollaborationEntry, type CollaborationMember,
+  activityCounts, changedPaths, currentStep, elapsedLabel, fileChangesLabel, fileStateLabel, grantUsable, journalCount, journalEntries,
+  memberStateLabel, needsUser, policyLabel, statusLabel, suggestAlias, summaryDecision, turnOutcomeLabel, validAlias, waitingByRecipient,
+  type CollaborationEntry, type CollaborationMember,
 } from "../src/lib/collaboration";
 import {
   CLAUDE_CODE_AGENT_ID,
@@ -2393,6 +2394,21 @@ test("an auto grant shows its turns left until it is used up or expires, and a l
   assert.equal(activityCounts({ commands: 0, failedCommands: 0, filesChanged: 0 }), null);
   assert.equal(elapsedLabel(245), "4 m 05 s");
   assert.equal(elapsedLabel(9), "9 s");
+});
+
+test("decisions show the user's latest choice, and file state reads from Pastey's scans", () => {
+  const summary: CollaborationEntry = { id: "s1", seq: 1, at: 1, member: "api", basis: "claim", body: { type: "summary", summary: { decisions: "cursors are opaque" } } };
+  const decided = (seq: number, confirmed: boolean): CollaborationEntry => ({ id: `d${seq}`, seq, at: seq, basis: "user", body: { type: "user", action: { type: "decided", entry: "s1", confirmed } } });
+  assert.equal(summaryDecision([summary], "s1"), null);
+  assert.equal(summaryDecision([summary, decided(2, true)], "s1"), true);
+  assert.equal(summaryDecision([summary, decided(2, true), decided(3, false)], "s1"), false, "the latest choice counts");
+  assert.equal(summaryDecision([summary, decided(2, true)], "other"), null);
+  const changes = { added: ["test_orders.py"], changed: ["orders.py"], removed: ["old.py", "older.py"], total: 6 };
+  assert.deepEqual(changedPaths(changes), ["test_orders.py", "orders.py", "old.py", "older.py"]);
+  assert.equal(fileChangesLabel(changes), "6 files changed: test_orders.py, orders.py, old.py +3");
+  assert.equal(fileChangesLabel({ total: 0 }), "no files changed");
+  assert.equal(fileStateLabel({ state: "observed", changed: ["a.py"], total: 1 }), "1 file changed: a.py");
+  assert.equal(fileStateLabel({ state: "unavailable", reason: "it has more than 50000 files" }), "file state unavailable: it has more than 50000 files");
 });
 
 test("a member alias is suggested from its folder and never collides with another or with the user", () => {

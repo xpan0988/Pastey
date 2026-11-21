@@ -2170,8 +2170,8 @@ fn installed_codex_and_claude_code_take_automatic_turns_within_their_grants() {
         assert!(plan.automatic, "{} started without approval", plan.alias);
         eprintln!("--- {}'s automatic prompt ---\n{}\n---", plan.alias, plan.prompt);
         assert!(
-            plan.prompt.contains("Since your last turn:") || plan.prompt.contains("Since this collaboration started:"),
-            "the digest is in the prompt"
+            plan.prompt.contains("Since your last turn:") || plan.prompt.contains("[Pastey briefing for "),
+            "the briefing or the digest is in the prompt"
         );
         let status = match plan.provider {
             ProviderV1::Codex => service.start_codex_conversation_task(&plan.workspace, &plan.prompt, false, &low),
@@ -2226,4 +2226,216 @@ fn installed_codex_and_claude_code_take_automatic_turns_within_their_grants() {
         EntryBodyV1::Grant { alias, change: GrantChangeV1::Ended { reason: GrantEndV1::UsedUp } } if alias == "web"
     )), "web's grant ended used up");
     assert!(live_seen.iter().any(|(alias, polls)| alias == "web" && *polls > 0), "web's live card showed activity while it ran");
+}
+
+/// M3 live measurement: a member that joins a collaboration with history
+/// reads the briefing, and its first reply lists the open items and who
+/// owns what, matching the Journal, without messaging anyone. The design's
+/// bar is 18 of 20. The Journal is built the same way for every run, from
+/// fixed turn outputs (no live turns); only the joining member's turn is
+/// live, alternating Codex and Claude Code, at effort low. Replies and
+/// grades go to `target/collab-join-results/`.
+#[test]
+#[ignore = "uses the installed, signed-in Codex and Claude Code and their quota"]
+fn installed_agents_joining_a_collaboration_read_its_briefing() {
+    use crate::collaboration::{
+        manifest, CollaborationServiceV1, EntryBodyV1, MemberInputV1, ProviderV1,
+    };
+    let runs: usize = std::env::var("PASTEY_M3_RUNS").ok().and_then(|runs| runs.parse().ok()).unwrap_or(20);
+    let results = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/collab-join-results");
+    let _ = fs::remove_dir_all(&results);
+    fs::create_dir_all(&results).unwrap();
+    let root = std::env::temp_dir().join(format!("pastey-collab-join-{}", Uuid::new_v4()));
+    let paths = crate::storage::AppPaths::new(root.join("app-data"), root.join("logs"));
+    paths.ensure_directories().unwrap();
+    crate::storage::init_database(&paths).unwrap();
+    let claude = Arc::new(ClaudeCodeConversationAdapterV1::default());
+    claude.use_lifeline_helper(&built_pastey());
+    let codex = Arc::new(super::super::super::codex::CodexNativeAdapterV1::default());
+    let mut service =
+        NativeAgentServiceV1::with_paths_and_adapters(paths, vec![claude, codex]).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    service.set_turn_listener(sender);
+    let low = options(None, Some("low"));
+    let first_message = "You just joined this collaboration. Before doing anything else, reply with two short lists: \
+                         the open items, and who owns what. Do not change any files.";
+    let mut passes = [0usize; 2];
+    let mut tried = [0usize; 2];
+    let mut lines = Vec::new();
+
+    for run in 0..runs {
+        let provider = if run % 2 == 0 { ProviderV1::Codex } else { ProviderV1::ClaudeCode };
+        let api = live_workspace(&format!("collab-join-{run}-api"));
+        let web = live_workspace(&format!("collab-join-{run}-web"));
+        let docs = live_workspace(&format!("collab-join-{run}-docs"));
+        fs::write(api.join("orders.py"), "def list_orders(offset=0, limit=50):\n    ...\n").unwrap();
+        fs::write(web.join("OrdersTable.js"), "// sends ?offset=\n").unwrap();
+        fs::create_dir_all(docs.join("docs")).unwrap();
+        fs::write(docs.join("docs/orders.md"), "# GET /v2/orders\n\nPaginate with `offset`.\n").unwrap();
+        let mut collaborations = CollaborationServiceV1::new(None).unwrap();
+        let id = collaborations
+            .create(
+                "orders-v2",
+                "Move GET /v2/orders to cursor pagination",
+                vec![
+                    MemberInputV1 {
+                        alias: "api".into(),
+                        provider: ProviderV1::Codex,
+                        workspace: api.to_string_lossy().into(),
+                        role: "owns the orders service (orders.py); does not edit the web client".into(),
+                    },
+                    MemberInputV1 {
+                        alias: "web".into(),
+                        provider: ProviderV1::ClaudeCode,
+                        workspace: web.to_string_lossy().into(),
+                        role: "owns the web client (OrdersTable.js)".into(),
+                    },
+                ],
+            )
+            .unwrap();
+        let fixed = |task: &str, workspace: &Path, provider: ProviderV1, text: &str, state| crate::native_agent::TurnEndedV1 {
+            task_id: task.into(),
+            capability_id: if provider == ProviderV1::Codex {
+                crate::native_agent::CODEX_CAPABILITY_ID.into()
+            } else {
+                crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY.into()
+            },
+            workspace: Some(workspace.to_path_buf()),
+            state,
+            code: None,
+            output: Some(OpaqueCapabilityPayloadV1::text_for_tests(text)),
+            activity: None,
+        };
+        // api's first turn changes files (scanned), decides, and asks web
+        // for a rename the user later dismisses.
+        collaborations.turn_starting(&id, "api", manifest::scan(&api)).unwrap();
+        fs::write(api.join("orders.py"), "def list_orders(cursor=None, limit=50):\n    ...\n").unwrap();
+        fs::write(api.join("test_orders.py"), "def test_cursor(): ...\n").unwrap();
+        collaborations
+            .turn_ended_observed(
+                &fixed(
+                    "join-api-1",
+                    &api,
+                    ProviderV1::Codex,
+                    "Switched list_orders to cursors.\n\n```pastey-message to=web\nsubject: Rename fetchOrders to fetchOrdersPage\n\nPlease rename it.\n```\n\n```pastey-summary\ndone: list_orders takes a cursor; tests added\ndecisions: nextCursor is an opaque base64 string; a request that sends offset gets 400\n```\n",
+                    NativeAgentTaskStateV1::Completed,
+                ),
+                Some(manifest::scan(&api)),
+            )
+            .unwrap();
+        let journal = collaborations.view(&id, |_| Default::default()).unwrap().entries;
+        let rename = journal
+            .iter()
+            .find(|entry| matches!(&entry.body, EntryBodyV1::Message { subject, .. } if subject.starts_with("Rename")))
+            .unwrap()
+            .id
+            .clone();
+        collaborations.dismiss(&id, &rename).unwrap();
+        let decided = journal
+            .iter()
+            .find(|entry| matches!(&entry.body, EntryBodyV1::Summary { .. }))
+            .unwrap()
+            .id
+            .clone();
+        collaborations.decide(&id, &decided, true).unwrap();
+        // api's second turn: a message to web (waiting for approval) and a
+        // question to the user (open).
+        collaborations
+            .turn_ended(&fixed(
+                "join-api-2",
+                &api,
+                ProviderV1::Codex,
+                "Contract is final.\n\n```pastey-message to=web\nsubject: Switch OrdersTable.js to nextCursor\n\nSend ?cursor=<nextCursor> instead of ?offset=; stop when nextCursor is null.\n```\n\n```pastey-message to=user\nsubject: Keep the offset UI behind a flag?\n\nShould web keep the old page-number UI behind a feature flag for one release?\n```\n\n```pastey-summary\nopen: web still sends offset; the user has not answered about the flag\n```\n",
+                NativeAgentTaskStateV1::Completed,
+            ))
+            .unwrap();
+        // The user starts web, then stops its turn: web is paused.
+        collaborations.user_message(&id, "web", "Start on OrdersTable.").unwrap();
+        let plans = collaborations.plan_starts(|_| false);
+        let plan = plans.iter().find(|plan| plan.alias == "web").unwrap().clone();
+        collaborations.started(&plan, "join-web-1").unwrap();
+        collaborations
+            .turn_ended(&fixed("join-web-1", &web, ProviderV1::ClaudeCode, "Stopped.", NativeAgentTaskStateV1::Cancelled))
+            .unwrap();
+
+        // docs joins, with the user's first message.
+        collaborations
+            .add_member(
+                &id,
+                MemberInputV1 {
+                    alias: "docs".into(),
+                    provider,
+                    workspace: docs.to_string_lossy().into(),
+                    role: "owns the API docs (docs/orders.md)".into(),
+                },
+                Some(first_message),
+            )
+            .unwrap();
+        let plans = collaborations.plan_starts(|workspace| service.workspace_in_use(workspace));
+        assert_eq!(plans.len(), 1, "{plans:?}");
+        let plan = &plans[0];
+        assert_eq!(plan.alias, "docs");
+        if run == 0 {
+            fs::write(results.join("briefing-prompt.txt"), &plan.prompt).unwrap();
+        }
+        let status = match provider {
+            ProviderV1::Codex => service.start_codex_conversation_task(&docs, &plan.prompt, true, &low),
+            ProviderV1::ClaudeCode => service.start_claude_code_member_task(&docs, &plan.prompt, true, &low),
+        }
+        .unwrap();
+        collaborations.started(plan, &status.task_id).unwrap();
+        let ended = receiver.recv_timeout(Duration::from_secs(300)).expect("docs' turn ended");
+        assert_eq!(ended.task_id, status.task_id);
+        let reply = ended
+            .output
+            .as_ref()
+            .and_then(|output| output.value().get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        collaborations.turn_ended(&ended).unwrap();
+        let messages = collaborations
+            .view(&id, |_| Default::default())
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|entry| matches!(&entry.body, EntryBodyV1::Message { from, .. } if from == "docs"))
+            .count();
+        // The grade: every open item, the owners, nothing closed listed, no
+        // message.
+        let text = reply.to_lowercase();
+        let any = |words: &[&str]| words.iter().any(|word| text.contains(word));
+        let waiting = any(&["orderstable", "nextcursor"]) && any(&["approv", "waiting", "pending", "not yet delivered", "undelivered"]);
+        let flag = text.contains("flag");
+        // "paused", or the user asked to resume it.
+        let paused = any(&["paused", "stopped", "resume"]);
+        let stale = text.contains("rename") || text.contains("fetchorderspage");
+        let owners = any(&["orders.py", "orders service"]) && text.contains("orderstable") && any(&["docs/orders.md", "api docs"]);
+        let passed = ended.state == NativeAgentTaskStateV1::Completed
+            && waiting
+            && flag
+            && paused
+            && !stale
+            && owners
+            && messages == 0;
+        let side = usize::from(provider == ProviderV1::ClaudeCode);
+        tried[side] += 1;
+        passes[side] += usize::from(passed);
+        let line = format!(
+            "run {run:02} {provider:?}: {} state={:?} waiting={waiting} flag={flag} paused={paused} stale={stale} owners={owners} messages={messages}",
+            if passed { "PASS" } else { "FAIL" },
+            ended.state
+        );
+        eprintln!("{line}");
+        lines.push(line);
+        fs::write(results.join(format!("run-{run:02}-{provider:?}.txt")), &reply).unwrap();
+    }
+    let total = format!(
+        "Codex {}/{}, Claude Code {}/{}, together {}/{}",
+        passes[0], tried[0], passes[1], tried[1], passes[0] + passes[1], runs
+    );
+    eprintln!("{total}");
+    lines.push(total);
+    fs::write(results.join("grades.txt"), lines.join("\n")).unwrap();
+    let _ = fs::remove_dir_all(root);
 }

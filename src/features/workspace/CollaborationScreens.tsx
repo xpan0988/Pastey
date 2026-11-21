@@ -1,7 +1,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import {
-  activityCounts, approveCollaborationMessages, basisLabel, createCollaboration, currentStep, DEFAULT_AUTO_HOURS, DEFAULT_AUTO_TURNS,
+  activityCounts, addCollaborationMember, approveCollaborationMessages, decideCollaborationSummary, fileChangesLabel, fileStateLabel,
+  removeCollaborationMember, setCollaborationGoal, setCollaborationRole, summaryDecision, basisLabel, createCollaboration, currentStep, DEFAULT_AUTO_HOURS, DEFAULT_AUTO_TURNS,
   deleteCollaboration, dismissCollaborationEntry, elapsedLabel, folderName, getCollaboration, grantEndLabel, grantUsable, journalCount,
   journalEntries, listCollaborations, MAX_AUTO_HOURS, MAX_AUTO_TURNS, memberStateLabel, policyLabel, providerLabel,
   resumeCollaborationMember, sendCollaborationMessage, setCollaborationGrant, setCollaborationState, statusLabel, suggestAlias,
@@ -59,6 +60,9 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   const [pending, setPending] = useState(false);
   const [confirming, setConfirming] = useState<"end" | "delete" | null>(null);
   const [granting, setGranting] = useState<CollaborationMember | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<{ kind: "goal" } | { kind: "role"; member: CollaborationMember } | null>(null);
+  const [removing, setRemoving] = useState<CollaborationMember | null>(null);
   const refresh = useCallback(async () => {
     try { setView(await getCollaboration(id)); setError(null); } catch (cause) { setError(errorText(cause, "This collaboration could not be read.")); }
   }, [id]);
@@ -88,7 +92,9 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
         <div className="page-header-actions">
           {view.state === "active" ? <button type="button" className="btn btn-sm" disabled={pending} onClick={() => void act(() => setCollaborationState(id, "paused"))}>Pause</button> : null}
           {view.state === "paused" ? <button type="button" className="btn btn-sm" disabled={pending} onClick={() => void act(() => setCollaborationState(id, "active"))}>Resume</button> : null}
+          {!ended && view.members.length < 6 ? <button type="button" className="btn btn-sm" disabled={pending} onClick={() => setAdding(true)}><Icon name="plus" small />Add member</button> : null}
           <MenuButton label="More collaboration actions">{(close) => <>
+            {!ended ? <button type="button" role="menuitem" onClick={() => { close(); setEditing({ kind: "goal" }); }}><Icon name="file" /><span>Edit goal…<small>Members see it from their next turn</small></span></button> : null}
             {!ended ? <button type="button" role="menuitem" onClick={() => { close(); setConfirming("end"); }}><Icon name="close" /><span>End collaboration<small>Members become ordinary conversations; the Journal stays</small></span></button> : null}
             <button type="button" role="menuitem" onClick={() => { close(); setConfirming("delete"); }}><Icon name="flame" /><span>Delete…<small>Removes the Journal; conversations stay</small></span></button>
           </>}</MenuButton>
@@ -102,18 +108,35 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
             onApprove={(ids) => void act(() => approveCollaborationMessages(id, ids))}
             onResume={() => void act(() => resumeCollaborationMember(id, member.alias))}
             onGrant={() => setGranting(member)}
-            onWithdraw={() => void act(() => withdrawCollaborationGrant(id, member.alias))} />)}
+            onWithdraw={() => void act(() => withdrawCollaborationGrant(id, member.alias))}
+            onEditRole={() => setEditing({ kind: "role", member })}
+            onRemove={view.members.length > 2 ? () => setRemoving(member) : undefined} />)}
         </div>
         {!ended ? <Composer members={view.members} disabled={pending} onSend={(to, text) => act(() => sendCollaborationMessage(id, to, text))} /> : null}
         <Segmented label="Show" value={filter} onChange={setFilter} options={filters} />
         {shown.length === 0 ? <EmptyState title={filter === "needs-you" ? "Nothing needs you" : "Nothing yet"}>
           {filter === "summaries" ? "An Agent writes a summary when its turn finishes a stage, makes a decision or gets blocked." : "Turns, messages and summaries appear here as they happen."}
         </EmptyState> : <div className="stack">
-          {shown.map((entry) => <EntryCard key={entry.id} entry={entry} members={view.members} disabled={pending || ended}
+          {shown.map((entry) => <EntryCard key={entry.id} entry={entry} entries={view.entries} members={view.members} disabled={pending || ended}
             onApprove={() => void act(() => approveCollaborationMessages(id, [entry.id]))}
-            onDismiss={() => void act(() => dismissCollaborationEntry(id, entry.id))} />)}
+            onDismiss={() => void act(() => dismissCollaborationEntry(id, entry.id))}
+            onDecide={(confirmed) => void act(() => decideCollaborationSummary(id, entry.id, confirmed))} />)}
         </div>}
       </div></div>
+      {adding ? <AddMemberDialog view={view} onClose={() => setAdding(false)}
+        onAdd={async (member, firstMessage) => { const next = await addCollaborationMember(id, member, firstMessage); setView(next); setAdding(false); }} /> : null}
+      {editing ? <TextEditDialog
+        title={editing.kind === "goal" ? "Edit the goal" : `Edit ${editing.member.alias}'s role`}
+        description={editing.kind === "goal" ? "One line every member sees, from its next turn on. The change is recorded in the Journal." : `What ${editing.member.alias} owns and does not touch. Every member sees it from its next turn on.`}
+        initial={editing.kind === "goal" ? view.goal : editing.member.role} maxLength={editing.kind === "goal" ? 300 : 200} pending={pending}
+        onClose={() => setEditing(null)}
+        onSave={(text) => { const which = editing; setEditing(null); void act(() => which.kind === "goal" ? setCollaborationGoal(id, text) : setCollaborationRole(id, which.member.alias, text)); }} /> : null}
+      {removing ? <Dialog title={`Remove ${removing.alias}?`} onClose={() => setRemoving(null)}
+        description={`${removing.alias} stops receiving messages. Its automatic turns end, and messages waiting for it are not delivered. Its ${providerLabel(removing.provider)} conversation is not changed, and what it wrote stays in the Journal.`}
+        footer={<><button type="button" className="btn btn-sm" onClick={() => setRemoving(null)}>Cancel</button>
+          <button type="button" className="btn btn-sm btn-danger" disabled={pending} onClick={() => { const alias = removing.alias; setRemoving(null); void act(() => removeCollaborationMember(id, alias)); }}>Remove</button></>}>
+        <span />
+      </Dialog> : null}
       {granting ? <GrantDialog member={granting} pending={pending} onClose={() => setGranting(null)}
         onGrant={(turns, hours) => { const alias = granting.alias; setGranting(null); void act(() => setCollaborationGrant(id, alias, turns, hours)); }} /> : null}
       {confirming ? <Dialog title={confirming === "end" ? `End ${view.name}?` : `Delete ${view.name}?`} onClose={() => setConfirming(null)}
@@ -136,14 +159,19 @@ function timeOfDay(seconds: number): string {
   return new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function MemberCard({ member, waiting, disabled, onApprove, onResume, onGrant, onWithdraw }: {
+function MemberCard({ member, waiting, disabled, onApprove, onResume, onGrant, onWithdraw, onEditRole, onRemove }: {
   member: CollaborationMember; waiting: string[]; disabled: boolean; onApprove: (ids: string[]) => void; onResume: () => void; onGrant: () => void; onWithdraw: () => void;
+  onEditRole: () => void; onRemove?: () => void;
 }) {
   const tone = member.paused ? "warn" : member.busy ? "live" : "neutral";
   const now = Date.now() / 1000;
   const automatic = grantUsable(member.grant, now);
   return <div className="card" style={{ flex: "1 1 260px", minWidth: 240 }}><div className="card-body stack" style={{ gap: 6 }}>
-    <div className="row" style={{ gap: 8 }}><Dot tone={tone} pulse={member.busy && !member.paused} /><strong>{member.alias}</strong><span className="small muted">{providerLabel(member.provider)}</span></div>
+    <div className="row" style={{ gap: 8 }}><Dot tone={tone} pulse={member.busy && !member.paused} /><strong>{member.alias}</strong><span className="small muted">{providerLabel(member.provider)}</span>
+      {!disabled ? <span style={{ marginLeft: "auto" }}><MenuButton label={`More actions for ${member.alias}`}>{(close) => <>
+        <button type="button" role="menuitem" onClick={() => { close(); onEditRole(); }}><Icon name="file" /><span>Edit role…</span></button>
+        {onRemove ? <button type="button" role="menuitem" onClick={() => { close(); onRemove(); }}><Icon name="close" /><span>Remove from collaboration…<small>Its conversation stays</small></span></button> : null}
+      </>}</MenuButton></span> : null}</div>
     <span className="xsmall subtle mono" title={member.workspace}>{folderName(member.workspace)}</span>
     {member.role ? <span className="small">{member.role}</span> : null}
     <span className="small muted">{memberStateLabel(member)}</span>
@@ -220,7 +248,9 @@ function Composer({ members, disabled, onSend }: { members: CollaborationMember[
   </div></div>;
 }
 
-function EntryCard({ entry, members, disabled, onApprove, onDismiss }: { entry: CollaborationEntry; members: CollaborationMember[]; disabled: boolean; onApprove: () => void; onDismiss: () => void }) {
+function EntryCard({ entry, entries, members, disabled, onApprove, onDismiss, onDecide }: {
+  entry: CollaborationEntry; entries: CollaborationEntry[]; members: CollaborationMember[]; disabled: boolean; onApprove: () => void; onDismiss: () => void; onDecide: (confirmed: boolean) => void;
+}) {
   const status = statusLabel(entry.status);
   const provider = (alias?: string) => members.find((member) => member.alias === alias)?.provider;
   const meta = <span className="xsmall subtle">{formatTimestamp(entry.at)} · {basisLabel(entry.basis)}{status ? ` · ${status}` : ""}</span>;
@@ -235,6 +265,7 @@ function EntryCard({ entry, members, disabled, onApprove, onDismiss }: { entry: 
       return <div className="stack" style={{ gap: 2 }}>
         <span className="small"><strong>{entry.member}</strong> · {kind} {turnOutcomeLabel(body.state, body.code)}</span>
         {counts ? <span className="xsmall subtle" title={body.activity?.files?.join("\n")}>{counts} · reported by the Agent's harness</span> : null}
+        {body.files ? <span className="xsmall subtle mono" title="From Pastey's scans of the folder at the turn's start and end">{fileStateLabel(body.files)}</span> : null}
         {meta}
       </div>;
     }
@@ -246,21 +277,39 @@ function EntryCard({ entry, members, disabled, onApprove, onDismiss }: { entry: 
         {meta}{actions}
       </div></div>;
     }
-    case "summary":
+    case "summary": {
+      const decision = body.summary.decisions ? summaryDecision(entries, entry.id) : null;
       return <div className="card"><div className="card-body stack" style={{ gap: 4 }}>
         <span className="small"><strong>{entry.member}</strong> · stage summary</span>
         {(["done", "decisions", "open", "next"] as const).map((field) => body.summary[field] ? <div key={field} className="small" style={{ whiteSpace: "pre-wrap" }}><span className="muted">{field}: </span>{body.summary[field]}</div> : null)}
         {meta}
+        {body.summary.decisions ? <div className="row row-wrap" style={{ gap: 6, alignItems: "center" }}>
+          {decision !== null ? <Badge tone={decision ? "ok" : "warn"}>{decision ? "You confirmed these decisions" : "You rejected these decisions"}</Badge> : <span className="xsmall subtle">Members joining later see whether you confirmed these decisions.</span>}
+          {decision !== true ? <button type="button" className="btn btn-sm" disabled={disabled} onClick={() => onDecide(true)}>Confirm decisions</button> : null}
+          {decision !== false ? <button type="button" className="btn btn-sm btn-ghost" disabled={disabled} onClick={() => onDecide(false)}>Reject</button> : null}
+        </div> : null}
       </div></div>;
+    }
     case "attention":
       return <Notice tone={entry.status?.state === "open" ? "warn" : "neutral"} action={actions}><span className="stack" style={{ gap: 2 }}><span>{body.text}</span>{meta}</span></Notice>;
     case "user": {
       const action = body.action;
-      const text = action.type === "created" ? "You created this collaboration" : action.type === "paused" ? "You paused it" : action.type === "resumed" ? "You resumed it" : action.type === "ended" ? "You ended it" : `You resumed ${action.alias}`;
+      const decided = action.type === "decided" ? entries.find((other) => other.id === action.entry)?.member : undefined;
+      const text = action.type === "created" ? "You created this collaboration"
+        : action.type === "paused" ? "You paused it"
+        : action.type === "resumed" ? "You resumed it"
+        : action.type === "ended" ? "You ended it"
+        : action.type === "member_resumed" ? `You resumed ${action.alias}`
+        : action.type === "goal_changed" ? `You changed the goal: ${action.goal || "(none)"}`
+        : action.type === "role_changed" ? `You changed ${action.alias}'s role: ${action.role || "(none)"}`
+        : `You ${action.confirmed ? "confirmed" : "rejected"} ${decided ?? "a member"}'s decisions`;
       return <div className="stack" style={{ gap: 2 }}><span className="small">{text}</span>{meta}</div>;
     }
     case "member":
-      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong> joined ({providerLabel(body.provider)}){body.role ? ` · ${body.role}` : ""}</span>{meta}</div>;
+      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong> {body.change === "left" ? "left" : "joined"} ({providerLabel(body.provider)}){body.role && body.change !== "left" ? ` · ${body.role}` : ""}</span>{meta}</div>;
+    case "files_outside":
+      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong>'s folder changed between its turns</span>
+        <span className="xsmall subtle mono" title="From Pastey's scans: by you, another app, or another client of its conversation">{fileChangesLabel(body)}</span>{meta}</div>;
     case "grant":
       return <div className="stack" style={{ gap: 2 }}><span className="small">{body.change === "granted"
         ? <>You allowed <strong>{body.alias}</strong> {body.turns} automatic turn{body.turns === 1 ? "" : "s"} until {timeOfDay(body.expiresAt)}</>
@@ -317,6 +366,60 @@ function CreateCollaborationDialog({ onClose, onCreated }: { onClose: () => void
         <input className="input input-sm" aria-label={`Member ${index + 1} role`} maxLength={200} value={member.role} placeholder="Role, e.g. owns api/; does not edit web/" onChange={(event) => update(member.key, { role: event.target.value })} />
       </div></div>)}
       {members.length < 6 ? <button type="button" className="btn btn-sm" onClick={() => setMembers((current) => [...current, { key: Math.max(...current.map((member) => member.key)) + 1, alias: "", provider: "codex", workspace: "", role: "" }])}><Icon name="plus" small />Add member</button> : null}
+      {problem ? <span className="small muted">{problem}</span> : null}
+      {error ? <Notice tone="bad">{error}</Notice> : null}
+    </div>
+  </Dialog>;
+}
+
+function TextEditDialog({ title, description, initial, maxLength, pending, onClose, onSave }: {
+  title: string; description: string; initial: string; maxLength: number; pending: boolean; onClose: () => void; onSave: (text: string) => void;
+}) {
+  const [text, setText] = useState(initial);
+  const changed = text.trim() !== initial.trim();
+  return <Dialog title={title} description={description} onClose={onClose}
+    footer={<><button type="button" className="btn btn-sm" onClick={onClose}>Cancel</button>
+      <button type="button" className="btn btn-sm btn-primary" disabled={pending || !changed} onClick={() => onSave(text.trim())}>Save</button></>}>
+    <input className="input" aria-label={title} maxLength={maxLength} value={text} autoFocus onChange={(event) => setText(event.target.value)}
+      onKeyDown={(event) => { if (event.key === "Enter" && changed) onSave(text.trim()); }} />
+  </Dialog>;
+}
+
+function AddMemberDialog({ view, onClose, onAdd }: { view: CollaborationView; onClose: () => void; onAdd: (member: CollaborationMemberInput, firstMessage: string) => Promise<void> }) {
+  const [member, setMember] = useState<CollaborationMemberInput>({ alias: "", provider: "codex", workspace: "", role: "" });
+  const [firstMessage, setFirstMessage] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const taken = view.members.map((other) => other.alias);
+  const choose = async () => {
+    const chosen = await open({ directory: true, multiple: false });
+    if (typeof chosen !== "string") return;
+    setMember((current) => ({ ...current, workspace: chosen, alias: current.alias || suggestAlias(chosen, taken) }));
+  };
+  const problem = !member.workspace ? "Choose its folder."
+    : !validAlias(member.alias) ? `Aliases use lowercase letters, digits, - and _ (and not "${USER_ALIAS}").`
+    : taken.includes(member.alias) ? `${member.alias} is already a member.` : null;
+  const add = async () => {
+    setPending(true);
+    try { await onAdd(member, firstMessage); } catch (cause) { setError(errorText(cause, "The member could not be added.")); } finally { setPending(false); }
+  };
+  return <Dialog wide title={`Add a member to ${view.name}`} onClose={onClose}
+    description="Pastey's Codex or Claude Code conversation in a folder of this device. Its first turn starts with a briefing Pastey compiles from the Journal: open items, each member's latest summary, the decisions and whether you confirmed them, recent turns and changed files. No model writes it."
+    footer={<><button type="button" className="btn btn-sm" onClick={onClose}>Cancel</button>
+      <button type="button" className="btn btn-sm btn-primary" disabled={pending || !!problem} onClick={() => void add()}>{firstMessage.trim() ? "Add and start" : "Add"}</button></>}>
+    <div className="stack-lg">
+      <div className="row row-wrap" style={{ gap: 8 }}>
+        <select className="select select-sm" aria-label="New member's Agent" value={member.provider} onChange={(event) => setMember({ ...member, provider: event.target.value as CollaborationProvider })}>
+          <option value="codex">Codex</option><option value="claude_code">Claude Code</option>
+        </select>
+        <button type="button" className="btn btn-sm" onClick={() => void choose()}><Icon name="folder" small />{member.workspace ? folderName(member.workspace) : "Choose folder…"}</button>
+        <input className="input input-sm" aria-label="New member's alias" maxLength={32} value={member.alias} placeholder="alias" onChange={(event) => setMember({ ...member, alias: event.target.value.toLowerCase() })} />
+      </div>
+      <input className="input input-sm" aria-label="New member's role" maxLength={200} value={member.role} placeholder="Role, e.g. owns docs/; does not edit api/" onChange={(event) => setMember({ ...member, role: event.target.value })} />
+      <Field label="First message (optional)" hint="Starts its first turn now, after the briefing. Leave it empty and the briefing goes with whatever reaches it first." htmlFor="first-message">
+        <textarea id="first-message" className="textarea" rows={3} maxLength={4096} value={firstMessage} onChange={(event) => setFirstMessage(event.target.value)}
+          placeholder="Read the briefing, then tell me what is open and who owns what." />
+      </Field>
       {problem ? <span className="small muted">{problem}</span> : null}
       {error ? <Notice tone="bad">{error}</Notice> : null}
     </div>

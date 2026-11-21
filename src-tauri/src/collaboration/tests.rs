@@ -780,7 +780,7 @@ fn a_prompt_tells_the_member_what_changed_since_its_last_turn() {
     service.approve(&id, &waiting_ids(&service, &id)).unwrap();
     let plans = service.plan_starts(free);
     let prompt = &plans[0].prompt;
-    assert!(prompt.contains("Since your last turn:\n- api: 1 turn (1 completed), 2 files changed (reported)\n"), "{prompt}");
+    assert!(prompt.contains("Since your last turn:\n- api: 1 turn (1 completed), 2 files reported changed\n"), "{prompt}");
     assert!(prompt.contains("- api's summary (its statement): done: reviewed pagination\n"), "{prompt}");
     assert!(prompt.contains("- api asked user (still open): Keep offset behind a flag?\n"), "{prompt}");
     // Before the digest, the messages; after it, the note.
@@ -792,4 +792,309 @@ fn a_prompt_tells_the_member_what_changed_since_its_last_turn() {
     let plans = service.plan_starts(free);
     let api = plans.iter().find(|plan| plan.alias == "api").unwrap();
     assert!(!api.prompt.contains("Since your last turn"), "{}", api.prompt);
+}
+
+// --- M3: joining, roles and goal, decisions, file state -----------------
+
+fn folder(fixture: &FixtureV1, name: &str) -> PathBuf {
+    let path = fixture.root.join(name);
+    fs::create_dir_all(&path).unwrap();
+    path.canonicalize().unwrap()
+}
+
+fn docs_member(workspace: &Path) -> MemberInputV1 {
+    MemberInputV1 {
+        alias: "docs".into(),
+        provider: ProviderV1::Codex,
+        workspace: workspace.to_string_lossy().into(),
+        role: "owns the API docs".into(),
+    }
+}
+
+const DECIDED: &str = "Done.\n\n```pastey-summary\ndone: switched list_orders to cursors\ndecisions: nextCursor is opaque base64; offset is rejected with 400\nopen: web still sends offset\nnext: add tests\n```\n";
+
+/// A collaboration with history: an api turn with a summary and decisions,
+/// a message to web waiting for approval, and a question to the user.
+fn with_history(fixture: &FixtureV1) -> (CollaborationServiceV1, String) {
+    let (mut service, id) = service_with(fixture);
+    service
+        .turn_ended(&ended("t1", ProviderV1::Codex, &fixture.api, Some(DECIDED)))
+        .unwrap();
+    let reply = TO_WEB.replace(
+        "```pastey-summary",
+        "```pastey-message to=user\nsubject: Keep offset behind a flag?\n\nYes or no.\n```\n\n```pastey-summary",
+    );
+    service
+        .turn_ended(&ended("t2", ProviderV1::Codex, &fixture.api, Some(&reply)))
+        .unwrap();
+    (service, id)
+}
+
+#[test]
+fn a_member_added_later_gets_the_briefing_on_its_first_turn_only() {
+    let fixture = FixtureV1::new("join");
+    let docs = folder(&fixture, "docs");
+    let (mut service, id) = with_history(&fixture);
+    let summary = entries(&service, &id)
+        .into_iter()
+        .find(|entry| matches!(&entry.body, EntryBodyV1::Summary { summary } if summary.decisions.is_some()))
+        .unwrap();
+    service.decide(&id, &summary.id, true).unwrap();
+    // A conversation already in a collaboration, a taken alias, and the
+    // user's alias are refused.
+    let mut taken = docs_member(&fixture.api);
+    taken.alias = "api2".into();
+    assert!(service.add_member(&id, taken, None).is_err());
+    let mut same = docs_member(&docs);
+    same.alias = "web".into();
+    assert!(service.add_member(&id, same, None).is_err());
+    service
+        .add_member(&id, docs_member(&docs), Some("Read the briefing and list the open items."))
+        .unwrap();
+    let joined = entries(&service, &id)
+        .into_iter()
+        .find(|entry| matches!(&entry.body, EntryBodyV1::Member { alias, .. } if alias == "docs"))
+        .unwrap();
+    assert_eq!(joined.basis, BasisV1::User);
+    assert_eq!(member(&service, &id, "docs").joined_seq, joined.seq);
+
+    // Its first message needs no approval, and its prompt is the briefing.
+    let plans = service.plan_starts(free);
+    let plan = plans.iter().find(|plan| plan.alias == "docs").unwrap();
+    let prompt = &plan.prompt;
+    assert!(prompt.len() <= MAX_PROMPT_BYTES);
+    assert!(prompt.contains("[Pastey briefing for docs: what happened in \"orders-v2\" before your first turn]"), "{prompt}");
+    assert!(prompt.contains("Open items (Pastey's record):\n"), "{prompt}");
+    assert!(prompt.contains("- message from api to web, waiting for the user's approval: \"Orders API now uses cursors\""), "{prompt}");
+    assert!(prompt.contains("- api asked user, not yet answered (statement): \"Keep offset behind a flag?\""), "{prompt}");
+    assert!(prompt.contains("Each member's latest summary:\n- api, just now (statement): done: reviewed pagination; open: web still uses offset"), "{prompt}");
+    assert!(prompt.contains("- api (statement, confirmed by the user (user)): nextCursor is opaque base64; offset is rejected with 400"), "{prompt}");
+    assert!(prompt.contains("Recent turns, oldest first (Pastey's record):\n- api: completed just now; completed just now"), "{prompt}");
+    // Then the user's message, then the note with the roles.
+    assert!(prompt.contains("From: user (the person you work for)\n\nRead the briefing and list the open items."));
+    assert!(prompt.contains("- docs (you), a Codex session: owns the API docs"));
+    assert!(prompt.contains("- web, a Claude Code session: owns web/"));
+    assert!(!prompt.contains("Since your last turn"));
+    // Other members' prompts carry no briefing: they have had turns, or
+    // joined before anything happened.
+    service.started(plan, "d1").unwrap();
+    service
+        .turn_ended(&ended("d1", ProviderV1::Codex, &docs, Some("Open: web's offset; user's flag question.")))
+        .unwrap();
+    service.user_message(&id, "docs", "Anything new?").unwrap();
+    let plans = service.plan_starts(free);
+    let again = plans.iter().find(|plan| plan.alias == "docs").unwrap();
+    assert!(!again.prompt.contains("[Pastey briefing"), "{}", again.prompt);
+}
+
+#[test]
+fn a_briefing_stays_within_its_bound_and_says_when_nothing_happened() {
+    let fixture = FixtureV1::new("bound");
+    let docs = folder(&fixture, "docs");
+    let (mut service, id) = service_with(&fixture);
+    service.add_member(&id, docs_member(&docs), None).unwrap();
+    let context = service.turn_context(ProviderV1::Codex, &docs, "hello").unwrap();
+    assert!(context.contains("Nothing has happened in this collaboration yet."), "{context}");
+    assert!(context.contains("- none"));
+    // A long Journal: the briefing is cut, with a pointer, never over its bound.
+    for index in 0..60 {
+        let long = format!(
+            "x\n\n```pastey-message to=web\nsubject: item {index} {}\n\nbody\n```\n\n```pastey-summary\ndone: {}\ndecisions: {}\n```\n",
+            "s".repeat(100),
+            "d".repeat(300),
+            "k".repeat(300)
+        );
+        service
+            .turn_ended(&ended(&format!("t{index}"), ProviderV1::Codex, &fixture.api, Some(&long)))
+            .unwrap();
+    }
+    let context = service.turn_context(ProviderV1::Codex, &docs, "hello").unwrap();
+    let briefing_end = context.find("[End of Pastey briefing]").unwrap();
+    assert!(briefing_end <= MAX_BRIEFING_BYTES, "{briefing_end}");
+    // One section never takes it all: 20 waiting and 40 identical notices
+    // read as 15 lines and a count.
+    assert!(context.contains("(×40)"), "{context}");
+    assert!(context.contains("- and 6 more open items (in the Journal)"), "{context}");
+    assert!(context.contains("Decisions recorded:"));
+    // A user's task that leaves only a little room: the briefing is cut,
+    // with a pointer, and the whole stays within the bound.
+    let task = "y".repeat(9000);
+    let context = service.turn_context(ProviderV1::Codex, &docs, &task).unwrap();
+    assert!(context.contains("[Pastey briefing"));
+    assert!(context.contains("(more in the Journal; ask a member or user)"), "{context}");
+    assert!(context.len() + task.len() <= MAX_PROMPT_BYTES);
+    // A user's task that leaves no room: the note only.
+    let big = "y".repeat(MAX_PROMPT_BYTES - 1500);
+    let context = service.turn_context(ProviderV1::Codex, &docs, &big).unwrap();
+    assert!(!context.contains("[Pastey briefing"));
+    assert!(context.starts_with("[Pastey collaboration"));
+    // A member that has had a turn gets the note only.
+    let api = service.turn_context(ProviderV1::Codex, &fixture.api, "hello").unwrap();
+    assert!(api.starts_with("[Pastey collaboration"));
+}
+
+#[test]
+fn removing_a_member_ends_its_grant_and_what_waited_for_it() {
+    let fixture = FixtureV1::new("remove");
+    let docs = folder(&fixture, "docs");
+    let (mut service, id) = with_history(&fixture);
+    // Two members are the minimum.
+    assert!(service.remove_member(&id, "web").is_err());
+    service.add_member(&id, docs_member(&docs), None).unwrap();
+    service.set_grant(&id, "web", 3, HOURS, now()).unwrap();
+    // A turn Pastey runs for it must end first.
+    let plans = service.plan_starts(free);
+    let plan = plans.iter().find(|plan| plan.alias == "web").unwrap().clone();
+    service.started(&plan, "w1").unwrap();
+    assert!(service.remove_member(&id, "web").is_err());
+    service
+        .turn_ended(&ended("w1", ProviderV1::ClaudeCode, &fixture.web, Some(&reply_to("api"))))
+        .unwrap();
+    service.user_message(&id, "web", "One more thing.").unwrap();
+    service.remove_member(&id, "web").unwrap();
+    let journal = entries(&service, &id);
+    assert!(journal.iter().any(|entry| entry.status
+        == Some(StatusV1::Undeliverable { reason: "web left the collaboration".into() })));
+    assert!(grant_ends(&service, &id).contains(&("web".into(), GrantEndV1::Withdrawn)));
+    assert!(journal.iter().any(|entry| matches!(
+        &entry.body,
+        EntryBodyV1::Member { alias, change: MemberChangeV1::Left, .. } if alias == "web"
+    )));
+    assert!(service.note_for(ProviderV1::ClaudeCode, &fixture.web).is_none());
+    // Its folder can join again, and gets a briefing again; the briefing
+    // marks what it said before as from a member that left.
+    let mut back = fixture.members().remove(1);
+    back.alias = "web2".into();
+    service.add_member(&id, back, None).unwrap();
+    let context = service.turn_context(ProviderV1::ClaudeCode, &fixture.web, "hi").unwrap();
+    assert!(context.contains("[Pastey briefing for web2"), "{context}");
+    assert!(context.contains("web (no longer a member)"), "{context}");
+}
+
+#[test]
+fn the_goal_roles_and_decisions_are_the_users_and_reach_the_next_turn() {
+    let fixture = FixtureV1::new("edit");
+    let (mut service, id) = with_history(&fixture);
+    // web's own turn, so its next prompt has the digest.
+    service
+        .turn_ended(&ended("w0", ProviderV1::ClaudeCode, &fixture.web, Some("ok")))
+        .unwrap();
+    service.set_goal(&id, "Ship cursor pagination by Friday").unwrap();
+    service.set_role(&id, "api", "owns api/ and the OpenAPI file").unwrap();
+    assert!(service.set_role(&id, "nobody", "x").is_err());
+    assert!(service.set_goal(&id, &"g".repeat(MAX_GOAL_CHARS + 1)).is_err());
+    let journal = entries(&service, &id);
+    let no_decisions = journal
+        .iter()
+        .find(|entry| matches!(&entry.body, EntryBodyV1::Summary { summary } if summary.decisions.is_none()))
+        .unwrap();
+    assert!(service.decide(&id, &no_decisions.id, true).is_err());
+    let with_decisions = journal
+        .iter()
+        .find(|entry| matches!(&entry.body, EntryBodyV1::Summary { summary } if summary.decisions.is_some()))
+        .unwrap();
+    service.decide(&id, &with_decisions.id, true).unwrap();
+    service.decide(&id, &with_decisions.id, false).unwrap();
+    // The same choice twice is one entry.
+    service.decide(&id, &with_decisions.id, false).unwrap();
+    let decided = entries(&service, &id)
+        .iter()
+        .filter(|entry| matches!(&entry.body, EntryBodyV1::User { action: UserActionV1::Decided { .. } }))
+        .count();
+    assert_eq!(decided, 2);
+    service.approve(&id, &waiting_ids(&service, &id)).unwrap();
+    let plans = service.plan_starts(free);
+    let prompt = &plans.iter().find(|plan| plan.alias == "web").unwrap().prompt;
+    assert!(prompt.contains("- user changed the goal to: Ship cursor pagination by Friday\n"), "{prompt}");
+    assert!(prompt.contains("- user changed api's role to: owns api/ and the OpenAPI file\n"), "{prompt}");
+    assert!(prompt.contains("- user rejected api's decisions\n"), "{prompt}");
+    assert!(prompt.contains("Goal: Ship cursor pagination by Friday\n"));
+    assert!(prompt.contains("- api, a Codex session: owns api/ and the OpenAPI file\n"));
+    service.set_state(&id, CollaborationStateV1::Ended).unwrap();
+    assert!(service.set_goal(&id, "again").is_err());
+}
+
+#[test]
+fn file_state_comes_from_scans_at_each_turns_start_and_end() {
+    let fixture = FixtureV1::new("files");
+    fs::write(fixture.api.join("orders.py"), "v1").unwrap();
+    let paths = fixture.paths();
+    let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
+    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    let scan = || manifest::scan(&fixture.api);
+
+    // Turn 1: a shell command adds a file and changes another.
+    service.turn_starting(&id, "api", scan()).unwrap();
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("echo v2 >> orders.py && echo t > test_orders.py")
+        .current_dir(&fixture.api)
+        .status()
+        .unwrap();
+    service
+        .turn_ended_observed(&ended("t1", ProviderV1::Codex, &fixture.api, Some("done")), Some(scan()))
+        .unwrap();
+    let files = |service: &CollaborationServiceV1, task: &str| {
+        entries(service, &id).into_iter().find_map(|entry| match entry.body {
+            EntryBodyV1::Turn { task_id, files, .. } if task_id == task => files,
+            _ => None,
+        })
+    };
+    let Some(FileStateV1::Observed { changes }) = files(&service, "t1") else {
+        panic!("observed");
+    };
+    assert_eq!((changes.added, changes.changed, changes.total), (vec!["test_orders.py".into()], vec!["orders.py".into()], 2));
+
+    // Between turns, someone else edits a file, across a restart: recorded
+    // once, as outside the collaboration's turns, and not as turn 2's.
+    drop(service);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(fixture.api.join("README.md"), "by hand").unwrap();
+    let mut service = CollaborationServiceV1::new(Some(paths)).unwrap();
+    service.turn_starting(&id, "api", scan()).unwrap();
+    service
+        .turn_ended_observed(&ended("t2", ProviderV1::Codex, &fixture.api, Some("done")), Some(scan()))
+        .unwrap();
+    let outside: Vec<FileChangesV1> = entries(&service, &id)
+        .into_iter()
+        .filter_map(|entry| match entry.body {
+            EntryBodyV1::FilesOutside { changes, .. } => Some(changes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outside.len(), 1);
+    assert_eq!(outside[0].added, vec!["README.md"]);
+    assert!(matches!(files(&service, "t2"), Some(FileStateV1::Observed { changes }) if changes.is_empty()));
+    // A start that is retried records nothing twice.
+    service.turn_starting(&id, "api", scan()).unwrap();
+    assert_eq!(
+        entries(&service, &id).iter().filter(|entry| matches!(entry.body, EntryBodyV1::FilesOutside { .. })).count(),
+        1
+    );
+
+    // A folder over the bounds: the turn says so, and claims nothing.
+    let over = manifest::scan_within(&fixture.api, 1, manifest::MAX_SCAN_TIME);
+    service.turn_starting(&id, "api", over.clone()).unwrap();
+    service
+        .turn_ended_observed(&ended("t3", ProviderV1::Codex, &fixture.api, Some("done")), Some(over))
+        .unwrap();
+    assert!(matches!(
+        files(&service, "t3"),
+        Some(FileStateV1::Unavailable { reason }) if reason.contains("more than 1 files")
+    ));
+    // A turn whose start Pastey did not scan claims nothing either.
+    service
+        .turn_ended_observed(&ended("t4", ProviderV1::Codex, &fixture.api, Some("done")), Some(scan()))
+        .unwrap();
+    assert!(matches!(files(&service, "t4"), Some(FileStateV1::Unavailable { .. })));
+
+    // web, joining later, reads the file state in its briefing.
+    let context = service.turn_context(ProviderV1::ClaudeCode, &fixture.web, "hi").unwrap();
+    assert!(context.contains("- api's folder: README.md (outside the collaboration's turns), orders.py (api's turn), test_orders.py (api's turn)"), "{context}");
+    // Deleting the collaboration deletes its manifests.
+    service.delete(&id).unwrap();
+    let left = fs::read_dir(fixture.root.join("app-data/collaboration-manifests"))
+        .map(|listing| listing.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0);
 }

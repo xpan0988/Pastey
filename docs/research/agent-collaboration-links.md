@@ -6,7 +6,7 @@ Status: design, revised after M0. The direction was approved on 2026-11-18 as "C
 - The user follows progress, reads summaries and answers what needs them from that Journal.
 - A member who joins later starts with a **briefing** compiled from it.
 
-M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). M1 is built: a collaboration on one device, with every delivery between Agents approved by the user ([M1](#milestones-and-acceptance-tests); [reference](../reference.md#agent-collaboration-facts)). M2 is built on 2026-11-20: a bounded auto grant per member, live progress during a turn, and the "since your last turn" digest. Nothing beyond M2 is built. Windows is not measured. Four of the five product decisions are made, and one is still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
+M1a, which tests this revision's collaboration note, was measured on macOS the same day ([M1a results](#m1a-results-macos-2026-11-18)). M1 is built: a collaboration on one device, with every delivery between Agents approved by the user ([M1](#milestones-and-acceptance-tests); [reference](../reference.md#agent-collaboration-facts)). M2 is built on 2026-11-20: a bounded auto grant per member, live progress during a turn, and the "since your last turn" digest. M3 is built on 2026-11-21: adding and removing members, editing the goal and roles, the briefing on a member's first turn, confirming decisions, and file state from scans of each member's folder. Nothing beyond M3 is built. Windows is not measured. Four of the five product decisions are made, and one is still open ([Open product decisions](#open-product-decisions)). It replaces an earlier "Agent Mailbox" proposal, which is not being built ([Why not a Mailbox](#why-not-a-mailbox)).
 
 ## What kind of evidence this is
 
@@ -633,6 +633,26 @@ Variations:
    - A member added mid-collaboration (Codex or Claude standing in for DeepSeek) lists, in its first reply, the open items and who owns what, matching the Journal in at least 18 of 20 runs, without messaging anyone.
    - A shell-made change appears in file state.
    - A folder over the bounds reports "file state unavailable".
+
+   Built on 2026-11-21. It delivers:
+   - members added to, and removed from, a running collaboration (local only); editing the goal and roles; each a `user`-basis entry carried by the next note;
+   - the briefing on a member's first turn after it joined (at most 12 KiB, within the room the turn's own text leaves), for turns the collaboration starts and turns the user types;
+   - Confirm and Reject on a summary's decisions, shown in briefings and digests;
+   - file state from Pastey's scans of each member's folder at each turn's start and end (`collaboration/manifest.rs`): the turn's `files`, and `files_outside` for changes between a member's turns; the digest gains goal, role, member, decision and outside-change lines.
+
+   Acceptance, as tested:
+   - Joining, live (macOS, 2026-11-21, `installed_agents_joining_a_collaboration_read_its_briefing`, Codex 0.170.0 and Claude Code 2.1.318 at effort `low`, 20 runs alternating, about 6 s per turn): **20 of 20** (Codex 10/10, Claude Code 10/10). The Journal was built the same way for each run from fixed turn outputs: an api turn that changed two files (scanned) and recorded a decision the user confirmed, a message to web the user dismissed, a message to web waiting for approval, a question to `user`, and a web turn the user stopped. Only the new member's turn was live, with the user's first message asking for the open items and who owns what. Every reply named the three open items (the flag question, the paused web, the message waiting for approval) and the three owners, never listed the dismissed message, and sent no message and no summary. 16 of 20 also named a file from the briefing's file state (`test_orders.py`), and 13 of 20 mentioned the confirmed decision (a 400 for `offset`, or the base64 cursor). A grader checked keywords; the replies are kept and were read. A first trial of 2 runs, not counted, failed only on two grader bugs (it counted the user's message to the member as the member's, and wanted the word "paused"); its replies were correct.
+   - A shell-made change appears in file state (`manifest::tests`, and through a turn in `collaboration::tests`), including across a restart; a change between turns is recorded once as outside the collaboration's turns.
+   - A folder over the bounds (files or time) gives the turn "file state unavailable" with the reason, and no paths.
+   - A briefing never exceeds its bound: one section cannot crowd out the rest (identical lines counted, at most 15 open items), and a long Journal ends a section with a pointer to the Journal.
+
+   M3's differences from the design above:
+   - The manifest records size and modification time only, with no hashes: a file rewritten with the same size and time is not seen, and one only touched is reported changed.
+   - The briefing lists only the paths each scan named (at most 20 per kind per turn, 15 per folder in the briefing).
+   - A turn the user types is scanned in the start command itself, so a very large folder can hold that command for up to 2 s.
+   - Removing a member is refused while Pastey runs a turn for it; nothing stops that turn.
+
+   Not yet verified: the add-member, edit and decision dialogs in the running app with real data, file state with real turns in the running app, and Windows.
 6. **M4, across devices.** Replicating published entries with the disclosure rules; executor-side grants; pinned keys. Acceptance:
    - Burn, forgetting the device and re-pairing with another key each delete memberships and entries. As in the resume tests, a freshly paired device inherits nothing.
    - An entry from a device whose key differs from the pin is refused.
@@ -783,6 +803,12 @@ A third consequence reaches beyond collaboration. A newer Codex GUI can switch t
 Still open:
 2. **A sender outbox,** as an exception to "Nothing is queued for a device that cannot be reached". Needed for M4.
 
+Decided by the user on 2026-11-21, for M3:
+- **A new member's first turn:** the add dialog takes an optional first message, which starts that turn after the briefing. Without one, the briefing goes on whichever turn reaches the member first.
+- **The manifest skips version-control and dependency folders by name** (`.git`, `node_modules`, `target`, `.venv` and similar), so ordinary projects fit its bounds (50,000 files, 2 s).
+- **The user can confirm or reject a summary's decisions;** briefings and digests show the choice.
+- **The joining acceptance is measured live,** 10 runs per Agent at the lowest effort.
+
 Decided by the user on 2026-11-20, for M2:
 1. **A second stored admission** (the auto grant) beside Full Access: stored with the collaboration, surviving restarts until used up or expired; default 3 turns within 2 h, at most 20 within 24 h; at most 30 automatic turns per hour on a device.
 
@@ -797,7 +823,7 @@ Design questions:
 - An unprompted warning to a peer starts that peer's turn under `auto`. Codex sent one in 5 of 10 reply runs. M2's loop tests cover a member that always messages: the budget and the hop limit stop it. How often it happens with real Agents under `auto` is not measured.
 - Should `kind` stay at all, now that it decides nothing?
 - Should a turn started by a collaboration be a distinct task owner, or `Local` with the collaboration id recorded on the envelope?
-- The manifest's bounds. (The budgets and limits were decided for M2; the digest is at most 2 KiB.)
+- The budgets and limits were decided for M2 and the manifest's for M3; the digest is at most 2 KiB and the briefing 12 KiB.
 
 ## Code this would touch
 

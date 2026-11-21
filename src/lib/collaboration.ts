@@ -5,7 +5,9 @@ import { invoke } from "@tauri-apps/api/core";
  * between members waits for this device's user to approve it, unless the
  * user gave its recipient an auto grant (a few turns within a few hours); the
  * user's own messages need no approval. Delivery always happens at a turn
- * boundary. */
+ * boundary. A member's first turn carries a briefing compiled from the
+ * Journal, and Pastey scans each member's folder at its turns' start and end
+ * for file state (paths only). */
 
 export type CollaborationProvider = "codex" | "claude_code";
 export type CollaborationState = "active" | "paused" | "ended";
@@ -91,7 +93,25 @@ export type CollaborationUserAction =
   | { type: "paused" }
   | { type: "resumed" }
   | { type: "ended" }
-  | { type: "member_resumed"; alias: string };
+  | { type: "member_resumed"; alias: string }
+  | { type: "goal_changed"; goal: string }
+  | { type: "role_changed"; alias: string; role: string }
+  /** The user confirmed or rejected the decisions of summary `entry`. */
+  | { type: "decided"; entry: string; confirmed: boolean };
+
+/** Paths that differ between two scans of a member's folder (each list at
+ * most 20; `total` counts all). */
+export interface FileChanges {
+  added?: string[];
+  changed?: string[];
+  removed?: string[];
+  total: number;
+}
+
+/** A turn's file state from Pastey's scans at its start and end. */
+export type FileState =
+  | ({ state: "observed" } & FileChanges)
+  | { state: "unavailable"; reason: string };
 
 /** What the Journal keeps of a turn's reported activity. */
 export interface TurnActivity {
@@ -105,12 +125,14 @@ export interface TurnActivity {
 export type GrantEnd = "used_up" | "expired" | "withdrawn" | "collaboration_ended";
 
 export type CollaborationEntryBody =
-  | { type: "turn"; taskId: string; origin: "collaboration" | "user"; state: CollaborationTaskState; code?: string; automatic?: boolean; activity?: TurnActivity }
+  | { type: "turn"; taskId: string; origin: "collaboration" | "user"; state: CollaborationTaskState; code?: string; automatic?: boolean; activity?: TurnActivity; files?: FileState }
   | { type: "message"; from: string; to: string; subject: string; body: string; hop: number }
   | { type: "summary"; summary: PublishedSummary }
   | { type: "attention"; text: string }
   | { type: "user"; action: CollaborationUserAction }
-  | { type: "member"; alias: string; provider: CollaborationProvider; role: string }
+  | { type: "member"; alias: string; provider: CollaborationProvider; role: string; change?: "joined" | "left" }
+  /** A member's folder changed between its turns. */
+  | ({ type: "files_outside"; alias: string } & FileChanges)
   | { type: "grant"; alias: string; change: "granted"; turns: number; expiresAt: number }
   | { type: "grant"; alias: string; change: "ended"; reason: GrantEnd };
 
@@ -197,6 +219,30 @@ export function setCollaborationGrant(collaborationId: string, alias: string, tu
 
 export function withdrawCollaborationGrant(collaborationId: string, alias: string): Promise<CollaborationView> {
   return invoke("withdraw_collaboration_grant", { collaborationId, alias });
+}
+
+/** Adds a conversation of this device. Its first turn carries the briefing;
+ * `firstMessage`, when given, starts that turn without another approval. */
+export function addCollaborationMember(collaborationId: string, member: CollaborationMemberInput, firstMessage?: string): Promise<CollaborationView> {
+  return invoke("add_collaboration_member", { collaborationId, member, firstMessage: firstMessage?.trim() || null });
+}
+
+/** Removes a member: its grant ends and messages waiting for it are not
+ * delivered. Its conversation is not changed. */
+export function removeCollaborationMember(collaborationId: string, alias: string): Promise<CollaborationView> {
+  return invoke("remove_collaboration_member", { collaborationId, alias });
+}
+
+export function setCollaborationGoal(collaborationId: string, goal: string): Promise<CollaborationView> {
+  return invoke("set_collaboration_goal", { collaborationId, goal });
+}
+
+export function setCollaborationRole(collaborationId: string, alias: string, role: string): Promise<CollaborationView> {
+  return invoke("set_collaboration_role", { collaborationId, alias, role });
+}
+
+export function decideCollaborationSummary(collaborationId: string, entryId: string, confirmed: boolean): Promise<CollaborationView> {
+  return invoke("decide_collaboration_summary", { collaborationId, entryId, confirmed });
 }
 
 export function collaborationNeedsYouCount(): Promise<number> {
@@ -305,6 +351,32 @@ export function activityCounts(activity: { commands: number; failedCommands: num
   if (activity.commands > 0) parts.push(`${activity.commands} command${activity.commands === 1 ? "" : "s"}${activity.failedCommands > 0 ? ` (${activity.failedCommands} failed)` : ""}`);
   if (activity.filesChanged > 0) parts.push(`${activity.filesChanged} file${activity.filesChanged === 1 ? "" : "s"} changed`);
   return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/** The user's latest choice on a summary's decisions, or null. */
+export function summaryDecision(entries: CollaborationEntry[], entryId: string): boolean | null {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const body = entries[index].body;
+    if (body.type === "user" && body.action.type === "decided" && body.action.entry === entryId) return body.action.confirmed;
+  }
+  return null;
+}
+
+/** Listed paths of a change, added first. */
+export function changedPaths(changes: FileChanges): string[] {
+  return [...(changes.added ?? []), ...(changes.changed ?? []), ...(changes.removed ?? [])];
+}
+
+/** "3 files changed: a.py, b.py +1", from Pastey's scans. */
+export function fileChangesLabel(changes: FileChanges, shown = 3): string {
+  if (changes.total === 0) return "no files changed";
+  const paths = changedPaths(changes).slice(0, shown);
+  const more = changes.total - paths.length;
+  return `${changes.total} file${changes.total === 1 ? "" : "s"} changed: ${paths.join(", ")}${more > 0 ? ` +${more}` : ""}`;
+}
+
+export function fileStateLabel(files: FileState): string {
+  return files.state === "observed" ? fileChangesLabel(files) : `file state unavailable: ${files.reason}`;
 }
 
 /** "4 m 05 s" from whole seconds. */

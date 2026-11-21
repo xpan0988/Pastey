@@ -26,7 +26,7 @@
 //! Agent service, which keeps every lifecycle rule it has.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
     thread,
@@ -44,6 +44,10 @@ use crate::native_agent::{
     MAX_MESSAGE_BODY_BYTES,
 };
 use crate::storage::{self, AppPaths};
+
+pub(crate) mod manifest;
+
+use manifest::{FileChangesV1, FileStateV1, ManifestV1, ScanV1};
 
 const SCHEMA_VERSION: &str = "pastey-collaboration-v1";
 const MIN_MEMBERS: usize = 2;
@@ -77,6 +81,17 @@ const HOUR: i64 = 3600;
 const MAX_DIGEST_BYTES: usize = 2 * 1024;
 /// Changed paths a turn entry keeps; more are only counted.
 const MAX_TURN_FILES: usize = 20;
+/// Bound for the briefing a member's first turn carries.
+const MAX_BRIEFING_BYTES: usize = 12 * 1024;
+/// A briefing smaller than this is left out (the turn's own text left no
+/// room for it).
+const MIN_BRIEFING_BYTES: usize = 1024;
+/// Turns per member a briefing lists.
+const BRIEFING_TURNS: usize = 3;
+/// Open items a briefing lists; more are counted.
+const BRIEFING_OPEN_ITEMS: usize = 15;
+/// Decisions a briefing lists.
+const BRIEFING_DECISIONS: usize = 10;
 /// The scheduler looks again this often without a turn ending.
 const SCHEDULER_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -132,6 +147,10 @@ pub(crate) struct MemberV1 {
     /// hourly bound).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) auto_starts: Vec<i64>,
+    /// The sequence number of the entry recording that it joined: its first
+    /// turn after this carries the briefing.
+    #[serde(default)]
+    pub(crate) joined_seq: i64,
 }
 
 /// The auto grant: `turns` automatic turns until `expires_at` (seconds).
@@ -261,6 +280,18 @@ pub(crate) enum UserActionV1 {
     Resumed,
     Ended,
     MemberResumed { alias: String },
+    GoalChanged { goal: String },
+    RoleChanged { alias: String, role: String },
+    /// The user confirmed or rejected the decisions of the summary `entry`.
+    Decided { entry: String, confirmed: bool },
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemberChangeV1 {
+    #[default]
+    Joined,
+    Left,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -280,6 +311,10 @@ pub(crate) enum EntryBodyV1 {
         /// reported, or the turn ended while Pastey was not running).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity: Option<TurnActivityV1>,
+        /// What Pastey's scans of its folder show it changed (absent when
+        /// Pastey did not scan at its end).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        files: Option<FileStateV1>,
     },
     /// From a member (an Agent's block) or from the user.
     Message {
@@ -303,6 +338,15 @@ pub(crate) enum EntryBodyV1 {
         alias: String,
         provider: ProviderV1,
         role: String,
+        #[serde(default)]
+        change: MemberChangeV1,
+    },
+    /// A member's folder changed between its turns: by the user, another
+    /// client or another program.
+    FilesOutside {
+        alias: String,
+        #[serde(flatten)]
+        changes: FileChangesV1,
     },
     /// A member's auto grant began or ended.
     Grant {
@@ -471,6 +515,12 @@ impl CollaborationV1 {
 pub(crate) struct CollaborationServiceV1 {
     paths: Option<AppPaths>,
     items: BTreeMap<String, CollaborationV1>,
+    /// Each member's folder as Pastey last saw it at the end of its turn
+    /// (Host-private; kept on disk beside the database).
+    last_manifests: HashMap<(String, String), Option<ManifestV1>>,
+    /// Each member's folder when its current turn started (in memory: a
+    /// restart loses it, and that turn's file state is unavailable).
+    start_scans: HashMap<(String, String), ScanV1>,
 }
 
 fn now() -> i64 {
@@ -565,7 +615,55 @@ impl CollaborationServiceV1 {
                 items.insert(record.id.clone(), CollaborationV1 { record, entries });
             }
         }
-        Ok(Self { paths, items })
+        Ok(Self {
+            paths,
+            items,
+            last_manifests: HashMap::new(),
+            start_scans: HashMap::new(),
+        })
+    }
+
+    fn manifest_file(&self, id: &str, alias: &str) -> Option<PathBuf> {
+        let key = blake3::hash(format!("{id}\0{alias}").as_bytes()).to_hex();
+        self.paths
+            .as_ref()
+            .map(|paths| paths.app_data_dir.join("collaboration-manifests").join(format!("{}.json", &key[..32])))
+    }
+
+    fn last_manifest(&mut self, id: &str, alias: &str) -> Option<ManifestV1> {
+        let key = (id.to_owned(), alias.to_owned());
+        if !self.last_manifests.contains_key(&key) {
+            let loaded = self
+                .manifest_file(id, alias)
+                .and_then(|file| std::fs::read(file).ok())
+                .and_then(|bytes| serde_json::from_slice::<ManifestV1>(&bytes).ok());
+            self.last_manifests.insert(key.clone(), loaded);
+        }
+        self.last_manifests.get(&key).cloned().flatten()
+    }
+
+    fn set_last_manifest(&mut self, id: &str, alias: &str, manifest: Option<ManifestV1>) {
+        if let Some(file) = self.manifest_file(id, alias) {
+            // File state is best effort: a write that fails only makes the
+            // next comparison unavailable.
+            match &manifest {
+                Some(manifest) => {
+                    let _ = file.parent().map(std::fs::create_dir_all);
+                    if let Ok(json) = serde_json::to_vec(manifest) {
+                        let _ = std::fs::write(&file, json);
+                    }
+                }
+                None => {
+                    let _ = std::fs::remove_file(&file);
+                }
+            }
+        }
+        self.last_manifests.insert((id.to_owned(), alias.to_owned()), manifest);
+    }
+
+    fn forget_manifests(&mut self, id: &str, alias: &str) {
+        self.set_last_manifest(id, alias, None);
+        self.start_scans.remove(&(id.to_owned(), alias.to_owned()));
     }
 
     fn save_record(&self, id: &str) -> AppResult<()> {
@@ -664,11 +762,72 @@ impl CollaborationServiceV1 {
 
     /// The note for a turn this device's user starts in a conversation of
     /// `provider` in `workspace`, when that conversation is a member.
+    #[cfg(test)]
     pub(crate) fn note_for(&self, provider: ProviderV1, workspace: &Path) -> Option<String> {
         let workspace = workspace.canonicalize().ok()?;
         let (id, alias) = self.member_of(provider, &workspace)?;
         let item = self.items.get(&id)?;
         Some(note(&item.record, item.member(&alias)?))
+    }
+
+    /// A new member from `input`, checked against `others` (the members it
+    /// would join) and every other collaboration.
+    fn accept_member(&self, others: &[MemberV1], input: MemberInputV1) -> AppResult<MemberV1> {
+        let alias = input.alias.trim().to_owned();
+        if !valid_alias(&alias) || alias == USER_ALIAS {
+            return invalid(format!(
+                "\"{alias}\" is not a usable alias: use lowercase letters, digits, - and _, and not \"{USER_ALIAS}\"."
+            ));
+        }
+        if others.iter().any(|member| member.alias == alias) {
+            return invalid(format!("Two members are called \"{alias}\"."));
+        }
+        if input.role.chars().count() > MAX_ROLE_CHARS {
+            return invalid(format!("{alias}'s role is over {MAX_ROLE_CHARS} characters."));
+        }
+        let workspace = canonical_workspace(&input.workspace)?;
+        if others
+            .iter()
+            .any(|member| member.provider == input.provider && Path::new(&member.workspace) == workspace)
+        {
+            return invalid("Two members are the same conversation.");
+        }
+        if self.member_of(input.provider, &workspace).is_some() {
+            return invalid(format!(
+                "{alias}'s {} conversation in that folder is already in a collaboration.",
+                input.provider.label()
+            ));
+        }
+        Ok(MemberV1 {
+            alias,
+            provider: input.provider,
+            workspace: workspace.to_string_lossy().into_owned(),
+            role: input.role.trim().to_owned(),
+            paused: false,
+            grant: None,
+            auto_task: None,
+            auto_starts: Vec::new(),
+            joined_seq: 0,
+        })
+    }
+
+    /// What a turn this device's user starts in a member conversation
+    /// carries before the user's `task`: the briefing on the member's first
+    /// turn (when `task` leaves room for it), then the note.
+    pub(crate) fn turn_context(&self, provider: ProviderV1, workspace: &Path, task: &str) -> Option<String> {
+        let workspace = workspace.canonicalize().ok()?;
+        let (id, alias) = self.member_of(provider, &workspace)?;
+        let item = self.items.get(&id)?;
+        let member = item.member(&alias)?;
+        let note = note(&item.record, member);
+        if !first_turn(item, member) {
+            return Some(note);
+        }
+        let room = MAX_PROMPT_BYTES.saturating_sub(note.len() + task.len() + 200).min(MAX_BRIEFING_BYTES);
+        if room < MIN_BRIEFING_BYTES {
+            return Some(note);
+        }
+        Some(format!("{}{note}", briefing(item, member, room, now())))
     }
 
     pub(crate) fn create(
@@ -689,40 +848,8 @@ impl CollaborationServiceV1 {
         }
         let mut accepted: Vec<MemberV1> = Vec::new();
         for input in members {
-            let alias = input.alias.trim().to_owned();
-            if !valid_alias(&alias) || alias == USER_ALIAS {
-                return invalid(format!(
-                    "\"{alias}\" is not a usable alias: use lowercase letters, digits, - and _, and not \"{USER_ALIAS}\"."
-                ));
-            }
-            if accepted.iter().any(|member| member.alias == alias) {
-                return invalid(format!("Two members are called \"{alias}\"."));
-            }
-            if input.role.chars().count() > MAX_ROLE_CHARS {
-                return invalid(format!("{alias}'s role is over {MAX_ROLE_CHARS} characters."));
-            }
-            let workspace = canonical_workspace(&input.workspace)?;
-            if accepted.iter().any(|member| {
-                member.provider == input.provider && Path::new(&member.workspace) == workspace
-            }) {
-                return invalid("Two members are the same conversation.");
-            }
-            if self.member_of(input.provider, &workspace).is_some() {
-                return invalid(format!(
-                    "{alias}'s {} conversation in that folder is already in another collaboration.",
-                    input.provider.label()
-                ));
-            }
-            accepted.push(MemberV1 {
-                alias,
-                provider: input.provider,
-                workspace: workspace.to_string_lossy().into_owned(),
-                role: input.role.trim().to_owned(),
-                paused: false,
-                grant: None,
-                auto_task: None,
-                auto_starts: Vec::new(),
-            });
+            let member = self.accept_member(&accepted, input)?;
+            accepted.push(member);
         }
         let id = format!("collaboration:{}", Uuid::new_v4());
         let record = CollaborationRecordV1 {
@@ -763,10 +890,17 @@ impl CollaborationServiceV1 {
                     alias: member.alias.clone(),
                     provider: member.provider,
                     role: member.role.clone(),
+                    change: MemberChangeV1::Joined,
                 },
                 None,
             )?;
+            let item = self.item_mut(&id)?;
+            let seq = item.entries.last().map_or(0, |entry| entry.seq);
+            if let Some(joined) = item.member_mut(&member.alias) {
+                joined.joined_seq = seq;
+            }
         }
+        self.save_record(&id)?;
         Ok(id)
     }
 
@@ -841,8 +975,207 @@ impl CollaborationServiceV1 {
         .map(|_| ())
     }
 
+    /// Adds a member to a collaboration that has not ended. Its first turn
+    /// carries the briefing; `first_message`, when given, is the user's
+    /// message that starts that turn.
+    pub(crate) fn add_member(
+        &mut self,
+        id: &str,
+        input: MemberInputV1,
+        first_message: Option<&str>,
+    ) -> AppResult<()> {
+        let item = self.item(id)?;
+        if item.record.state == CollaborationStateV1::Ended {
+            return invalid("This collaboration has ended.");
+        }
+        if item.record.members.len() >= MAX_MEMBERS {
+            return invalid(format!("A collaboration has at most {MAX_MEMBERS} members."));
+        }
+        let first_message = first_message.map(str::trim).filter(|text| !text.is_empty());
+        if first_message.is_some_and(|text| text.len() > MAX_MESSAGE_BODY_BYTES) {
+            return invalid(format!("A message is 1 to {MAX_MESSAGE_BODY_BYTES} bytes."));
+        }
+        let member = self.accept_member(&item.record.members, input)?;
+        let alias = member.alias.clone();
+        let (provider, role) = (member.provider, member.role.clone());
+        self.item_mut(id)?.record.members.push(member);
+        // A folder this alias had before (a member that left) is not its.
+        self.forget_manifests(id, &alias);
+        self.append(
+            id,
+            Some(&alias),
+            BasisV1::User,
+            EntryBodyV1::Member {
+                alias: alias.clone(),
+                provider,
+                role,
+                change: MemberChangeV1::Joined,
+            },
+            None,
+        )?;
+        let item = self.item_mut(id)?;
+        let seq = item.entries.last().map_or(0, |entry| entry.seq);
+        if let Some(joined) = item.member_mut(&alias) {
+            joined.joined_seq = seq;
+        }
+        self.save_record(id)?;
+        if let Some(text) = first_message {
+            self.user_message(id, &alias, text)?;
+        }
+        Ok(())
+    }
+
+    /// Removes a member whose turn Pastey is not running. Its grant ends,
+    /// and messages still waiting for it become undeliverable. Its
+    /// conversation stays as it is.
+    pub(crate) fn remove_member(&mut self, id: &str, alias: &str) -> AppResult<()> {
+        let item = self.item(id)?;
+        let Some(member) = item.member(alias) else {
+            return invalid("That member no longer exists.");
+        };
+        if item.record.members.len() <= MIN_MEMBERS {
+            return invalid(format!("A collaboration keeps at least {MIN_MEMBERS} members."));
+        }
+        if item.scheduled_for(alias) || member.auto_task.is_some() {
+            return invalid(format!("{alias} has a turn running: stop it or wait for it to end first."));
+        }
+        let (provider, role) = (member.provider, member.role.clone());
+        self.end_grant(id, alias, GrantEndV1::Withdrawn)?;
+        let pending: Vec<String> = self
+            .item(id)?
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.addressed_to(alias)
+                    && matches!(
+                        entry.status,
+                        Some(StatusV1::Waiting) | Some(StatusV1::Approved { .. }) | Some(StatusV1::Auto { .. })
+                    )
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        for entry_id in pending {
+            self.set_status(
+                id,
+                &entry_id,
+                StatusV1::Undeliverable {
+                    reason: format!("{alias} left the collaboration"),
+                },
+            )?;
+        }
+        self.item_mut(id)?.record.members.retain(|member| member.alias != alias);
+        self.save_record(id)?;
+        self.forget_manifests(id, alias);
+        self.append(
+            id,
+            Some(alias),
+            BasisV1::User,
+            EntryBodyV1::Member {
+                alias: alias.into(),
+                provider,
+                role,
+                change: MemberChangeV1::Left,
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// The user edits the goal; the next note carries it.
+    pub(crate) fn set_goal(&mut self, id: &str, goal: &str) -> AppResult<()> {
+        let goal = goal.trim();
+        if goal.chars().count() > MAX_GOAL_CHARS {
+            return invalid(format!("The goal is over {MAX_GOAL_CHARS} characters."));
+        }
+        let item = self.item_mut(id)?;
+        if item.record.state == CollaborationStateV1::Ended {
+            return invalid("This collaboration has ended.");
+        }
+        if item.record.goal == goal {
+            return Ok(());
+        }
+        item.record.goal = goal.to_owned();
+        self.save_record(id)?;
+        self.append(
+            id,
+            None,
+            BasisV1::User,
+            EntryBodyV1::User {
+                action: UserActionV1::GoalChanged { goal: goal.into() },
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// The user edits a member's role; the next note carries it.
+    pub(crate) fn set_role(&mut self, id: &str, alias: &str, role: &str) -> AppResult<()> {
+        let role = role.trim();
+        if role.chars().count() > MAX_ROLE_CHARS {
+            return invalid(format!("{alias}'s role is over {MAX_ROLE_CHARS} characters."));
+        }
+        let item = self.item_mut(id)?;
+        if item.record.state == CollaborationStateV1::Ended {
+            return invalid("This collaboration has ended.");
+        }
+        let Some(member) = item.member_mut(alias) else {
+            return invalid("That member no longer exists.");
+        };
+        if member.role == role {
+            return Ok(());
+        }
+        member.role = role.to_owned();
+        self.save_record(id)?;
+        self.append(
+            id,
+            Some(alias),
+            BasisV1::User,
+            EntryBodyV1::User {
+                action: UserActionV1::RoleChanged {
+                    alias: alias.into(),
+                    role: role.into(),
+                },
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// The user confirms or rejects the decisions a summary records. The
+    /// latest choice counts; briefings and digests show it.
+    pub(crate) fn decide(&mut self, id: &str, entry_id: &str, confirmed: bool) -> AppResult<()> {
+        let item = self.item(id)?;
+        let has_decisions = item.entries.iter().any(|entry| {
+            entry.id == entry_id
+                && matches!(&entry.body, EntryBodyV1::Summary { summary } if summary.decisions.is_some())
+        });
+        if !has_decisions {
+            return invalid("That summary records no decisions.");
+        }
+        if decision_of(item, entry_id) == Some(confirmed) {
+            return Ok(());
+        }
+        let author = item.entries.iter().find(|entry| entry.id == entry_id).and_then(|entry| entry.member.clone());
+        self.append(
+            id,
+            author.as_deref(),
+            BasisV1::User,
+            EntryBodyV1::User {
+                action: UserActionV1::Decided {
+                    entry: entry_id.into(),
+                    confirmed,
+                },
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
     pub(crate) fn delete(&mut self, id: &str) -> AppResult<()> {
-        self.item(id)?;
+        let aliases: Vec<String> = self.item(id)?.record.members.iter().map(|member| member.alias.clone()).collect();
+        for alias in aliases {
+            self.forget_manifests(id, &alias);
+        }
         if let Some(paths) = self.paths.as_ref() {
             storage::delete_collaboration(paths, id)?;
         }
@@ -1045,9 +1378,58 @@ impl CollaborationServiceV1 {
             .count()
     }
 
+    /// The collaboration and alias of a member conversation of `provider`
+    /// in `workspace`, and its folder: what the runtime scans.
+    pub(crate) fn member_folder(&self, provider: ProviderV1, workspace: &Path) -> Option<(String, String, PathBuf)> {
+        let workspace = workspace.canonicalize().ok()?;
+        let (id, alias) = self.member_of(provider, &workspace)?;
+        Some((id, alias, workspace))
+    }
+
+    /// The folder to scan when `ended` is a member's turn.
+    pub(crate) fn ended_folder(&self, ended: &TurnEndedV1) -> Option<PathBuf> {
+        let provider = ProviderV1::of_capability(&ended.capability_id)?;
+        self.member_folder(provider, ended.workspace.as_deref()?).map(|(_, _, folder)| folder)
+    }
+
+    /// A member's turn is about to start, and `scan` is its folder now.
+    /// What changed since its last turn ended was changed outside the
+    /// collaboration's turns, and is recorded as such.
+    pub(crate) fn turn_starting(&mut self, id: &str, alias: &str, scan: ScanV1) -> AppResult<()> {
+        if self.item(id)?.member(alias).is_none() {
+            return Ok(());
+        }
+        if let (Some(last), Ok(now)) = (self.last_manifest(id, alias), scan.as_ref()) {
+            let changes = manifest::diff(&last, now);
+            if !changes.is_empty() {
+                self.append(
+                    id,
+                    Some(alias),
+                    BasisV1::Fact,
+                    EntryBodyV1::FilesOutside {
+                        alias: alias.into(),
+                        changes,
+                    },
+                    None,
+                )?;
+            }
+        }
+        // Recorded once: the next comparison starts from here.
+        self.set_last_manifest(id, alias, scan.as_ref().ok().cloned());
+        self.start_scans.insert((id.to_owned(), alias.to_owned()), scan);
+        Ok(())
+    }
+
     /// Records a turn that ended in a member's conversation. Returns
     /// whether it was a member's turn at all.
     pub(crate) fn turn_ended(&mut self, ended: &TurnEndedV1) -> AppResult<bool> {
+        self.turn_ended_observed(ended, None)
+    }
+
+    /// `turn_ended`, with Pastey's scan of the member's folder at the turn's
+    /// end (`end_scan`): the turn's file state compares it with the scan at
+    /// its start.
+    pub(crate) fn turn_ended_observed(&mut self, ended: &TurnEndedV1, end_scan: Option<ScanV1>) -> AppResult<bool> {
         let (Some(provider), Some(workspace)) = (
             ProviderV1::of_capability(&ended.capability_id),
             ended.workspace.as_deref(),
@@ -1094,6 +1476,18 @@ impl CollaborationServiceV1 {
         let failed_at_once = ended.state == NativeAgentTaskStateV1::Failed
             && !not_started
             && ended.activity.as_ref().is_none_or(|activity| activity.actions == 0);
+        let start_scan = self.start_scans.remove(&(id.clone(), alias.clone()));
+        let files = end_scan.map(|end| {
+            let state = manifest::turn_file_state(start_scan.as_ref(), &end);
+            (state, end.ok())
+        });
+        let files = match files {
+            Some((state, end)) => {
+                self.set_last_manifest(&id, &alias, end);
+                Some(state)
+            }
+            None => None,
+        };
         if automatic {
             let member = self.item_mut(&id)?.member_mut(&alias).expect("member exists");
             member.auto_task = None;
@@ -1117,6 +1511,7 @@ impl CollaborationServiceV1 {
                 code: ended.code.clone(),
                 automatic,
                 activity: ended.activity.as_ref().map(TurnActivityV1::from),
+                files,
             },
             None,
         )?;
@@ -1296,7 +1691,7 @@ impl CollaborationServiceV1 {
                         entry.seq,
                     )
                 });
-                let (prompt, entry_ids) = prompt(item, member, &deliverable);
+                let (prompt, entry_ids) = prompt(item, member, &deliverable, now);
                 if entry_ids.is_empty() {
                     continue;
                 }
@@ -1545,33 +1940,50 @@ impl CollaborationServiceV1 {
 
 /// The prompt delivering `entries` to `member`, within its bound, and the
 /// entries it carries.
-fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1]) -> (String, Vec<String>) {
+fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], now: i64) -> (String, Vec<String>) {
     let record = &item.record;
     let note = note(record, member);
-    let digest = digest(item, member);
-    let mut blocks: Vec<String> = Vec::new();
-    let mut ids = Vec::new();
-    let mut from_agents = false;
-    for entry in entries {
+    let render = |entry: &EntryV1| -> Option<(String, bool)> {
         let EntryBodyV1::Message { from, subject, body, hop, .. } = &entry.body else {
-            continue;
+            return None;
         };
-        let block = if from == USER_ALIAS {
-            format!("From: {USER_ALIAS} (the person you work for)\n\n{body}\n")
+        Some(if from == USER_ALIAS {
+            (format!("From: {USER_ALIAS} (the person you work for)\n\n{body}\n"), false)
         } else {
             let provider = record
                 .members
                 .iter()
                 .find(|other| &other.alias == from)
                 .map_or("Agent", |other| other.provider.label());
-            format!("From: {from} ({provider}) · hop {hop}\nsubject: {subject}\n\n{body}\n")
+            (format!("From: {from} ({provider}) · hop {hop}\nsubject: {subject}\n\n{body}\n"), true)
+        })
+    };
+    // A member's first turn carries the briefing, in the room the first
+    // message leaves; later turns carry the digest.
+    let digest = if first_turn(item, member) {
+        let first = entries.iter().find_map(|entry| render(entry)).map_or(0, |(block, _)| block.len());
+        let room = MAX_PROMPT_BYTES.saturating_sub(note.len() + first + 800).min(MAX_BRIEFING_BYTES);
+        if room >= MIN_BRIEFING_BYTES {
+            briefing(item, member, room, now)
+        } else {
+            String::new()
+        }
+    } else {
+        digest(item, member)
+    };
+    let mut blocks: Vec<String> = Vec::new();
+    let mut ids = Vec::new();
+    let mut from_agents = false;
+    for entry in entries {
+        let Some((block, from_agent)) = render(entry) else {
+            continue;
         };
         let candidate: usize =
             blocks.iter().map(String::len).sum::<usize>() + block.len() + note.len() + digest.len() + 600;
         if candidate > MAX_PROMPT_BYTES && !blocks.is_empty() {
             break;
         }
-        from_agents |= from != USER_ALIAS;
+        from_agents |= from_agent;
         blocks.push(block);
         ids.push(entry.id.clone());
     }
@@ -1630,29 +2042,82 @@ fn digest(item: &CollaborationV1, member: &MemberV1) -> String {
     let later = || item.entries.iter().filter(move |entry| since.is_none_or(|seq| entry.seq > seq));
     let mut lines: Vec<String> = Vec::new();
     for other in record_members_except(&item.record, &member.alias) {
-        let turns: Vec<(&NativeAgentTaskStateV1, Option<&TurnActivityV1>)> = later()
+        let turns: Vec<(&NativeAgentTaskStateV1, Option<&TurnActivityV1>, Option<&FileStateV1>)> = later()
             .filter(|entry| entry.member.as_deref() == Some(other))
             .filter_map(|entry| match &entry.body {
-                EntryBodyV1::Turn { state, activity, .. } => Some((state, activity.as_ref())),
+                EntryBodyV1::Turn { state, activity, files, .. } => Some((state, activity.as_ref(), files.as_ref())),
                 _ => None,
             })
             .collect();
         if turns.is_empty() {
             continue;
         }
-        let completed = turns.iter().filter(|(state, _)| **state == NativeAgentTaskStateV1::Completed).count();
-        let files: u32 = turns.iter().filter_map(|(_, activity)| activity.map(|activity| activity.files_changed)).sum();
+        let completed = turns.iter().filter(|(state, _, _)| **state == NativeAgentTaskStateV1::Completed).count();
+        // Pastey's scans where it has them, else what the harness reported.
+        let (mut observed, mut reported) = (0u32, 0u32);
+        let mut paths: Vec<&str> = Vec::new();
+        for (_, activity, files) in &turns {
+            match files {
+                Some(FileStateV1::Observed { changes }) => {
+                    observed += changes.total;
+                    paths.extend(changes.paths().map(String::as_str));
+                }
+                _ => reported += activity.map_or(0, |activity| activity.files_changed),
+            }
+        }
         let mut line = format!(
             "- {other}: {} turn{} ({completed} completed)",
             turns.len(),
             if turns.len() == 1 { "" } else { "s" }
         );
-        if files > 0 {
-            line.push_str(&format!(", {files} file{} changed (reported)", if files == 1 { "" } else { "s" }));
+        if observed > 0 {
+            paths.sort_unstable();
+            paths.dedup();
+            let listed: Vec<&str> = paths.into_iter().take(5).collect();
+            line.push_str(&format!(", {} changed in its folder: {}", plural(observed as usize, "file"), listed.join(", ")));
+        }
+        if reported > 0 {
+            line.push_str(&format!(", {} reported changed", plural(reported as usize, "file")));
         }
         lines.push(line);
     }
     for entry in later() {
+        // What the user changed, and the member's own folder.
+        match &entry.body {
+            EntryBodyV1::User { action: UserActionV1::GoalChanged { goal } } => {
+                lines.push(format!("- {USER_ALIAS} changed the goal to: {}", short(goal, 200)));
+            }
+            EntryBodyV1::User { action: UserActionV1::RoleChanged { alias, role } } => {
+                lines.push(format!("- {USER_ALIAS} changed {alias}'s role to: {}", short(role, 160)));
+            }
+            EntryBodyV1::User { action: UserActionV1::Decided { entry: decided, confirmed } } => {
+                let author = item
+                    .entries
+                    .iter()
+                    .find(|summary| &summary.id == decided)
+                    .and_then(|summary| summary.member.clone())
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "- {USER_ALIAS} {} {author}'s decisions",
+                    if *confirmed { "confirmed" } else { "rejected" }
+                ));
+            }
+            EntryBodyV1::Member { alias, change, .. } if *alias != member.alias => {
+                lines.push(format!(
+                    "- {alias} {}",
+                    if *change == MemberChangeV1::Joined { "joined" } else { "left" }
+                ));
+            }
+            EntryBodyV1::FilesOutside { alias, changes } if *alias == member.alias => {
+                let listed: Vec<&str> = changes.paths().take(5).map(String::as_str).collect();
+                lines.push(format!(
+                    "- your folder: {} changed outside the collaboration's turns: {}",
+                    plural(changes.total as usize, "file"),
+                    listed.join(", ")
+                ));
+            }
+            _ => {}
+        }
         let Some(author) = entry.member.as_deref().filter(|author| *author != member.alias) else {
             continue;
         };
@@ -1693,6 +2158,333 @@ fn digest(item: &CollaborationV1, member: &MemberV1) -> String {
     }
     text.push('\n');
     text
+}
+
+/// Whether `member` has had no turn since it joined.
+fn first_turn(item: &CollaborationV1, member: &MemberV1) -> bool {
+    !item.entries.iter().any(|entry| {
+        entry.seq > member.joined_seq
+            && entry.member.as_deref() == Some(member.alias.as_str())
+            && matches!(entry.body, EntryBodyV1::Turn { .. })
+    })
+}
+
+fn ago(at: i64, now: i64) -> String {
+    let seconds = (now - at).max(0);
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", seconds / 60),
+        3600..=86_399 => format!("{} h ago", seconds / 3600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+fn state_word(state: &NativeAgentTaskStateV1) -> &'static str {
+    match state {
+        NativeAgentTaskStateV1::Completed => "completed",
+        NativeAgentTaskStateV1::Failed => "failed",
+        NativeAgentTaskStateV1::Cancelled => "stopped",
+        NativeAgentTaskStateV1::Interrupted => "interrupted",
+        NativeAgentTaskStateV1::Queued | NativeAgentTaskStateV1::Running => "not ended",
+    }
+}
+
+fn plural(count: usize, word: &str) -> String {
+    format!("{count} {word}{}", if count == 1 { "" } else { "s" })
+}
+
+/// Lines within a byte budget: a line that does not fit ends its section
+/// with a pointer to the Journal.
+struct BoundedTextV1 {
+    text: String,
+    budget: usize,
+    full: bool,
+}
+
+impl BoundedTextV1 {
+    fn push(&mut self, line: &str) -> bool {
+        if self.full {
+            return false;
+        }
+        if self.text.len() + line.len() + 1 > self.budget.saturating_sub(48) {
+            self.text.push_str("- (more in the Journal; ask a member or user)\n");
+            self.full = true;
+            return false;
+        }
+        self.text.push_str(line);
+        self.text.push('\n');
+        true
+    }
+
+    fn section(&mut self, heading: &str, lines: Vec<String>) {
+        if lines.is_empty() || self.full {
+            return;
+        }
+        if self.push(&format!("\n{heading}")) {
+            for line in lines {
+                if !self.push(&line) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// The briefing on `member`'s first turn, compiled from the Journal with no
+/// model ("Joining: the briefing" in the design): open items and recent
+/// turns (Pastey facts), file state (Pastey's scans), each member's latest
+/// summary and the decisions recorded (Agent statements, quoted and labelled,
+/// with the user's confirmations). The note that follows it gives the goal,
+/// the members and their roles. At most `budget` bytes.
+fn briefing(item: &CollaborationV1, member: &MemberV1, budget: usize, now: i64) -> String {
+    let record = &item.record;
+    let alias = member.alias.as_str();
+    let author_label = |author: &str| -> String {
+        if record.members.iter().any(|other| other.alias == author) {
+            author.to_owned()
+        } else {
+            format!("{author} (no longer a member)")
+        }
+    };
+    let mut out = BoundedTextV1 {
+        text: format!(
+            "[Pastey briefing for {alias}: what happened in \"{}\" before your first turn]\n\
+             Pastey compiled this from the collaboration's Journal; no model wrote it. \"(statement)\" marks what an Agent wrote, which may be wrong. \"(user)\" marks the person you work for. Other members work in their own folders, on their own devices or not; paths below are relative to the folder named.\n",
+            record.name
+        ),
+        budget,
+        full: false,
+    };
+
+    // 1. Open items: Pastey facts.
+    let mut open = Vec::new();
+    for entry in &item.entries {
+        match (&entry.body, &entry.status) {
+            (EntryBodyV1::Message { from, to, subject, .. }, Some(StatusV1::Open)) if to == USER_ALIAS => {
+                open.push(format!("- {} asked {USER_ALIAS}, not yet answered (statement): \"{}\"", author_label(from), short(subject, 160)));
+            }
+            (EntryBodyV1::Message { from, to, subject, .. }, Some(status)) if to != alias => {
+                let state = match status {
+                    StatusV1::Waiting => "waiting for the user's approval",
+                    StatusV1::Auto { .. } => "waiting for its automatic turn",
+                    StatusV1::Approved { .. } => "approved, not yet delivered",
+                    StatusV1::Scheduled { .. } => "being delivered",
+                    _ => continue,
+                };
+                open.push(format!("- message from {} to {to}, {state}: \"{}\"", author_label(from), short(subject, 160)));
+            }
+            (EntryBodyV1::Attention { text }, Some(StatusV1::Open)) => {
+                open.push(format!("- needs the user: {}", short(text, 200)));
+            }
+            _ => {}
+        }
+    }
+    for other in &record.members {
+        if other.paused && other.alias != alias {
+            open.push(format!("- {} is paused until the user resumes it", other.alias));
+        }
+    }
+    // What needs the user first, then paused members, then messages.
+    open.sort_by_key(|line| {
+        if line.starts_with("- message from") {
+            2
+        } else if line.ends_with("until the user resumes it") {
+            1
+        } else {
+            0
+        }
+    });
+    // The same line many times reads once; past the cap, a count.
+    let mut counted: Vec<(String, usize)> = Vec::new();
+    for line in open {
+        match counted.iter_mut().find(|(seen, _)| *seen == line) {
+            Some((_, count)) => *count += 1,
+            None => counted.push((line, 1)),
+        }
+    }
+    let more = counted.len().saturating_sub(BRIEFING_OPEN_ITEMS);
+    let mut open: Vec<String> = counted
+        .into_iter()
+        .take(BRIEFING_OPEN_ITEMS)
+        .map(|(line, count)| if count > 1 { format!("{line} (×{count})") } else { line })
+        .collect();
+    if more > 0 {
+        open.push(format!("- and {} (in the Journal)", plural(more, "more open item")));
+    }
+    if open.is_empty() {
+        open.push("- none".into());
+    }
+    out.section("Open items (Pastey's record):", open);
+
+    // 2. Each member's latest summary: Agent statements.
+    let mut latest: Vec<&EntryV1> = Vec::new();
+    for entry in item.entries.iter().rev() {
+        if let (EntryBodyV1::Summary { .. }, Some(author)) = (&entry.body, entry.member.as_deref()) {
+            if author != alias && !latest.iter().any(|seen| seen.member.as_deref() == Some(author)) {
+                latest.push(entry);
+            }
+        }
+    }
+    latest.reverse();
+    let summaries = latest
+        .iter()
+        .filter_map(|entry| {
+            let EntryBodyV1::Summary { summary } = &entry.body else { return None };
+            let fields: Vec<String> = [
+                ("done", &summary.done),
+                ("decisions", &summary.decisions),
+                ("open", &summary.open),
+                ("next", &summary.next),
+            ]
+            .into_iter()
+            .filter_map(|(name, value)| value.as_deref().map(|value| format!("{name}: {}", short(value, 240))))
+            .collect();
+            (!fields.is_empty()).then(|| {
+                format!(
+                    "- {}, {} (statement): {}",
+                    author_label(entry.member.as_deref().unwrap_or("?")),
+                    ago(entry.at, now),
+                    fields.join("; ")
+                )
+            })
+        })
+        .collect();
+    out.section("Each member's latest summary:", summaries);
+
+    // 3. Decisions, newest first, with the user's confirmations.
+    let decisions = item
+        .entries
+        .iter()
+        .rev()
+        .filter_map(|entry| {
+            let EntryBodyV1::Summary { summary } = &entry.body else { return None };
+            let decided = summary.decisions.as_deref()?;
+            let user = match decision_of(item, &entry.id) {
+                Some(true) => ", confirmed by the user (user)",
+                Some(false) => ", rejected by the user (user)",
+                None => "",
+            };
+            Some(format!(
+                "- {} (statement{user}): {}",
+                author_label(entry.member.as_deref().unwrap_or("?")),
+                short(decided, 240)
+            ))
+        })
+        .take(BRIEFING_DECISIONS)
+        .collect();
+    out.section("Decisions recorded:", decisions);
+
+    // 4. Recent turns: Pastey facts, with what scans or harnesses reported.
+    let mut aliases: Vec<&str> = Vec::new();
+    for entry in &item.entries {
+        if let (EntryBodyV1::Turn { .. }, Some(author)) = (&entry.body, entry.member.as_deref()) {
+            if author != alias && !aliases.contains(&author) {
+                aliases.push(author);
+            }
+        }
+    }
+    let turns = aliases
+        .iter()
+        .map(|author| {
+            let mut recent: Vec<String> = item
+                .entries
+                .iter()
+                .rev()
+                .filter(|entry| entry.member.as_deref() == Some(*author))
+                .filter_map(|entry| match &entry.body {
+                    EntryBodyV1::Turn { state, files, activity, automatic, .. } => {
+                        let mut text = format!("{} {}", state_word(state), ago(entry.at, now));
+                        if *automatic {
+                            text.push_str(", automatic");
+                        }
+                        match (files, activity) {
+                            (Some(FileStateV1::Observed { changes }), _) if !changes.is_empty() => {
+                                let listed: Vec<&str> = changes.paths().take(5).map(String::as_str).collect();
+                                text.push_str(&format!(", {} changed: {}", plural(changes.total as usize, "file"), listed.join(", ")));
+                            }
+                            (Some(FileStateV1::Observed { .. }), _) => text.push_str(", no files changed"),
+                            (_, Some(activity)) if activity.files_changed > 0 => {
+                                text.push_str(&format!(", {} reported changed", plural(activity.files_changed as usize, "file")));
+                            }
+                            _ => {}
+                        }
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .take(BRIEFING_TURNS)
+                .collect();
+            recent.reverse();
+            format!("- {}: {}", author_label(author), recent.join("; "))
+        })
+        .collect();
+    out.section("Recent turns, oldest first (Pastey's record):", turns);
+
+    // 5. File state: paths changed in each folder, and during whose turn.
+    let mut folders: Vec<String> = Vec::new();
+    for owner in aliases.iter().copied() {
+        let mut by_path: BTreeMap<String, String> = BTreeMap::new();
+        let mut unavailable: Option<String> = None;
+        for entry in item.entries.iter().filter(|entry| entry.member.as_deref() == Some(owner)) {
+            let (changes, during) = match &entry.body {
+                EntryBodyV1::Turn { files: Some(FileStateV1::Observed { changes }), .. } => (changes, format!("{owner}'s turn")),
+                EntryBodyV1::Turn { files: Some(FileStateV1::Unavailable { reason }), .. } => {
+                    unavailable = Some(reason.clone());
+                    continue;
+                }
+                EntryBodyV1::FilesOutside { changes, .. } => (changes, "outside the collaboration's turns".to_owned()),
+                _ => continue,
+            };
+            for path in &changes.removed {
+                by_path.insert(path.clone(), format!("removed, {during}"));
+            }
+            for path in changes.added.iter().chain(&changes.changed) {
+                by_path.insert(path.clone(), during.clone());
+            }
+        }
+        if by_path.is_empty() {
+            if let Some(reason) = unavailable {
+                folders.push(format!("- {}'s folder: file state unavailable ({reason})", author_label(owner)));
+            }
+            continue;
+        }
+        let shown: Vec<String> = by_path
+            .iter()
+            .take(15)
+            .map(|(path, during)| format!("{path} ({during})"))
+            .collect();
+        let more = by_path.len().saturating_sub(shown.len());
+        folders.push(format!(
+            "- {}'s folder: {}{}",
+            author_label(owner),
+            shown.join(", "),
+            if more > 0 { format!(", and {more} more") } else { String::new() }
+        ));
+    }
+    out.section(
+        "Files changed since the collaboration started (Pastey's scans; paths only, read files with your own tools):",
+        folders,
+    );
+    if item.entries.iter().all(|entry| {
+        matches!(
+            entry.body,
+            EntryBodyV1::User { .. } | EntryBodyV1::Member { .. } | EntryBodyV1::Grant { .. }
+        ) || entry.member.as_deref() == Some(alias)
+    }) {
+        out.push("\nNothing has happened in this collaboration yet.");
+    }
+    out.text.push_str("[End of Pastey briefing]\n\n");
+    out.text
+}
+
+/// The user's latest choice on the decisions of summary `entry_id`.
+fn decision_of(item: &CollaborationV1, entry_id: &str) -> Option<bool> {
+    item.entries.iter().rev().find_map(|entry| match &entry.body {
+        EntryBodyV1::User {
+            action: UserActionV1::Decided { entry, confirmed },
+        } if entry == entry_id => Some(*confirmed),
+        _ => None,
+    })
 }
 
 fn record_members_except<'a>(record: &'a CollaborationRecordV1, alias: &'a str) -> impl Iterator<Item = &'a str> {
@@ -1748,11 +2540,16 @@ pub(crate) fn start_scheduler(runtime: &Arc<HostRuntime>) {
         };
         let Some(runtime) = weak.upgrade() else { break };
         let relevant = match ended {
-            Some(ended) => runtime
-                .collaborations
-                .lock()
-                .turn_ended(&ended)
-                .unwrap_or(false),
+            Some(ended) => {
+                // The folder is scanned with no lock held.
+                let folder = runtime.collaborations.lock().ended_folder(&ended);
+                let scan = folder.map(|folder| manifest::scan(&folder));
+                runtime
+                    .collaborations
+                    .lock()
+                    .turn_ended_observed(&ended, scan)
+                    .unwrap_or(false)
+            }
             None => true,
         };
         if relevant {
@@ -1772,6 +2569,7 @@ pub(crate) fn drive(runtime: &HostRuntime) {
         collaborations.plan_starts(|workspace| natives.workspace_in_use(workspace))
     };
     for plan in plans {
+        scan_before_turn(runtime, &plan.collaboration_id, &plan.alias, &plan.workspace);
         let result = {
             let mut natives = runtime.native_agents.lock();
             match plan.provider {
@@ -1795,6 +2593,29 @@ pub(crate) fn drive(runtime: &HostRuntime) {
             Err(error) => collaborations.start_refused(&plan, &error.message()),
         };
     }
+}
+
+/// Scans a member's folder before its turn starts (with no lock held while
+/// scanning), unless something already runs there.
+fn scan_before_turn(runtime: &HostRuntime, id: &str, alias: &str, folder: &Path) {
+    if runtime.native_agents.lock().workspace_in_use(folder) {
+        return;
+    }
+    let scan = manifest::scan(folder);
+    let _ = runtime.collaborations.lock().turn_starting(id, alias, scan);
+}
+
+/// A turn this device's user starts in a conversation of `provider` in
+/// `workspace`: when it is a member's, its folder is scanned and the task
+/// carries the briefing (on its first turn) and the note.
+pub(crate) fn user_turn_task(runtime: &HostRuntime, provider: ProviderV1, workspace: &Path, task: &str) -> (String, bool) {
+    let target = runtime.collaborations.lock().member_folder(provider, workspace);
+    let Some((id, alias, folder)) = target else {
+        return (task.to_owned(), false);
+    };
+    scan_before_turn(runtime, &id, &alias, &folder);
+    let context = runtime.collaborations.lock().turn_context(provider, workspace, task);
+    (with_note(context, task), true)
 }
 
 /// What views show of each member's folder: whether it is busy, and the

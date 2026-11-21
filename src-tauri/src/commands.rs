@@ -1295,12 +1295,14 @@ pub fn start_native_codex_task(
     options: Option<crate::native_agent::NativeSessionOptionsV1>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
-    // A collaboration member's turn carries the collaboration note.
-    let note = state.collaborations.lock().note_for(
+    // A collaboration member's turn carries the collaboration note (and its
+    // first, the briefing); its folder is scanned for file state.
+    let (task, _) = crate::collaboration::user_turn_task(
+        &state,
         crate::collaboration::ProviderV1::Codex,
         std::path::Path::new(&workspace),
+        &task,
     );
-    let task = crate::collaboration::with_note(note, &task);
     state
         .native_agents
         .lock()
@@ -1327,12 +1329,12 @@ pub fn start_native_claude_code_task(
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     // A collaboration member's turn carries the collaboration note, and
     // Claude Code refuses other sessions' messages for it.
-    let note = state.collaborations.lock().note_for(
+    let (task, member) = crate::collaboration::user_turn_task(
+        &state,
         crate::collaboration::ProviderV1::ClaudeCode,
         std::path::Path::new(&workspace),
+        &task,
     );
-    let member = note.is_some();
-    let task = crate::collaboration::with_note(note, &task);
     let mut natives = state.native_agents.lock();
     let workspace = std::path::Path::new(&workspace);
     let new_conversation = new_conversation.unwrap_or(false);
@@ -9606,4 +9608,84 @@ mod tests {
         assert!(check_pairing_target(&paths, "another", Some("existing")).is_err());
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+/// Adds a Pastey conversation of this device to a collaboration. Its first
+/// turn carries the briefing; `first_message`, when given, starts it.
+#[tauri::command]
+pub fn add_collaboration_member(
+    collaboration_id: String,
+    member: crate::collaboration::MemberInputV1,
+    first_message: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .add_member(&collaboration_id, member, first_message.as_deref())
+        .map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Removes a member; its conversation stays as it is.
+#[tauri::command]
+pub fn remove_collaboration_member(
+    collaboration_id: String,
+    alias: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .remove_member(&collaboration_id, &alias)
+        .map_err(|error| error.message())?;
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Edits the goal; the next note carries it.
+#[tauri::command]
+pub fn set_collaboration_goal(
+    collaboration_id: String,
+    goal: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .set_goal(&collaboration_id, &goal)
+        .map_err(|error| error.message())?;
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Edits a member's role; the next note carries it.
+#[tauri::command]
+pub fn set_collaboration_role(
+    collaboration_id: String,
+    alias: String,
+    role: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .set_role(&collaboration_id, &alias, &role)
+        .map_err(|error| error.message())?;
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Confirms or rejects the decisions a summary records.
+#[tauri::command]
+pub fn decide_collaboration_summary(
+    collaboration_id: String,
+    entry_id: String,
+    confirmed: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .decide(&collaboration_id, &entry_id, confirmed)
+        .map_err(|error| error.message())?;
+    collaboration_view(&state, &collaboration_id)
 }
