@@ -165,6 +165,17 @@ fn main() {
     if native_agent::run_claude_code_lifeline_if_requested() {
         return;
     }
+    // The desktop app takes no arguments. Anything else is a launcher Pastey
+    // no longer answers (such as a stale MCP entry), so refuse it instead of
+    // opening a second Host on this device's data.
+    if let LaunchMode::Refused(argument) = launch_mode(std::env::args_os().skip(1)) {
+        eprintln!(
+            "pastey: unsupported argument {argument:?}. The Pastey app starts only without \
+             arguments; if an MCP client or launcher starts Pastey with this argument, \
+             remove that entry."
+        );
+        std::process::exit(2);
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -580,4 +591,63 @@ fn desktop_default_logs_dir(app_data_dir: &std::path::Path) -> PathBuf {
     }
 
     app_data_dir.join("logs")
+}
+
+/// What one start of this executable is for, once the helper modes above
+/// (Windows sandbox setup, the Claude Code lifeline) have had their turn.
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchMode {
+    /// No arguments: the desktop app.
+    Desktop,
+    /// An argument the desktop app does not take.
+    Refused(String),
+}
+
+fn launch_mode(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> LaunchMode {
+    for argument in arguments {
+        let text = argument.to_string_lossy();
+        // Older macOS Launch Services passed a process serial number.
+        if text.starts_with("-psn_") {
+            continue;
+        }
+        return LaunchMode::Refused(text.into_owned());
+    }
+    LaunchMode::Desktop
+}
+
+#[cfg(test)]
+mod launch_mode_tests {
+    use super::{launch_mode, LaunchMode};
+    use std::ffi::OsString;
+
+    fn mode(arguments: &[&str]) -> LaunchMode {
+        launch_mode(arguments.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn no_arguments_start_the_desktop_app() {
+        assert_eq!(mode(&[]), LaunchMode::Desktop);
+        assert_eq!(mode(&["-psn_0_12345"]), LaunchMode::Desktop);
+    }
+
+    #[test]
+    fn a_retired_mcp_entry_is_refused_rather_than_opening_the_app() {
+        assert_eq!(
+            mode(&["--physical-mcp", "/tmp/grant.json"]),
+            LaunchMode::Refused("--physical-mcp".into())
+        );
+    }
+
+    #[test]
+    fn any_other_argument_is_refused() {
+        assert_eq!(
+            mode(&["--anything"]),
+            LaunchMode::Refused("--anything".into())
+        );
+        assert_eq!(mode(&["file.txt"]), LaunchMode::Refused("file.txt".into()));
+        assert_eq!(
+            mode(&["-psn_0_1", "--x"]),
+            LaunchMode::Refused("--x".into())
+        );
+    }
 }
