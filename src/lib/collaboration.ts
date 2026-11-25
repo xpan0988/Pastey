@@ -160,6 +160,8 @@ export interface CollaborationSummary {
   lastActivityAt: number;
   /** Its members' execution choice (absent: your default). */
   execution?: { kind: "ask" } | { kind: "profile"; profile: ExecutionProfile; authorizedAt: number };
+  /** Member turns may start: every member was ready and you released it. */
+  released?: boolean;
 }
 
 export interface PublishedSummary {
@@ -183,6 +185,8 @@ export type CollaborationUserAction =
   | { type: "accepted"; alias: string }
   /** The model and effort of `alias`'s turns changed. */
   | { type: "options_changed"; alias: string; model?: string; effort?: string }
+  /** Every member was ready, and the user released the collaboration. */
+  | { type: "released" }
   /** The execution choice of the collaboration, or of `alias`, changed. */
   | { type: "execution_changed"; alias?: string; name: string };
 
@@ -380,6 +384,30 @@ export function answerCollaborationInvitation(collaborationId: string, alias: st
 
 export function collaborationNeedsYouCount(): Promise<number> {
   return invoke("collaboration_needs_you_count");
+}
+
+export type FactBasis = "configured" | "probed" | "measured" | "unknown";
+
+export interface MemberFact { text: string; basis: FactBasis }
+
+export interface ReadinessCheck { name: string; ok?: boolean; basis: FactBasis; detail: string }
+
+export interface MemberReadiness {
+  alias: string;
+  provider: CollaborationProvider;
+  ready: boolean;
+  checks: ReadinessCheck[];
+  facts: MemberFact[];
+}
+
+/** Checks every member now, without a model call (a few seconds). */
+export function checkCollaborationReadiness(collaborationId: string): Promise<MemberReadiness[]> {
+  return invoke("check_collaboration_readiness", { collaborationId });
+}
+
+/** Releases the collaboration once every member is ready (checked again). */
+export function releaseCollaboration(collaborationId: string): Promise<CollaborationView> {
+  return invoke("release_collaboration", { collaborationId });
 }
 
 export function listExecutionPresets(): Promise<ExecutionProfile[]> {

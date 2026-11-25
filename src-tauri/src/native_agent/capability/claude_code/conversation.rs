@@ -760,6 +760,31 @@ fn names_folder(key: &str, folder: &Path) -> bool {
 }
 
 impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
+    fn readiness_checks(&self, workspace: &Path) -> Vec<super::super::NativeReadinessCheckV1> {
+        use super::super::NativeReadinessCheckV1 as Check;
+        let mut checks = Vec::new();
+        let signed_in = self.cli().and_then(|cli| {
+            super::super::run_bounded(&cli, &["auth", "status"], std::time::Duration::from_secs(10))
+        });
+        checks.push(match signed_in {
+            Some((_, output)) => match serde_json::from_str::<Value>(output.trim())
+                .ok()
+                .and_then(|status| status.get("loggedIn").and_then(Value::as_bool))
+            {
+                Some(true) => Check { name: "Signed in".into(), ok: Some(true), detail: "`claude auth status` reports signed in.".into() },
+                Some(false) => Check { name: "Signed in".into(), ok: Some(false), detail: "Claude Code is not signed in on this device (`claude auth login`).".into() },
+                None => Check { name: "Signed in".into(), ok: None, detail: "`claude auth status` gave no answer Pastey could read.".into() },
+            },
+            None => Check { name: "Signed in".into(), ok: None, detail: "Claude Code did not answer `auth status` in time, or is not installed.".into() },
+        });
+        let workspace = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+        checks.push(match trust_problem(&workspace, self.global_config().as_deref()) {
+            None => Check { name: "Folder trusted".into(), ok: Some(true), detail: "Claude Code may run this folder's project configuration, or it has none.".into() },
+            Some(problem) => Check { name: "Folder trusted".into(), ok: Some(false), detail: problem },
+        });
+        checks
+    }
+
     fn capability_id(&self) -> &'static str {
         CLAUDE_CODE_CONVERSATION_ID
     }

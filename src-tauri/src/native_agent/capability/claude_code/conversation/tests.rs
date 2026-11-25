@@ -2075,7 +2075,7 @@ fn installed_codex_and_claude_code_exchange_an_approved_collaboration_message() 
     service.set_turn_listener(sender);
     let mut collaborations = CollaborationServiceV1::new(Some(paths)).unwrap();
     let id = collaborations
-        .create(
+        .create_released(
             "orders-v2",
             "Move GET /v2/orders to cursor pagination",
             vec![
@@ -2189,7 +2189,7 @@ fn installed_codex_and_claude_code_take_automatic_turns_within_their_grants() {
     service.set_turn_listener(sender);
     let mut collaborations = CollaborationServiceV1::new(Some(paths)).unwrap();
     let id = collaborations
-        .create(
+        .create_released(
             "orders-v2",
             "Move GET /v2/orders to cursor pagination",
             vec![
@@ -2354,7 +2354,7 @@ fn installed_agents_joining_a_collaboration_read_its_briefing() {
         fs::write(docs.join("docs/orders.md"), "# GET /v2/orders\n\nPaginate with `offset`.\n").unwrap();
         let mut collaborations = CollaborationServiceV1::new(None).unwrap();
         let id = collaborations
-            .create(
+            .create_released(
                 "orders-v2",
                 "Move GET /v2/orders to cursor pagination",
                 vec![

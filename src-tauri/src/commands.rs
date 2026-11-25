@@ -1534,6 +1534,44 @@ pub fn set_collaboration_execution(
     collaboration_view(&state, &collaboration_id)
 }
 
+/// Checks, without a model call, whether every member of a collaboration
+/// is ready: installed, signed in, its folder usable and trusted, and what
+/// it is configured to do. May take a few seconds.
+#[tauri::command]
+pub async fn check_collaboration_readiness(
+    collaboration_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::collaboration::readiness::MemberReadinessV1>, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::collaboration::readiness::check(&state, &collaboration_id).map_err(|error| error.message())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Releases a collaboration after checking every member again: member
+/// turns may start, and each member's facts reach the others in the note.
+#[tauri::command]
+pub async fn release_collaboration(
+    collaboration_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let readiness = crate::collaboration::readiness::check(&state, &collaboration_id).map_err(|error| error.message())?;
+        state
+            .collaborations
+            .lock()
+            .release(&collaboration_id, &readiness)
+            .map_err(|error| error.message())?;
+        drive_collaborations(&state);
+        collaboration_view(&state, &collaboration_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 /// Sets the model and effort of every turn the collaboration starts for
 /// this device's member `alias` (empty: the Agent's own default).
 #[tauri::command]

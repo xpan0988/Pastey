@@ -5709,6 +5709,33 @@ impl NativeAgentServiceV1 {
         })
     }
 
+    /// A probe of whether `capability_id` can run in a folder now, to run
+    /// after the service lock is released (it may take seconds): the
+    /// capability's availability, then its own model-free checks.
+    pub(crate) fn readiness_probe(
+        &self,
+        capability_id: &str,
+    ) -> Option<impl FnOnce(&Path) -> Vec<capability::NativeReadinessCheckV1> + Send + 'static> {
+        let adapter = self.adapter(capability_id).ok()?;
+        Some(move |workspace: &Path| {
+            let report = adapter.availability_report();
+            let available = adapter.availability() == NativeAgentCapabilityStateV1::Available;
+            let mut checks = vec![capability::NativeReadinessCheckV1 {
+                name: "Installed and compatible".into(),
+                ok: Some(available),
+                detail: if available {
+                    format!("{} is available on this device.", adapter.display_name())
+                } else {
+                    report.detail.clone().unwrap_or_else(|| format!("{} is not available on this device.", adapter.display_name()))
+                },
+            }];
+            if available {
+                checks.extend(adapter.readiness_checks(workspace));
+            }
+            checks
+        })
+    }
+
     /// Tells `listener` about every native turn that ends from now on.
     pub(crate) fn set_turn_listener(&mut self, listener: std::sync::mpsc::Sender<TurnEndedV1>) {
         self.turn_listener = Some(listener);

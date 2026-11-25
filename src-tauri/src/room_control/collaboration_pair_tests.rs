@@ -78,7 +78,7 @@ async fn linked() -> LinkedV1 {
         .runtime
         .collaborations
         .lock()
-        .create(
+        .create_released(
             "orders-v2",
             "Move GET /v2/orders to cursor pagination",
             vec![MemberInputV1 {
@@ -315,7 +315,7 @@ async fn only_a_shared_folder_can_be_invited_and_declining_tells_the_inviter() {
         .runtime
         .collaborations
         .lock()
-        .create(
+        .create_released(
             "orders-v2",
             "",
             vec![MemberInputV1 {

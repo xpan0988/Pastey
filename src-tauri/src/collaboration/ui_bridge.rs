@@ -183,6 +183,8 @@ fn mock_app(runtime: Arc<HostRuntime>) -> tauri::App<tauri::test::MockRuntime> {
             crate::commands::get_execution_default,
             crate::commands::set_execution_default,
             crate::commands::set_collaboration_execution,
+            crate::commands::check_collaboration_readiness,
+            crate::commands::release_collaboration,
             crate::commands::respond_remote_native_decision,
             crate::commands::stop_bridge_native_agent_task,
             crate::commands::propose_remote_native_codex_workspace_movement,

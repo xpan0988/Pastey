@@ -281,6 +281,21 @@ Limits and open decision:
 - Claude Code's effort and `auto` mode are not observable from its output; the preset avoids `auto` and uses the sandbox as the boundary.
 - Codex keeps turn overrides on the thread (see Layer 5).
 
+### R2: readiness barrier (2026-11-25)
+
+Boundary: no member turn of a new collaboration starts until every member is ready; readiness is checked without a model call; each member's abilities reach the others as facts with their basis. No scheduler, no inference.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| Native checks | `NativeCapabilityAdapterV1::readiness_checks` (default none): Codex `codex login status`; Claude Code `claude auth status` (`loggedIn`) and its folder-trust rule; each bounded to 10 s and run off the service lock (`NativeAgentServiceV1::readiness_probe`), after the capability's own availability | live: `installed_agents_answer_readiness_without_a_model_call` (ignored; ran on this Mac: Codex 0.36 s, Claude Code 0.30 s, all passing) |
+| Member readiness | `collaboration/readiness.rs`: folder, installed, signed in, trusted (probed); model and effort, execution profile (configured); a check nobody could answer is not a pass; a member on the linked device is ready once it accepted | `a_new_collaboration_starts_no_turn_until_every_member_is_ready` |
+| Facts | From the effective profile (configured: what it edits, runs, reaches, may not do, who decides escalations), fixed tool probes of this device (probed, labelled "outside any Agent's sandbox"), the member's last completed turn (measured) | `profile_facts_say_what_a_member_can_and_cannot_do` |
+| Barrier | `CollaborationRecordV1.released` (collaborations from before R2 count as released); `plan_starts` starts nothing before release; messages sent meanwhile wait; `release_collaboration` checks again and refuses unless every member is ready; all members then start together | same test |
+| Shared facts | Kept per member at release; every note lists them per member with their basis ("do not assume more") | same test (both prompts carry both members' facts) |
+| UI | "Preparing" card: per-member checklist with basis, the facts others will be told, Check again, Start collaboration (enabled only when all are ready) | build + type check |
+
+Limits: readiness is a snapshot at release (sign-in or quota can change later; M2's fast-failure pause still applies). Tool presence is probed in Pastey's environment, not inside an Agent's sandbox (Codex's `command/exec` could probe inside it; not used yet). Claude Code's effort is still not observable. A member added after release has no facts until a later check.
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).

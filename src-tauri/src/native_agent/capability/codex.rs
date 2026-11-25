@@ -691,6 +691,17 @@ impl CodexNativeAdapterV1 {
 }
 
 impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
+    fn readiness_checks(&self, _workspace: &Path) -> Vec<super::NativeReadinessCheckV1> {
+        use super::NativeReadinessCheckV1 as Check;
+        let answer = super::run_bounded(&self.executable(), &["login", "status"], std::time::Duration::from_secs(10));
+        vec![match answer {
+            Some((true, output)) if output.contains("Logged in") => Check { name: "Signed in".into(), ok: Some(true), detail: "`codex login status` reports signed in.".into() },
+            Some((_, output)) if output.to_lowercase().contains("not logged in") => Check { name: "Signed in".into(), ok: Some(false), detail: "Codex is not signed in on this device (`codex login`).".into() },
+            Some(_) => Check { name: "Signed in".into(), ok: None, detail: "`codex login status` gave no answer Pastey could read.".into() },
+            None => Check { name: "Signed in".into(), ok: None, detail: "Codex did not answer `login status` in time, or is not installed.".into() },
+        }]
+    }
+
     fn capability_id(&self) -> &'static str {
         CODEX_CAPABILITY_ID
     }

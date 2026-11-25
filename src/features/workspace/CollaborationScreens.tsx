@@ -14,6 +14,7 @@ import {
   turnOutcomeLabel, USER_ALIAS, validAlias, waitingByRecipient, withdrawCollaborationGrant, type CollaborationEntry,
   optionsLabel, pendingDecisions, setCollaborationMemberOptions, stopCollaborationMember, type MemberOptions,
   executionSourceLabel, setCollaborationExecution, type ExecutionChoice,
+  checkCollaborationReadiness, releaseCollaboration, type MemberReadiness,
   type CollaborationMember, type CollaborationMemberInput, type CollaborationProvider, type CollaborationSummary, type CollaborationView,
   type JournalFilter, type RunningTurn,
 } from "../../lib/collaboration";
@@ -134,6 +135,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
       <div className="page-body"><div className="content stack-lg">
         {error ? <Notice tone="bad">{error}</Notice> : null}
         {view.state === "paused" ? <Notice tone="warn" title="Paused">No member turn starts. Messages still arrive and wait.</Notice> : null}
+        {!ended && view.released === false ? <ReadinessPanel id={id} disabled={pending} onReleased={setView} /> : null}
         {ended ? <Notice title="Ended">Its members are ordinary conversations again. The Journal stays until you delete it.</Notice> : null}
         {link ? <LinkNotice link={link} ended={ended} /> : null}
         <div className="row row-wrap" style={{ gap: 12, alignItems: "stretch" }}>
@@ -205,6 +207,43 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
       </Dialog> : null}
     </section>
   );
+}
+
+const BASIS_WORD: Record<string, string> = { configured: "configured", probed: "checked now", measured: "seen in a turn", unknown: "not known" };
+
+/** Preparing: no member turn starts until every member is ready. Checks
+ * need no model call; facts say how each is known. */
+function ReadinessPanel({ id, disabled, onReleased }: { id: string; disabled: boolean; onReleased: (view: CollaborationView) => void }) {
+  const [results, setResults] = useState<MemberReadiness[] | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const check = async () => {
+    setChecking(true); setError(null);
+    try { setResults(await checkCollaborationReadiness(id)); } catch (cause) { setError(errorText(cause, "The members could not be checked.")); } finally { setChecking(false); }
+  };
+  useEffect(() => { void check(); }, [id]);
+  const allReady = results !== null && results.length > 0 && results.every((result) => result.ready);
+  return <div className="card"><div className="card-body stack" style={{ gap: 10 }}>
+    <div className="row row-wrap" style={{ gap: 8, alignItems: "center" }}>
+      <strong>Preparing</strong>
+      <span className="small muted" style={{ flex: 1 }}>No member turn starts until every member is ready. Messages you send now wait, and all members start together.</span>
+      <button type="button" className="btn btn-sm" disabled={checking} onClick={() => void check()}>{checking ? "Checking…" : "Check again"}</button>
+      <button type="button" className="btn btn-sm btn-primary" disabled={disabled || checking || !allReady}
+        onClick={() => void releaseCollaboration(id).then(onReleased).catch((cause) => setError(errorText(cause, "It could not start.")))}>Start collaboration</button>
+    </div>
+    {error ? <Notice tone="bad">{error}</Notice> : null}
+    {results === null ? <span className="small subtle">Checking each member…</span> : results.map((result) => <div key={result.alias} className="stack" style={{ gap: 4 }}>
+      <span className="small"><strong>{result.alias}</strong> · {providerLabel(result.provider)} · {result.ready ? "ready" : "not ready"}</span>
+      <ul className="xsmall" style={{ margin: 0, paddingLeft: 16 }}>
+        {result.checks.map((item) => <li key={item.name} style={item.ok === true ? undefined : { color: "var(--danger)" }}>
+          {item.ok === true ? "✓" : item.ok === false ? "✗" : "?"} {item.name}: {item.detail} <span className="subtle">({BASIS_WORD[item.basis]})</span>
+        </li>)}
+      </ul>
+      {result.facts.length > 0 ? <details className="xsmall"><summary>What the other members will be told it can do</summary>
+        <ul style={{ margin: 0, paddingLeft: 16 }}>{result.facts.map((fact, index) => <li key={index}>{fact.text} <span className="subtle">({BASIS_WORD[fact.basis]})</span></li>)}</ul>
+      </details> : null}
+    </div>)}
+  </div></div>;
 }
 
 function toChoice(stored: CollaborationMember["execution"]): ExecutionChoice {
@@ -413,6 +452,7 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
         : action.type === "goal_changed" ? `You changed the goal: ${action.goal || "(none)"}`
         : action.type === "role_changed" ? `You changed ${action.alias}'s role: ${action.role || "(none)"}`
         : action.type === "accepted" ? `You accepted the invitation for ${action.alias}`
+        : action.type === "released" ? "You started it: every member was ready"
         : action.type === "execution_changed" ? `You set ${action.alias ? `${action.alias}'s` : "the collaboration's"} execution to ${action.name === "inherit" ? (action.alias ? "the collaboration's choice" : "your default") : action.name}`
         : action.type === "options_changed" ? `You set ${action.alias}'s model to ${action.model ?? "its default"} and effort to ${action.effort ?? "its default"}`
         : `You ${action.confirmed ? "confirmed" : "rejected"} ${decided ?? "a member"}'s decisions`;

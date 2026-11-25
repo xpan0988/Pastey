@@ -330,6 +330,57 @@ pub(crate) enum PeerFolderUseV1 {
     ContinueSession,
 }
 
+/// One check of whether a native capability is ready to run in a folder,
+/// made without a model call (R2 readiness). `ok` absent: not known.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeReadinessCheckV1 {
+    pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ok: Option<bool>,
+    pub(crate) detail: String,
+}
+
+/// Runs `program args` with no input, for at most `timeout`; its exit
+/// status and combined output (bounded), or nothing when it could not run
+/// or did not finish in time (then it is killed).
+pub(crate) fn run_bounded(
+    program: &std::path::Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<(bool, String)> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let mut output = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.by_ref().take(64 * 1024).read_to_string(&mut output);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.by_ref().take(16 * 1024).read_to_string(&mut output);
+    }
+    Some((status.success(), output))
+}
+
 pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
     fn capability_id(&self) -> &'static str;
     fn display_name(&self) -> &'static str;
@@ -387,6 +438,12 @@ pub(crate) trait NativeCapabilityAdapterV1: Send + Sync {
         }
     }
 
+    /// Checks, without a model call, that it can run in `workspace` now:
+    /// signed in, the folder usable, whatever the capability needs. May
+    /// take seconds; never called under the service lock.
+    fn readiness_checks(&self, _workspace: &std::path::Path) -> Vec<NativeReadinessCheckV1> {
+        Vec::new()
+    }
     /// Validates the opaque input and reports identity and exclusivity.
     /// Called only for input Core has already admitted.
     fn prepare(&self, input: &OpaqueCapabilityPayloadV1) -> AppResult<PreparedInvocationV1>;

@@ -286,7 +286,11 @@ fn read_wire_entry(value: &Value) -> AppResult<IncomingV1> {
             UserActionV1::RoleChanged { alias, role } => valid_alias(alias) && role.chars().count() <= MAX_ROLE_CHARS,
             UserActionV1::MemberResumed { alias } => valid_alias(alias),
             UserActionV1::Decided { entry, .. } => valid_id(entry, "entry:"),
-            UserActionV1::Accepted { .. } | UserActionV1::Paused | UserActionV1::Resumed | UserActionV1::Ended => true,
+            UserActionV1::Accepted { .. }
+            | UserActionV1::Paused
+            | UserActionV1::Resumed
+            | UserActionV1::Ended
+            | UserActionV1::Released => true,
             UserActionV1::ExecutionChanged { alias, name } => {
                 alias.as_deref().is_none_or(valid_alias) && name.chars().count() <= 60
             }
@@ -439,6 +443,7 @@ impl CollaborationServiceV1 {
         item.record.members.push(MemberV1 {
             options: Default::default(),
             execution: None,
+            facts: Vec::new(),
             alias: alias.clone(),
             provider: input.provider,
             workspace: String::new(),
@@ -735,6 +740,7 @@ impl CollaborationServiceV1 {
             .map(|member| MemberV1 {
                 options: Default::default(),
             execution: None,
+            facts: Vec::new(),
                 alias: member.alias.clone(),
                 provider: member.provider,
                 workspace: String::new(),
@@ -751,6 +757,7 @@ impl CollaborationServiceV1 {
         members.push(MemberV1 {
             options: Default::default(),
             execution: None,
+            facts: Vec::new(),
             alias: invitation.member.alias.clone(),
             provider: invitation.member.provider,
             workspace: workspace.to_string_lossy().into_owned(),
@@ -765,6 +772,8 @@ impl CollaborationServiceV1 {
         });
         let record = CollaborationRecordV1 {
             execution: None,
+            // The device that created it held its readiness barrier.
+            released: true,
             schema_version: SCHEMA_VERSION.into(),
             id: invitation.collaboration_id.clone(),
             name: invitation.name.clone(),
@@ -975,6 +984,7 @@ impl CollaborationServiceV1 {
                         None => item.record.members.push(MemberV1 {
                             options: Default::default(),
             execution: None,
+            facts: Vec::new(),
                             alias: alias.clone(),
                             provider: *provider,
                             workspace: String::new(),

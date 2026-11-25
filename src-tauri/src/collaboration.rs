@@ -171,6 +171,10 @@ pub(crate) struct MemberV1 {
     /// This member's own execution choice (absent: the collaboration's).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) execution: Option<ExecutionChoiceV1>,
+    /// What it can do, as its readiness check found when the collaboration
+    /// was released: told to every member in the note.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) facts: Vec<readiness::FactV1>,
 }
 
 /// The auto grant: `turns` automatic turns until `expires_at` (seconds).
@@ -359,6 +363,14 @@ pub(crate) struct CollaborationRecordV1 {
     /// Its members' execution choice (absent: the user's default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) execution: Option<ExecutionChoiceV1>,
+    /// No member turn starts until every member is ready and the user
+    /// released it (R2). Collaborations from before R2 count as released.
+    #[serde(default = "released_before_r2")]
+    pub(crate) released: bool,
+}
+
+fn released_before_r2() -> bool {
+    true
 }
 
 /// Where an entry's content comes from.
@@ -396,6 +408,8 @@ pub(crate) enum UserActionV1 {
     Decided { entry: String, confirmed: bool },
     /// This device's user accepted the invitation for `alias`.
     Accepted { alias: String },
+    /// Every member was ready, and the user released the collaboration.
+    Released,
     /// The execution choice of the collaboration (`alias` absent) or of a
     /// member changed: `name` of the profile now chosen, `inherit` or `Ask`.
     ExecutionChanged {
@@ -621,6 +635,8 @@ pub(crate) struct CollaborationSummaryV1 {
     /// Its members' execution choice (absent: the user's default).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) execution: Option<ExecutionChoiceV1>,
+    /// Member turns may start (R2: every member was ready).
+    pub(crate) released: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -755,6 +771,7 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
          You are the member \"{alias}\" ({provider}). The members are:\n\
          {members}\
          - {USER_ALIAS}: the person you work for. Message them only with a question or decision only they can answer.\n\n\
+         {facts}\
          To message a member, end your final answer with a block in exactly this form:\n\n\
          ```pastey-message to=<member>\n\
          subject: <one line>\n\n\
@@ -776,6 +793,10 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
         goal = if record.goal.trim().is_empty() { "(none given)" } else { record.goal.trim() },
         alias = member.alias,
         provider = member.provider.label(),
+        facts = {
+            let section = readiness::facts_section(&record.members);
+            if section.is_empty() { section } else { format!("{section}\n") }
+        },
     )
 }
 
@@ -1060,6 +1081,7 @@ impl CollaborationServiceV1 {
             invite: None,
             options: input.options.clone(),
             execution: None,
+            facts: Vec::new(),
         })
     }
 
@@ -1106,6 +1128,8 @@ impl CollaborationServiceV1 {
         let id = format!("collaboration:{}", Uuid::new_v4());
         let record = CollaborationRecordV1 {
             execution: None,
+            // A new collaboration waits for every member to be ready (R2).
+            released: false,
             schema_version: SCHEMA_VERSION.into(),
             id: id.clone(),
             name: name.to_owned(),
@@ -2054,7 +2078,12 @@ impl CollaborationServiceV1 {
                 continue;
             }
             for member in &item.record.members {
-                if member.remote || member.paused || item.scheduled_for(&member.alias) || member.auto_task.is_some() {
+                if !item.record.released
+                    || member.remote
+                    || member.paused
+                    || item.scheduled_for(&member.alias)
+                    || member.auto_task.is_some()
+                {
                     continue;
                 }
                 let automatic_allowed = auto_left > 0
@@ -2336,6 +2365,47 @@ impl CollaborationServiceV1 {
         self.effective_execution(item, item.member(&alias)?).0
     }
 
+    /// Tests from before R2: a collaboration whose turns may start at once.
+    #[cfg(test)]
+    pub(crate) fn create_released(&mut self, name: &str, goal: &str, members: Vec<MemberInputV1>) -> AppResult<String> {
+        let id = self.create(name, goal, members)?;
+        self.item_mut(&id)?.record.released = true;
+        self.save_record(&id)?;
+        Ok(id)
+    }
+
+    /// Releases collaboration `id` once every member is ready (`readiness`
+    /// from `readiness::check`, just now): each member's facts are kept for
+    /// the note, and member turns may start.
+    pub(crate) fn release(&mut self, id: &str, readiness: &[readiness::MemberReadinessV1]) -> AppResult<()> {
+        let item = self.item_mut(id)?;
+        if item.record.state == CollaborationStateV1::Ended {
+            return invalid("This collaboration has ended.");
+        }
+        if item.record.released {
+            return Ok(());
+        }
+        let missing: Vec<String> = item
+            .record
+            .members
+            .iter()
+            .filter(|member| !readiness.iter().any(|result| result.alias == member.alias && result.ready))
+            .map(|member| member.alias.clone())
+            .collect();
+        if !missing.is_empty() {
+            return invalid(format!("Not every member is ready: {}.", missing.join(", ")));
+        }
+        for member in &mut item.record.members {
+            if let Some(result) = readiness.iter().find(|result| result.alias == member.alias) {
+                member.facts = result.facts.clone();
+            }
+        }
+        item.record.released = true;
+        self.save_record(id)?;
+        self.append(id, None, BasisV1::User, EntryBodyV1::User { action: UserActionV1::Released }, None)
+            .map(|_| ())
+    }
+
     /// The user's authorised default, if any.
     pub(crate) fn execution_default(&self) -> Option<ExecutionDefaultV1> {
         self.execution_default.clone()
@@ -2533,6 +2603,7 @@ impl CollaborationServiceV1 {
                 },
             last_activity_at: item.last_activity_at(),
             execution: item.record.execution.clone(),
+            released: item.record.released,
         }
     }
 
@@ -3354,6 +3425,8 @@ fn redact_paths(text: &str, workspace: &Path) -> String {
         })
         .collect()
 }
+
+pub(crate) mod readiness;
 
 #[cfg(test)]
 mod tests;

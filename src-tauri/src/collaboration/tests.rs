@@ -80,7 +80,7 @@ fn idle(_: &Path) -> MemberRuntimeV1 {
 
 fn service_with(fixture: &FixtureV1) -> (CollaborationServiceV1, String) {
     let mut service = CollaborationServiceV1::new(None).unwrap();
-    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    let id = service.create_released("orders-v2", "Cursor pagination", fixture.members()).unwrap();
     (service, id)
 }
 
@@ -92,23 +92,23 @@ fn entries(service: &CollaborationServiceV1, id: &str) -> Vec<EntryV1> {
 fn a_collaboration_needs_distinct_valid_members() {
     let fixture = FixtureV1::new("create");
     let mut service = CollaborationServiceV1::new(None).unwrap();
-    assert!(service.create("x", "", Vec::new()).is_err());
+    assert!(service.create_released("x", "", Vec::new()).is_err());
     let mut same_alias = fixture.members();
     same_alias[1].alias = "api".into();
-    assert!(service.create("x", "", same_alias).is_err());
+    assert!(service.create_released("x", "", same_alias).is_err());
     let mut user_alias = fixture.members();
     user_alias[0].alias = USER_ALIAS.into();
-    assert!(service.create("x", "", user_alias).is_err());
+    assert!(service.create_released("x", "", user_alias).is_err());
     let mut bad_alias = fixture.members();
     bad_alias[0].alias = "Web Team".into();
-    assert!(service.create("x", "", bad_alias).is_err());
+    assert!(service.create_released("x", "", bad_alias).is_err());
     let mut same_conversation = fixture.members();
     same_conversation[1].provider = ProviderV1::Codex;
     same_conversation[1].workspace = fixture.api.to_string_lossy().into();
-    assert!(service.create("x", "", same_conversation).is_err());
-    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    assert!(service.create_released("x", "", same_conversation).is_err());
+    let id = service.create_released("orders-v2", "Cursor pagination", fixture.members()).unwrap();
     // A conversation belongs to one collaboration at a time.
-    assert!(service.create("again", "", fixture.members()).is_err());
+    assert!(service.create_released("again", "", fixture.members()).is_err());
     let view = service.view(&id, idle).unwrap();
     assert_eq!(view.summary.members.len(), 2);
     assert!(matches!(view.entries[0].body, EntryBodyV1::User { .. }));
@@ -395,7 +395,7 @@ fn ending_dismisses_what_waits_and_deleting_removes_the_journal() {
     let fixture = FixtureV1::new("end");
     let paths = fixture.paths();
     let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
-    let id = service.create("orders-v2", "", fixture.members()).unwrap();
+    let id = service.create_released("orders-v2", "", fixture.members()).unwrap();
     service
         .turn_ended(&ended("t1", ProviderV1::Codex, &fixture.api, Some(TO_WEB)))
         .unwrap();
@@ -557,7 +557,7 @@ fn the_hop_limit_holds_across_three_members_under_auto() {
         role: "writes tests".into(),
     });
     let mut service = CollaborationServiceV1::new(None).unwrap();
-    let id = service.create("orders-v2", "", members).unwrap();
+    let id = service.create_released("orders-v2", "", members).unwrap();
     for alias in ["api", "web", "qa"] {
         service.set_grant(&id, alias, MAX_AUTO_TURNS, HOURS, now()).unwrap();
     }
@@ -738,7 +738,7 @@ fn a_grant_survives_a_restart_and_withdrawing_it_returns_messages_to_approval() 
     let fixture = FixtureV1::new("restart-grant");
     let paths = fixture.paths();
     let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
-    let id = service.create("orders-v2", "", fixture.members()).unwrap();
+    let id = service.create_released("orders-v2", "", fixture.members()).unwrap();
     service.set_grant(&id, "web", 3, HOURS, now()).unwrap();
     service
         .turn_ended(&ended("t1", ProviderV1::Codex, &fixture.api, Some(TO_WEB)))
@@ -1044,7 +1044,7 @@ fn file_state_comes_from_scans_at_each_turns_start_and_end() {
     fs::write(fixture.api.join("orders.py"), "v1").unwrap();
     let paths = fixture.paths();
     let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
-    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    let id = service.create_released("orders-v2", "Cursor pagination", fixture.members()).unwrap();
     let scan = || manifest::scan(&fixture.api);
 
     // Turn 1: a shell command adds a file and changes another.
@@ -1128,7 +1128,7 @@ fn a_members_model_and_effort_reach_every_turn_the_collaboration_starts() {
     let fixture = FixtureV1::new("options");
     let paths = fixture.paths();
     let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
-    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    let id = service.create_released("orders-v2", "Cursor pagination", fixture.members()).unwrap();
     let options = crate::native_agent::NativeSessionOptionsV1 {
         model: Some("claude-sonnet-5-5".into()),
         effort: Some("xhigh".into()),
@@ -1228,7 +1228,7 @@ fn execution_profiles_resolve_member_then_collaboration_then_the_users_default()
     let fixture = FixtureV1::new("execution");
     let paths = fixture.paths();
     let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
-    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    let id = service.create_released("orders-v2", "Cursor pagination", fixture.members()).unwrap();
     let unattended = ExecutionProfileV1::unattended_engineering();
     let source = |service: &CollaborationServiceV1, alias: &str| {
         service
@@ -1279,4 +1279,73 @@ fn execution_profiles_resolve_member_then_collaboration_then_the_users_default()
         .filter(|entry| matches!(&entry.body, EntryBodyV1::User { action: UserActionV1::ExecutionChanged { .. } }))
         .count();
     assert_eq!(changes, 3);
+}
+
+#[test]
+fn a_new_collaboration_starts_no_turn_until_every_member_is_ready() {
+    let fixture = FixtureV1::new("readiness");
+    let mut service = CollaborationServiceV1::new(None).unwrap();
+    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    service.user_message(&id, "api", "Investigate.").unwrap();
+    service.user_message(&id, "web", "Investigate.").unwrap();
+    // E01: one member started while the other could not; now nothing starts.
+    assert!(service.plan_starts(free).is_empty());
+    assert!(!service.view(&id, idle).unwrap().summary.released);
+    let ready = |alias: &str, ok: bool| readiness::MemberReadinessV1 {
+        alias: alias.into(),
+        provider: ProviderV1::Codex,
+        ready: ok,
+        checks: Vec::new(),
+        facts: vec![readiness::FactV1 { text: format!("{alias} can run cargo"), basis: readiness::FactBasisV1::Probed }],
+    };
+    assert!(service.release(&id, &[ready("api", true), ready("web", false)]).is_err());
+    assert!(service.release(&id, &[ready("api", true)]).is_err(), "every member must be covered");
+    assert!(service.plan_starts(free).is_empty());
+    service.release(&id, &[ready("api", true), ready("web", true)]).unwrap();
+    // Released: both start together, and each one's prompt tells it what
+    // the other can do, with how that is known.
+    let plans = service.plan_starts(free);
+    assert_eq!(plans.len(), 2);
+    for plan in &plans {
+        assert!(plan.prompt.contains("- api: api can run cargo (probed)"), "{}", plan.prompt);
+        assert!(plan.prompt.contains("- web: web can run cargo (probed)"), "{}", plan.prompt);
+    }
+    assert!(entries(&service, &id)
+        .iter()
+        .any(|entry| matches!(&entry.body, EntryBodyV1::User { action: UserActionV1::Released })));
+}
+
+#[test]
+fn profile_facts_say_what_a_member_can_and_cannot_do() {
+    let unattended = ExecutionProfileV1::unattended_engineering();
+    let claude = readiness::profile_facts(ProviderV1::ClaudeCode, Some(&unattended));
+    assert!(claude.iter().all(|fact| fact.basis == readiness::FactBasisV1::Configured));
+    assert!(claude.iter().any(|fact| fact.text.contains("runs shell commands without asking, inside Claude Code's sandbox")));
+    assert!(claude.iter().any(|fact| fact.text.contains("may not: Bash(git push)")));
+    let codex = readiness::profile_facts(ProviderV1::Codex, Some(&unattended));
+    assert!(codex.iter().any(|fact| fact.text.contains("network off: cannot download packages")));
+    assert!(codex.iter().any(|fact| fact.text.contains("auto-review (a model's judgement)")));
+    // E01's Claude member: nothing passed, so it could not run commands.
+    let ask = readiness::profile_facts(ProviderV1::ClaudeCode, None);
+    assert!(ask[0].text.contains("declined"));
+}
+
+/// Live (ignored): the installed Codex and Claude Code answer readiness
+/// without a model call. Run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn installed_agents_answer_readiness_without_a_model_call() {
+    let mut natives = crate::native_agent::NativeAgentServiceV1::default();
+    natives.add_installed_claude_code_conversation_for_test(&std::env::current_exe().unwrap());
+    let folder = std::env::temp_dir().canonicalize().unwrap();
+    for capability in [crate::native_agent::CODEX_CAPABILITY_ID, crate::native_agent::CLAUDE_CODE_CONVERSATION_CAPABILITY] {
+        let probe = natives.readiness_probe(capability).expect("registered");
+        let started = std::time::Instant::now();
+        let checks = probe(&folder);
+        println!("{capability} ({:?}):", started.elapsed());
+        for check in &checks {
+            println!("  {:?} {}: {}", check.ok, check.name, check.detail);
+        }
+        assert!(checks.iter().any(|check| check.name == "Signed in"), "{checks:?}");
+    }
 }
