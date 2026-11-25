@@ -311,6 +311,20 @@ Boundary: make every way a collaboration can stop moving visible and bounded, wi
 
 Limits: waits stay on this device (a linked device does not receive them; the waiter's message conveys the need). "Progress" is files or a recorded stage; a turn that only reads and answers usefully counts as no progress, so a long purely analytical exchange pauses after 4 automatic turns. Cycle detection covers declared waits only, not implicit ones ("I'll wait for your reply" in prose).
 
+### R4: user preference profile (2026-11-25)
+
+Boundary: Pastey stores, versions and delivers the user's preferences; native Agents interpret them; nothing in them is authority.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| Profile | `collaboration/preferences.rs`: four sections kept apart (hard restrictions, delegated decision scope, ordinary preferences, decisions already made), each at most 1,200 characters and checked with the shared faithful-rendering rule; stored in `user_preferences`, a new version on every save | `preferences::tests::preferences_are_delivered_as_the_users_text_and_never_as_permission` |
+| Collaboration context | A collaboration's own preferences (`preferences_note`), and the decisions the user confirmed in its Journal, join the profile in one section | `preferences_reach_each_member_once_per_version_and_grant_nothing` |
+| Delivery | A member's turn carries the section in full when it has not had this text (digest kept per member at the turn's start); later turns do not repeat it; a new version or note reaches every member again; a turn the user types carries it too; it counts against the prompt's bound | same |
+| Guidance, not authority | The section says it grants no permission; it tells Agents to make routine, reversible decisions within the delegated scope and record them with a reason in the summary's `decisions`, and to escalate only material uncertainty, substantial risk or decisions outside scope, with what is needed, why, the options and a recommendation. A preference never creates an execution profile; enforcement of a restriction belongs in the profile's deny rules (the UI says so) | same; Settings text |
+| UI | Settings → Preferences for Agents (four fields, version shown); Preferences… on a collaboration | build + type check |
+
+Limits: whether Agents follow the profile is their behaviour, measured in E02, not something Pastey checks. Restrictions written only as preferences are not enforced.
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).

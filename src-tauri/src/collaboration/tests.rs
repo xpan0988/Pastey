@@ -1517,3 +1517,47 @@ fn the_watchdog_tells_a_provider_failure_and_an_unknown_outcome_apart() {
     let api = view.summary.members.iter().find(|member| member.member.alias == "api").unwrap();
     assert!(matches!(api.condition, MemberConditionV1::Working { quiet_minutes: Some(40) }), "{:?}", api.condition);
 }
+
+#[test]
+fn preferences_reach_each_member_once_per_version_and_grant_nothing() {
+    let fixture = FixtureV1::new("preferences");
+    let paths = fixture.paths();
+    let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
+    let id = service.create_released("orders-v2", "Mobile support", fixture.members()).unwrap();
+    let saved = service
+        .set_preferences(preferences::PreferencesInputV1 {
+            restrictions: "Never push or publish.".into(),
+            delegated: "Build-system changes.".into(),
+            preferences: "iOS before Android.".into(),
+            decisions: String::new(),
+        })
+        .unwrap();
+    assert_eq!(saved.version, 1);
+    service.set_preferences_note(&id, "Keep the desktop UI unchanged.").unwrap();
+    // The first turn carries them in full.
+    service.user_message(&id, "web", "Start.").unwrap();
+    let plans = service.plan_starts(free);
+    assert!(plans[0].prompt.contains("iOS before Android."), "{}", plans[0].prompt);
+    assert!(plans[0].prompt.contains("Keep the desktop UI unchanged."));
+    assert!(plans[0].prompt.contains("They grant no permission"));
+    assert!(plans[0].execution.is_none(), "preferences create no execution profile");
+    service.started(&plans[0], "t1").unwrap();
+    service.turn_ended(&ended("t1", ProviderV1::ClaudeCode, &fixture.web, None)).unwrap();
+    // The next turn does not repeat them.
+    service.user_message(&id, "web", "Next.").unwrap();
+    let plans = service.plan_starts(free);
+    assert!(!plans[0].prompt.contains("iOS before Android."), "{}", plans[0].prompt);
+    service.started(&plans[0], "t2").unwrap();
+    service.turn_ended(&ended("t2", ProviderV1::ClaudeCode, &fixture.web, None)).unwrap();
+    // A new version reaches it again; versions survive a restart.
+    let next = service
+        .set_preferences(preferences::PreferencesInputV1 { preferences: "Android first.".into(), ..Default::default() })
+        .unwrap();
+    assert_eq!(next.version, 2);
+    service.user_message(&id, "web", "Again.").unwrap();
+    assert!(service.plan_starts(free)[0].prompt.contains("Android first."));
+    assert_eq!(CollaborationServiceV1::new(Some(paths)).unwrap().preferences().unwrap().version, 2);
+    assert!(service
+        .set_preferences(preferences::PreferencesInputV1 { restrictions: "x".repeat(preferences::MAX_SECTION_CHARS + 1), ..Default::default() })
+        .is_err());
+}

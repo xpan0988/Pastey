@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  getUserPreferences, setUserPreferences, type PreferenceSections, type UserPreferences,
   describeProfile, getExecutionDefault, listExecutionPresets, setExecutionDefault,
   type ExecutionChoice, type ExecutionDefault, type ExecutionProfile,
 } from "../../lib/collaboration";
@@ -146,4 +147,45 @@ export function ExecutionChoiceDialog({ title, scope, initial, pending, onClose,
       </> : null}
     </div>
   </Dialog>;
+}
+
+const PREFERENCE_FIELDS: ReadonlyArray<{ key: keyof PreferenceSections; label: string; hint: string }> = [
+  { key: "restrictions", label: "Never do", hint: "Hard restrictions Agents must follow. To have them enforced, also add deny rules to the execution profile." },
+  { key: "delegated", label: "Agents may decide on their own", hint: "Routine, reversible decisions they make and record without asking you." },
+  { key: "preferences", label: "Preferences", hint: "Product, architecture, engineering, technology, platform, risk tolerance." },
+  { key: "decisions", label: "Decisions already made", hint: "What you decided before, to be respected." },
+];
+
+/** Settings: the user's preference profile for Agents. Pastey stores,
+ * versions and delivers it; Agents interpret it; it grants nothing. */
+export function PreferencesSettings() {
+  const [current, setCurrent] = useState<UserPreferences | null | undefined>(undefined);
+  const [draft, setDraft] = useState<PreferenceSections>({ restrictions: "", delegated: "", preferences: "", decisions: "" });
+  const [pending, setPending] = useState(false);
+  const [message, setMessage] = useState<{ tone: "ok" | "bad"; text: string } | null>(null);
+  useEffect(() => {
+    void getUserPreferences().then((read) => {
+      setCurrent(read);
+      if (read) setDraft({ restrictions: read.restrictions, delegated: read.delegated, preferences: read.preferences, decisions: read.decisions });
+    }).catch(() => setCurrent(null));
+  }, []);
+  const save = async () => {
+    setPending(true); setMessage(null);
+    try { const saved = await setUserPreferences(draft); setCurrent(saved); setMessage({ tone: "ok", text: `Saved as version ${saved.version}. Each member gets it in full on its next turn.` }); }
+    catch (cause) { setMessage({ tone: "bad", text: errorText(cause, "It could not be saved.") }); }
+    finally { setPending(false); }
+  };
+  return <section className="section" aria-label="Preferences for Agents">
+    <div className="section-head-row"><div className="section-head"><h2>Preferences for Agents</h2>
+      <p>What collaboration members should assume when they read an objective, plan and decide. They decide routine, reversible matters themselves within what you delegate, and ask you only about material uncertainty, risk, or decisions outside it. Preferences are guidance: they never let an Agent do more.</p></div>
+      <button type="button" className="btn btn-sm btn-primary" disabled={pending || current === undefined} onClick={() => void save()}>Save</button></div>
+    {message ? <Notice tone={message.tone}>{message.text}</Notice> : null}
+    <div className="card"><div className="card-body stack" style={{ gap: 10 }}>
+      {current ? <span className="xsmall subtle">Version {current.version} · saved {formatTimestamp(current.updatedAt * 1000)}</span> : null}
+      {PREFERENCE_FIELDS.map((field) => <Field key={field.key} label={field.label} htmlFor={`preferences-${field.key}`} hint={field.hint}>
+        <textarea id={`preferences-${field.key}`} className="input small" rows={3} maxLength={1200} value={draft[field.key]}
+          onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.value }))} />
+      </Field>)}
+    </div></div>
+  </section>;
 }

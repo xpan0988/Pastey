@@ -175,6 +175,10 @@ pub(crate) struct MemberV1 {
     /// was released: told to every member in the note.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) facts: Vec<readiness::FactV1>,
+    /// The digest of the preferences its last turn carried (R4): a turn
+    /// carries them in full again only when they changed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) preferences_seen: String,
 }
 
 /// The auto grant: `turns` automatic turns until `expires_at` (seconds).
@@ -371,6 +375,9 @@ pub(crate) struct CollaborationRecordV1 {
     /// (R3): at `NO_PROGRESS_LIMIT` the collaboration pauses.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) no_progress: u8,
+    /// This collaboration's own preferences, beside the user's profile (R4).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) preferences_note: String,
 }
 
 fn is_zero(count: &u8) -> bool {
@@ -425,6 +432,8 @@ pub(crate) enum UserActionV1 {
     Accepted { alias: String },
     /// Every member was ready, and the user released the collaboration.
     Released,
+    /// The user changed this collaboration's own preferences (R4).
+    PreferencesChanged { note: String },
     /// The execution choice of the collaboration (`alias` absent) or of a
     /// member changed: `name` of the profile now chosen, `inherit` or `Ask`.
     ExecutionChanged {
@@ -609,6 +618,9 @@ pub(crate) struct StartPlanV1 {
     pub(crate) options: NativeSessionOptionsV1,
     /// The member's effective execution profile (absent: nothing passed).
     pub(crate) execution: Option<ExecutionProfileV1>,
+    /// The digest of the preferences this turn carries in full (empty:
+    /// none, or the member already has them).
+    pub(crate) preferences_digest: String,
 }
 
 /// What the runtime knows of a member's folder now.
@@ -691,6 +703,9 @@ pub(crate) struct CollaborationSummaryV1 {
     pub(crate) execution: Option<ExecutionChoiceV1>,
     /// Member turns may start (R2: every member was ready).
     pub(crate) released: bool,
+    /// This collaboration's own preferences (R4).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) preferences_note: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -769,6 +784,8 @@ pub(crate) struct CollaborationServiceV1 {
     noted_waits: std::collections::HashSet<String>,
     /// This device's user's authorised default execution profile.
     execution_default: Option<ExecutionDefaultV1>,
+    /// This device's user's preference profile for Agents (R4).
+    preferences: Option<preferences::PreferencesV1>,
 }
 
 fn now() -> i64 {
@@ -881,10 +898,13 @@ impl CollaborationServiceV1 {
             syncing: Arc::default(),
             noted_waits: Default::default(),
             execution_default: None,
+            preferences: None,
         };
         let Some(paths) = service.paths.clone() else {
             return Ok(service);
         };
+        service.preferences = storage::load_user_preferences(&paths)?
+            .and_then(|json| serde_json::from_str::<preferences::PreferencesV1>(&json).ok());
         // A default that no longer reads as a valid profile is not used.
         service.execution_default = storage::load_execution_default(&paths)?
             .and_then(|json| serde_json::from_str::<ExecutionDefaultV1>(&json).ok())
@@ -1023,7 +1043,9 @@ impl CollaborationServiceV1 {
         let device_private = matches!(
             &body,
             EntryBodyV1::User {
-                action: UserActionV1::OptionsChanged { .. } | UserActionV1::ExecutionChanged { .. }
+                action: UserActionV1::OptionsChanged { .. }
+                    | UserActionV1::ExecutionChanged { .. }
+                    | UserActionV1::PreferencesChanged { .. }
             } | EntryBodyV1::Wait { .. }
         );
         let outbox = item
@@ -1141,6 +1163,7 @@ impl CollaborationServiceV1 {
             options: input.options.clone(),
             execution: None,
             facts: Vec::new(),
+            preferences_seen: String::new(),
         })
     }
 
@@ -1152,7 +1175,9 @@ impl CollaborationServiceV1 {
         let (id, alias) = self.member_of(provider, &workspace)?;
         let item = self.items.get(&id)?;
         let member = item.member(&alias)?;
-        let note = note(&item.record, member);
+        // The user's preferences, when this member has not had them.
+        let (preferences, _) = self.preferences_for(item, member);
+        let note = if preferences.is_empty() { note(&item.record, member) } else { format!("{preferences}\n{}", note(&item.record, member)) };
         if !first_turn(item, member) {
             return Some(note);
         }
@@ -1190,6 +1215,7 @@ impl CollaborationServiceV1 {
             // A new collaboration waits for every member to be ready (R2).
             released: false,
             no_progress: 0,
+            preferences_note: String::new(),
             schema_version: SCHEMA_VERSION.into(),
             id: id.clone(),
             name: name.to_owned(),
@@ -2326,7 +2352,8 @@ impl CollaborationServiceV1 {
                         entry.seq,
                     )
                 });
-                let (prompt, entry_ids) = prompt(item, member, &deliverable, now);
+                let (prefs_text, prefs_digest) = self.preferences_for(item, member);
+                let (prompt, entry_ids) = prompt(item, member, &deliverable, &prefs_text, now);
                 if entry_ids.is_empty() {
                     continue;
                 }
@@ -2346,6 +2373,7 @@ impl CollaborationServiceV1 {
                     automatic,
                     options: member.options.clone(),
                     execution: self.effective_execution(item, member).0,
+                    preferences_digest: prefs_digest,
                 });
             }
         }
@@ -2358,6 +2386,12 @@ impl CollaborationServiceV1 {
     }
 
     pub(crate) fn started_at(&mut self, plan: &StartPlanV1, task_id: &str, now: i64) -> AppResult<()> {
+        if !plan.preferences_digest.is_empty() {
+            if let Some(member) = self.item_mut(&plan.collaboration_id)?.member_mut(&plan.alias) {
+                member.preferences_seen = plan.preferences_digest.clone();
+            }
+            self.save_record(&plan.collaboration_id)?;
+        }
         for entry_id in &plan.entry_ids {
             let pending = self
                 .item(&plan.collaboration_id)?
@@ -2620,6 +2654,63 @@ impl CollaborationServiceV1 {
             .map(|_| ())
     }
 
+    /// The preferences section `member`'s next turn carries, with its
+    /// digest: empty when there are none or the member already has them.
+    fn preferences_for(&self, item: &CollaborationV1, member: &MemberV1) -> (String, String) {
+        let confirmed = confirmed_decisions(item);
+        let text = preferences::section(self.preferences.as_ref(), &item.record.preferences_note, &confirmed);
+        if text.is_empty() {
+            return (String::new(), String::new());
+        }
+        let digest = blake3::hash(text.as_bytes()).to_hex()[..16].to_owned();
+        if member.preferences_seen == digest {
+            (String::new(), String::new())
+        } else {
+            (text, digest)
+        }
+    }
+
+    /// The user's preference profile, if any.
+    pub(crate) fn preferences(&self) -> Option<preferences::PreferencesV1> {
+        self.preferences.clone()
+    }
+
+    /// Saves the user's preference profile as a new version; every member
+    /// gets it in full on its next turn.
+    pub(crate) fn set_preferences(&mut self, input: preferences::PreferencesInputV1) -> AppResult<preferences::PreferencesV1> {
+        input.validate()?;
+        let next = preferences::PreferencesV1 {
+            version: self.preferences.as_ref().map_or(1, |current| current.version + 1),
+            updated_at: now(),
+            sections: input,
+        };
+        if let Some(paths) = self.paths.as_ref() {
+            storage::save_user_preferences(paths, &serde_json::to_string(&next)?)?;
+        }
+        self.preferences = Some(next.clone());
+        Ok(next)
+    }
+
+    /// Sets this collaboration's own preferences; a user entry records it.
+    pub(crate) fn set_preferences_note(&mut self, id: &str, note: &str) -> AppResult<()> {
+        let note = note.trim();
+        preferences::PreferencesInputV1 { preferences: note.to_owned(), ..Default::default() }.validate()?;
+        let item = self.item_mut(id)?;
+        if item.record.preferences_note == note {
+            return Ok(());
+        }
+        item.record.preferences_note = note.to_owned();
+        self.save_record(id)?;
+        self.append(
+            id,
+            None,
+            BasisV1::User,
+            EntryBodyV1::User { action: UserActionV1::PreferencesChanged { note: short(note, 200) } },
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// The user's authorised default, if any.
     pub(crate) fn execution_default(&self) -> Option<ExecutionDefaultV1> {
         self.execution_default.clone()
@@ -2853,6 +2944,7 @@ impl CollaborationServiceV1 {
             last_activity_at: item.last_activity_at(),
             execution: item.record.execution.clone(),
             released: item.record.released,
+            preferences_note: item.record.preferences_note.clone(),
         }
     }
 
@@ -2888,7 +2980,7 @@ impl CollaborationServiceV1 {
 
 /// The prompt delivering `entries` to `member`, within its bound, and the
 /// entries it carries.
-fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], now: i64) -> (String, Vec<String>) {
+fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], preferences: &str, now: i64) -> (String, Vec<String>) {
     let record = &item.record;
     let note = note(record, member);
     let render = |entry: &EntryV1| -> Option<(String, bool)> {
@@ -2923,6 +3015,8 @@ fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], now: 
     } else {
         digest(item, member)
     };
+    // The user's preferences, when this member has not seen this version.
+    let digest = if preferences.is_empty() { digest } else { format!("{preferences}\n{digest}") };
     let mut blocks: Vec<String> = Vec::new();
     let mut ids = Vec::new();
     let mut from_agents = false;
@@ -3695,6 +3789,21 @@ fn condition_of(
     wait.unwrap_or(MemberConditionV1::Idle)
 }
 
+/// The decisions of summaries the user confirmed (and did not later
+/// reject), each shortened, oldest first.
+fn confirmed_decisions(item: &CollaborationV1) -> Vec<String> {
+    item.entries
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            EntryBodyV1::Summary { summary } if decision_of(item, &entry.id) == Some(true) => summary
+                .decisions
+                .as_deref()
+                .map(|decisions| format!("{} ({})", short(decisions, 240), entry.member.as_deref().unwrap_or("a member"))),
+            _ => None,
+        })
+        .collect()
+}
+
 /// A cycle of members waiting on each other through `alias`'s open wait,
 /// in order (`a → b → a`), if there is one. Waits on `user` end nowhere.
 fn wait_cycle(item: &CollaborationV1, alias: &str) -> Option<Vec<String>> {
@@ -3786,6 +3895,7 @@ fn redact_paths(text: &str, workspace: &Path) -> String {
         .collect()
 }
 
+pub(crate) mod preferences;
 pub(crate) mod readiness;
 
 #[cfg(test)]

@@ -291,6 +291,7 @@ fn read_wire_entry(value: &Value) -> AppResult<IncomingV1> {
             | UserActionV1::Resumed
             | UserActionV1::Ended
             | UserActionV1::Released => true,
+            UserActionV1::PreferencesChanged { note } => bounded(note, 1024),
             UserActionV1::ExecutionChanged { alias, name } => {
                 alias.as_deref().is_none_or(valid_alias) && name.chars().count() <= 60
             }
@@ -447,6 +448,7 @@ impl CollaborationServiceV1 {
             options: Default::default(),
             execution: None,
             facts: Vec::new(),
+            preferences_seen: String::new(),
             alias: alias.clone(),
             provider: input.provider,
             workspace: String::new(),
@@ -744,6 +746,7 @@ impl CollaborationServiceV1 {
                 options: Default::default(),
             execution: None,
             facts: Vec::new(),
+            preferences_seen: String::new(),
                 alias: member.alias.clone(),
                 provider: member.provider,
                 workspace: String::new(),
@@ -761,6 +764,7 @@ impl CollaborationServiceV1 {
             options: Default::default(),
             execution: None,
             facts: Vec::new(),
+            preferences_seen: String::new(),
             alias: invitation.member.alias.clone(),
             provider: invitation.member.provider,
             workspace: workspace.to_string_lossy().into_owned(),
@@ -778,6 +782,7 @@ impl CollaborationServiceV1 {
             // The device that created it held its readiness barrier.
             released: true,
             no_progress: 0,
+            preferences_note: String::new(),
             schema_version: SCHEMA_VERSION.into(),
             id: invitation.collaboration_id.clone(),
             name: invitation.name.clone(),
@@ -989,6 +994,7 @@ impl CollaborationServiceV1 {
                             options: Default::default(),
             execution: None,
             facts: Vec::new(),
+            preferences_seen: String::new(),
                             alias: alias.clone(),
                             provider: *provider,
                             workspace: String::new(),

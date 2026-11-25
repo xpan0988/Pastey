@@ -349,6 +349,13 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             updated_at INTEGER NOT NULL
         );
 
+        -- This device's user's preference profile for Agents (one row).
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            id TEXT PRIMARY KEY,
+            record_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS collaboration_entries (
             id TEXT PRIMARY KEY,
             collaboration_id TEXT NOT NULL,
@@ -1790,6 +1797,30 @@ pub(crate) fn save_execution_default(paths: &AppPaths, record_json: Option<&str>
             conn.execute("DELETE FROM execution_defaults WHERE id = 'default'", [])?;
         }
     }
+    Ok(())
+}
+
+/// The user's preference profile record, if any.
+pub(crate) fn load_user_preferences(paths: &AppPaths) -> AppResult<Option<String>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare("SELECT record_json FROM user_preferences WHERE id = 'default'")?;
+    let mut rows = statement.query([])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
+pub(crate) fn save_user_preferences(paths: &AppPaths, record_json: &str) -> AppResult<()> {
+    connection(paths)?.execute(
+        r#"
+        INSERT INTO user_preferences (id, record_json, updated_at) VALUES ('default', ?1, ?2)
+        ON CONFLICT(id) DO UPDATE SET
+            record_json = excluded.record_json,
+            updated_at = excluded.updated_at
+        "#,
+        params![record_json, now_ts()],
+    )?;
     Ok(())
 }
 

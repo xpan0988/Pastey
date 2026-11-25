@@ -146,7 +146,7 @@ impl OpaqueCapabilityPayloadV1 {
 /// than line breaks and tabs, no bidirectional overrides that could reorder
 /// what a reviewer reads, and no invisible format, separator or filler
 /// characters that could make two different strings look the same.
-fn renders_faithfully(text: &str) -> bool {
+pub(crate) fn renders_faithfully(text: &str) -> bool {
     !text.chars().any(|character| {
         (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
             || matches!(

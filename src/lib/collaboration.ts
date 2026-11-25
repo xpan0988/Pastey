@@ -175,6 +175,8 @@ export interface CollaborationSummary {
   execution?: { kind: "ask" } | { kind: "profile"; profile: ExecutionProfile; authorizedAt: number };
   /** Member turns may start: every member was ready and you released it. */
   released?: boolean;
+  /** This collaboration's own preferences, beside your profile. */
+  preferencesNote?: string;
 }
 
 export interface PublishedSummary {
@@ -200,6 +202,8 @@ export type CollaborationUserAction =
   | { type: "options_changed"; alias: string; model?: string; effort?: string }
   /** Every member was ready, and the user released the collaboration. */
   | { type: "released" }
+  /** The user changed this collaboration's own preferences. */
+  | { type: "preferences_changed"; note: string }
   /** The execution choice of the collaboration, or of `alias`, changed. */
   | { type: "execution_changed"; alias?: string; name: string };
 
@@ -427,6 +431,23 @@ export function checkCollaborationReadiness(collaborationId: string): Promise<Me
 /** Releases the collaboration once every member is ready (checked again). */
 export function releaseCollaboration(collaborationId: string): Promise<CollaborationView> {
   return invoke("release_collaboration", { collaborationId });
+}
+
+/** Your preference profile for Agents: guidance they interpret, never
+ * permission. Each save is a new version every member receives. */
+export interface PreferenceSections { restrictions: string; delegated: string; preferences: string; decisions: string }
+export interface UserPreferences extends PreferenceSections { version: number; updatedAt: number }
+
+export function getUserPreferences(): Promise<UserPreferences | null> {
+  return invoke("get_user_preferences");
+}
+
+export function setUserPreferences(preferences: PreferenceSections): Promise<UserPreferences> {
+  return invoke("set_user_preferences", { preferences });
+}
+
+export function setCollaborationPreferences(collaborationId: string, note: string): Promise<CollaborationView> {
+  return invoke("set_collaboration_preferences", { collaborationId, note });
 }
 
 export function listExecutionPresets(): Promise<ExecutionProfile[]> {

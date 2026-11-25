@@ -37,6 +37,7 @@ use admission::{
 use capability::codex::codex_compatibility_at;
 pub(crate) use capability::NativeSessionRefV1 as LocalNativeSessionRefV1;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
+pub(crate) use capability::renders_faithfully;
 pub(crate) use capability::activity::TaskActivityV1;
 #[cfg(test)]
 pub(crate) use capability::activity::NativeActivityV1;

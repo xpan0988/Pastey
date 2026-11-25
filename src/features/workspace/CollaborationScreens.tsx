@@ -14,7 +14,7 @@ import {
   turnOutcomeLabel, USER_ALIAS, validAlias, waitingByRecipient, withdrawCollaborationGrant, type CollaborationEntry,
   optionsLabel, pendingDecisions, setCollaborationMemberOptions, stopCollaborationMember, type MemberOptions,
   executionSourceLabel, setCollaborationExecution, type ExecutionChoice,
-  checkCollaborationReadiness, releaseCollaboration, type MemberReadiness,
+  checkCollaborationReadiness, releaseCollaboration, type MemberReadiness, setCollaborationPreferences,
   type CollaborationMember, type CollaborationMemberInput, type CollaborationProvider, type CollaborationSummary, type CollaborationView,
   type JournalFilter, type RunningTurn,
 } from "../../lib/collaboration";
@@ -88,7 +88,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   const [choosing, setChoosing] = useState<CollaborationMember | null>(null);
   const [executing, setExecuting] = useState<{ alias: string | null; initial: ExecutionChoice } | null>(null);
   const [adding, setAdding] = useState(false);
-  const [editing, setEditing] = useState<{ kind: "goal" } | { kind: "role"; member: CollaborationMember } | null>(null);
+  const [editing, setEditing] = useState<{ kind: "goal" } | { kind: "preferences" } | { kind: "role"; member: CollaborationMember } | null>(null);
   const [removing, setRemoving] = useState<CollaborationMember | null>(null);
   const [inviting, setInviting] = useState(false);
   const refresh = useCallback(async () => {
@@ -127,6 +127,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
           <MenuButton label="More collaboration actions">{(close) => <>
             {!ended && !guest && view.members.length < 6 ? <button type="button" role="menuitem" onClick={() => { close(); setInviting(true); }}><Icon name="device" /><span>Invite from another device…<small>A conversation on a device paired with this one</small></span></button> : null}
             {!ended && !guest ? <button type="button" role="menuitem" onClick={() => { close(); setEditing({ kind: "goal" }); }}><Icon name="file" /><span>Edit goal…<small>Members see it from their next turn</small></span></button> : null}
+            {!ended && !guest ? <button type="button" role="menuitem" onClick={() => { close(); setEditing({ kind: "preferences" }); }}><Icon name="file" /><span>Preferences…<small>What its members should assume, beside your profile</small></span></button> : null}
             {!ended ? <button type="button" role="menuitem" onClick={() => { close(); setExecuting({ alias: null, initial: toChoice(view.execution) }); }}><Icon name="settings" /><span>Execution…<small>What its members may do without asking you</small></span></button> : null}
             {!ended ? <button type="button" role="menuitem" onClick={() => { close(); setConfirming("end"); }}><Icon name="close" /><span>{guest ? "Leave collaboration" : "End collaboration"}<small>{guest ? `This device's members leave; ${link?.deviceLabel} is told` : "Members become ordinary conversations; the Journal stays"}</small></span></button> : null}
             <button type="button" role="menuitem" onClick={() => { close(); setConfirming("delete"); }}><Icon name="flame" /><span>Delete…<small>Removes the Journal; conversations stay</small></span></button>
@@ -169,11 +170,14 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
       {adding ? <AddMemberDialog view={view} onClose={() => setAdding(false)}
         onAdd={async (member, firstMessage) => { const next = await addCollaborationMember(id, member, firstMessage); setView(next); setAdding(false); }} /> : null}
       {editing ? <TextEditDialog
-        title={editing.kind === "goal" ? "Edit the goal" : `Edit ${editing.member.alias}'s role`}
-        description={editing.kind === "goal" ? "One line every member sees, from its next turn on. The change is recorded in the Journal." : `What ${editing.member.alias} owns and does not touch. Every member sees it from its next turn on.`}
-        initial={editing.kind === "goal" ? view.goal : editing.member.role} maxLength={editing.kind === "goal" ? 300 : 200} pending={pending}
+        title={editing.kind === "goal" ? "Edit the goal" : editing.kind === "preferences" ? "Preferences for this collaboration" : `Edit ${editing.member.alias}'s role`}
+        description={editing.kind === "goal" ? "One line every member sees, from its next turn on. The change is recorded in the Journal."
+          : editing.kind === "preferences" ? "What its members should assume here, beside your preference profile (Settings). Guidance only: it lets no Agent do more. Each member gets it in full on its next turn."
+          : `What ${editing.member.alias} owns and does not touch. Every member sees it from its next turn on.`}
+        initial={editing.kind === "goal" ? view.goal : editing.kind === "preferences" ? view.preferencesNote ?? "" : editing.member.role}
+        maxLength={editing.kind === "goal" ? 300 : editing.kind === "preferences" ? 1200 : 200} pending={pending}
         onClose={() => setEditing(null)}
-        onSave={(text) => { const which = editing; setEditing(null); void act(() => which.kind === "goal" ? setCollaborationGoal(id, text) : setCollaborationRole(id, which.member.alias, text)); }} /> : null}
+        onSave={(text) => { const which = editing; setEditing(null); void act(() => which.kind === "goal" ? setCollaborationGoal(id, text) : which.kind === "preferences" ? setCollaborationPreferences(id, text) : setCollaborationRole(id, which.member.alias, text)); }} /> : null}
       {removing ? <Dialog title={`Remove ${removing.alias}?`} onClose={() => setRemoving(null)}
         description={`${removing.alias} stops receiving messages. Its automatic turns end, and messages waiting for it are not delivered. Its ${providerLabel(removing.provider)} conversation is not changed, and what it wrote stays in the Journal.`}
         footer={<><button type="button" className="btn btn-sm" onClick={() => setRemoving(null)}>Cancel</button>
@@ -455,6 +459,7 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
         : action.type === "role_changed" ? `You changed ${action.alias}'s role: ${action.role || "(none)"}`
         : action.type === "accepted" ? `You accepted the invitation for ${action.alias}`
         : action.type === "released" ? "You started it: every member was ready"
+        : action.type === "preferences_changed" ? `You set this collaboration's preferences: ${action.note || "(none)"}`
         : action.type === "execution_changed" ? `You set ${action.alias ? `${action.alias}'s` : "the collaboration's"} execution to ${action.name === "inherit" ? (action.alias ? "the collaboration's choice" : "your default") : action.name}`
         : action.type === "options_changed" ? `You set ${action.alias}'s model to ${action.model ?? "its default"} and effort to ${action.effort ?? "its default"}`
         : `You ${action.confirmed ? "confirmed" : "rejected"} ${decided ?? "a member"}'s decisions`;

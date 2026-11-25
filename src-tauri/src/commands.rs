@@ -1572,6 +1572,43 @@ pub async fn release_collaboration(
     .map_err(|error| error.to_string())?
 }
 
+/// This device's user's preference profile for Agents, if any.
+#[tauri::command]
+pub fn get_user_preferences(
+    state: State<'_, Arc<AppState>>,
+) -> Option<crate::collaboration::preferences::PreferencesV1> {
+    state.collaborations.lock().preferences()
+}
+
+/// Saves the preference profile as a new version: guidance Agents
+/// interpret, never permission.
+#[tauri::command]
+pub fn set_user_preferences(
+    preferences: crate::collaboration::preferences::PreferencesInputV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::preferences::PreferencesV1, String> {
+    state
+        .collaborations
+        .lock()
+        .set_preferences(preferences)
+        .map_err(|error| error.message())
+}
+
+/// Sets one collaboration's own preferences, beside the profile.
+#[tauri::command]
+pub fn set_collaboration_preferences(
+    collaboration_id: String,
+    note: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .set_preferences_note(&collaboration_id, &note)
+        .map_err(|error| error.message())?;
+    collaboration_view(&state, &collaboration_id)
+}
+
 /// Sets the model and effort of every turn the collaboration starts for
 /// this device's member `alias` (empty: the Agent's own default).
 #[tauri::command]
