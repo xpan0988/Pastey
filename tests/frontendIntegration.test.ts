@@ -2378,6 +2378,12 @@ test("a collaboration's Journal reads three ways, and only open items need the u
   assert.equal(memberStateLabel({ ...blocked, live: undefined }), "Busy · a turn is ending, or another task holds its folder");
   assert.equal(memberStateLabel({ ...blocked, live: { ...live, awaitingDecision: false } }), "Working");
   assert.equal(optionsLabel(undefined), "Model and effort: the Agent's own default");
+  // R3: the watchdog tells quiet, dependency waits, provider failures and unknown outcomes apart.
+  const base: CollaborationMember = { alias: "api", provider: "codex", workspace: "/a", role: "", paused: false, busy: false, waiting: 0 };
+  assert.equal(memberStateLabel({ ...base, busy: true, live: { taskId: "t", capabilityId: "c" }, condition: { kind: "working", quietMinutes: 40 } }), "Working · nothing reported for 40 min (not a failure)");
+  assert.equal(memberStateLabel({ ...base, condition: { kind: "dependency_wait", on: "web", reason: "the API contract", until: 1 } }), "Waiting for web: the API contract");
+  assert.match(memberStateLabel({ ...base, paused: true, condition: { kind: "provider_failure" } }), /failed before doing anything/);
+  assert.match(memberStateLabel({ ...base, condition: { kind: "outcome_unknown" } }), /will not run it again/);
   assert.equal(optionsLabel({ model: "gpt-6.2-sol", effort: "high" }), "Model gpt-6.2-sol · effort high");
 });
 

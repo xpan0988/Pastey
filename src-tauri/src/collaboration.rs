@@ -367,7 +367,22 @@ pub(crate) struct CollaborationRecordV1 {
     /// released it (R2). Collaborations from before R2 count as released.
     #[serde(default = "released_before_r2")]
     pub(crate) released: bool,
+    /// Automatic turns in a row that changed no file and recorded no stage
+    /// (R3): at `NO_PROGRESS_LIMIT` the collaboration pauses.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) no_progress: u8,
 }
+
+fn is_zero(count: &u8) -> bool {
+    *count == 0
+}
+
+/// A running turn quiet this long gets one note in the Journal (R3).
+const QUIET_NOTE_MINUTES: i64 = 30;
+
+/// Automatic turns in a row without progress before the collaboration
+/// pauses for its user (R3).
+pub(crate) const NO_PROGRESS_LIMIT: u8 = 4;
 
 fn released_before_r2() -> bool {
     true
@@ -494,6 +509,13 @@ pub(crate) enum EntryBodyV1 {
         #[serde(flatten)]
         changes: FileChangesV1,
     },
+    /// A member declared it cannot go on until `on` (a member or `user`)
+    /// answers or delivers `reason`, at the latest by `until` (R3).
+    Wait {
+        on: String,
+        reason: String,
+        until: i64,
+    },
     /// A member's auto grant began or ended.
     Grant {
         alias: String,
@@ -534,6 +556,10 @@ pub(crate) enum StatusV1 {
     /// Needs the user (a message to `user`, a problem).
     Open,
     Resolved,
+    /// A wait on another member, not yet answered (R3): needs nobody.
+    Pending,
+    /// A wait whose deadline passed with no answer.
+    Expired,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -607,6 +633,34 @@ pub(crate) struct MemberViewV1 {
     pub(crate) live: Option<RunningTurnV1>,
     /// What its next turn runs with (configured, not verified).
     pub(crate) effective_execution: EffectiveExecutionV1,
+    /// What it is doing, as the watchdog tells it apart.
+    pub(crate) condition: MemberConditionV1,
+}
+
+/// What a member is doing, as the watchdog tells it apart (R3). Quiet is
+/// not failure: only a turn's own end says how it ended.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum MemberConditionV1 {
+    Idle,
+    /// A turn runs; `quiet_minutes` since its harness last reported
+    /// anything (absent: nothing reported yet).
+    Working {
+        #[serde(rename = "quietMinutes", skip_serializing_if = "Option::is_none")]
+        quiet_minutes: Option<i64>,
+    },
+    /// Its running turn waits for a native decision of this user.
+    ApprovalWait,
+    /// Stop was asked or a turn is ending: its folder is still held.
+    Ending,
+    /// It declared that it waits on `on`.
+    DependencyWait { on: String, reason: String, until: i64 },
+    /// Its last turn failed before doing anything (often the provider: a
+    /// usage limit, a sign-in, a model); it is paused.
+    ProviderFailure,
+    /// Pastey cannot tell how its last turn ended; it is never run again.
+    OutcomeUnknown,
+    Paused,
 }
 
 /// The linked device, as views show it.
@@ -776,6 +830,11 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
          ```pastey-message to=<member>\n\
          subject: <one line>\n\n\
          <what they need to know or do>\n\
+         ```\n\n\
+         If you cannot go on until a member (or {USER_ALIAS}) answers or delivers something, end your turn with this block after any messages; you are resumed when they message you, and the user is told if the deadline passes:\n\n\
+         ```pastey-wait on=<member>\n\
+         for: <what you need, one line>\n\
+         until: <30m to 24h>\n\
          ```\n\n\
          To record a stage, put this block after any messages:\n\n\
          ```pastey-summary\n\
@@ -965,7 +1024,7 @@ impl CollaborationServiceV1 {
             &body,
             EntryBodyV1::User {
                 action: UserActionV1::OptionsChanged { .. } | UserActionV1::ExecutionChanged { .. }
-            }
+            } | EntryBodyV1::Wait { .. }
         );
         let outbox = item
             .record
@@ -1130,6 +1189,7 @@ impl CollaborationServiceV1 {
             execution: None,
             // A new collaboration waits for every member to be ready (R2).
             released: false,
+            no_progress: 0,
             schema_version: SCHEMA_VERSION.into(),
             id: id.clone(),
             name: name.to_owned(),
@@ -1198,6 +1258,10 @@ impl CollaborationServiceV1 {
             return invalid("An ended collaboration cannot be resumed.");
         }
         item.record.state = state;
+        if state == CollaborationStateV1::Active {
+            // The user looked: progress is counted afresh.
+            item.record.no_progress = 0;
+        }
         if state == CollaborationStateV1::Ended {
             // Nothing is delivered any more, and no grant outlives it.
             let granted: Vec<String> = item
@@ -1551,6 +1615,13 @@ impl CollaborationServiceV1 {
     /// A message the user writes to a member. It needs no approval: it
     /// starts the member's next turn once its folder is free.
     pub(crate) fn user_message(&mut self, id: &str, to: &str, text: &str) -> AppResult<()> {
+        // The user answered whatever `to` waited on them for, and steered.
+        self.close_waits(
+            id,
+            |entry| entry.member.as_deref() == Some(to) && matches!(&entry.body, EntryBodyV1::Wait { on, .. } if on == USER_ALIAS),
+            StatusV1::Resolved,
+        )?;
+        self.item_mut(id)?.record.no_progress = 0;
         let item = self.item(id)?;
         if item.record.state == CollaborationStateV1::Ended {
             return invalid("This collaboration has ended.");
@@ -1876,6 +1947,12 @@ impl CollaborationServiceV1 {
             }
             None => None,
         };
+        // What the turn changed: Pastey's scan where it has one, else what
+        // the harness reported (R3's progress measure).
+        let changed_files = match &files {
+            Some(FileStateV1::Observed { changes }) => changes.total,
+            _ => ended.activity.as_ref().map_or(0, |activity| activity.files_changed),
+        };
         if automatic {
             let member = self.item_mut(&id)?.member_mut(&alias).expect("member exists");
             member.auto_task = None;
@@ -1970,6 +2047,12 @@ impl CollaborationServiceV1 {
                 )?;
             }
         }
+        // A turn that ran ends the member's earlier waits: it declares one
+        // again if it still waits.
+        if !not_started {
+            self.close_waits(&id, |entry| entry.member.as_deref() == Some(alias.as_str()), StatusV1::Resolved)?;
+        }
+        let mut progressed = changed_files > 0;
         if ended.state == NativeAgentTaskStateV1::Completed {
             if let Some(blocks) = ended.output.as_ref().and_then(OpaqueCapabilityPayloadV1::published_blocks) {
                 let hop = carried.iter().map(|(_, hop, _, _)| *hop).max().unwrap_or(0) + 1;
@@ -1977,6 +2060,7 @@ impl CollaborationServiceV1 {
                     self.publish_message(&id, &alias, message, hop)?;
                 }
                 if let Some(summary) = blocks.summary {
+                    progressed = true;
                     self.append(
                         &id,
                         Some(&alias),
@@ -1985,13 +2069,136 @@ impl CollaborationServiceV1 {
                         None,
                     )?;
                 }
+                if let Some(wait) = blocks.wait {
+                    self.declare_wait(&id, &alias, wait)?;
+                }
                 for problem in blocks.problems {
                     self.attention(&id, Some(&alias), format!("Pastey did not take a block from {alias}: {problem}."))?;
                 }
             }
         }
+        if automatic && !not_started {
+            self.count_progress(&id, progressed)?;
+        }
         self.settle_grants(now())?;
         Ok(true)
+    }
+
+    /// Sets every open wait `which` selects to `status`.
+    fn close_waits(&mut self, id: &str, which: impl Fn(&EntryV1) -> bool, status: StatusV1) -> AppResult<()> {
+        let open: Vec<String> = self
+            .item(id)?
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry.body, EntryBodyV1::Wait { .. })
+                    && matches!(entry.status, Some(StatusV1::Pending) | Some(StatusV1::Open))
+                    && which(entry)
+            })
+            .map(|entry| entry.id.clone())
+            .collect();
+        for entry_id in open {
+            self.set_status(id, &entry_id, status.clone())?;
+        }
+        Ok(())
+    }
+
+    /// Records `alias`'s declared wait: on a member it needs nobody (the
+    /// member's message ends it); on `user` it needs the user. A wait that
+    /// closes a cycle of members waiting on each other is flagged at once:
+    /// nobody in it will answer until one of them is told to go ahead.
+    fn declare_wait(&mut self, id: &str, alias: &str, wait: crate::native_agent::PublishedWaitV1) -> AppResult<()> {
+        let item = self.item(id)?;
+        if wait.on != USER_ALIAS && (wait.on == alias || item.member(&wait.on).is_none()) {
+            return self.attention(
+                id,
+                Some(alias),
+                format!("Pastey did not take a wait from {alias}: \"{}\" is not another member.", wait.on),
+            );
+        }
+        let status = if wait.on == USER_ALIAS { StatusV1::Open } else { StatusV1::Pending };
+        self.append(
+            id,
+            Some(alias),
+            BasisV1::Claim,
+            EntryBodyV1::Wait {
+                on: wait.on.clone(),
+                reason: wait.reason,
+                until: now() + i64::from(wait.minutes) * 60,
+            },
+            Some(status),
+        )?;
+        if let Some(cycle) = wait_cycle(self.item(id)?, alias) {
+            self.attention(
+                id,
+                Some(alias),
+                format!(
+                    "Members wait on each other: {}. None of them will answer while all wait; tell one of them to go ahead, or answer for one.",
+                    cycle.join(" → ")
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Ends waits whose deadline passed (R3), each with an item for the
+    /// user. The waiter stays idle: a deadline starts no turn and uses no
+    /// automatic turn.
+    pub(crate) fn settle_waits(&mut self, now: i64) -> AppResult<()> {
+        let expired: Vec<(String, String, String, String, String, i64)> = self
+            .items
+            .values()
+            .filter(|item| item.record.state != CollaborationStateV1::Ended)
+            .flat_map(|item| {
+                item.entries.iter().filter_map(move |entry| match (&entry.body, &entry.status) {
+                    (EntryBodyV1::Wait { on, reason, until }, Some(StatusV1::Pending) | Some(StatusV1::Open)) if *until <= now => Some((
+                        item.record.id.clone(),
+                        entry.id.clone(),
+                        entry.member.clone().unwrap_or_default(),
+                        on.clone(),
+                        reason.clone(),
+                        entry.at,
+                    )),
+                    _ => None,
+                })
+            })
+            .collect();
+        for (id, entry_id, waiter, on, reason, since) in expired {
+            self.set_status(&id, &entry_id, StatusV1::Expired)?;
+            self.attention(
+                &id,
+                Some(&waiter),
+                bound_text(
+                    &format!(
+                        "{waiter} waited {} for {on} ({reason}) and the deadline passed with no answer. {waiter} stays idle until a message reaches it.",
+                        ago(since, now).trim_end_matches(" ago")
+                    ),
+                    MAX_ATTENTION_BYTES,
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Counts automatic turns without progress (no file changed, no stage
+    /// recorded); at `NO_PROGRESS_LIMIT` in a row the collaboration pauses
+    /// for its user, so members cannot loop on messages alone.
+    fn count_progress(&mut self, id: &str, progressed: bool) -> AppResult<()> {
+        let item = self.item_mut(id)?;
+        item.record.no_progress = if progressed { 0 } else { item.record.no_progress.saturating_add(1) };
+        let stalled = item.record.no_progress >= NO_PROGRESS_LIMIT && item.record.state == CollaborationStateV1::Active;
+        self.save_record(id)?;
+        if stalled {
+            self.set_state(id, CollaborationStateV1::Paused)?;
+            self.attention(
+                id,
+                None,
+                format!(
+                    "Paused: {NO_PROGRESS_LIMIT} automatic turns in a row changed no file and recorded no stage. Read the messages, then resume (or answer a member) if they should go on."
+                ),
+            )?;
+        }
+        Ok(())
     }
 
     /// How a message from `from` to `to` at `hop` is held here.
@@ -2047,7 +2254,7 @@ impl CollaborationServiceV1 {
             BasisV1::Claim,
             EntryBodyV1::Message {
                 from: from.into(),
-                to,
+                to: to.clone(),
                 subject: message.subject,
                 body: message.body,
                 hop,
@@ -2056,6 +2263,13 @@ impl CollaborationServiceV1 {
         )?;
         if let Some(reason) = refused {
             self.attention(id, Some(from), format!("A message from {from} was not delivered: {reason}."))?;
+        } else {
+            // The member it waited on answered.
+            self.close_waits(
+                id,
+                |entry| entry.member.as_deref() == Some(to.as_str()) && matches!(&entry.body, EntryBodyV1::Wait { on, .. } if on == from),
+                StatusV1::Resolved,
+            )?;
         }
         Ok(())
     }
@@ -2532,6 +2746,39 @@ impl CollaborationServiceV1 {
         Ok(())
     }
 
+    /// Records, once per turn, that a member's running turn has reported
+    /// nothing for a long time (`quiet`: folder, task, minutes). A fact, not
+    /// a failure: it may be thinking or running a long command.
+    pub(crate) fn note_quiet_turns(&mut self, quiet: &[(PathBuf, String, i64)]) -> AppResult<()> {
+        for (folder, task_id, minutes) in quiet {
+            if !self.noted_waits.insert(format!("quiet:{task_id}")) {
+                continue;
+            }
+            let found = self.items.values().find_map(|item| {
+                item.record
+                    .members
+                    .iter()
+                    .find(|member| !member.remote && Path::new(&member.workspace) == folder)
+                    .filter(|_| item.record.state != CollaborationStateV1::Ended)
+                    .map(|member| (item.record.id.clone(), member.alias.clone()))
+            });
+            if let Some((id, alias)) = found {
+                self.append(
+                    &id,
+                    Some(&alias),
+                    BasisV1::Fact,
+                    EntryBodyV1::Attention {
+                        text: format!(
+                            "{alias}'s turn has reported nothing for {minutes} minutes. That is not a failure: it may be thinking or running a long command. Stop it if it should not go on."
+                        ),
+                    },
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Items waiting for this device's user, with the native decisions the
     /// members' running turns wait for (`runtime`).
     pub(crate) fn needs_you_total_with(&self, runtime: impl Fn(&Path) -> MemberRuntimeV1) -> usize {
@@ -2572,12 +2819,14 @@ impl CollaborationServiceV1 {
                 .iter()
                 .map(|member| {
                     let MemberRuntimeV1 { busy, live } = runtime(Path::new(&member.workspace));
+                    let condition = condition_of(item, member, busy, live.as_ref(), now());
                     MemberViewV1 {
                         member: member.clone(),
                         busy,
                         waiting: item.waiting_for(&member.alias),
                         live,
                         effective_execution: self.effective_execution(item, member).1,
+                        condition,
                     }
                 })
                 .collect(),
@@ -2712,6 +2961,16 @@ fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], now: 
             if left == 1 { "" } else { "s" },
             if left == 1 { "s" } else { "" }
         ));
+    }
+    // Who waits on this member now (on every turn, the first included).
+    for entry in &item.entries {
+        if let (EntryBodyV1::Wait { on, reason, .. }, Some(StatusV1::Pending), Some(waiter)) =
+            (&entry.body, &entry.status, entry.member.as_deref())
+        {
+            if *on == member.alias {
+                text.push_str(&format!("- {waiter} waits for you: {}\n", short(reason, 200)));
+            }
+        }
     }
     text.push('\n');
     text.push_str(&digest);
@@ -3279,7 +3538,22 @@ pub(crate) fn drive(runtime: &HostRuntime) {
     // folder is no longer shared with the device that created it pauses.
     remote::settle(runtime);
     remote::pause_unshared(runtime);
-    // Running member turns that wait for a native decision of this user.
+    // Running member turns that wait for a native decision of this user,
+    // and those quiet for a long time (noted once; quiet is not failure).
+    let quiet: Vec<(PathBuf, String, i64)> = {
+        let workspaces = runtime.collaborations.lock().member_workspaces();
+        let natives = runtime.native_agents.lock();
+        workspaces
+            .into_iter()
+            .filter_map(|workspace| {
+                let live = natives.running_turn(&workspace)?;
+                let activity = live.activity?;
+                let minutes = (now() - activity.last_at.max(activity.since)) / 60;
+                (minutes >= QUIET_NOTE_MINUTES && !live.awaiting_decision).then_some((workspace, live.task_id, minutes))
+            })
+            .collect()
+    };
+    let _ = runtime.collaborations.lock().note_quiet_turns(&quiet);
     let waits: Vec<(PathBuf, String)> = {
         let workspaces = runtime.collaborations.lock().member_workspaces();
         let natives = runtime.native_agents.lock();
@@ -3292,6 +3566,7 @@ pub(crate) fn drive(runtime: &HostRuntime) {
             .collect()
     };
     let _ = runtime.collaborations.lock().note_native_waits(&waits);
+    let _ = runtime.collaborations.lock().settle_waits(now());
     let plans = {
         let mut collaborations = runtime.collaborations.lock();
         let _ = collaborations.settle_grants(now());
@@ -3368,6 +3643,91 @@ pub(crate) fn member_runtime(runtime: &HostRuntime) -> impl Fn(&Path) -> MemberR
             .collect()
     };
     move |workspace: &Path| known.get(workspace).cloned().unwrap_or_default()
+}
+
+/// The watchdog's reading of `member` now.
+fn condition_of(
+    item: &CollaborationV1,
+    member: &MemberV1,
+    busy: bool,
+    live: Option<&RunningTurnV1>,
+    now: i64,
+) -> MemberConditionV1 {
+    if let Some(live) = live {
+        let runtime = MemberRuntimeV1 { busy, live: Some(live.clone()) };
+        if pending_decisions(&runtime) > 0 {
+            return MemberConditionV1::ApprovalWait;
+        }
+        return MemberConditionV1::Working {
+            quiet_minutes: live.activity.as_ref().map(|activity| (now - activity.last_at.max(activity.since)).max(0) / 60),
+        };
+    }
+    if busy {
+        return MemberConditionV1::Ending;
+    }
+    let last_turn = item.entries.iter().rev().find_map(|entry| match &entry.body {
+        EntryBodyV1::Turn { state, code, activity, .. } if entry.member.as_deref() == Some(member.alias.as_str()) => {
+            Some((state.clone(), code.clone(), activity.as_ref().map_or(0, |activity| activity.actions)))
+        }
+        _ => None,
+    });
+    if let Some((state, code, _)) = &last_turn {
+        if *state == NativeAgentTaskStateV1::Interrupted && code.as_deref() == Some("native_agent_outcome_unknown") {
+            return MemberConditionV1::OutcomeUnknown;
+        }
+    }
+    if member.paused {
+        return match last_turn {
+            Some((NativeAgentTaskStateV1::Failed, code, 0)) if code.as_deref() != Some(START_FAILED_CODE) => {
+                MemberConditionV1::ProviderFailure
+            }
+            _ => MemberConditionV1::Paused,
+        };
+    }
+    let wait = item.entries.iter().rev().find_map(|entry| match (&entry.body, &entry.status) {
+        (EntryBodyV1::Wait { on, reason, until }, Some(StatusV1::Pending) | Some(StatusV1::Open))
+            if entry.member.as_deref() == Some(member.alias.as_str()) =>
+        {
+            Some(MemberConditionV1::DependencyWait { on: on.clone(), reason: reason.clone(), until: *until })
+        }
+        _ => None,
+    });
+    wait.unwrap_or(MemberConditionV1::Idle)
+}
+
+/// A cycle of members waiting on each other through `alias`'s open wait,
+/// in order (`a → b → a`), if there is one. Waits on `user` end nowhere.
+fn wait_cycle(item: &CollaborationV1, alias: &str) -> Option<Vec<String>> {
+    let waits_on = |member: &str| -> Vec<String> {
+        item.entries
+            .iter()
+            .filter(|entry| entry.member.as_deref() == Some(member) && entry.status == Some(StatusV1::Pending))
+            .filter_map(|entry| match &entry.body {
+                EntryBodyV1::Wait { on, .. } => Some(on.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    // Depth-first from `alias`; members are few (at most six).
+    fn walk(start: &str, at: &str, path: &mut Vec<String>, waits_on: &dyn Fn(&str) -> Vec<String>) -> bool {
+        for next in waits_on(at) {
+            if next == start {
+                path.push(next);
+                return true;
+            }
+            if path.contains(&next) {
+                continue;
+            }
+            path.push(next.clone());
+            if walk(start, &next, path, waits_on) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = vec![alias.to_owned()];
+    walk(alias, alias, &mut path, &waits_on).then_some(path)
 }
 
 /// The native decisions a member's running turn waits for: each review

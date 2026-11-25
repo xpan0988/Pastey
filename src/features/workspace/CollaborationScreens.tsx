@@ -439,6 +439,8 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
         </div> : null}
       </div></div>;
     }
+    case "wait":
+      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> waits for <strong>{body.on}</strong>: {body.reason} <span className="subtle">(until {timeOfDay(body.until)})</span></span>{meta}</div>;
     case "attention":
       return <Notice tone={entry.status?.state === "open" ? "warn" : "neutral"} action={actions}><span className="stack" style={{ gap: 2 }}><span>{body.text}</span>{meta}</span></Notice>;
     case "user": {

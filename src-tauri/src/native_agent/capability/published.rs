@@ -22,6 +22,11 @@ const MAX_ALIAS_CHARS: usize = 32;
 
 const MESSAGE_FENCE: &str = "```pastey-message";
 const SUMMARY_FENCE: &str = "```pastey-summary";
+const WAIT_FENCE: &str = "```pastey-wait";
+/// A declared wait lasts at least this and at most a day (minutes).
+pub(crate) const MIN_WAIT_MINUTES: u32 = 5;
+pub(crate) const MAX_WAIT_MINUTES: u32 = 24 * 60;
+pub(crate) const DEFAULT_WAIT_MINUTES: u32 = 120;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +50,17 @@ pub(crate) struct PublishedSummaryV1 {
     pub(crate) next: Option<String>,
 }
 
+/// A member declaring that it cannot go on until `on` (a member or `user`)
+/// answers or delivers `reason`; it ends its turn and waits at most
+/// `minutes` (R3 liveness).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublishedWaitV1 {
+    pub(crate) on: String,
+    pub(crate) reason: String,
+    pub(crate) minutes: u32,
+}
+
 /// The blocks one final reply published, and why any were not taken.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +68,8 @@ pub(crate) struct PublishedBlocksV1 {
     pub(crate) messages: Vec<PublishedMessageV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) summary: Option<PublishedSummaryV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) wait: Option<PublishedWaitV1>,
     /// Plain-language reasons, one per block (or rule) that was refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) problems: Vec<String>,
@@ -59,15 +77,22 @@ pub(crate) struct PublishedBlocksV1 {
 
 impl PublishedBlocksV1 {
     pub(crate) fn is_empty(&self) -> bool {
-        self.messages.is_empty() && self.summary.is_none() && self.problems.is_empty()
+        self.messages.is_empty() && self.summary.is_none() && self.wait.is_none() && self.problems.is_empty()
     }
 }
 
 /// One fenced block found in the reply, by byte range.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KindV1 {
+    Message,
+    Summary,
+    Wait,
+}
+
 struct BlockV1<'a> {
     start: usize,
     end: usize,
-    summary: bool,
+    kind: KindV1,
     info: &'a str,
     body: &'a str,
 }
@@ -77,32 +102,34 @@ struct BlockV1<'a> {
 fn blocks(text: &str) -> Vec<BlockV1<'_>> {
     let mut found = Vec::new();
     let mut offset = 0;
-    let mut open: Option<(usize, usize, bool, &str)> = None;
+    let mut open: Option<(usize, usize, KindV1, &str)> = None;
     for line in text.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
         let bare = line.trim_end_matches(['\n', '\r']);
         match open {
             None => {
-                let (summary, rest) = if let Some(rest) = bare.strip_prefix(MESSAGE_FENCE) {
-                    (false, rest)
+                let (kind, rest) = if let Some(rest) = bare.strip_prefix(MESSAGE_FENCE) {
+                    (KindV1::Message, rest)
                 } else if let Some(rest) = bare.strip_prefix(SUMMARY_FENCE) {
-                    (true, rest)
+                    (KindV1::Summary, rest)
+                } else if let Some(rest) = bare.strip_prefix(WAIT_FENCE) {
+                    (KindV1::Wait, rest)
                 } else {
                     continue;
                 };
                 // `pastey-messages` or similar is not this fence.
                 if rest.is_empty() || rest.starts_with([' ', '\t']) {
-                    open = Some((start, offset, summary, rest.trim()));
+                    open = Some((start, offset, kind, rest.trim()));
                 }
             }
-            Some((block_start, body_start, summary, info)) => {
+            Some((block_start, body_start, kind, info)) => {
                 if bare.trim_end() == "```" {
                     let body = text[body_start..start].trim_end_matches(['\n', '\r']);
                     found.push(BlockV1 {
                         start: block_start,
                         end: offset,
-                        summary,
+                        kind,
                         info,
                         body,
                     });
@@ -244,6 +271,54 @@ fn summary(block: &BlockV1<'_>) -> Result<PublishedSummaryV1, String> {
     Ok(summary)
 }
 
+/// A duration such as `30m`, `2h` or `1d`, in minutes.
+fn minutes(text: &str) -> Option<u32> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.find(|c: char| !c.is_ascii_digit())?);
+    let number: u32 = number.parse().ok()?;
+    let factor = match unit.trim() {
+        "m" | "min" | "mins" | "minutes" => 1,
+        "h" | "hour" | "hours" => 60,
+        "d" | "day" | "days" => 24 * 60,
+        _ => return None,
+    };
+    number.checked_mul(factor)
+}
+
+fn wait(block: &BlockV1<'_>) -> Result<PublishedWaitV1, String> {
+    let on = block
+        .info
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("on="))
+        .ok_or("a wait names nobody to wait on (`on=`)")?;
+    if !valid_alias(on) {
+        return Err(format!("a wait's \"{on}\" is not a member alias"));
+    }
+    let mut reason = None;
+    let mut until = None;
+    for line in block.body.lines() {
+        let line = line.trim().trim_start_matches(['-', '*']).trim();
+        if let Some(value) = line.strip_prefix("for:") {
+            reason = Some(value.trim().to_owned());
+        } else if let Some(value) = line.strip_prefix("until:") {
+            until = Some(value.trim().to_owned());
+        }
+    }
+    let reason = reason
+        .filter(|reason| !reason.is_empty())
+        .ok_or("a wait has no `for:` line saying what it needs")?;
+    if reason.chars().count() > MAX_SUBJECT_CHARS {
+        return Err(format!("a wait's `for:` is over {MAX_SUBJECT_CHARS} characters"));
+    }
+    let minutes = match until {
+        None => DEFAULT_WAIT_MINUTES,
+        Some(text) => minutes(&text)
+            .ok_or_else(|| format!("a wait's `until: {text}` is not a duration like 30m, 2h or 1d"))?
+            .clamp(MIN_WAIT_MINUTES, MAX_WAIT_MINUTES),
+    };
+    Ok(PublishedWaitV1 { on: on.to_owned(), reason, minutes })
+}
+
 /// The blocks that end `text`, checked against the block rules. Blocks that
 /// break a rule are left out, each with its reason.
 pub(crate) fn extract(text: &str) -> PublishedBlocksV1 {
@@ -263,7 +338,18 @@ pub(crate) fn extract(text: &str) -> PublishedBlocksV1 {
                 .push("a block contains characters that could hide what it says".into());
             continue;
         }
-        if block.summary {
+        if block.kind == KindV1::Wait {
+            if published.wait.is_some() {
+                published
+                    .problems
+                    .push("a reply may declare only one wait; later ones were ignored".into());
+                continue;
+            }
+            match wait(block) {
+                Ok(wait) => published.wait = Some(wait),
+                Err(problem) => published.problems.push(problem),
+            }
+        } else if block.kind == KindV1::Summary {
             if published.summary.is_some() {
                 published
                     .problems
@@ -293,6 +379,27 @@ mod tests {
     use super::*;
 
     const MESSAGE: &str = "```pastey-message to=web\nsubject: Orders API now uses cursors\n\nOrdersTable still sends offset.\n```";
+
+    #[test]
+    fn a_wait_is_one_bounded_block_at_the_end() {
+        let text = format!("Done for now.\n\n{MESSAGE}\n\n```pastey-wait on=web\nfor: the crate split compiles on your branch\nuntil: 3h\n```\n");
+        let blocks = extract(&text);
+        assert_eq!(blocks.messages.len(), 1);
+        assert_eq!(
+            blocks.wait,
+            Some(PublishedWaitV1 { on: "web".into(), reason: "the crate split compiles on your branch".into(), minutes: 180 })
+        );
+        let long = extract("```pastey-wait on=web\nfor: x\nuntil: 9d\n```");
+        assert_eq!(long.wait.unwrap().minutes, MAX_WAIT_MINUTES);
+        let default = extract("```pastey-wait on=user\nfor: which phone first\n```");
+        assert_eq!(default.wait.unwrap().minutes, DEFAULT_WAIT_MINUTES);
+        assert!(extract("```pastey-wait\nfor: x\n```").problems[0].contains("on="));
+        assert!(extract("```pastey-wait on=web\nuntil: 1h\n```").problems[0].contains("for:"));
+        assert!(extract("```pastey-wait on=web\nfor: x\nuntil: soon\n```").problems[0].contains("duration"));
+        let two = extract("```pastey-wait on=web\nfor: a\n```\n```pastey-wait on=api\nfor: b\n```");
+        assert_eq!(two.wait.unwrap().on, "web");
+        assert!(two.problems[0].contains("only one wait"));
+    }
     const SUMMARY: &str = "```pastey-summary\ndone: reviewed pagination\nopen: web still uses offset\n```";
 
     #[test]

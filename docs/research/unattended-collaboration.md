@@ -296,6 +296,21 @@ Boundary: no member turn of a new collaboration starts until every member is rea
 
 Limits: readiness is a snapshot at release (sign-in or quota can change later; M2's fast-failure pause still applies). Tool presence is probed in Pastey's environment, not inside an Agent's sandbox (Codex's `command/exec` could probe inside it; not used yet). Claude Code's effort is still not observable. A member added after release has no facts until a later check.
 
+### R3: liveness (2026-11-25)
+
+Boundary: make every way a collaboration can stop moving visible and bounded, with deterministic rules on declared structure and observed facts only. No scheduler beyond the existing turn boundary; nothing is delivered mid-turn; a deadline starts no turn.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| Explicit waits | A fenced `pastey-wait on=<member or user>` block (`for:` one line, `until:` 5 min to 24 h, default 2 h; one per reply), parsed with the same rules as messages; the note teaches it. A wait on a member needs nobody; on `user` it needs the user | `published::tests::a_wait_is_one_bounded_block_at_the_end` |
+| Yield and resume | The waiter's turn has ended; its wait ends when the awaited member messages it (or the user does, for `user`), or when the waiter runs another turn (it re-declares if still waiting). Every prompt to the awaited member says who waits for it | `a_declared_wait_yields_the_turn_and_ends_when_answered_or_at_its_deadline` |
+| Deadlines | At the deadline (scheduler tick) the wait becomes `expired` with an Open item for the user; the waiter stays idle and uses no turn | same |
+| Cycles | A wait that closes a cycle of members waiting on each other (wait-for graph, depth-first over at most six members) is flagged at once as an Open item naming the cycle; Pastey breaks nothing | `members_waiting_on_each_other_are_flagged_at_once` |
+| Watchdog | `MemberConditionV1` per member: working (with minutes since the harness last reported, `TaskActivityV1::last_at`), approval wait, turn ending, dependency wait, provider failure (failed before any action), outcome unknown, paused, idle. A running turn quiet for 30 min gets one Journal fact saying quiet is not failure | `the_watchdog_tells_a_provider_failure_and_an_unknown_outcome_apart`, frontend label tests |
+| Progress pause | Automatic turns in a row that changed no file (scan, else harness report) and recorded no stage: at 4 the collaboration pauses with an Open item; the user's resume or message counts afresh. The hop limit and budgets stay as backstops | `automatic_turns_without_progress_pause_the_collaboration_for_its_user` |
+
+Limits: waits stay on this device (a linked device does not receive them; the waiter's message conveys the need). "Progress" is files or a recorded stage; a turn that only reads and answers usefully counts as no progress, so a long purely analytical exchange pauses after 4 automatic turns. Cycle detection covers declared waits only, not implicit ones ("I'll wait for your reply" in prose).
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).

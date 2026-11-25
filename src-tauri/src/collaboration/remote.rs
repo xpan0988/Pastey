@@ -303,6 +303,9 @@ fn read_wire_entry(value: &Value) -> AppResult<IncomingV1> {
         },
         EntryBodyV1::Member { alias, role, .. } => valid_alias(alias) && role.chars().count() <= MAX_ROLE_CHARS,
         EntryBodyV1::Grant { alias, .. } => valid_alias(alias),
+        EntryBodyV1::Wait { on, reason, .. } => {
+            (on == USER_ALIAS || valid_alias(on)) && reason.chars().count() <= MAX_SUBJECT_CHARS
+        }
         EntryBodyV1::FilesOutside { alias, changes } => {
             valid_alias(alias) && paths_bounded(&changes.added) && paths_bounded(&changes.changed) && paths_bounded(&changes.removed)
         }
@@ -774,6 +777,7 @@ impl CollaborationServiceV1 {
             execution: None,
             // The device that created it held its readiness barrier.
             released: true,
+            no_progress: 0,
             schema_version: SCHEMA_VERSION.into(),
             id: invitation.collaboration_id.clone(),
             name: invitation.name.clone(),

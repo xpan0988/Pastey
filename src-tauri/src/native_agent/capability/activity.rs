@@ -89,6 +89,10 @@ pub(crate) struct RecentActionV1 {
 pub(crate) struct TaskActivityV1 {
     /// When the first activity arrived (seconds).
     pub(crate) since: i64,
+    /// When the latest activity arrived (seconds): how long the turn has
+    /// been quiet (R3's watchdog; quiet is not failure).
+    #[serde(default)]
+    pub(crate) last_at: i64,
     /// Every action that began.
     pub(crate) actions: u32,
     pub(crate) commands: u32,
@@ -135,12 +139,14 @@ impl TaskActivityV1 {
     pub(crate) fn new(since: i64) -> Self {
         Self {
             since,
+            last_at: since,
             ..Self::default()
         }
     }
 
     /// Folds one reported fact in. `workspace` makes paths relative.
     pub(crate) fn apply(&mut self, activity: NativeActivityV1, workspace: Option<&Path>) {
+        self.last_at = self.last_at.max(crate::storage::now_ts());
         match activity {
             NativeActivityV1::Plan(steps) => {
                 self.plan = steps

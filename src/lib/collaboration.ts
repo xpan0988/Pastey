@@ -105,6 +105,17 @@ export type ExecutionChoice =
   | { kind: "ask" }
   | { kind: "profile"; profile: ExecutionProfile; confirmed: boolean };
 
+/** The watchdog's reading of a member (R3). Quiet is not failure. */
+export type MemberCondition =
+  | { kind: "idle" }
+  | { kind: "working"; quietMinutes?: number }
+  | { kind: "approval_wait" }
+  | { kind: "ending" }
+  | { kind: "dependency_wait"; on: string; reason: string; until: number }
+  | { kind: "provider_failure" }
+  | { kind: "outcome_unknown" }
+  | { kind: "paused" };
+
 /** The native model and effort of every turn the collaboration starts for
  * a member (absent: the Agent's own default). */
 export interface MemberOptions {
@@ -138,6 +149,8 @@ export interface CollaborationMember {
   execution?: { kind: "ask" } | { kind: "profile"; profile: ExecutionProfile; authorizedAt: number };
   /** What its next turn runs with (views only). */
   effectiveExecution?: EffectiveExecution;
+  /** What it is doing, as the watchdog tells it apart (views only). */
+  condition?: MemberCondition;
 }
 
 /** The other device a collaboration spans. */
@@ -225,7 +238,9 @@ export type CollaborationEntryBody =
   /** A member's folder changed between its turns. */
   | ({ type: "files_outside"; alias: string } & FileChanges)
   | { type: "grant"; alias: string; change: "granted"; turns: number; expiresAt: number }
-  | { type: "grant"; alias: string; change: "ended"; reason: GrantEnd };
+  | { type: "grant"; alias: string; change: "ended"; reason: GrantEnd }
+  /** A member declared it cannot go on until `on` answers (R3). */
+  | { type: "wait"; on: string; reason: string; until: number };
 
 export type CollaborationEntryStatus =
   | { state: "waiting" }
@@ -238,7 +253,11 @@ export type CollaborationEntryStatus =
   /** For a member on the linked device: delivered (or not) there. */
   | { state: "elsewhere" }
   | { state: "open" }
-  | { state: "resolved" };
+  | { state: "resolved" }
+  /** A wait on another member, not yet answered: needs nobody. */
+  | { state: "pending" }
+  /** A wait whose deadline passed with no answer. */
+  | { state: "expired" };
 
 export interface CollaborationEntry {
   id: string;
@@ -542,6 +561,8 @@ export function statusLabel(status: CollaborationEntryStatus | undefined): strin
     case "elsewhere": return "Its device decides when it runs";
     case "open": return "Needs you";
     case "resolved": return "Done";
+    case "pending": return "Waiting";
+    case "expired": return "Deadline passed";
     default: return null;
   }
 }
@@ -647,6 +668,15 @@ export function memberStateLabel(member: CollaborationMember): string {
   if (member.invite) return member.invite.sent ? "Invited · waiting for its device's user" : "Invited · not yet sent";
   if (member.remote) return member.waiting > 0 ? `${member.waiting} waiting` : "On the other device";
   if (pendingDecisions(member) > 0) return "Waiting for your approval";
+  switch (member.condition?.kind) {
+    case "working": return member.condition.quietMinutes !== undefined && member.condition.quietMinutes >= 10
+      ? `Working · nothing reported for ${member.condition.quietMinutes} min (not a failure)` : "Working";
+    case "ending": return member.paused ? "Paused · its last turn is still ending" : "Busy · a turn is ending, or another task holds its folder";
+    case "dependency_wait": return `Waiting for ${member.condition.on}: ${member.condition.reason}`;
+    case "provider_failure": return "Paused · its last turn failed before doing anything (often a usage limit, sign-in or model)";
+    case "outcome_unknown": return "Outcome unknown · Pastey cannot tell what its last turn did, and will not run it again";
+    default: break;
+  }
   if (member.paused) return member.busy ? "Paused · its last turn is still ending" : "Paused";
   if (member.busy && !member.live) return "Busy · a turn is ending, or another task holds its folder";
   if (member.busy) return "Working";

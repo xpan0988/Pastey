@@ -1349,3 +1349,171 @@ fn installed_agents_answer_readiness_without_a_model_call() {
         assert!(checks.iter().any(|check| check.name == "Signed in"), "{checks:?}");
     }
 }
+
+fn wait_on(on: &str, minutes: &str) -> String {
+    format!("Blocked.\n\n```pastey-wait on={on}\nfor: the API contract\nuntil: {minutes}\n```\n")
+}
+
+fn condition(service: &CollaborationServiceV1, id: &str, alias: &str) -> MemberConditionV1 {
+    service
+        .view(id, idle)
+        .unwrap()
+        .summary
+        .members
+        .into_iter()
+        .find(|member| member.member.alias == alias)
+        .unwrap()
+        .condition
+}
+
+/// Runs one turn of `alias` carrying what waits for it, ending with `text`.
+fn turn(service: &mut CollaborationServiceV1, fixture: &FixtureV1, task: &str, alias: &str, text: &str) {
+    let plans = service.plan_starts(free);
+    let plan = plans.iter().find(|plan| plan.alias == alias).expect("a turn to start");
+    service.started(plan, task).unwrap();
+    let (provider, workspace) = if alias == "api" { (ProviderV1::Codex, &fixture.api) } else { (ProviderV1::ClaudeCode, &fixture.web) };
+    service.turn_ended(&ended(task, provider, workspace, Some(text))).unwrap();
+}
+
+#[test]
+fn a_declared_wait_yields_the_turn_and_ends_when_answered_or_at_its_deadline() {
+    let fixture = FixtureV1::new("waits");
+    let (mut service, id) = service_with(&fixture);
+    service.user_message(&id, "api", "Start.").unwrap();
+    turn(&mut service, &fixture, "t1", "api", &wait_on("web", "1h"));
+    let waiting = |service: &CollaborationServiceV1, id: &str| {
+        entries(service, id)
+            .into_iter()
+            .filter(|entry| matches!(entry.body, EntryBodyV1::Wait { .. }))
+            .map(|entry| entry.status)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(waiting(&service, &id), vec![Some(StatusV1::Pending)]);
+    assert!(matches!(condition(&service, &id, "api"), MemberConditionV1::DependencyWait { ref on, .. } if on == "web"));
+    // Waiting needs nobody, starts nothing, and web is told it is waited on.
+    assert_eq!(service.needs_you_total(), 0);
+    assert!(service.plan_starts(free).is_empty());
+    service.user_message(&id, "web", "Go.").unwrap();
+    let web = service.plan_starts(free);
+    assert!(web[0].prompt.contains("- api waits for you: the API contract"), "{}", web[0].prompt);
+    // web answers api: the wait ends and api's turn can start.
+    turn(&mut service, &fixture, "t2", "web", &reply_to("api"));
+    assert_eq!(waiting(&service, &id), vec![Some(StatusV1::Resolved)]);
+    // web's answer waits for the user's approval (no grant here), as any
+    // message between members does.
+    assert_eq!(waiting_ids(&service, &id).len(), 1);
+    assert!(matches!(condition(&service, &id, "api"), MemberConditionV1::Idle));
+
+    // A deadline that passes with no answer ends the wait for the user,
+    // starting no turn.
+    let fixture = FixtureV1::new("waits-deadline");
+    let (mut service, id) = service_with(&fixture);
+    service.user_message(&id, "api", "Start.").unwrap();
+    turn(&mut service, &fixture, "t1", "api", &wait_on("web", "30m"));
+    service.settle_waits(crate::storage::now_ts() + 10 * 60).unwrap();
+    assert_eq!(waiting(&service, &id), vec![Some(StatusV1::Pending)], "not yet");
+    service.settle_waits(crate::storage::now_ts() + 31 * 60).unwrap();
+    assert_eq!(waiting(&service, &id), vec![Some(StatusV1::Expired)]);
+    assert!(entries(&service, &id).iter().any(|entry| entry.needs_user()
+        && matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("deadline passed"))));
+    assert!(service.plan_starts(free).is_empty());
+}
+
+#[test]
+fn members_waiting_on_each_other_are_flagged_at_once() {
+    let fixture = FixtureV1::new("wait-cycle");
+    let (mut service, id) = service_with(&fixture);
+    service.user_message(&id, "api", "Start.").unwrap();
+    service.user_message(&id, "web", "Start.").unwrap();
+    turn(&mut service, &fixture, "t1", "api", &wait_on("web", "2h"));
+    turn(&mut service, &fixture, "t2", "web", &wait_on("api", "2h"));
+    let cycle: Vec<EntryV1> = entries(&service, &id)
+        .into_iter()
+        .filter(|entry| matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("wait on each other")))
+        .collect();
+    assert_eq!(cycle.len(), 1);
+    assert!(cycle[0].needs_user());
+    assert!(matches!(&cycle[0].body, EntryBodyV1::Attention { text } if text.contains("web → api → web")));
+    // A wait on the user needs the user, and the user's message ends it.
+    let fixture = FixtureV1::new("wait-user");
+    let (mut service, id) = service_with(&fixture);
+    service.user_message(&id, "api", "Start.").unwrap();
+    turn(&mut service, &fixture, "t1", "api", &wait_on("user", "2h"));
+    assert_eq!(service.needs_you_total(), 1);
+    service.user_message(&id, "api", "Use cursors.").unwrap();
+    assert_eq!(service.needs_you_total(), 0);
+}
+
+#[test]
+fn automatic_turns_without_progress_pause_the_collaboration_for_its_user() {
+    let fixture = FixtureV1::new("no-progress");
+    let (mut service, id) = service_with(&fixture);
+    service.set_grant(&id, "api", 20, 24, crate::storage::now_ts()).unwrap();
+    service.set_grant(&id, "web", 20, 24, crate::storage::now_ts()).unwrap();
+    service.user_message(&id, "api", "Start.").unwrap();
+    // Messages only: no file changed, no stage recorded.
+    let chatter = |to: &str| format!("Thoughts.\n\n```pastey-message to={}\nsubject: more\n\nWhat do you think?\n```\n", if to == "api" { "web" } else { "api" });
+    let ran = run_until_quiet(
+        &mut service,
+        &[("api", ProviderV1::Codex, fixture.api.clone()), ("web", ProviderV1::ClaudeCode, fixture.web.clone())],
+        chatter,
+    );
+    let automatic = ran.iter().filter(|plan| plan.automatic).count();
+    assert_eq!(automatic, NO_PROGRESS_LIMIT as usize, "the hop limit or budget did not stop it first");
+    assert_eq!(service.view(&id, idle).unwrap().summary.state, CollaborationStateV1::Paused);
+    assert!(entries(&service, &id).iter().any(|entry| entry.needs_user()
+        && matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("changed no file"))));
+    // The user looks and resumes: counted afresh.
+    service.set_state(&id, CollaborationStateV1::Active).unwrap();
+    assert_eq!(service.item(&id).unwrap().record.no_progress, 0);
+}
+
+#[test]
+fn the_watchdog_tells_a_provider_failure_and_an_unknown_outcome_apart() {
+    let fixture = FixtureV1::new("conditions");
+    let (mut service, id) = service_with(&fixture);
+    assert!(matches!(condition(&service, &id, "web"), MemberConditionV1::Idle));
+    service.user_message(&id, "web", "Do it.").unwrap();
+    let plans = service.plan_starts(free);
+    service.started(&plans[0], "t1").unwrap();
+    service
+        .turn_ended(&TurnEndedV1 {
+            state: NativeAgentTaskStateV1::Failed,
+            code: Some("native_agent_failed".into()),
+            output: None,
+            ..ended("t1", ProviderV1::ClaudeCode, &fixture.web, None)
+        })
+        .unwrap();
+    assert!(matches!(condition(&service, &id, "web"), MemberConditionV1::ProviderFailure));
+    service.resume_member(&id, "web").unwrap();
+    service.user_message(&id, "web", "Again.").unwrap();
+    let plans = service.plan_starts(free);
+    service.started(&plans[0], "t2").unwrap();
+    service
+        .turn_ended(&TurnEndedV1 {
+            state: NativeAgentTaskStateV1::Interrupted,
+            code: Some("native_agent_outcome_unknown".into()),
+            output: None,
+            ..ended("t2", ProviderV1::ClaudeCode, &fixture.web, None)
+        })
+        .unwrap();
+    assert!(matches!(condition(&service, &id, "web"), MemberConditionV1::OutcomeUnknown));
+    // Running and quiet is working, not failed.
+    let quiet = |_: &Path| MemberRuntimeV1 {
+        busy: true,
+        live: Some(crate::native_agent::RunningTurnV1 {
+            task_id: "t3".into(),
+            capability_id: CODEX_CAPABILITY_ID.into(),
+            activity: Some({
+                let mut activity = crate::native_agent::TaskActivityV1::new(crate::storage::now_ts() - 45 * 60);
+                activity.last_at = crate::storage::now_ts() - 40 * 60;
+                activity
+            }),
+            awaiting_decision: false,
+            decisions: Vec::new(),
+        }),
+    };
+    let view = service.view(&id, quiet).unwrap();
+    let api = view.summary.members.iter().find(|member| member.member.alias == "api").unwrap();
+    assert!(matches!(api.condition, MemberConditionV1::Working { quiet_minutes: Some(40) }), "{:?}", api.condition);
+}
