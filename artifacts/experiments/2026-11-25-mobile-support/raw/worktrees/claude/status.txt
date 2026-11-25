@@ -1,0 +1,27 @@
+ M docs/development.md
+ M docs/reference.md
+ M docs/research/wan-reliability-throughput.md
+ M index.html
+ M scripts/windows-acceptance/stage-5-managed-execute.ps1
+ M src-tauri/Cargo.toml
+ M src-tauri/capabilities/default.json
+ M src-tauri/src/collaboration/ui_bridge.rs
+ M src-tauri/src/commands.rs
+ M src-tauri/src/connectivity/wan_pair_tests.rs
+ M src-tauri/src/discovery.rs
+ M src-tauri/src/main.rs
+ M src-tauri/src/worker_provider_config.rs
+ M src/features/workspace/BridgeNetworkPanel.tsx
+ M src/features/workspace/BridgeWorkspace.tsx
+ M src/features/workspace/SettingsScreens.tsx
+ M src/features/workspace/WorkspaceChrome.tsx
+ M src/features/workspace/WorkspaceScreens.tsx
+ M src/lib/tauri.ts
+ M src/styles.css
+ M tests/frontendIntegration.test.ts
+ M tools/ui-bridge/README.md
+?? docs/research/mobile-support.md
+?? src-tauri/capabilities/mobile.json
+?? src-tauri/src/lib.rs
+?? src/lib/mobileFiles.ts
+?? src/lib/platform.ts

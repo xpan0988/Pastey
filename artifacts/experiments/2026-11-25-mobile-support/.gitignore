@@ -1,0 +1,4 @@
+# Native session transcripts carry the user's email, account ids and full session context; kept local only.
+raw/runtime/*.jsonl
+# Observer poller state
+raw/.journal_seen.json

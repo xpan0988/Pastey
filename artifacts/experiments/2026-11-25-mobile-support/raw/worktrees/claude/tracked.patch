@@ -1,0 +1,1419 @@
+diff --git a/docs/development.md b/docs/development.md
+index 08df2f8..5d05840 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -102,7 +102,7 @@ For a single-machine dual-instance smoke, create/join a Bridge and exercise sele
+ The internet carrier's contract ([Connectivity](layers/layer-4-connectivity.md)) is tested in `connectivity::tests`: two real Hosts from the Room Control pair harness (production room routers on loopback) joined by the in-memory carrier, covering card validation and pinning, per-Bridge stream admission, reconnect and `/join` through the tunnel, a session surviving a carrier outage and a path change, a continuation running once across an outage, and revocation by Burn, forgetting a device and re-pairing; plus one test of real iroh QUIC on loopback with relays off (unpinned key refused, pinned key carries streams both ways). They bind loopback sockets:
+ 
+ ```bash
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey connectivity::
++cargo test --manifest-path src-tauri/Cargo.toml --lib connectivity::
+ ```
+ 
+ These automated checks do not exercise NAT traversal, relays, real networks or Windows. For a physical regression check, pair the devices on the LAN, enable Across the internet on both, then put them on separate networks. Check the reported path, reconnect, run Codex remotely and verify the outcome after an outage without resending the turn. Use [net-probe](../tools/net-probe/README.md) to isolate the raw path from the Bridge.
+@@ -110,7 +110,7 @@ These automated checks do not exercise NAT traversal, relays, real networks or W
+ The pairing and authenticated transfer regression suites also use loopback sockets:
+ 
+ ```bash
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- bridge_auth join_authentication discovery:: bridge_lifecycle:: storage::tests::a_pairing_code storage::tests::a_pinned_peer commands::tests::a_code_pairs
++cargo test --manifest-path src-tauri/Cargo.toml --lib -- bridge_auth join_authentication discovery:: bridge_lifecycle:: storage::tests::a_pairing_code storage::tests::a_pinned_peer commands::tests::a_code_pairs
+ ```
+ 
+ ## Automated, local, and physical evidence
+@@ -138,7 +138,7 @@ These tests cover Host-native session reuse and terminal-success handling, capab
+ Live tests against the Codex installed on this machine are ignored by default, because they need an installed, signed-in Codex and use the account's model quota. On a Mac with only the ChatGPT desktop app, they use its bundled Codex:
+ 
+ ```bash
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_codex -- --ignored --nocapture
++cargo test --manifest-path src-tauri/Cargo.toml --lib installed_codex -- --ignored --nocapture
+ ```
+ 
+ - `installed_codex_is_discovered_with_its_backend` reports which installation Pastey selects.
+@@ -150,15 +150,15 @@ The last two pass their settings through Codex's own `-c` flag for that run only
+ Read-only session discovery has a live check against this Host's real Claude Code and Codex sessions. It defaults to this checkout as the workspace; set `PASTEY_SESSION_WORKSPACE` to another folder. It starts, resumes and changes nothing, and prints statuses and evidence with titles reduced to their length:
+ 
+ ```bash
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_sessions_are_discovered_and_inspected_read_only -- --ignored --nocapture
++cargo test --manifest-path src-tauri/Cargo.toml --lib installed_sessions_are_discovered_and_inspected_read_only -- --ignored --nocapture
+ ```
+ 
+-Remote session reading has a deterministic two-Host check without sockets. In it, the Mac's query passes the Windows Host's Room Control validator, Windows resolves the Mac's permission from its own storage and answers from a real Claude Code store, and the answer passes the Mac's validator into its outstanding query. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey native_session_pair_tests`. It does not exercise the HTTP transport, a running app, or Windows.
++Remote session reading has a deterministic two-Host check without sockets. In it, the Mac's query passes the Windows Host's Room Control validator, Windows resolves the Mac's permission from its own storage and answers from a real Claude Code store, and the answer passes the Mac's validator into its outstanding query. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --lib native_session_pair_tests`. It does not exercise the HTTP transport, a running app, or Windows.
+ 
+ Full Access has unit tests (`full_access`, `session_read_access`, the `full_access_*` and landing tests in `native_agent`, the Developer Terminal tests) and a two-Host check over the real room router and Room Control: the Mac opens a Windows folder by path and continues a Codex thread with no Review on Windows, a terminal opens without Accept, and revoking ends both. The terminal tests need a PTY, which a sandboxed shell may refuse:
+ 
+ ```bash
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey full_access
++cargo test --manifest-path src-tauri/Cargo.toml --lib full_access
+ ```
+ 
+ The automated pair uses neither a packaged app nor a native Windows session. For physical use and regression setup, see [Unattended Windows readiness](reference.md#unattended-windows-readiness).
+@@ -168,7 +168,7 @@ The automated pair uses neither a packaged app nor a native Windows session. For
+ If the Room Control burst test fails on its query/answer counts, rerun it alone on an idle machine. Its shared projection can unblock callers before the final answer reaches the requester, so a count mismatch at that instant does not by itself prove loss or replay.
+ 
+ ```bash
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- --exact room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers
++cargo test --manifest-path src-tauri/Cargo.toml --lib -- --exact room_control::runtime_pair_tests::a_burst_beyond_the_budget_is_refused_cleanly_and_recovers
+ ```
+ 
+ ### Claude Code live validation
+@@ -176,7 +176,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- --exact room_con
+ The separate Claude Code background-session continuation has a live check on macOS. It uses the installed, signed-in Claude Code and a little of its quota. In `src-tauri/target/claude-s2-live` it creates a fresh session, continues it through Pastey's Native Agent lifecycle, and then shows that a session a foreground run holds is refused without anything being sent:
+ 
+ ```bash
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_continues_an_unheld_session_and_refuses_a_held_one -- --ignored --nocapture
++cargo test --manifest-path src-tauri/Cargo.toml --lib installed_claude_code_continues_an_unheld_session_and_refuses_a_held_one -- --ignored --nocapture
+ ```
+ 
+ Two more live checks kill a separate Pastey process (this test binary) with SIGKILL while Claude Code runs a continuation. They then reopen its database:
+@@ -186,7 +186,7 @@ Two more live checks kill a separate Pastey process (this test binary) with SIGK
+ Run them one at a time, from a clean environment: a shell inside a Claude Code session passes its host variables to every child `claude`.
+ 
+ ```bash
+-env -i HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="$TMPDIR" LANG=en_US.UTF-8 cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_ -- --ignored --nocapture --test-threads=1
++env -i HOME="$HOME" USER="$USER" PATH="$PATH" TMPDIR="$TMPDIR" LANG=en_US.UTF-8 cargo test --manifest-path src-tauri/Cargo.toml --lib installed_claude_code_ -- --ignored --nocapture --test-threads=1
+ ```
+ 
+ That filter also selects the Claude Code Conversation checks, the headless existing-session check (an existing session continued in place with a chosen model and effort, then a held session refused) and the conversation options check (a conversation begun with a chosen model and continued with a chosen effort stays one session, read back through discovery). Before running it, build the real lifeline with `cargo build --manifest-path src-tauri/Cargo.toml --bin pastey`. The Conversation checks exercise:
+@@ -199,15 +199,15 @@ They use disposable folders under `src-tauri/target/`. Open the checkout in Clau
+ On Windows, the Claude Code conversation adapter has its own suites. They run real Windows processes in the product's Job Object (a fixture `claude.cmd` with PowerShell `-p` runs, `ping`, `conhost`), and no Claude Code:
+ 
+ ```powershell
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- claude_code::job:: conversation::windows_tests --test-threads=4
++cargo test --manifest-path src-tauri/Cargo.toml --lib -- claude_code::job:: conversation::windows_tests --test-threads=4
+ ```
+ 
+ For the Windows live checks, use a fresh PowerShell outside any Claude Code session. Install the standalone CLI (2.1.319 or later), sign in, and check `claude --version` and `claude auth status`. Run from a disposable checkout trusted by Claude Code. The live checks use the account's model quota. The Stop and crash tests grant only `Bash(ping:*)` in their disposable folders' own Claude Code settings so they can observe a real tool process.
+ 
+ ```powershell
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_conversation_ -- --ignored --nocapture --test-threads=1
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey windows_stop_tests
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_codex_stop_ends_the_command_the_turn_ran -- --ignored --nocapture
++cargo test --manifest-path src-tauri/Cargo.toml --lib installed_claude_code_conversation_ -- --ignored --nocapture --test-threads=1
++cargo test --manifest-path src-tauri/Cargo.toml --lib windows_stop_tests
++cargo test --manifest-path src-tauri/Cargo.toml --lib installed_codex_stop_ends_the_command_the_turn_ran -- --ignored --nocapture
+ ```
+ 
+ The last two commands check Windows Codex Stop. The ignored Codex test requires a signed-in Codex installation with its Windows sandbox set up. For isolated diagnosis use the [Codex Stop probe](../tools/codex-stop-probe/README.md).
+@@ -217,8 +217,8 @@ The last two commands check Windows Codex Stop. The ignored Codex test requires
+ Not yet recorded. Run on the Windows Host first, in a fresh PowerShell outside any Claude Code session, signed in with 2.1.319 or later, from a checkout Claude Code trusts:
+ 
+ ```powershell
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey -- claude_code::job:: conversation::windows_tests --test-threads=4
+-cargo test --manifest-path src-tauri/Cargo.toml --bin pastey installed_claude_code_conversation_ -- --ignored --nocapture --test-threads=1
++cargo test --manifest-path src-tauri/Cargo.toml --lib -- claude_code::job:: conversation::windows_tests --test-threads=4
++cargo test --manifest-path src-tauri/Cargo.toml --lib installed_claude_code_conversation_ -- --ignored --nocapture --test-threads=1
+ ```
+ 
+ The headless existing-session check (`installed_claude_code_continues_an_existing_session_in_place_with_a_chosen_model`) uses the Unix lifeline and runs on macOS; on Windows the same path is exercised by the packaged flow below. Then, packaged, Mac (no Claude Code installed) and Windows paired:
+@@ -235,7 +235,7 @@ Record versions, steps and outcomes only; omit session ids, paths and transcript
+ 
+ ### Native Workspace Movement regression checks
+ 
+-The test-only `native_agent::tests::pair_harness` scenarios use Requester Host A and Executor Host B with separate `AppPaths`, SQLite databases, and `NativeAgentServiceV1` instances, each independently restarted from durable state. Two compositions share it. The Codex workspace-movement pair uses a deterministic fake Codex app-server that writes app-server launches and native turns to external ledgers. The capability pair registers only the test-only `fake.longjob.v1` adapter, with Codex absent, to prove the lifecycle is capability-neutral. Executor admission scenarios in both show that a direct remote invocation or a landed workspace waits for executor Review without any adapter `prepare`/`start` or app-server launch. The fixture controls delivery and fault timing while exercising production state, movement, regular-file-set package/materialization, task, reconciliation, Return, apply, cancellation, and Burn code; it does not implement another Native Agent state machine. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey native_agent::tests::pair_harness`. It gives deterministic evidence for authority, task ownership, executor admission and Review, movement, restart, reconciliation, exact Return and retry, conflict retention, apply idempotence, cancellation, Burn, late completion/observer behavior, and Agent-at-most-once. It does not prove APFS ↔ NTFS behavior, real macOS/Windows process lifecycle, installed and authenticated Codex, real app-server behavior, LAN/socket interruption and reconnect, sleep/wake, firewall/platform behavior, or packaged release UX. Use physical hosts to exercise those boundaries.
++The test-only `native_agent::tests::pair_harness` scenarios use Requester Host A and Executor Host B with separate `AppPaths`, SQLite databases, and `NativeAgentServiceV1` instances, each independently restarted from durable state. Two compositions share it. The Codex workspace-movement pair uses a deterministic fake Codex app-server that writes app-server launches and native turns to external ledgers. The capability pair registers only the test-only `fake.longjob.v1` adapter, with Codex absent, to prove the lifecycle is capability-neutral. Executor admission scenarios in both show that a direct remote invocation or a landed workspace waits for executor Review without any adapter `prepare`/`start` or app-server launch. The fixture controls delivery and fault timing while exercising production state, movement, regular-file-set package/materialization, task, reconciliation, Return, apply, cancellation, and Burn code; it does not implement another Native Agent state machine. Run it with `cargo test --manifest-path src-tauri/Cargo.toml --lib native_agent::tests::pair_harness`. It gives deterministic evidence for authority, task ownership, executor admission and Review, movement, restart, reconciliation, exact Return and retry, conflict retention, apply idempotence, cancellation, Burn, late completion/observer behavior, and Agent-at-most-once. It does not prove APFS ↔ NTFS behavior, real macOS/Windows process lifecycle, installed and authenticated Codex, real app-server behavior, LAN/socket interruption and reconnect, sleep/wake, firewall/platform behavior, or packaged release UX. Use physical hosts to exercise those boundaries.
+ 
+ For a packaged regression run on two devices, use disposable folders. Verify secure pairing and reconnect, requester movement approval, executor Accept and Deny, encrypted outbound transfer, one Codex turn, exact result Return and Apply, and conflict retention when the source changes. Exercise a network drop or restart and verify recovery does not run a second turn. Verify that Burn cuts off Bridge authority. To check Full Access while locked, grant it on Windows, lock with Win+L while Pastey is running, and from the Mac start Codex and open a Developer Terminal without an Accept on Windows. Verify revocation prevents later requests from starting without Accept. Record only non-secret evidence; omit credentials, native session ids, private paths, grants, and raw Agent or terminal content.
+ 
+diff --git a/docs/reference.md b/docs/reference.md
+index 110f70f..b8faef3 100644
+--- a/docs/reference.md
++++ b/docs/reference.md
+@@ -269,7 +269,7 @@ M1 to M4 of [Agent collaboration](research/agent-collaboration-links.md): on thi
+ | Local Claude Code session continuation (`agent.coding.claude_code`) | `src-tauri/src/native_agent/capability/claude_code.rs` |
+ | Remote session reading: permissions, wire types, minimal disclosure, Room Control kinds and requester wait | `src-tauri/src/session_read_access.rs`, `src-tauri/src/native_agent/sessions/remote.rs`, `src-tauri/src/room_control.rs` (`native_agent.session_query` / `session_response`), `src-tauri/src/bridge_lifecycle.rs` (`request_native_sessions`); UI in `src/features/workspace/BridgeWorkspaces.tsx` (Bridge details → Workspaces), `src/features/workspace/NativeSessionsCard.tsx`, `src/features/workspace/SessionReadingSettings.tsx` (Settings overview), `src/lib/workspaceShares.ts`, `src/lib/nativeSessions.ts` |
+ | Test-only deterministic requester/executor pair and external Agent-turn ledger | `src-tauri/src/native_agent_pair_harness.rs` |
+-| Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/main.rs` |
++| Registered commands and remote-session/movement dispatch | `src-tauri/src/commands.rs`, `src-tauri/src/lib.rs` |
+ | Native Agent Room Control envelope, validation, replay/session handling | `src-tauri/src/room_control.rs` |
+ | Encrypted workspace package send, private landing, and movement registration | `src-tauri/src/transfer.rs`, `src-tauri/src/models.rs` |
+ | Host-owned Native Agent service lifetime | `src-tauri/src/host_runtime.rs` |
+diff --git a/docs/research/wan-reliability-throughput.md b/docs/research/wan-reliability-throughput.md
+index 2890dcc..0a256e3 100644
+--- a/docs/research/wan-reliability-throughput.md
++++ b/docs/research/wan-reliability-throughput.md
+@@ -296,7 +296,7 @@ Limits of this evidence:
+ - Each cell ran once, and the three deciding cells twice, with identical outcomes; no wider statistics.
+ - Not covered: Windows, sleep/wake, a network change mid-transfer (as opposed to a blackout), a relay that drops or rate-limits per connection, and Burn while a Native Agent workspace movement is in flight.
+ 
+-Run them with `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey connectivity::wan_pair_tests -- --ignored --nocapture --test-threads 1`. They need local sockets, and take about 15 minutes plus 8 for the below-floor case. The quick harness check, `a_shaped_direct_path_carries_a_verified_transfer_between_two_hosts`, runs in the normal suite.
++Run them with `cargo test --manifest-path src-tauri/Cargo.toml --lib connectivity::wan_pair_tests -- --ignored --nocapture --test-threads 1`. They need local sockets, and take about 15 minutes plus 8 for the below-floor case. The quick harness check, `a_shaped_direct_path_carries_a_verified_transfer_between_two_hosts`, runs in the normal suite.
+ 
+ **Step 3 — BBRv3 behind a developer setting (rank 3), default off. Done; see the result below.** Turn it on by default only after Step 0's matrix is repeated with it on real paths and shows no regression on direct LAN-like paths.
+ 
+diff --git a/index.html b/index.html
+index 6561b9b..638af83 100644
+--- a/index.html
++++ b/index.html
+@@ -2,9 +2,12 @@
+ <html lang="en">
+   <head>
+     <meta charset="UTF-8" />
++    <!-- viewport-fit=cover lets the app use the whole screen on a phone; the
++         stylesheet keeps its content out of the notch and home indicator with
++         env(safe-area-inset-*). Zooming stays allowed. -->
+     <meta
+       name="viewport"
+-      content="width=device-width, initial-scale=1.0"
++      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+     />
+     <title>pastey</title>
+   </head>
+diff --git a/scripts/windows-acceptance/stage-5-managed-execute.ps1 b/scripts/windows-acceptance/stage-5-managed-execute.ps1
+index 3cf3668..020e78f 100644
+--- a/scripts/windows-acceptance/stage-5-managed-execute.ps1
++++ b/scripts/windows-acceptance/stage-5-managed-execute.ps1
+@@ -41,7 +41,7 @@ Invoke-PasteyAcceptanceStage -StageNumber 5 -Body {
+         $testName = "managed_worker_coordinator::tests::native_windows_managed_execute_through_codex_backend"
+         $test = Invoke-PasteyCommand -FilePath $cargo -ArgumentList @(
+             "test", "--manifest-path", "src-tauri/Cargo.toml", "--features", "native-windows-acceptance",
+-            "--bin", "pastey", $testName, "--", "--exact", "--ignored", "--nocapture"
++            "--lib", $testName, "--", "--exact", "--ignored", "--nocapture"
+         )
+         if ($test.ExitCode -ne 0 -or
+             -not $test.Output.Contains("test $testName ... ok") -or
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index b0d1817..044fa7f 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -6,6 +6,13 @@ authors = ["xpan0988"]
+ edition = "2021"
+ default-run = "pastey"
+ 
++# The app is a library so that Tauri's Android and iOS shells can load it
++# (`pastey_lib::run`); `src/main.rs` is only the desktop entry. The library is
++# not named `pastey`, which would collide with the executable's output name.
++[lib]
++name = "pastey_lib"
++crate-type = ["staticlib", "cdylib", "rlib"]
++
+ [[bin]]
+ name = "pastey-managed-execute-probe"
+ path = "src/bin/pastey-managed-execute-probe.rs"
+@@ -28,7 +35,7 @@ futures-util = "0.3"
+ # Internet connectivity carrier (QUIC, NAT traversal, relay fallback) for
+ # the Bridge tunnel in `connectivity`. Never an authority; see
+ # docs/layers/layer-4-bridge.md.
+-iroh = { version = "1.3", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
++iroh = { version = "1.3", default-features = false, features = ["tls-ring", "portmapper"] }
+ # BBRv3 for the internet carrier (iroh does not re-export the type); must be
+ # the noq-proto that iroh uses, so it follows iroh's minor version.
+ noq-proto = { version = "~1.3", default-features = false }
+@@ -53,7 +60,6 @@ spake2 = "0.4"
+ tauri = { version = "2", features = ["tray-icon"] }
+ tauri-plugin-clipboard-manager = "2"
+ tauri-plugin-dialog = "2"
+-tauri-plugin-global-shortcut = "2"
+ tauri-plugin-opener = "2"
+ thiserror = "2"
+ time = { version = "0.3", features = ["formatting", "parsing"] }
+@@ -71,6 +77,16 @@ tauri = { version = "2", features = ["tray-icon", "test"] }
+ # WAN tests (`connectivity/shaped_net.rs`). Not in a normal build.
+ iroh = { version = "1.3", default-features = false, features = ["tls-ring", "test-utils", "unstable-custom-transports"] }
+ 
++# Desktop only: a phone has no global shortcut.
++[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
++tauri-plugin-global-shortcut = "2"
++
++# macOS only. This feature (iroh's fast datapath on Apple platforms) is for the
++# Mac build; it is kept off iOS, where it would use syscalls Apple does not
++# document (verify against iroh's docs before an App Store build).
++[target.'cfg(target_os = "macos")'.dependencies]
++iroh = { version = "1.3", default-features = false, features = ["tls-ring", "portmapper", "fast-apple-datapath"] }
++
+ [target.'cfg(windows)'.dependencies]
+ windows-codex-sandbox = { path = "crates/windows-codex-sandbox" }
+ windows-sys = { version = "0.61.2", features = [
+diff --git a/src-tauri/capabilities/default.json b/src-tauri/capabilities/default.json
+index f3e37d2..8270d91 100644
+--- a/src-tauri/capabilities/default.json
++++ b/src-tauri/capabilities/default.json
+@@ -1,8 +1,9 @@
+ {
+   "$schema": "../gen/schemas/desktop-schema.json",
+   "identifier": "main-capability",
+-  "description": "Capability for the main window",
++  "description": "Capability for the main window on a desktop",
+   "windows": ["main"],
++  "platforms": ["macOS", "windows", "linux"],
+   "permissions": [
+     "core:default",
+     "core:app:default",
+diff --git a/src-tauri/src/collaboration/ui_bridge.rs b/src-tauri/src/collaboration/ui_bridge.rs
+index b4cc0cf..ae08561 100644
+--- a/src-tauri/src/collaboration/ui_bridge.rs
++++ b/src-tauri/src/collaboration/ui_bridge.rs
+@@ -7,7 +7,7 @@
+ //!
+ //! Run it, then open the frontend with the IPC shim (`tools/ui-bridge`):
+ //!
+-//!     cargo test --bin pastey collaboration_screens_over_a_browser_bridge -- --ignored --nocapture
++//!     cargo test --lib collaboration_screens_over_a_browser_bridge -- --ignored --nocapture
+ //!     npx vite --config tools/ui-bridge/vite.config.mjs
+ //!
+ //! Mac: port 17431, Windows: 17432. `POST /ipc {cmd, args}` answers
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index e3d2548..08895eb 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -4026,6 +4026,20 @@ pub fn get_bridge_peer_address(
+     storage::get_bridge_peer_address(&state.paths, &room_id).map_err(|error| error.message())
+ }
+ 
++/// This device's own addresses on private or overlay networks, for a device
++/// that pairs by address instead of by broadcast (a phone). Read only.
++#[tauri::command]
++pub async fn get_local_network_addresses() -> Result<Vec<String>, String> {
++    tokio::task::spawn_blocking(|| {
++        discovery::local_private_ipv4_addresses()
++            .into_iter()
++            .map(|address| address.to_string())
++            .collect()
++    })
++    .await
++    .map_err(|error| error.to_string())
++}
++
+ /// Remembers (or with `None` forgets) where to reach a Bridge's peer when it
+ /// is not on this network, so the Bridge can reconnect across networks.
+ #[tauri::command]
+@@ -7089,6 +7103,37 @@ pub fn write_temp_file(
+     Ok(path.display().to_string())
+ }
+ 
++/// Like `write_temp_file`, but the bytes arrive as the request's raw body
++/// instead of a JSON array of numbers, which a phone cannot afford for a file
++/// of a few megabytes. The name is in the `x-file-name` header as URL-safe
++/// base64 of its UTF-8 text, since a header cannot carry arbitrary text. Used
++/// where the frontend holds a file's bytes but no path: a phone's file picker
++/// (docs/research/mobile-support.md, "Sending").
++#[tauri::command]
++pub fn write_temp_file_raw(
++    request: tauri::ipc::Request,
++    state: State<'_, Arc<AppState>>,
++) -> Result<String, String> {
++    use base64::Engine as _;
++    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
++        return Err("the file's bytes were not sent as a raw body".into());
++    };
++    let file_name = request
++        .headers()
++        .get("x-file-name")
++        .and_then(|value| value.to_str().ok())
++        .and_then(|value| {
++            base64::engine::general_purpose::URL_SAFE_NO_PAD
++                .decode(value)
++                .ok()
++        })
++        .and_then(|decoded| String::from_utf8(decoded).ok())
++        .unwrap_or_default();
++    let path = storage::write_temp_file(&state.paths, &file_name, bytes)
++        .map_err(|error| error.message())?;
++    Ok(path.display().to_string())
++}
++
+ #[tauri::command]
+ pub fn get_file_transfer_metadata(path: String) -> Result<FileTransferMetadata, String> {
+     let file_path = resolve_user_path(&path).map_err(|error| error.message())?;
+@@ -7688,6 +7733,7 @@ pub async fn update_config(
+     Ok(updated)
+ }
+ 
++#[cfg(desktop)]
+ #[tauri::command]
+ pub fn reveal_in_folder(path: String, app: AppHandle) -> Result<(), String> {
+     let path = resolve_user_path(&path).map_err(|error| error.message())?;
+@@ -7696,6 +7742,17 @@ pub fn reveal_in_folder(path: String, app: AppHandle) -> Result<(), String> {
+         .map_err(|error| error.to_string())
+ }
+ 
++/// A phone has no file manager window to reveal a file in. The received
++/// file's own screen offers what the system does allow (docs/research/
++/// mobile-support.md, "Receiving").
++#[cfg(mobile)]
++#[tauri::command]
++#[allow(unused_variables)]
++pub fn reveal_in_folder(path: String, app: AppHandle) -> Result<(), String> {
++    Err("Showing a file in its folder is not available on this device.".into())
++}
++
++#[cfg(desktop)]
+ #[tauri::command]
+ pub fn open_logs_folder(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
+     std::fs::create_dir_all(&state.paths.logs_dir).map_err(|error| error.to_string())?;
+@@ -7704,6 +7761,13 @@ pub fn open_logs_folder(state: State<'_, Arc<AppState>>, app: AppHandle) -> Resu
+         .map_err(|error| error.to_string())
+ }
+ 
++#[cfg(mobile)]
++#[tauri::command]
++#[allow(unused_variables)]
++pub fn open_logs_folder(state: State<'_, Arc<AppState>>, app: AppHandle) -> Result<(), String> {
++    Err("Opening the logs folder is not available on this device.".into())
++}
++
+ #[tauri::command]
+ pub fn copy_last_error(
+     state: State<'_, Arc<AppState>>,
+diff --git a/src-tauri/src/connectivity/wan_pair_tests.rs b/src-tauri/src/connectivity/wan_pair_tests.rs
+index edd17b4..240da00 100644
+--- a/src-tauri/src/connectivity/wan_pair_tests.rs
++++ b/src-tauri/src/connectivity/wan_pair_tests.rs
+@@ -7,7 +7,7 @@
+ //! reconnect and Burn. Nothing here shortens a product timeout.
+ //!
+ //! The long scenarios are ignored by default. Run them with
+-//! `cargo test --manifest-path src-tauri/Cargo.toml --bin pastey
++//! `cargo test --manifest-path src-tauri/Cargo.toml --lib
+ //! connectivity::wan_pair_tests -- --ignored --nocapture --test-threads 1`.
+ //! Each prints one `WAN_PAIR {json}` line of evidence before it asserts.
+ 
+diff --git a/src-tauri/src/discovery.rs b/src-tauri/src/discovery.rs
+index d2a7cd3..d853b13 100644
+--- a/src-tauri/src/discovery.rs
++++ b/src-tauri/src/discovery.rs
+@@ -612,6 +612,31 @@ fn is_private_or_overlay_ipv4(ip: Ipv4Addr) -> bool {
+     is_device_ipv4(ip) && (ip.is_private() || shared)
+ }
+ 
++/// This device's own IPv4 addresses on private or overlay networks, for
++/// another device to type when it pairs by address: a phone cannot count on
++/// broadcast discovery (docs/research/mobile-support.md, "Pairing"). Read
++/// only; it shows what the interface list already shows and grants nothing.
++pub(crate) fn local_private_ipv4_addresses() -> Vec<Ipv4Addr> {
++    let mut addresses: Vec<Ipv4Addr> = discovery_interfaces()
++        .into_iter()
++        .map(|interface| interface.ipv4)
++        .collect();
++    // `ip` and `ifconfig` do not exist everywhere (Windows has neither). The
++    // address the system would use toward a private network is the fallback:
++    // connecting a UDP socket sends nothing, it only selects the route.
++    if let Ok(socket) = std::net::UdpSocket::bind(("0.0.0.0", 0)) {
++        if socket.connect(("192.168.0.1", 9)).is_ok() {
++            if let Ok(SocketAddr::V4(local)) = socket.local_addr() {
++                addresses.push(*local.ip());
++            }
++        }
++    }
++    addresses.retain(|ip| is_private_or_overlay_ipv4(*ip));
++    addresses.sort();
++    addresses.dedup();
++    addresses
++}
++
+ /// How long a LAN pairing or reconnect query waits for an answer.
+ const LAN_DISCOVERY_WAIT: Duration = Duration::from_secs(5);
+ const LAN_DISCOVERY_SENDS: usize = 3;
+@@ -1300,6 +1325,10 @@ pub fn platform_name() -> &'static str {
+         "Windows"
+     } else if cfg!(target_os = "linux") {
+         "Linux"
++    } else if cfg!(target_os = "ios") {
++        "iOS"
++    } else if cfg!(target_os = "android") {
++        "Android"
+     } else {
+         "Desktop"
+     }
+@@ -1317,6 +1346,16 @@ fn major_version(version: &str) -> Option<&str> {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn this_devices_addresses_are_private_or_overlay_sorted_and_unique() {
++        // Whatever this machine's network is, including none.
++        let addresses = local_private_ipv4_addresses();
++        assert!(addresses
++            .iter()
++            .all(|address| is_private_or_overlay_ipv4(*address)));
++        assert!(addresses.windows(2).all(|pair| pair[0] < pair[1]));
++    }
++
+     #[test]
+     fn beacon_serialization_contains_no_sensitive_fields() {
+         let beacon = NearbyBeacon {
+diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
+index 7671c37..9fb8126 100644
+--- a/src-tauri/src/main.rs
++++ b/src-tauri/src/main.rs
+@@ -1,653 +1,5 @@
+-mod bridge_auth;
+-mod bridge_lifecycle;
+-mod bridge_plan;
+-mod bridge_plan_v2;
+-mod capability_acquisition_confirmation;
+-mod capability_probe;
+-mod chunk_frame;
+-mod cleanup;
+-mod collaboration;
+-mod commands;
+-mod config;
+-mod connectivity;
+-mod crypto;
+-mod dev_tools;
+-mod developer_terminal;
+-mod device_identity;
+-mod device_profile;
+-mod device_trust;
+-mod diagnostics;
+-mod discovery;
+-mod effect_authority;
+-mod error;
+-mod execution_backend;
+-mod execution_world;
+-mod file_candidates;
+-mod full_access;
+-mod host_admission;
+-mod host_identity;
+-mod host_process;
+-mod host_runtime;
+-mod link_benchmark;
+-mod logging;
+-mod managed_execution;
+-mod managed_objects;
+-mod managed_resources;
+-mod managed_runtime_config;
+-mod managed_worker_coordinator;
+-mod managed_workspace;
+-mod models;
+-mod native_agent;
+-mod native_v2_orchestration;
+-mod natural_v2;
+-mod network_broker;
+-mod object_refs;
+-mod peer_capabilities;
+-mod regular_file_set_transfer;
+-mod room_control;
+-mod safe_file_identity;
+-mod session_read_access;
+-mod storage;
+-mod transfer;
+-mod transfer_orchestration;
+-mod transfer_tuning;
+-#[cfg(windows)]
+-mod windows_codex_backend;
+-#[cfg(any(windows, test))]
+-mod windows_verifier_diagnostics;
+-mod worker_harness;
+-mod worker_provider;
+-mod worker_provider_config;
+-
+-use std::{path::PathBuf, sync::Arc};
+-
+-use tauri::{
+-    menu::MenuBuilder,
+-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+-    AppHandle, Emitter, Manager, WindowEvent,
+-};
+-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+-
+-use crate::{
+-    commands::{
+-        accept_developer_terminal, accept_native_invocation_review, accept_nearby_join,
+-        approve_bridge_plan, approve_native_v2_plan,
+-        approve_remote_native_codex_workspace_movement, authorize_search_folder,
+-        bind_bridge_plan_to_session, burn_room, cancel_native_agent_task,
+-        cancel_native_v2_plan_attempt, cancel_remote_native_agent_task, cancel_transfer,
+-        check_for_updates, check_managed_worker_provider_health, close_developer_terminal,
+-        close_hosted_developer_terminal, complete_nearby_join, compose_native_v2_plan,
+-        compose_natural_v2_candidate, confirm_capability_acquisition, continue_native_session,
+-        continue_remote_native_session, copy_last_error, copy_text_to_clipboard,
+-        create_composed_file_bridge_plan, create_direct_file_transfer_bridge_plan,
+-        create_managed_worker_provider, create_room, delete_managed_worker_provider,
+-        delete_temp_file, deny_developer_terminal, deny_native_invocation_review,
+-        discard_native_agent_conflict_result, discover_native_sessions,
+-        discover_remote_native_sessions, enter_developer_mode, forget_known_device,
+-        get_bridge_full_access, get_bridge_internet_status, get_bridge_node_list_projection,
+-        get_bridge_peer_address, get_config, get_developer_terminal_workspace,
+-        get_device_capabilities, get_device_identity, get_device_profile,
+-        get_file_transfer_metadata, get_internet_connectivity, get_last_benchmark_results,
+-        get_managed_worker_provider_settings, get_native_agent_recovery_projection,
+-        get_native_agent_task_session, get_native_agent_task_status,
+-        get_native_agent_workspace_movement_status, get_native_v2_plan_status, get_room,
+-        get_room_control_diagnostics, get_room_control_session_context, grant_full_access,
+-        inspect_native_session, inspect_remote_native_session, join_room, join_room_at,
+-        list_authorized_search_folders, list_bridge_plan_workspace, list_bridge_workspace_shares,
+-        list_full_access, list_known_devices, list_managed_runtime_options,
+-        list_native_agent_capabilities, list_native_invocation_reviews, list_nearby_devices,
+-        list_received_room_control_events, list_remote_native_agent_capabilities,
+-        list_remote_shared_workspaces, list_room_items, list_rooms, list_seen_peer_devices,
+-        list_session_read_grants, list_trusted_devices, log_frontend_diagnostic,
+-        mark_bridge_peer_pairing_rotation_required, mark_join_prompt_rendered, open_bridge_pairing,
+-        open_logs_folder, open_remote_folder, pair_bridge_peer, pending_join_requests,
+-        present_device_identity, propose_remote_native_codex_workspace_movement,
+-        read_native_agent_defaults, read_native_model_catalogs, read_remote_native_model_catalogs,
+-        reconcile_remote_native_agent_task, refresh_selected_peer_capabilities, reject_nearby_join,
+-        remove_full_access_folder, repair_bridge, request_developer_terminal, request_nearby_join,
+-        resize_developer_terminal, respond_remote_native_decision,
+-        retry_native_agent_workspace_result_return, reveal_in_folder,
+-        reveal_native_agent_conflict_result, revoke_authorized_search_folder,
+-        revoke_bridge_peer_pairing, revoke_full_access, revoke_trusted_device,
+-        rotate_device_identity, run_bridge_device_diagnostics, run_bridge_device_self_check,
+-        run_loopback_benchmark, run_peer_link_benchmark, select_bridge_plan_search_candidate,
+-        select_managed_execute_runtime, select_managed_worker_provider,
+-        send_developer_terminal_input, send_file_to_room, send_text_to_room,
+-        set_bridge_peer_address, set_internet_connectivity, share_bridge_workspace,
+-        start_bridge_plan_attempt, start_native_claude_code_task, start_native_codex_task,
+-        list_collaborations, get_collaboration, create_collaboration, set_collaboration_state,
+-        delete_collaboration, send_collaboration_message, approve_collaboration_messages,
+-        dismiss_collaboration_entry, resume_collaboration_member, collaboration_needs_you_count,
+-        set_collaboration_grant, withdraw_collaboration_grant, add_collaboration_member,
+-        remove_collaboration_member, set_collaboration_goal, set_collaboration_role,
+-        decide_collaboration_summary, invite_collaboration_member, list_collaboration_invitations,
+-        answer_collaboration_invitation,
+-        start_native_v2_plan_attempt, start_remote_native_capability_task,
+-        start_remote_native_claude_code_task, start_remote_native_codex_task,
+-        stop_bridge_native_agent_task, stop_sharing_workspace, trust_peer_device, update_config,
+-        update_managed_worker_provider, update_transfer_window, update_workspace_share,
+-        withdraw_bridge_plan_revision, write_temp_file,
+-    },
+-    error::{AppError, AppResult},
+-    host_runtime::{HostEvent, HostEventSink, HostRuntime, RuntimeTask, RuntimeTaskSpawner},
+-    storage::AppPaths,
+-};
+-
+-const APP_DATA_DIR_ENV: &str = "PASTEY_APP_DATA_DIR";
+-
+-struct TauriHostEventSink {
+-    app_handle: AppHandle,
+-}
+-
+-impl HostEventSink for TauriHostEventSink {
+-    fn emit(&self, event: HostEvent) -> AppResult<()> {
+-        self.app_handle
+-            .emit(event.name, event.payload)
+-            .map_err(|error| AppError::InvalidInput(format!("failed to emit Host event: {error}")))
+-    }
+-}
+-
+-struct TauriRuntimeTaskSpawner;
+-
+-impl RuntimeTaskSpawner for TauriRuntimeTaskSpawner {
+-    fn spawn(&self, task: RuntimeTask) {
+-        tauri::async_runtime::spawn(task);
+-    }
+-}
+-
++// The app itself is the `pastey_lib` library (src/lib.rs), so that a phone can
++// load it as one. This executable is only its desktop entry.
+ fn main() {
+-    #[cfg(windows)]
+-    if windows_codex_backend::run_helper_if_requested() {
+-        return;
+-    }
+-    // A Claude Code run's lifeline: Pastey's own executable, started again.
+-    #[cfg(unix)]
+-    if native_agent::run_claude_code_lifeline_if_requested() {
+-        return;
+-    }
+-    // The desktop app takes no arguments. Anything else is a launcher Pastey
+-    // no longer answers (such as a stale MCP entry), so refuse it instead of
+-    // opening a second Host on this device's data.
+-    if let LaunchMode::Refused(argument) = launch_mode(std::env::args_os().skip(1)) {
+-        eprintln!(
+-            "pastey: unsupported argument {argument:?}. The Pastey app starts only without \
+-             arguments; if an MCP client or launcher starts Pastey with this argument, \
+-             remove that entry."
+-        );
+-        std::process::exit(2);
+-    }
+-    let app = tauri::Builder::default()
+-        .plugin(tauri_plugin_opener::init())
+-        .plugin(tauri_plugin_dialog::init())
+-        .plugin(tauri_plugin_clipboard_manager::init())
+-        .setup(|app| {
+-            let shortcut_label = default_shortcut_label();
+-            let paths = desktop_app_paths(app.handle())?;
+-            let state = HostRuntime::initialize(
+-                paths,
+-                shortcut_label,
+-                Arc::new(TauriHostEventSink {
+-                    app_handle: app.handle().clone(),
+-                }),
+-                Arc::new(TauriRuntimeTaskSpawner),
+-            )?;
+-
+-            app.manage(state.clone());
+-            logging::install_crash_reporting(env!("CARGO_PKG_VERSION"));
+-            // Agent collaborations: deliver at turn boundaries from now on.
+-            collaboration::start_scheduler(&state);
+-            let antenna_state = state.clone();
+-            state.spawn(async move {
+-                if discovery::ensure_service(antenna_state.clone())
+-                    .await
+-                    .is_err()
+-                {
+-                    logging::write_error_line(
+-                        "[pastey antenna] event=antenna_start error_code=service_unavailable",
+-                    );
+-                    return;
+-                }
+-                discovery::start_antenna(antenna_state).await;
+-            });
+-            let lifecycle_state = state.clone();
+-            state.spawn(async move {
+-                bridge_lifecycle::start(lifecycle_state).await;
+-            });
+-            // Internet connectivity, only if this device's user turned it on.
+-            let connectivity_state = state.clone();
+-            state.spawn(async move {
+-                connectivity::start(connectivity_state).await;
+-            });
+-            install_global_shortcut(app.handle())?;
+-            install_tray(app.handle())?;
+-            cleanup::start_cleanup_scheduler(state);
+-            Ok(())
+-        })
+-        .on_window_event(|window, event| {
+-            if let WindowEvent::CloseRequested { api, .. } = event {
+-                api.prevent_close();
+-                let app = window.app_handle().clone();
+-                if let Some(state) = app.try_state::<Arc<HostRuntime>>() {
+-                    let state = state.inner().clone();
+-                    let task_state = state.clone();
+-                    state.spawn(async move {
+-                        discovery::stop_antenna(task_state).await;
+-                    });
+-                }
+-                let _ = window.hide();
+-            }
+-        })
+-        .invoke_handler(tauri::generate_handler![
+-            create_room,
+-            open_bridge_pairing,
+-            repair_bridge,
+-            list_known_devices,
+-            forget_known_device,
+-            join_room,
+-            join_room_at,
+-            get_device_identity,
+-            rotate_device_identity,
+-            present_device_identity,
+-            list_seen_peer_devices,
+-            trust_peer_device,
+-            list_trusted_devices,
+-            revoke_trusted_device,
+-            get_bridge_full_access,
+-            list_full_access,
+-            grant_full_access,
+-            revoke_full_access,
+-            remove_full_access_folder,
+-            get_bridge_peer_address,
+-            set_bridge_peer_address,
+-            list_nearby_devices,
+-            request_nearby_join,
+-            complete_nearby_join,
+-            accept_nearby_join,
+-            reject_nearby_join,
+-            pending_join_requests,
+-            mark_join_prompt_rendered,
+-            list_rooms,
+-            get_room,
+-            pair_bridge_peer,
+-            revoke_bridge_peer_pairing,
+-            mark_bridge_peer_pairing_rotation_required,
+-            list_room_items,
+-            send_text_to_room,
+-            send_file_to_room,
+-            create_composed_file_bridge_plan,
+-            create_direct_file_transfer_bridge_plan,
+-            refresh_selected_peer_capabilities,
+-            compose_natural_v2_candidate,
+-            compose_native_v2_plan,
+-            approve_native_v2_plan,
+-            start_native_v2_plan_attempt,
+-            get_native_v2_plan_status,
+-            cancel_native_v2_plan_attempt,
+-            list_native_agent_capabilities,
+-            discover_native_sessions,
+-            read_native_agent_defaults,
+-            read_native_model_catalogs,
+-            read_remote_native_model_catalogs,
+-            inspect_native_session,
+-            continue_native_session,
+-            get_internet_connectivity,
+-            set_internet_connectivity,
+-            get_bridge_internet_status,
+-            continue_remote_native_session,
+-            discover_remote_native_sessions,
+-            inspect_remote_native_session,
+-            list_session_read_grants,
+-            list_bridge_workspace_shares,
+-            share_bridge_workspace,
+-            update_workspace_share,
+-            stop_sharing_workspace,
+-            list_remote_shared_workspaces,
+-            open_remote_folder,
+-            list_authorized_search_folders,
+-            authorize_search_folder,
+-            revoke_authorized_search_folder,
+-            list_remote_native_agent_capabilities,
+-            start_native_codex_task,
+-            start_native_claude_code_task,
+-            list_collaborations,
+-            get_collaboration,
+-            create_collaboration,
+-            set_collaboration_state,
+-            delete_collaboration,
+-            send_collaboration_message,
+-            approve_collaboration_messages,
+-            dismiss_collaboration_entry,
+-            resume_collaboration_member,
+-            collaboration_needs_you_count,
+-            set_collaboration_grant,
+-            withdraw_collaboration_grant,
+-            add_collaboration_member,
+-            remove_collaboration_member,
+-            set_collaboration_goal,
+-            set_collaboration_role,
+-            decide_collaboration_summary,
+-            invite_collaboration_member,
+-            list_collaboration_invitations,
+-            answer_collaboration_invitation,
+-            get_native_agent_task_session,
+-            get_native_agent_task_status,
+-            cancel_native_agent_task,
+-            list_native_invocation_reviews,
+-            accept_native_invocation_review,
+-            deny_native_invocation_review,
+-            start_remote_native_codex_task,
+-            start_remote_native_capability_task,
+-            start_remote_native_claude_code_task,
+-            cancel_remote_native_agent_task,
+-            respond_remote_native_decision,
+-            stop_bridge_native_agent_task,
+-            propose_remote_native_codex_workspace_movement,
+-            approve_remote_native_codex_workspace_movement,
+-            get_native_agent_workspace_movement_status,
+-            get_native_agent_recovery_projection,
+-            reveal_native_agent_conflict_result,
+-            discard_native_agent_conflict_result,
+-            retry_native_agent_workspace_result_return,
+-            reconcile_remote_native_agent_task,
+-            list_bridge_plan_workspace,
+-            approve_bridge_plan,
+-            withdraw_bridge_plan_revision,
+-            bind_bridge_plan_to_session,
+-            start_bridge_plan_attempt,
+-            select_bridge_plan_search_candidate,
+-            get_room_control_session_context,
+-            list_received_room_control_events,
+-            get_room_control_diagnostics,
+-            enter_developer_mode,
+-            get_developer_terminal_workspace,
+-            request_developer_terminal,
+-            accept_developer_terminal,
+-            close_hosted_developer_terminal,
+-            deny_developer_terminal,
+-            send_developer_terminal_input,
+-            resize_developer_terminal,
+-            close_developer_terminal,
+-            cancel_transfer,
+-            update_transfer_window,
+-            write_temp_file,
+-            get_file_transfer_metadata,
+-            delete_temp_file,
+-            burn_room,
+-            get_config,
+-            list_managed_runtime_options,
+-            select_managed_execute_runtime,
+-            get_managed_worker_provider_settings,
+-            create_managed_worker_provider,
+-            update_managed_worker_provider,
+-            delete_managed_worker_provider,
+-            select_managed_worker_provider,
+-            check_managed_worker_provider_health,
+-            get_device_profile,
+-            get_device_capabilities,
+-            confirm_capability_acquisition,
+-            get_bridge_node_list_projection,
+-            run_bridge_device_diagnostics,
+-            run_bridge_device_self_check,
+-            run_loopback_benchmark,
+-            run_peer_link_benchmark,
+-            get_last_benchmark_results,
+-            update_config,
+-            reveal_in_folder,
+-            open_logs_folder,
+-            copy_last_error,
+-            check_for_updates,
+-            copy_text_to_clipboard,
+-            log_frontend_diagnostic
+-        ])
+-        .build(tauri::generate_context!())
+-        .expect("error while building pastey");
+-    app.run(|app_handle, event| {
+-        if matches!(event, tauri::RunEvent::Exit) {
+-            if let Some(state) = app_handle.try_state::<Arc<HostRuntime>>() {
+-                state.shutdown_all();
+-            }
+-            logging::record_clean_exit();
+-        }
+-    });
+-}
+-
+-fn install_global_shortcut(app: &AppHandle) -> AppResult<()> {
+-    let shortcut = default_shortcut();
+-    let watched_shortcut = shortcut.clone();
+-
+-    app.plugin(
+-        tauri_plugin_global_shortcut::Builder::new()
+-            .with_handler(move |app, triggered_shortcut, event| {
+-                if triggered_shortcut == &watched_shortcut
+-                    && matches!(event.state(), ShortcutState::Pressed)
+-                {
+-                    let _ = toggle_main_window(app, "home");
+-                }
+-            })
+-            .build(),
+-    )
+-    .map_err(|error| {
+-        AppError::InvalidInput(format!(
+-            "failed to initialize global shortcut plugin: {error}"
+-        ))
+-    })?;
+-
+-    app.global_shortcut().register(shortcut).map_err(|error| {
+-        AppError::InvalidInput(format!("failed to register global shortcut: {error}"))
+-    })?;
+-
+-    Ok(())
+-}
+-
+-fn install_tray(app: &AppHandle) -> AppResult<()> {
+-    let menu = MenuBuilder::new(app)
+-        .text("toggle", "Show / Hide")
+-        .text("new_room", "Open pastey")
+-        .separator()
+-        .text("quit", "Quit")
+-        .build()
+-        .map_err(|error| AppError::InvalidInput(format!("failed to build tray menu: {error}")))?;
+-
+-    let icon = app
+-        .default_window_icon()
+-        .ok_or_else(|| AppError::InvalidInput("missing default window icon".into()))?
+-        .clone();
+-
+-    TrayIconBuilder::new()
+-        .icon(icon)
+-        .menu(&menu)
+-        .on_menu_event(|app, event| match event.id.as_ref() {
+-            "toggle" | "new_room" => {
+-                let _ = toggle_main_window(app, "home");
+-            }
+-            "quit" => {
+-                app.exit(0);
+-            }
+-            _ => {}
+-        })
+-        .on_tray_icon_event(|tray, event| {
+-            if let TrayIconEvent::Click {
+-                button: MouseButton::Left,
+-                button_state: MouseButtonState::Up,
+-                ..
+-            } = event
+-            {
+-                let _ = toggle_main_window(tray.app_handle(), "home");
+-            }
+-        })
+-        .build(app)
+-        .map_err(|error| AppError::InvalidInput(format!("failed to create tray icon: {error}")))?;
+-
+-    Ok(())
+-}
+-
+-fn toggle_main_window(app: &AppHandle, target: &str) -> AppResult<()> {
+-    let window = app
+-        .get_webview_window("main")
+-        .ok_or_else(|| AppError::NotFound("main window not found".into()))?;
+-    let is_visible = window.is_visible().map_err(|error| {
+-        AppError::InvalidInput(format!("failed to read window visibility: {error}"))
+-    })?;
+-
+-    if is_visible {
+-        window
+-            .hide()
+-            .map_err(|error| AppError::InvalidInput(format!("failed to hide window: {error}")))?;
+-        let state = app.state::<Arc<HostRuntime>>().inner().clone();
+-        let task_state = state.clone();
+-        state.spawn(async move {
+-            discovery::stop_antenna(task_state).await;
+-        });
+-    } else {
+-        window
+-            .show()
+-            .map_err(|error| AppError::InvalidInput(format!("failed to show window: {error}")))?;
+-        let state = app.state::<Arc<HostRuntime>>().inner().clone();
+-        let task_state = state.clone();
+-        state.spawn(async move {
+-            if discovery::ensure_service(task_state.clone()).await.is_ok() {
+-                discovery::start_antenna(task_state).await;
+-            }
+-        });
+-        let _ = window.unminimize();
+-        let _ = window.set_focus();
+-        app.emit(
+-            "pastey://focus",
+-            serde_json::json!({
+-                "target": target
+-            }),
+-        )
+-        .map_err(|error| AppError::InvalidInput(format!("failed to emit focus event: {error}")))?;
+-    }
+-
+-    Ok(())
+-}
+-
+-fn default_shortcut() -> Shortcut {
+-    let modifiers = if cfg!(target_os = "macos") {
+-        Modifiers::SUPER | Modifiers::SHIFT
+-    } else {
+-        Modifiers::CONTROL | Modifiers::SHIFT
+-    };
+-    Shortcut::new(Some(modifiers), Code::KeyV)
+-}
+-
+-fn default_shortcut_label() -> &'static str {
+-    "CommandOrControl+Shift+V"
+-}
+-
+-fn desktop_app_paths(app: &AppHandle) -> AppResult<AppPaths> {
+-    let default_app_data_dir = app.path().app_data_dir().map_err(|error| {
+-        AppError::InvalidInput(format!("unable to resolve app data directory: {error}"))
+-    })?;
+-    let app_data_dir_override = desktop_app_data_dir_override()?;
+-    let app_data_dir = app_data_dir_override
+-        .clone()
+-        .unwrap_or(default_app_data_dir);
+-    let logs_dir = app_data_dir_override
+-        .as_ref()
+-        .map(|dir| dir.join("logs"))
+-        .unwrap_or_else(|| desktop_default_logs_dir(&app_data_dir));
+-    let paths = AppPaths::new(app_data_dir, logs_dir);
+-    paths.ensure_directories()?;
+-    Ok(paths)
+-}
+-
+-fn desktop_app_data_dir_override() -> AppResult<Option<PathBuf>> {
+-    let Some(value) = std::env::var_os(APP_DATA_DIR_ENV) else {
+-        return Ok(None);
+-    };
+-    let display = value.to_string_lossy();
+-    if display.trim().is_empty() {
+-        return Err(AppError::InvalidInput(format!(
+-            "{APP_DATA_DIR_ENV} must not be empty"
+-        )));
+-    }
+-    let path = PathBuf::from(value);
+-    if path.is_absolute() {
+-        Ok(Some(path))
+-    } else {
+-        Ok(Some(std::env::current_dir()?.join(path)))
+-    }
+-}
+-
+-fn desktop_default_logs_dir(app_data_dir: &std::path::Path) -> PathBuf {
+-    #[cfg(target_os = "macos")]
+-    {
+-        if let Some(home) = std::env::var_os("HOME") {
+-            return PathBuf::from(home)
+-                .join("Library")
+-                .join("Application Support")
+-                .join("pastey")
+-                .join("logs");
+-        }
+-    }
+-
+-    #[cfg(target_os = "windows")]
+-    {
+-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+-            return PathBuf::from(local_app_data).join("pastey").join("logs");
+-        }
+-    }
+-
+-    app_data_dir.join("logs")
+-}
+-
+-/// What one start of this executable is for, once the helper modes above
+-/// (Windows sandbox setup, the Claude Code lifeline) have had their turn.
+-#[derive(Debug, PartialEq, Eq)]
+-enum LaunchMode {
+-    /// No arguments: the desktop app.
+-    Desktop,
+-    /// An argument the desktop app does not take.
+-    Refused(String),
+-}
+-
+-fn launch_mode(arguments: impl IntoIterator<Item = std::ffi::OsString>) -> LaunchMode {
+-    for argument in arguments {
+-        let text = argument.to_string_lossy();
+-        // Older macOS Launch Services passed a process serial number.
+-        if text.starts_with("-psn_") {
+-            continue;
+-        }
+-        return LaunchMode::Refused(text.into_owned());
+-    }
+-    LaunchMode::Desktop
+-}
+-
+-#[cfg(test)]
+-mod launch_mode_tests {
+-    use super::{launch_mode, LaunchMode};
+-    use std::ffi::OsString;
+-
+-    fn mode(arguments: &[&str]) -> LaunchMode {
+-        launch_mode(arguments.iter().map(OsString::from))
+-    }
+-
+-    #[test]
+-    fn no_arguments_start_the_desktop_app() {
+-        assert_eq!(mode(&[]), LaunchMode::Desktop);
+-        assert_eq!(mode(&["-psn_0_12345"]), LaunchMode::Desktop);
+-    }
+-
+-    #[test]
+-    fn a_retired_mcp_entry_is_refused_rather_than_opening_the_app() {
+-        assert_eq!(
+-            mode(&["--physical-mcp", "/tmp/grant.json"]),
+-            LaunchMode::Refused("--physical-mcp".into())
+-        );
+-    }
+-
+-    #[test]
+-    fn any_other_argument_is_refused() {
+-        assert_eq!(
+-            mode(&["--anything"]),
+-            LaunchMode::Refused("--anything".into())
+-        );
+-        assert_eq!(mode(&["file.txt"]), LaunchMode::Refused("file.txt".into()));
+-        assert_eq!(
+-            mode(&["-psn_0_1", "--x"]),
+-            LaunchMode::Refused("--x".into())
+-        );
+-    }
++    pastey_lib::run()
+ }
+diff --git a/src-tauri/src/worker_provider_config.rs b/src-tauri/src/worker_provider_config.rs
+index b0b78b0..94c99c5 100644
+--- a/src-tauri/src/worker_provider_config.rs
++++ b/src-tauri/src/worker_provider_config.rs
+@@ -1028,8 +1028,9 @@ mod tests {
+ 
+     #[test]
+     fn provider_product_commands_are_limited_to_configuration_and_health() {
+-        let main_source = include_str!("main.rs");
+-        let invoke_registration = main_source
++        // The registration lives in `lib.rs`: `main.rs` only calls it.
++        let app_source = include_str!("lib.rs");
++        let invoke_registration = app_source
+             .split(".invoke_handler(tauri::generate_handler![")
+             .nth(1)
+             .and_then(|source| source.split("])").next())
+diff --git a/src/features/workspace/BridgeNetworkPanel.tsx b/src/features/workspace/BridgeNetworkPanel.tsx
+index 2fa6f50..7371e42 100644
+--- a/src/features/workspace/BridgeNetworkPanel.tsx
++++ b/src/features/workspace/BridgeNetworkPanel.tsx
+@@ -1,7 +1,7 @@
+ import { useEffect, useState } from "react";
+ import { bridgeReachability, peerAddressProblem } from "../../lib/bridgeAddress";
+ import { bridgeInternetLine } from "../../lib/internetStatus";
+-import { getBridgeInternetStatus, getBridgePeerAddress, openBridgePairing, presentDeviceIdentity, repairBridge, setBridgePeerAddress, type BridgeInternetStatus } from "../../lib/tauri";
++import { getBridgeInternetStatus, getBridgePeerAddress, getLocalNetworkAddresses, openBridgePairing, presentDeviceIdentity, repairBridge, setBridgePeerAddress, type BridgeInternetStatus } from "../../lib/tauri";
+ import { bridgeCode, roomPeers } from "./workspaceViewModel";
+ import type { RoomInfo } from "../../lib/types";
+ import { Badge, Dot, Field, Icon, Notice, type Tone } from "./ui";
+@@ -37,6 +37,16 @@ export function BridgeConnectionSection({ room, onPairingChanged }: { room: Room
+   const pairing = room.pairing_state ?? "pairing_required";
+   const [pairCode, setPairCode] = useState("");
+   const [internet, setInternet] = useState<BridgeInternetStatus | null>(null);
++  const [localAddresses, setLocalAddresses] = useState<string[]>([]);
++
++  // A phone pairs by this device's address and the code, not by broadcast.
++  // Asked only while a code is open.
++  useEffect(() => {
++    if ((room.pairing_state ?? "pairing_required") !== "awaiting_peer") { setLocalAddresses([]); return; }
++    let cancelled = false;
++    void getLocalNetworkAddresses().then((addresses) => { if (!cancelled) setLocalAddresses(addresses); }).catch(() => undefined);
++    return () => { cancelled = true; };
++  }, [room.id, room.pairing_state]);
+ 
+   // The path can change at any time (a network change, the relay taking
+   // over): asked again every few seconds while this panel is open.
+@@ -100,6 +110,7 @@ export function BridgeConnectionSection({ room, onPairingChanged }: { room: Room
+         : pairing === "awaiting_peer"
+           ? `Enter ${bridgeCode(room)} on the other device: under New Bridge, or, if it already has this Bridge, in this panel there. The code works once and expires after 15 minutes.`
+           : "This Bridge has no verified device, so it cannot reconnect or receive anything. Pair it again: show a new code here and enter it in this panel on the other device, or enter the code the other device shows. Only the code decides which device is trusted; give it only to your own device. Folders shared with this Bridge and earlier Agent tasks and conversations are removed when it pairs."}</p>
++      {pairing === "awaiting_peer" && localAddresses.length > 0 ? <p className="small muted">To pair a phone: on the phone, open New Bridge, choose Join with a code, tick “Pair by the other device’s address” and enter <span className="mono">{localAddresses.join(" or ")}</span> with this code.</p> : null}
+       {/* Shown in every state: after the other device replaces its identity
+           this side still looks paired, and only this field can re-pair it.
+           While paired it is one click away instead of always open. */}
+diff --git a/src/features/workspace/BridgeWorkspace.tsx b/src/features/workspace/BridgeWorkspace.tsx
+index ead97ac..9e057d6 100644
+--- a/src/features/workspace/BridgeWorkspace.tsx
++++ b/src/features/workspace/BridgeWorkspace.tsx
+@@ -5,7 +5,9 @@ import type { BridgeRoute } from "../../lib/bridgeRouting";
+ import { composerShortcutHint } from "../../lib/composerKeys";
+ import { sendTextToRoomWithBridgeRoute } from "../../lib/bridgeRoutingRuntime";
+ import { legacyRoomToBridgePeerCollection } from "../../lib/bridgeRoomAdapter";
++import { pickFilesFromDevice, skippedFilesMessage, stagePickedFiles } from "../../lib/mobileFiles";
+ import { nativeDecisionsAwaitUser } from "../../lib/nativeDecisions";
++import { isMobilePlatform } from "../../lib/platform";
+ import { ownAsyncDisposer } from "../../lib/subscriptionLifecycle";
+ import { copyTextToClipboard, presentDeviceIdentity, sendTextToRoom } from "../../lib/tauri";
+ import type { TransferQueueInput, TransferQueueItem } from "../../lib/transferScheduler";
+@@ -168,10 +170,14 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
+   }, [thread.length, queued.length, orphanTransfers.length, active]);
+ 
+   function enqueuePaths(paths: string[]) {
+-    if (!selectedRoute || !selectedPeer || !paths.length) return;
++    enqueueFiles(paths.map((path) => ({ path })));
++  }
++
++  function enqueueFiles(files: Array<Pick<TransferQueueInput, "path" | "displayName" | "mimeType" | "sizeBytes" | "modifiedMs" | "deleteWhenDone">>) {
++    if (!selectedRoute || !selectedPeer || !files.length) return;
+     const operationId = `bridge-send:${room.id}:${crypto.randomUUID()}`;
+-    onEnqueue(room.id, paths.map((path) => ({
+-      path,
++    onEnqueue(room.id, files.map((file) => ({
++      ...file,
+       bridgeRoute: selectedRoute,
+       bridgeOperationId: operationId,
+       bridgeTargetKind: "selected_peer",
+@@ -214,8 +220,22 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
+   const inputRef = useRef<HTMLTextAreaElement>(null);
+   const enterMode = useEnterKeyMode();
+ 
++  // A phone's picker gives files, not paths: read them and keep a copy to send.
++  async function chooseFilesOnPhone() {
++    try {
++      const picked = await pickFilesFromDevice();
++      if (picked.length === 0) return;
++      const result = await stagePickedFiles(picked);
++      enqueueFiles(result.staged);
++      setMessage(skippedFilesMessage(result));
++    } catch (error) {
++      setMessage(error instanceof Error ? error.message : "Pastey could not choose files.");
++    }
++  }
++
+   async function chooseFiles() {
+     if (!selectedRoute || !selectedPeer) return;
++    if (isMobilePlatform()) return chooseFilesOnPhone();
+     try {
+       const selected = await open({ multiple: true, directory: false });
+       enqueuePaths(typeof selected === "string" ? [selected] : Array.isArray(selected) ? selected : []);
+diff --git a/src/features/workspace/SettingsScreens.tsx b/src/features/workspace/SettingsScreens.tsx
+index 78b9652..82ca196 100644
+--- a/src/features/workspace/SettingsScreens.tsx
++++ b/src/features/workspace/SettingsScreens.tsx
+@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
+ import type { ReactNode } from "react";
+ import { readAppearance, saveAppearance, type Appearance } from "../../lib/appearance";
+ import { isApplePlatform, readEnterKeyMode, saveEnterKeyMode, type EnterKeyMode } from "../../lib/composerKeys";
++import { isMobilePlatform } from "../../lib/platform";
+ import {
+   authorizeSearchFolder,
+   checkForUpdates,
+@@ -114,7 +115,7 @@ function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConf
+           <Segmented label="Appearance" value={appearance} onChange={(value) => { setAppearance(value); saveAppearance(value); }} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} /></div>
+         <div className="setting-row"><span><strong>{enter} key in messages</strong><small>{enterMode === "send" ? `${enter} sends; Shift+${enter} adds a line.` : `${enter} adds a line; ${isApplePlatform() ? "⌘" : "Ctrl+"}${enter} sends.`} An input method's {enter} only confirms its text.</small></span>
+           <Segmented label={`${enter} key in messages`} value={enterMode} onChange={(value) => { setEnterMode(value); saveEnterKeyMode(value); }} options={[{ value: "send", label: "Sends" }, { value: "newline", label: "Adds a line" }]} /></div>
+-        <div className="setting-row"><span><strong>Global shortcut</strong><small>Opens Pastey from anywhere.</small></span><span className="value mono">{config.shortcut}</span></div>
++        {isMobilePlatform() ? null : <div className="setting-row"><span><strong>Global shortcut</strong><small>Opens Pastey from anywhere.</small></span><span className="value mono">{config.shortcut}</span></div>}
+       </div>
+     </section>
+     <section className="section" aria-label="Receiving">
+diff --git a/src/features/workspace/WorkspaceChrome.tsx b/src/features/workspace/WorkspaceChrome.tsx
+index 1703ba1..814e497 100644
+--- a/src/features/workspace/WorkspaceChrome.tsx
++++ b/src/features/workspace/WorkspaceChrome.tsx
+@@ -1,3 +1,4 @@
++import { isMobilePlatform } from "../../lib/platform";
+ import type { RoomInfo } from "../../lib/types";
+ import { bridgeStatus } from "./BridgeNetworkPanel";
+ import { Dot, Icon } from "./ui";
+@@ -27,9 +28,10 @@ export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, collabo
+       <button type="button" className={`nav-item${route === "inbox" ? " active" : ""}`} onClick={() => onNavigate("inbox")}>
+         <Icon name="inbox" />Inbox{inboxCount > 0 ? <span className="count">{inboxCount}</span> : null}
+       </button>
+-      <button type="button" className={`nav-item${route === "collaborations" ? " active" : ""}`} onClick={() => onNavigate("collaborations")}>
++      {/* A collaboration groups this device's own Codex and Claude Code conversations; a phone runs none. */}
++      {isMobilePlatform() ? null : <button type="button" className={`nav-item${route === "collaborations" ? " active" : ""}`} onClick={() => onNavigate("collaborations")}>
+         <Icon name="agent" />Collaborations{collaborationCount > 0 ? <span className="count" title="Waiting for you">{collaborationCount}</span> : null}
+-      </button>
++      </button>}
+       <p className="nav-label">Bridges</p>
+       <div className="nav-list">
+         {activeRooms.map((room) => {
+diff --git a/src/features/workspace/WorkspaceScreens.tsx b/src/features/workspace/WorkspaceScreens.tsx
+index 06f15b4..2e6331b 100644
+--- a/src/features/workspace/WorkspaceScreens.tsx
++++ b/src/features/workspace/WorkspaceScreens.tsx
+@@ -1,4 +1,5 @@
+ import { peerAddressProblem } from "../../lib/bridgeAddress";
++import { isMobilePlatform } from "../../lib/platform";
+ import { useEffect, useRef, useState } from "react";
+ import type { NearbyDevice, NearbyJoinPending, RoomInfo, RoomItem } from "../../lib/types";
+ import { MessageCard } from "./BridgeWorkspace";
+@@ -25,7 +26,10 @@ export function NewBridgeScreen({
+   const [code, setCode] = useState("");
+   const [nearbyPending, setNearbyPending] = useState<NearbyJoinPending | null>(null);
+   const [nearbyCode, setNearbyCode] = useState("");
+-  const [remote, setRemote] = useState(false);
++  // A phone pairs by the other device's address: it cannot count on hearing
++  // the other device's broadcast (docs/research/mobile-support.md, "Pairing").
++  const phone = isMobilePlatform();
++  const [remote, setRemote] = useState(phone);
+   const [address, setAddress] = useState("");
+   const addressProblem = remote ? peerAddressProblem(address) : null;
+   const [busyAction, setBusyAction] = useState<string | null>(null);
+@@ -108,9 +112,11 @@ export function NewBridgeScreen({
+           <div className="section-head"><h2>Join with a code</h2><p>Enter the 8-digit code another device shows for its Bridge.</p></div>
+           <div className="card"><div className="card-body">
+             <div className="row"><input className="input code-input" value={code} onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 8))} placeholder="4829 1736" aria-label="Bridge code" inputMode="numeric" /><button type="button" className="btn btn-primary" disabled={code.length !== 8 || busyAction !== null || (remote && addressProblem !== null)} onClick={() => void run("join", () => onJoin(code, remote ? address.trim() : undefined))}>{busyAction === "join" ? "Joining…" : "Join"}</button></div>
+-            <label className="check"><input type="checkbox" checked={remote} onChange={(event) => setRemote(event.target.checked)} /><span>The other device is on another network</span></label>
+-            {remote ? <Field label="Its private-network address" hint={<>Its address on a private network you both use, such as Tailscale or WireGuard. The address only says where to look; the code still decides whether you join, and it gives the other device no permissions.{address.trim() && addressProblem ? ` ${addressProblem}` : ""}</>}>
+-              <input className="input input-mono" value={address} onChange={(event) => setAddress(event.target.value)} placeholder="home-pc.tail1234.ts.net or 100.x.y.z" aria-label="Other device's overlay address" />
++            <label className="check"><input type="checkbox" checked={remote} onChange={(event) => setRemote(event.target.checked)} /><span>{phone ? "Pair by the other device’s address" : "The other device is on another network"}</span></label>
++            {remote ? <Field label={phone ? "Its address" : "Its private-network address"} hint={<>{phone
++              ? "The address its Bridge shows when a code is open (for example 192.168.1.20), or its address on a private network you both use. "
++              : "Its address on a private network you both use, such as Tailscale or WireGuard. "}The address only says where to look; the code still decides whether you join, and it gives the other device no permissions.{address.trim() && addressProblem ? ` ${addressProblem}` : ""}</>}>
++              <input className="input input-mono" value={address} onChange={(event) => setAddress(event.target.value)} placeholder={phone ? "192.168.1.20" : "home-pc.tail1234.ts.net or 100.x.y.z"} aria-label={phone ? "Other device's address" : "Other device's overlay address"} inputMode={phone ? "decimal" : undefined} autoCapitalize="none" autoCorrect="off" />
+             </Field> : null}
+             <p className="xsmall subtle">Session permission ends when the Bridge is burned or the current session is replaced.</p>
+           </div></div>
+diff --git a/src/lib/tauri.ts b/src/lib/tauri.ts
+index b90c2bc..54b5d57 100644
+--- a/src/lib/tauri.ts
++++ b/src/lib/tauri.ts
+@@ -692,6 +692,12 @@ export function getBridgePeerAddress(roomId: string): Promise<string | null> {
+   return invoke("get_bridge_peer_address", { roomId });
+ }
+ 
++/** This device's own addresses on private or overlay networks, for a device
++ * that pairs by address instead of by broadcast (a phone). Read only. */
++export function getLocalNetworkAddresses(): Promise<string[]> {
++  return invoke("get_local_network_addresses");
++}
++
+ /** Remembers (or with null forgets) where this Bridge's peer can be reached
+  * from another network, for reconnects. Grants nothing. */
+ export function setBridgePeerAddress(roomId: string, address: string | null): Promise<string | null> {
+@@ -1307,6 +1313,17 @@ export async function writeTempFile(fileName: string, bytes: number[]): Promise<
+   return invoke("write_temp_file", { fileName, bytes });
+ }
+ 
++/** Stores a file's bytes in this device's temp folder and returns the path.
++ * Unlike `writeTempFile`, the bytes travel as the request body rather than as
++ * a JSON array of numbers, so a photo or a document is affordable on a phone.
++ * The name rides in a header as URL-safe base64 of its UTF-8 text. */
++export async function writeTempFileRaw(fileName: string, bytes: Uint8Array): Promise<string> {
++  let binary = "";
++  for (const byte of new TextEncoder().encode(fileName)) binary += String.fromCharCode(byte);
++  const encodedName = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
++  return invoke("write_temp_file_raw", bytes, { headers: { "x-file-name": encodedName } });
++}
++
+ export async function getFileTransferMetadata(path: string): Promise<FileTransferMetadata> {
+   return invoke("get_file_transfer_metadata", { path });
+ }
+diff --git a/src/styles.css b/src/styles.css
+index ae5fa8d..d6d5d6f 100644
+--- a/src/styles.css
++++ b/src/styles.css
+@@ -498,6 +498,34 @@ button.status-pill:hover { background: var(--surface-2); color: var(--text); }
+ .progress.indeterminate i { width: 35%; animation: slide 1.2s ease-in-out infinite; }
+ @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+ 
++/* ── Phones and tablets ─────────────────────────────────────────────────
++ * The layouts above already collapse below 680 px. This block adds what a
++ * touch screen needs: room for the notch and the home indicator, a viewport
++ * that follows the system's toolbars and keyboard, targets a finger can hit,
++ * and text large enough that iOS does not zoom the page when a field gets
++ * focus. A mouse on a desktop sees none of it: the safe-area insets are 0
++ * there, dvh equals vh, and `pointer: coarse` is false. */
++
++.app { padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); }
++@supports (height: 100dvh) {
++  .app, .app-loading { height: 100dvh; }
++  .dialog { max-height: calc(100dvh - 48px); }
++  .dialog.wide { height: min(680px, calc(100dvh - 48px)); }
++}
++html { -webkit-text-size-adjust: 100%; }
++button, .btn, .nav-item, .list-row, .menu button { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
++@media (max-width: 680px) {
++  /* The sidebar is a fixed overlay here, outside the padded .app. */
++  .sidebar { padding-top: calc(14px + env(safe-area-inset-top, 0px)); padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px)); padding-left: calc(10px + env(safe-area-inset-left, 0px)); }
++}
++@media (pointer: coarse) {
++  :root { --control-h: 44px; --control-h-sm: 36px; }
++  body { overscroll-behavior: none; }
++  .input, .select, .textarea, .composer textarea { font-size: 16px; }
++  .nav-item, .menu button { min-height: 44px; }
++  .send-button { width: 40px; height: 40px; }
++}
++
+ .composer-wrap { padding: 0 var(--space-6) var(--space-5); }
+ .composer { max-width: var(--content-w); margin: 0 auto; border: 1px solid var(--border-strong); border-radius: var(--radius-xl); background: var(--surface); box-shadow: 0 1px 3px rgba(0,0,0,.05); transition: border-color var(--duration), box-shadow var(--duration); }
+ .composer:focus-within { border-color: var(--accent); box-shadow: var(--focus-ring); }
+diff --git a/tests/frontendIntegration.test.ts b/tests/frontendIntegration.test.ts
+index 6cb4bae..8c19912 100644
+--- a/tests/frontendIntegration.test.ts
++++ b/tests/frontendIntegration.test.ts
+@@ -5,6 +5,8 @@ import test from "node:test";
+ import { mergeRoomItems, reconcileRoomItems, reconcileRooms } from "../src/lib/authoritativeSnapshots";
+ import { chooseInitialBridgeId, reconcileSelectedBridgeId, visibleBridgeRooms } from "../src/lib/bridgeSelection";
+ import { ownAsyncDisposer } from "../src/lib/subscriptionLifecycle";
++import { skippedFilesMessage, stagePickedFiles } from "../src/lib/mobileFiles";
++import { isMobilePlatform, platformOfUserAgent } from "../src/lib/platform";
+ import { mergeTransferEvent } from "../src/lib/transferState";
+ import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewModel";
+ import {
+@@ -2445,3 +2447,34 @@ test("a member alias is suggested from its folder and never collides with anothe
+   assert.equal(validAlias("Web Team"), false);
+   assert.equal(validAlias("x".repeat(33)), false);
+ });
++
++test("a phone is told apart from a desktop by what its user agent says, and a Mac with a touch screen is an iPad", () => {
++  const iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148";
++  const android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36";
++  const mac = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
++  const windows = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
++  assert.equal(platformOfUserAgent(iphone, 5), "ios");
++  assert.equal(platformOfUserAgent(android, 5), "android");
++  assert.equal(platformOfUserAgent(mac, 0), "desktop");
++  assert.equal(platformOfUserAgent(windows, 10), "desktop");
++  // iPadOS asks for the desktop site and reports a Mac, but it has a touch screen.
++  assert.equal(platformOfUserAgent(mac, 5), "ios");
++  // Under Node there is no phone to be.
++  assert.equal(isMobilePlatform(), false);
++});
++
++test("a phone sends files it was handed as bytes, and says which it left out", async () => {
++  const big = new File([new Uint8Array(10)], "big.bin");
++  // Over the limit: never read, never stored.
++  const result = await stagePickedFiles([big], 5);
++  assert.deepEqual(result.tooLarge, ["big.bin"]);
++  assert.deepEqual(result.staged, []);
++  assert.deepEqual(result.failed, []);
++  assert.match(skippedFilesMessage(result, 5 * 1024 * 1024) ?? "", /big\.bin is over 5 MB/);
++  // Under Node there is no Pastey to store the bytes: reported, not queued.
++  const unstorable = await stagePickedFiles([new File([new Uint8Array(3)], "note.txt")]);
++  assert.deepEqual(unstorable.staged, []);
++  assert.deepEqual(unstorable.failed, ["note.txt"]);
++  assert.equal(skippedFilesMessage({ staged: [], tooLarge: [], failed: [] }), null);
++  assert.match(skippedFilesMessage({ staged: [], tooLarge: ["a", "b", "c"], failed: ["d"] }) ?? "", /a and 2 more are over 64 MB.*d could not be read\./);
++});
+diff --git a/tools/ui-bridge/README.md b/tools/ui-bridge/README.md
+index 1e31ad0..5109f9a 100644
+--- a/tools/ui-bridge/README.md
++++ b/tools/ui-bridge/README.md
+@@ -6,7 +6,7 @@ Development tool: Pastey's real frontend in a browser, driving two real Hosts, w
+ - `vite.config.mjs` serves the frontend on 1430 with a shim that sends `invoke` to the bridge. `?bridge=17431` is the Mac, and `?bridge=17432` is Windows.
+ 
+ ```bash
+-cd src-tauri && cargo build && cargo test --bin pastey collaboration_screens_over_a_browser_bridge -- --ignored --nocapture
++cd src-tauri && cargo build && cargo test --lib collaboration_screens_over_a_browser_bridge -- --ignored --nocapture
+ ```
+ 
+ ```bash

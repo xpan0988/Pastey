@@ -1,0 +1,189 @@
+{
+  "experiment": "pastey-open-ended-mobile-support",
+  "date": "2026-11-25",
+  "timezone": "+11:00",
+  "baseline_commit": "3dec3dced906aa1d0ea3afc5b41dfd7d1766635c",
+  "outcome": "blocked",
+  "termination": {
+    "condition": "unable to make further progress under existing authorization; user stopped the experiment",
+    "at": "2026-11-25T16:04+11:00",
+    "blocking_cause": "codex turn held on a native escalation request (sandbox_permissions=require_escalated) that Pastey's collaboration view did not surface"
+  },
+  "wall_clock": {
+    "setup_start": "2026-11-25T14:40+11:00",
+    "collaboration_created": "2026-11-25T15:07:16+11:00",
+    "first_objective_delivered": "2026-11-25T15:08:35+11:00",
+    "last_agent_progress": "2026-11-25T15:31:33+11:00",
+    "collaboration_ended": "2026-11-25T16:09:00+11:00",
+    "minutes_objective_to_end": 60.4,
+    "minutes_productive_codex": 13.2,
+    "minutes_productive_claude": 17.4,
+    "minutes_codex_stalled_on_approval": 47.1,
+    "minutes_claude_idle_waiting": 37.5,
+    "minutes_claude_start_delay_vs_codex": 5.6
+  },
+  "turns": {
+    "codex": {
+      "started": 1,
+      "completed": 0,
+      "interrupted_by_quit": 1,
+      "automatic": 0,
+      "grant_used": 0,
+      "grant": {
+        "turns": 20,
+        "hours": 24
+      }
+    },
+    "claude": {
+      "started": 1,
+      "completed": 1,
+      "failed_to_start": 3,
+      "automatic": 0,
+      "grant_used": 0,
+      "grant": {
+        "turns": 20,
+        "hours": 24
+      }
+    },
+    "automatic_turns_total": 0
+  },
+  "journal": {
+    "entries_total": 19,
+    "by_type": {
+      "user": 3,
+      "member": 2,
+      "grant": 4,
+      "message": 5,
+      "turn": 4,
+      "summary": 1
+    },
+    "user_actions": {
+      "created": 1,
+      "decided": 1,
+      "ended": 1
+    },
+    "source": "raw/journal-export.jsonl"
+  },
+  "messages": {
+    "user_to_agent": 3,
+    "user_to_agent_undeliverable": 1,
+    "agent_to_agent": 1,
+    "agent_to_agent_delivered": 0,
+    "agent_to_user": 1,
+    "agent_to_user_answered": 0,
+    "acknowledgements": 0,
+    "summaries": 1,
+    "max_hop": 1
+  },
+  "human_interventions": {
+    "observer_setup_interventions_user_authorised": 3,
+    "user_product_decisions": 1,
+    "user_permission_grants_for_full_screen_control": 4,
+    "native_approvals_answered": 0,
+    "native_approvals_pending_unanswered": 1,
+    "agent_questions_to_user": 1,
+    "agent_questions_answered": 0,
+    "details": [
+      "I-1 folder-local Claude config (model, effortLevel xhigh, acceptEdits, deny push/PR/release)",
+      "I-2 .git/info/exclude for the config file",
+      "I-3 hand-written Claude Code trust record for the Claude worktree",
+      "H-1 user confirmed claude's summary decisions (15:42:52)"
+    ]
+  },
+  "engineering": {
+    "commits": {
+      "codex": 0,
+      "claude": 0
+    },
+    "claude": {
+      "files_added": 5,
+      "files_changed": 22,
+      "tracked_diff": "22 files, +284 -690",
+      "compiled": false,
+      "tests_run": 0
+    },
+    "codex": {
+      "files_added": 13,
+      "files_changed_tracked": 17,
+      "tracked_diff": "17 files, +255 -131",
+      "compiled": "agent statement: offline cargo check ran; npm run build reported passing by the agent; not verified by the observer",
+      "tests_run": "1 targeted cargo test (mobile_companion_exchanges) failed per Pastey runtime report"
+    },
+    "overlapping_files_both_changed": [
+      "src-tauri/src/lib.rs (both created)",
+      "src-tauri/capabilities/mobile.json (both created)",
+      "src-tauri/src/main.rs",
+      "src-tauri/src/commands.rs",
+      "src-tauri/Cargo.toml",
+      "src-tauri/capabilities/default.json",
+      "src/lib/tauri.ts",
+      "src/features/workspace/BridgeWorkspace.tsx"
+    ],
+    "merged_to_main": false,
+    "pushed": false,
+    "observer_build_or_test": null
+  },
+  "runtime_reports": {
+    "claude_turn1": {
+      "actions": 232,
+      "commands": 120,
+      "failed_commands": 17,
+      "files_changed": 27,
+      "permission_declined": {
+        "cargo": 1,
+        "npm": 1,
+        "rustc": 2,
+        "rustup": 1,
+        "xcodebuild": 1,
+        "git": 3,
+        "WebSearch": 4
+      }
+    },
+    "codex_turn1_at_stall": {
+      "commands": 81,
+      "failed_commands": 17,
+      "files_changed": 27
+    }
+  },
+  "tokens": {
+    "claude": {
+      "model": "claude-sonnet-5-5",
+      "assistant_messages": 348,
+      "input_fresh": 704,
+      "output": 383662,
+      "cache_read": 62626534,
+      "cache_write": 979445,
+      "source": "session transcript usage fields"
+    },
+    "codex": {
+      "model": "gpt-6.2-sol",
+      "effort": "high",
+      "input": 5703319,
+      "cached_input": 5510144,
+      "output": 33476,
+      "reasoning_output": 9410,
+      "total": 5736795,
+      "rate_limit_after": {
+        "5h_window_used_percent": 17.0,
+        "weekly_used_percent": 39.0
+      },
+      "source": "rollout token_count"
+    },
+    "observer": null,
+    "claude_quota_percent": null,
+    "claude_cost_estimate_usd": null
+  },
+  "verification": {
+    "codex_model_effort_verified": true,
+    "claude_model_verified": true,
+    "claude_effort_verified": false,
+    "claude_effort_note": "effortLevel xhigh configured; Claude Code reports no effort level in any output"
+  },
+  "unavailable": [
+    "observer token usage",
+    "Claude quota percentage",
+    "Pastey-side automatic-turn scheduling latency (no automatic turn ever started)",
+    "message delivery latency agent-to-agent (never delivered)",
+    "build/test results verified by observer (not run; worktrees were removed at user instruction after patches were saved)"
+  ]
+}

@@ -1,0 +1,13 @@
+docs/platform/mobile.md
+mobile.html
+src-tauri/Info.ios.plist
+src-tauri/capabilities/mobile.json
+src-tauri/src/host_modules.rs
+src-tauri/src/lib.rs
+src-tauri/src/mobile_companion.rs
+src-tauri/src/tauri_host.rs
+src-tauri/tauri.android.conf.json
+src-tauri/tauri.ios.conf.json
+src/features/workspace/MobileCompanion.tsx
+src/mobile.css
+src/mobile.tsx

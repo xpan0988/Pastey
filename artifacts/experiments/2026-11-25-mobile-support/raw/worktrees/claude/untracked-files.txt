@@ -1,0 +1,5 @@
+docs/research/mobile-support.md
+src-tauri/capabilities/mobile.json
+src-tauri/src/lib.rs
+src/lib/mobileFiles.ts
+src/lib/platform.ts

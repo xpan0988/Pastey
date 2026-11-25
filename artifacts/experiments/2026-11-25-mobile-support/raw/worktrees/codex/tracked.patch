@@ -1,0 +1,833 @@
+diff --git a/README.md b/README.md
+index b295f1e..2dc40ad 100644
+--- a/README.md
++++ b/README.md
+@@ -40,6 +40,8 @@ Native task completion is separate from result capture, Return, and apply. Paste
+ - Workspace movement carries at most 1,024 regular files. Symlinks, special files, empty folders, executable modes, names that collide when case is ignored, and names that are not portable between macOS and Windows are refused before review.
+ - macOS (Apple Silicon) and Windows 11 x64 are the supported desktop platforms. Linux is outside the supported release scope.
+ 
++This branch includes a development [mobile companion](docs/platform/mobile.md) for pairing with a desktop, sharing text, and requesting desktop Agent turns. Mobile packages and devices are pending qualification.
++
+ ## Install
+ 
+ Download from [Releases](https://github.com/xpan0988/Pastey/releases/latest):
+diff --git a/docs/layers/layer-4-connectivity.md b/docs/layers/layer-4-connectivity.md
+index 8c99748..dc9806b 100644
+--- a/docs/layers/layer-4-connectivity.md
++++ b/docs/layers/layer-4-connectivity.md
+@@ -79,4 +79,4 @@ Unchanged from before the carrier. Joining by code may name the creator's addres
+ - Liveness checks run one after another: a stalled tunnel probe delays the other Bridges' checks by up to 5 s per round.
+ - Windows Defender Firewall may ask about network access on first start of the carrier; the answer and the network profile matter.
+ - iroh must stay current for n0's public relays, which support only the latest stable release.
+-- Mobile devices, push wake-up and offline delivery are out of scope.
++- The development [mobile companion](../platform/mobile.md) uses manual unicast pairing and reconnect. Push wake-up and offline delivery are out of scope.
+diff --git a/src-tauri/Cargo.toml b/src-tauri/Cargo.toml
+index b0d1817..cd494f0 100644
+--- a/src-tauri/Cargo.toml
++++ b/src-tauri/Cargo.toml
+@@ -6,6 +6,10 @@ authors = ["xpan0988"]
+ edition = "2021"
+ default-run = "pastey"
+ 
++[lib]
++name = "pastey_mobile"
++crate-type = ["staticlib", "cdylib", "rlib"]
++
+ [[bin]]
+ name = "pastey-managed-execute-probe"
+ path = "src/bin/pastey-managed-execute-probe.rs"
+@@ -50,10 +54,9 @@ serde_json = "1"
+ sha2 = "0.10"
+ socket2 = "0.6"
+ spake2 = "0.4"
+-tauri = { version = "2", features = ["tray-icon"] }
++tauri = { version = "2", features = [] }
+ tauri-plugin-clipboard-manager = "2"
+ tauri-plugin-dialog = "2"
+-tauri-plugin-global-shortcut = "2"
+ tauri-plugin-opener = "2"
+ thiserror = "2"
+ time = { version = "0.3", features = ["formatting", "parsing"] }
+@@ -63,10 +66,14 @@ url = "2.5"
+ uuid = { version = "1", features = ["serde", "v4"] }
+ x25519-dalek = { version = "2", features = ["static_secrets"] }
+ 
++[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
++tauri = { version = "2", features = ["tray-icon"] }
++tauri-plugin-global-shortcut = "2"
++
+ [dev-dependencies]
+ # Tests only: Tauri's mock runtime, to dispatch real IPC into the app's own
+ # commands (`collaboration/ui_bridge.rs`).
+-tauri = { version = "2", features = ["tray-icon", "test"] }
++tauri = { version = "2", features = ["test"] }
+ # Tests only: an in-process relay and path pinning for the shaped two-Host
+ # WAN tests (`connectivity/shaped_net.rs`). Not in a normal build.
+ iroh = { version = "1.3", default-features = false, features = ["tls-ring", "test-utils", "unstable-custom-transports"] }
+diff --git a/src-tauri/capabilities/default.json b/src-tauri/capabilities/default.json
+index f3e37d2..363780c 100644
+--- a/src-tauri/capabilities/default.json
++++ b/src-tauri/capabilities/default.json
+@@ -2,6 +2,7 @@
+   "$schema": "../gen/schemas/desktop-schema.json",
+   "identifier": "main-capability",
+   "description": "Capability for the main window",
++  "platforms": ["macOS", "windows", "linux"],
+   "windows": ["main"],
+   "permissions": [
+     "core:default",
+diff --git a/src-tauri/src/bridge_lifecycle.rs b/src-tauri/src/bridge_lifecycle.rs
+index 445219b..9c5f6d6 100644
+--- a/src-tauri/src/bridge_lifecycle.rs
++++ b/src-tauri/src/bridge_lifecycle.rs
+@@ -775,6 +775,11 @@ async fn reconnect_room(state: Arc<AppState>, room: &StoredRoom) -> AppResult<()
+     // way (an offer signed by the pinned device key for this attempt).
+     let (peer_host, peer_port, verified) = match unicast {
+         Some((source, verified)) => (source.ip().to_string(), verified.offer.port, verified),
++        None if state.is_companion() => {
++            return Err(AppError::Network(
++                "The paired desktop did not answer at its saved network address.".into(),
++            ));
++        }
+         None => {
+             let lan = discovery::discover_reconnect(&attempt, &discovery::DiscoveryTargets::Lan);
+             let internet = async {
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index e3d2548..7150f1f 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -2125,6 +2125,9 @@ pub async fn start_remote_native_codex_task(
+     options: Option<crate::native_agent::NativeSessionOptionsV1>,
+     state: State<'_, Arc<AppState>>,
+ ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
++    if state.is_companion() && !crate::native_agent::sessions::remote::valid_scope_ref(&workspace) {
++        return Err("Choose a workspace shared by the desktop Host.".into());
++    }
+     let target =
+         crate::host_identity::HostRef::parse_peer(target_host_ref.clone(), &state.local_host_ref)
+             .map_err(|error| error.message())?;
+@@ -3974,6 +3977,7 @@ pub(crate) fn establish_fresh_peer_trust(
+ pub async fn repair_bridge(
+     room_id: String,
+     code: String,
++    address: Option<String>,
+     state: State<'_, Arc<AppState>>,
+ ) -> Result<RoomInfo, String> {
+     run_async(async move {
+@@ -3982,6 +3986,21 @@ pub async fn repair_bridge(
+         if room.status == crate::models::RoomStatus::Burned {
+             return Err(AppError::InvalidInput("Bridge is burned.".into()));
+         }
++        if let Some(address) = address {
++            let address = discovery::validate_peer_address(&address)?;
++            let targets = discovery::resolve_peer_targets(&address).await?;
++            let (source, verified) =
++                discovery::discover_pairing(state.inner(), &compact, &targets).await?;
++            return join_discovered_room(
++                state.inner().clone(),
++                &compact,
++                source,
++                verified,
++                Some(address),
++                Some(&room_id),
++            )
++            .await;
++        }
+         let remembered = storage::get_bridge_peer_address(&state.paths, &room_id)?;
+         let unicast = match remembered.as_deref() {
+             Some(address) => match discovery::resolve_peer_targets(address).await {
+@@ -3994,6 +4013,11 @@ pub async fn repair_bridge(
+         };
+         let (source, verified) = match unicast {
+             Some(found) => found,
++            None if state.is_companion() => {
++                return Err(AppError::Network(
++                    "Enter the desktop's current network address to pair again.".into(),
++                ));
++            }
+             None => {
+                 discovery::discover_pairing(
+                     state.inner(),
+diff --git a/src-tauri/src/host_runtime.rs b/src-tauri/src/host_runtime.rs
+index 7a288d4..e3a2274 100644
+--- a/src-tauri/src/host_runtime.rs
++++ b/src-tauri/src/host_runtime.rs
+@@ -60,6 +60,7 @@ pub trait RuntimeTaskSpawner: Send + Sync {
+ /// Developer Mode authority; extracting it does not add a new semantic layer.
+ pub struct HostRuntime {
+     pub paths: AppPaths,
++    companion: bool,
+     /// Durable logical identity for this installation. It is not a route,
+     /// current session, capability observation, or paired-device label.
+     pub local_host_ref: HostRef,
+@@ -173,6 +174,29 @@ impl HostRuntime {
+         default_shortcut_label: &str,
+         event_sink: Arc<dyn HostEventSink>,
+         task_spawner: Arc<dyn RuntimeTaskSpawner>,
++    ) -> AppResult<Arc<Self>> {
++        Self::initialize_inner(paths, default_shortcut_label, event_sink, task_spawner, false)
++    }
++
++    #[cfg(any(mobile, test))]
++    pub(crate) fn initialize_companion(
++        paths: AppPaths,
++        event_sink: Arc<dyn HostEventSink>,
++        task_spawner: Arc<dyn RuntimeTaskSpawner>,
++    ) -> AppResult<Arc<Self>> {
++        Self::initialize_inner(paths, "", event_sink, task_spawner, true)
++    }
++
++    pub(crate) fn is_companion(&self) -> bool {
++        self.companion
++    }
++
++    fn initialize_inner(
++        paths: AppPaths,
++        default_shortcut_label: &str,
++        event_sink: Arc<dyn HostEventSink>,
++        task_spawner: Arc<dyn RuntimeTaskSpawner>,
++        companion: bool,
+     ) -> AppResult<Arc<Self>> {
+         logging::init(paths.logs_dir.clone());
+         storage::init_database(&paths)?;
+@@ -192,14 +216,25 @@ impl HostRuntime {
+         bridge_plan::reconcile_protocol_startup(&paths, storage::now_ts())?;
+         file_candidates::cleanup_orphaned_pipeline_handoffs(&paths.temp_dir);
+ 
+-        Self::new(paths, config, event_sink, task_spawner).map(Arc::new)
++        Self::new_inner(paths, config, event_sink, task_spawner, companion).map(Arc::new)
+     }
+ 
++    #[cfg(test)]
+     pub fn new(
+         paths: AppPaths,
+         config: StoredConfig,
+         event_sink: Arc<dyn HostEventSink>,
+         task_spawner: Arc<dyn RuntimeTaskSpawner>,
++    ) -> AppResult<Self> {
++        Self::new_inner(paths, config, event_sink, task_spawner, false)
++    }
++
++    fn new_inner(
++        paths: AppPaths,
++        config: StoredConfig,
++        event_sink: Arc<dyn HostEventSink>,
++        task_spawner: Arc<dyn RuntimeTaskSpawner>,
++        companion: bool,
+     ) -> AppResult<Self> {
+         let local_host_ref = HostRef::from_device_id(&config.device_id)?;
+         let managed_resource_root = paths.temp_dir.join("managed-execution-resources");
+@@ -209,6 +244,7 @@ impl HostRuntime {
+         let master_key = config::master_key(&config)?;
+         Ok(Self {
+             paths: paths.clone(),
++            companion,
+             local_host_ref: local_host_ref.clone(),
+             local_runtime_ref: LocalRuntimeRef::fresh(local_host_ref.clone()),
+             config: RwLock::new(config),
+@@ -260,8 +296,9 @@ impl HostRuntime {
+             managed_resources: Mutex::new(managed_resources::ManagedResourceResolverV1::new(
+                 managed_resource_root,
+             )),
+-            native_agents: Mutex::new(crate::native_agent::NativeAgentServiceV1::with_paths(
++            native_agents: Mutex::new(crate::native_agent::NativeAgentServiceV1::with_paths_for_host(
+                 paths.clone(),
++                companion,
+             )?),
+             collaborations: Mutex::new(crate::collaboration::CollaborationServiceV1::new_with_key(
+                 Some(paths.clone()),
+diff --git a/src-tauri/src/main.rs b/src-tauri/src/main.rs
+index 7671c37..58b117a 100644
+--- a/src-tauri/src/main.rs
++++ b/src-tauri/src/main.rs
+@@ -1,63 +1,7 @@
+-mod bridge_auth;
+-mod bridge_lifecycle;
+-mod bridge_plan;
+-mod bridge_plan_v2;
+-mod capability_acquisition_confirmation;
+-mod capability_probe;
+-mod chunk_frame;
+-mod cleanup;
+-mod collaboration;
+-mod commands;
+-mod config;
+-mod connectivity;
+-mod crypto;
+-mod dev_tools;
+-mod developer_terminal;
+-mod device_identity;
+-mod device_profile;
+-mod device_trust;
+-mod diagnostics;
+-mod discovery;
+-mod effect_authority;
+-mod error;
+-mod execution_backend;
+-mod execution_world;
+-mod file_candidates;
+-mod full_access;
+-mod host_admission;
+-mod host_identity;
+-mod host_process;
+-mod host_runtime;
+-mod link_benchmark;
+-mod logging;
+-mod managed_execution;
+-mod managed_objects;
+-mod managed_resources;
+-mod managed_runtime_config;
+-mod managed_worker_coordinator;
+-mod managed_workspace;
+-mod models;
+-mod native_agent;
+-mod native_v2_orchestration;
+-mod natural_v2;
+-mod network_broker;
+-mod object_refs;
+-mod peer_capabilities;
+-mod regular_file_set_transfer;
+-mod room_control;
+-mod safe_file_identity;
+-mod session_read_access;
+-mod storage;
+-mod transfer;
+-mod transfer_orchestration;
+-mod transfer_tuning;
+-#[cfg(windows)]
+-mod windows_codex_backend;
+-#[cfg(any(windows, test))]
+-mod windows_verifier_diagnostics;
+-mod worker_harness;
+-mod worker_provider;
+-mod worker_provider_config;
++include!("host_modules.rs");
++
++#[cfg(test)]
++mod mobile_companion;
+ 
+ use std::{path::PathBuf, sync::Arc};
+ 
+@@ -129,32 +73,13 @@ use crate::{
+         withdraw_bridge_plan_revision, write_temp_file,
+     },
+     error::{AppError, AppResult},
+-    host_runtime::{HostEvent, HostEventSink, HostRuntime, RuntimeTask, RuntimeTaskSpawner},
++    host_runtime::HostRuntime,
++    tauri_host::{TauriHostEventSink, TauriRuntimeTaskSpawner},
+     storage::AppPaths,
+ };
+ 
+ const APP_DATA_DIR_ENV: &str = "PASTEY_APP_DATA_DIR";
+ 
+-struct TauriHostEventSink {
+-    app_handle: AppHandle,
+-}
+-
+-impl HostEventSink for TauriHostEventSink {
+-    fn emit(&self, event: HostEvent) -> AppResult<()> {
+-        self.app_handle
+-            .emit(event.name, event.payload)
+-            .map_err(|error| AppError::InvalidInput(format!("failed to emit Host event: {error}")))
+-    }
+-}
+-
+-struct TauriRuntimeTaskSpawner;
+-
+-impl RuntimeTaskSpawner for TauriRuntimeTaskSpawner {
+-    fn spawn(&self, task: RuntimeTask) {
+-        tauri::async_runtime::spawn(task);
+-    }
+-}
+-
+ fn main() {
+     #[cfg(windows)]
+     if windows_codex_backend::run_helper_if_requested() {
+diff --git a/src-tauri/src/native_agent.rs b/src-tauri/src/native_agent.rs
+index 0b4a18c..f416106 100644
+--- a/src-tauri/src/native_agent.rs
++++ b/src-tauri/src/native_agent.rs
+@@ -1514,14 +1514,24 @@ impl NativeAgentServiceV1 {
+         }
+     }
+ 
++    #[cfg(test)]
+     pub(crate) fn with_paths(paths: crate::storage::AppPaths) -> AppResult<Self> {
+-        let mut service = Self {
+-            durable_paths: Some(paths),
+-            ..Self::default()
++        Self::with_paths_for_host(paths, false)
++    }
++
++    pub(crate) fn with_paths_for_host(
++        paths: crate::storage::AppPaths,
++        companion: bool,
++    ) -> AppResult<Self> {
++        let mut service = if companion {
++            Self::with_adapters(Arc::new(CodexNativeAdapterV1::default()), Vec::new())
++        } else {
++            Self::default()
+         };
++        service.durable_paths = Some(paths);
+         service.restore_durable_envelopes()?;
+         #[cfg(not(test))]
+-        {
++        if !companion {
+             // Observe availability once in the background so the first
+             // capability query or invocation does not pay for the probe.
+             let registry = service.capability_registry();
+diff --git a/src-tauri/src/native_agent/sessions/remote.rs b/src-tauri/src/native_agent/sessions/remote.rs
+index 1d5c73f..376a676 100644
+--- a/src-tauri/src/native_agent/sessions/remote.rs
++++ b/src-tauri/src/native_agent/sessions/remote.rs
+@@ -316,7 +316,7 @@ fn valid_request_id(id: &str) -> bool {
+     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+ }
+ 
+-fn valid_scope_ref(scope: &str) -> bool {
++pub(crate) fn valid_scope_ref(scope: &str) -> bool {
+     scope
+         .strip_prefix("scope:")
+         .is_some_and(|hex| hex.len() == 16 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+diff --git a/src-tauri/src/room_control.rs b/src-tauri/src/room_control.rs
+index 979322f..ad58974 100644
+--- a/src-tauri/src/room_control.rs
++++ b/src-tauri/src/room_control.rs
+@@ -185,6 +185,20 @@ const PEER_CAPABILITY_PROTOCOL_FAMILY: &str = "peer_capability";
+ const DEVELOPER_TERMINAL_PROTOCOL_FAMILY: &str = "developer_terminal";
+ const BRIDGE_MEMBERSHIP_PROTOCOL_FAMILY: &str = "bridge_membership";
+ const NATIVE_AGENT_PROTOCOL_FAMILY: &str = "native_agent";
++
++/// A companion receives Bridge membership and replies to its own queries
++/// and tasks. It offers no inbound execution, workspace or collaboration.
++fn companion_accepts_control(kind: &str) -> bool {
++    matches!(
++        kind,
++        "bridge_membership.departure"
++            | "peer_capability.response"
++            | "native_agent.device_identity"
++            | "native_agent.session_response"
++            | "native_agent.status"
++            | "native_agent.reconciliation"
++    )
++}
+ const BRIDGE_MEMBERSHIP_SCHEMA: &str = "pastey-bridge-membership-v1";
+ const MAX_TERMINAL_EVENTS_PER_MINUTE: usize = 3_000;
+ const MAX_TERMINAL_BURST_EVENTS: usize = 256;
+@@ -1677,6 +1691,13 @@ pub async fn receive_room_control_event_handler(
+             )
+         }
+     };
++    if ctx.state.is_companion() && !companion_accepts_control(&validated.kind) {
++        return control_error(
++            StatusCode::FORBIDDEN,
++            "companion_request_unsupported",
++            "This device uses Pastey as a mobile companion.",
++        );
++    }
+     if validated.kind.starts_with("bridge_plan.") {
+         log_bridge_plan_control_event(&validated, "inbound_validated");
+     }
+diff --git a/src-tauri/src/room_control/runtime_pair_tests.rs b/src-tauri/src/room_control/runtime_pair_tests.rs
+index d35824a..1c74655 100644
+--- a/src-tauri/src/room_control/runtime_pair_tests.rs
++++ b/src-tauri/src/room_control/runtime_pair_tests.rs
+@@ -111,15 +111,22 @@ fn config(device_id: &str) -> StoredConfig {
+     }
+ }
+ 
+-async fn start_host(root: &Path, name: &'static str) -> PairHostV1 {
++async fn start_host(root: &Path, name: &'static str, companion: bool) -> PairHostV1 {
+     let paths = AppPaths::new(root.join(name), root.join(format!("{name}-logs")));
+     paths.ensure_directories().unwrap();
+     storage::init_database(&paths).unwrap();
++    let events = Arc::new(PairEvents::default());
++    let spawner = Arc::new(TokioSpawner(tokio::runtime::Handle::current()));
++    let runtime = if companion {
++        HostRuntime::initialize_companion(paths, events.clone(), spawner).unwrap()
++    } else {
++        Arc::new(HostRuntime::new(paths, config(name), events.clone(), spawner).unwrap())
++    };
+     // Wrapped by this Host's own master key, as the app does, so payloads
+     // of the Bridge (a received file) can be stored and read.
+     storage::create_room(
+-        &paths,
+-        &crate::config::master_key(&config(name)).unwrap(),
++        &runtime.paths,
++        &crate::config::master_key(&runtime.config.read()).unwrap(),
+         "12345678",
+         60,
+         LocalRole::Creator,
+@@ -127,11 +134,7 @@ async fn start_host(root: &Path, name: &'static str) -> PairHostV1 {
+         None,
+     )
+     .unwrap();
+-    storage::set_room_status(&paths, ROOM, crate::models::RoomStatus::Active).unwrap();
+-    let events = Arc::new(PairEvents::default());
+-    let runtime = Arc::new(
+-        HostRuntime::new(paths, config(name), events.clone(), Arc::new(TokioSpawner(tokio::runtime::Handle::current()))).unwrap(),
+-    );
++    storage::set_room_status(&runtime.paths, ROOM, crate::models::RoomStatus::Active).unwrap();
+     let mut host = PairHostV1 {
+         runtime,
+         events,
+@@ -211,11 +214,15 @@ pub(crate) fn introduce_at(local: &PairHostV1, peer: &PairHostV1, port: u16) {
+ 
+ impl RuntimePairV1 {
+     pub(crate) async fn new() -> Self {
++        Self::with_requester(false).await
++    }
++
++    async fn with_requester(companion: bool) -> Self {
+         let turn = ONE_PAIR_AT_A_TIME.lock().await;
+         let root = std::env::temp_dir().join(format!("pastey-rc-pair-{}", uuid::Uuid::new_v4()));
+         std::fs::create_dir_all(&root).unwrap();
+-        let mac = start_host(&root, "mac").await;
+-        let windows = start_host(&root, "windows").await;
++        let mac = start_host(&root, "mac", companion).await;
++        let windows = start_host(&root, "windows", false).await;
+         introduce(&mac, &windows);
+         introduce(&windows, &mac);
+         Self {
+@@ -273,6 +280,64 @@ impl RuntimePairV1 {
+ pub(crate) const THREAD: &str = "019a0000-0000-7000-8000-000000000001";
+ pub(crate) const MARKER: &str = "turn-0042";
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn mobile_companion_exchanges_text_and_follows_a_desktop_reviewed_turn() {
++    use crate::{models::RoomItemDirection, native_agent::NativeAgentTaskStateV1};
++
++    let pair = RuntimePairV1::with_requester(true).await;
++    assert!(pair.mac.runtime.native_agents.lock().capabilities().is_empty());
++
++    for (sender, receiver, message) in [
++        (&pair.mac, &pair.windows, "Hello desktop"),
++        (&pair.windows, &pair.mac, "Hello mobile"),
++    ] {
++        let master_key = crate::config::master_key(&sender.runtime.config.read()).unwrap();
++        let outgoing =
++            storage::create_outgoing_text_item(&sender.runtime.paths, &master_key, ROOM, message)
++                .unwrap();
++        let session = sender
++            .runtime
++            .resolve_current_remote_host_session(ROOM, &receiver.host_ref())
++            .await
++            .unwrap();
++        crate::transfer::send_room_item_to_bridge_peer_endpoint(
++            sender.runtime.clone(),
++            ROOM,
++            &outgoing.id,
++            session.transfer_endpoint().clone(),
++        )
++        .await
++        .unwrap();
++        let master_key = crate::config::master_key(&receiver.runtime.config.read()).unwrap();
++        let incoming = storage::get_room_item_by_id(&receiver.runtime.paths, &outgoing.id).unwrap();
++        let incoming = storage::room_item_to_info(&receiver.runtime.paths, &master_key, incoming)
++            .unwrap();
++        assert_eq!(incoming.direction, RoomItemDirection::Incoming);
++        assert_eq!(incoming.text.as_deref(), Some(message));
++    }
++
++    let unexpected = reqwest::Client::new()
++        .post(format!("http://127.0.0.1:{}/rooms/{ROOM}/transfers/start", pair.mac.port))
++        .send()
++        .await
++        .unwrap();
++    assert_eq!(unexpected.status(), reqwest::StatusCode::NOT_FOUND);
++    assert!(pair.windows_checks_mac_capabilities().await.is_err());
++
++    let codex = install_windows_codex(&pair);
++    pair.windows_shares(&codex, true, true).await;
++    let shares = pair.mac_lists_shares().await.unwrap();
++    let task = pair.mac_continues(&shares.scopes[0].scope_ref).await.unwrap();
++    pair.windows_review_appears(&task.task_id).await;
++    assert_eq!(codex.turn_starts(), 0);
++    pair.windows_accepts(&task.task_id).unwrap();
++    assert_eq!(
++        pair.mac_task_ends(&task.task_id).await.state,
++        NativeAgentTaskStateV1::Completed
++    );
++    assert_eq!(codex.turn_starts(), 1);
++}
++
+ /// A fake Codex on Windows with one idle thread in `PasteySessionTest`.
+ /// It answers the availability probes and Codex's app-server protocol as
+ /// Codex 0.163 does for a continuation, takes the thread's writer lock
+diff --git a/src-tauri/src/transfer.rs b/src-tauri/src/transfer.rs
+index a1d6fdc..d21184b 100644
+--- a/src-tauri/src/transfer.rs
++++ b/src-tauri/src/transfer.rs
+@@ -375,7 +375,7 @@ impl ChunkSendFailureKind {
+ 
+ /// Every route a Bridge's room server answers, for one room.
+ pub(crate) fn room_router(state: Arc<AppState>, room_id: &str) -> Router {
+-    Router::new()
++    let router = Router::new()
+         .route("/rooms/:room_id/join", post(join_handler))
+         .route("/rooms/:room_id/items", post(receive_item_handler))
+         .route(
+@@ -385,6 +385,13 @@ pub(crate) fn room_router(state: Arc<AppState>, room_id: &str) -> Router {
+             ),
+         )
+         .route(
++            "/rooms/:room_id/diagnostics/ping",
++            post(diagnostics_ping_handler),
++        );
++    let router = if state.is_companion() {
++        router
++    } else {
++        router.route(
+             "/rooms/:room_id/transfers/start",
+             post(start_file_transfer_handler),
+         )
+@@ -400,10 +407,6 @@ pub(crate) fn room_router(state: Arc<AppState>, room_id: &str) -> Router {
+             "/rooms/:room_id/transfers/:transfer_id/cancel",
+             post(cancel_file_transfer_handler),
+         )
+-        .route(
+-            "/rooms/:room_id/diagnostics/ping",
+-            post(diagnostics_ping_handler),
+-        )
+         .route(
+             "/rooms/:room_id/diagnostics/benchmark/raw",
+             post(diagnostics_raw_benchmark_handler)
+@@ -414,7 +417,8 @@ pub(crate) fn room_router(state: Arc<AppState>, room_id: &str) -> Router {
+             post(diagnostics_pipeline_benchmark_handler)
+                 .layer(DefaultBodyLimit::max(MAX_CHUNK_BODY_BYTES)),
+         )
+-        .with_state(RoomServerContext::new(state, room_id.to_owned()))
++    };
++    router.with_state(RoomServerContext::new(state, room_id.to_owned()))
+ }
+ 
+ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult<u16> {
+@@ -466,7 +470,9 @@ pub async fn start_room_server(state: Arc<AppState>, room_id: &str) -> AppResult
+         storage::set_room_status(&state.paths, room_id, RoomStatus::Active)?;
+     }
+ 
+-    discovery::ensure_service(state).await?;
++    if !state.is_companion() {
++        discovery::ensure_service(state).await?;
++    }
+     Ok(port)
+ }
+ 
+@@ -3124,6 +3130,9 @@ fn map_missing_payload_error(error: std::io::Error) -> AppError {
+ }
+ 
+ pub fn device_name() -> String {
++    if cfg!(mobile) {
++        return if cfg!(target_os = "ios") { "iOS device" } else { "Android device" }.into();
++    }
+     std::env::var("PASTEY_DEVICE_NAME")
+         .or_else(|_| {
+             std::env::var("PASTEY_PROFILE").map(|profile| {
+@@ -3284,6 +3293,9 @@ async fn receive_item_handler(
+     if let Some(response) = unavailable_room_response(&ctx.state, &room_id) {
+         return response;
+     }
++    if ctx.state.is_companion() && upload.payload_type != PayloadType::Text {
++        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
++    }
+     // The wrapped key below is bound by X25519 to the named sender key, so
+     // naming the current peer's key is proof of being that peer.
+     if !crate::bridge_auth::is_current_peer_key(
+diff --git a/src/features/workspace/AgentWorkspace.tsx b/src/features/workspace/AgentWorkspace.tsx
+index a7b2df8..cfac240 100644
+--- a/src/features/workspace/AgentWorkspace.tsx
++++ b/src/features/workspace/AgentWorkspace.tsx
+@@ -71,22 +71,24 @@ function choiceOf(place: ConversationPlace): PlaceChoice {
+  * one open conversation. A new conversation and an existing session are
+  * different things and never stand in for each other. Running and reading
+  * stay separate authorities, decided by the device that holds them. */
+-export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOpenDetails }: {
++export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOpenDetails, companion = false }: {
+   room: RoomInfo;
+   agent: NativeAgentController;
+   peers: readonly BridgePeerSession[];
+   members: readonly BridgePeerSession[];
+-  onOpenDevice: (hostRef: string) => void;
++  onOpenDevice?: (hostRef: string) => void;
+   onOpenDetails?: () => void;
++  companion?: boolean;
+ }) {
+   // Prefer the other device: running there is why most people open this.
+-  const [target, setTarget] = useState<string>(() => members.find((peer) => peer.hostRef)?.hostRef ?? "local");
++  const [selectedTarget, setTarget] = useState<string>(() => members.find((peer) => peer.hostRef)?.hostRef ?? "local");
+   const [choice, setChoice] = useState<PlaceChoice | null>(null);
+   const [view, setView] = useState<AgentView | null>(null);
+   const [accessOpen, setAccessOpen] = useState(false);
+   const [localFolders, setLocalFolders] = useState<string[]>(() => readStored<string[]>(LOCAL_FOLDERS_KEY, []));
+   const [waitedForAccept, setWaitedForAccept] = useState<Record<string, boolean>>({});
+   const options = useMemo(() => members.filter((peer) => peer.hostRef), [members]);
++  const target = companion ? options[0]?.hostRef ?? "" : selectedTarget;
+   const targetHostRef = target === "local" ? null : target;
+   const targetName = targetHostRef ? options.find((peer) => peer.hostRef === targetHostRef)?.displayName ?? "the other device" : "this device";
+   const remote = targetHostRef ? peers.find((peer) => peer.hostRef === targetHostRef) ?? null : null;
+@@ -116,12 +118,12 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
+     const remembered = readStored<Record<string, PlaceChoice>>(PLACE_KEY, {})[storedKey] ?? null;
+     const offered = (candidate: PlaceChoice | null) => !!candidate && (candidate.kind === "shared"
+       ? sharedList.some((share) => share.scopeRef === candidate.scopeRef)
+-      : candidate.kind === "local" ? !targetHostRef : !!targetHostRef);
++      : !companion && (candidate.kind === "local" ? !targetHostRef : !!targetHostRef));
+     const best = [...sharedList].sort((a, b) => Number(b.readSessions && b.agentRequests) - Number(a.readSessions && a.agentRequests))[0];
+     setChoice((current) => offered(current) ? current : offered(remembered) ? remembered : targetHostRef
+       ? best ? { kind: "shared", scopeRef: best.scopeRef } : null
+       : localFolders[0] ? { kind: "local", path: localFolders[0] } : null);
+-  }, [storedKey, shares.knowledge, localFolders]); // eslint-disable-line react-hooks/exhaustive-deps
++  }, [storedKey, shares.knowledge, localFolders, companion]); // eslint-disable-line react-hooks/exhaustive-deps
+ 
+   const choose = useCallback((next: PlaceChoice) => {
+     setChoice(next);
+@@ -224,7 +226,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
+ 
+   function openTask() {
+     const origin = agent.origin;
+-    if (taskTarget !== target) setTarget(taskTarget);
++    if (!companion && taskTarget !== target) setTarget(taskTarget);
+     if (origin?.kind === "session") {
+       if (origin.session.scopeRef) setChoice(taskTarget === "local" ? { kind: "local", path: origin.session.scopeRef } : { kind: "shared", scopeRef: origin.session.scopeRef });
+       setView({ kind: "session", session: { provider: origin.session.provider, sessionId: origin.session.sessionId } });
+@@ -247,7 +249,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
+     : choice || shownView?.kind === "current"
+       ? <NewConversation key={`${target}:${placeKey(choice)}:${shownView?.kind === "current"}`} nativeDefault={list.defaults[nativeSessionProvider(viewAgent)] ?? null} sessionConfig={currentSessionConfig} roomId={room.id} agent={agent} agentId={viewAgent} onChooseAgent={!agentChoosable || shownView?.kind === "current" ? undefined : chooseLocalAgent} peers={peers} members={members} target={target} choice={choice} shares={shares} availability={availability} onRecheck={() => void (remote ? remoteCapabilities.refresh() : agent.refreshCapabilities())} current={shownView?.kind === "current"} onNewDraft={() => setView({ kind: "new" })} onBack={back} />
+       : <div className="conversation conversation-empty"><EmptyState title={targetHostRef ? `Nothing to work in on ${targetName} yet` : "Choose a folder"}>{targetHostRef
+-        ? peerShareGuidance(targetName, shares.knowledge, "run") ?? `Choose a workspace ${targetName} shares, or a folder by path.`
++        ? peerShareGuidance(targetName, shares.knowledge, "run") ?? (companion ? `Choose a workspace ${targetName} shares.` : `Choose a workspace ${targetName} shares, or a folder by path.`)
+         : "Add a folder on this device to see its sessions and start conversations there."}</EmptyState></div>;
+ 
+   return <div className="agents"><div className="agents-layout" data-open={view !== null || undefined}>
+@@ -255,11 +257,13 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
+       {taskNeedsAttention && !taskShown ? <TaskBanner agent={agent} members={members} onOpen={openTask} /> : null}
+ 
+       <div className="nav-host">
+-        <label className="nav-label" htmlFor="agent-device">Agents on</label>
+-        <select id="agent-device" className="select" value={target} onChange={(event) => changeTarget(event.target.value)}>
+-          {options.map((peer) => <option key={peer.hostRef} value={peer.hostRef}>{peer.displayName}{peers.some((routeable) => routeable.hostRef === peer.hostRef) ? "" : " (not connected)"}</option>)}
+-          <option value="local">This device</option>
+-        </select>
++        {companion ? <strong>Agents on {targetName}</strong> : <>
++          <label className="nav-label" htmlFor="agent-device">Agents on</label>
++          <select id="agent-device" className="select" value={target} onChange={(event) => changeTarget(event.target.value)}>
++            {options.map((peer) => <option key={peer.hostRef} value={peer.hostRef}>{peer.displayName}{peers.some((routeable) => routeable.hostRef === peer.hostRef) ? "" : " (not connected)"}</option>)}
++            <option value="local">This device</option>
++          </select>
++        </>}
+         <div className="nav-host-status" role="status">
+           <Dot tone={!connected ? "neutral" : (targetHostRef ? remoteReady.length > 0 : readyHere.length > 0) ? "ok" : availability.state === "checking" ? "neutral" : "warn"} pulse={availability.state === "checking"} />
+           <span>{!connected ? "Not connected"
+@@ -268,14 +272,14 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
+         </div>
+         {targetHostRef ? <div className="row nav-host-actions">
+           <button type="button" className="btn btn-ghost btn-sm" onClick={() => setAccessOpen(true)}><Icon name="shield" small />Access</button>
+-          <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenDevice(targetHostRef)}><Icon name="device" small />Device</button>
++          {onOpenDevice ? <button type="button" className="btn btn-ghost btn-sm" onClick={() => onOpenDevice(targetHostRef)}><Icon name="device" small />Device</button> : null}
+         </div> : null}
+       </div>
+ 
+       <div className="nav-section-head">
+         <span>{targetHostRef ? fullAccess ? `Workspaces on ${targetName}` : "Shared workspaces" : "Folders on this device"}</span>
+         {targetHostRef ? <span className="row">
+-          {fullAccess ? <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label={`Add a folder on ${targetName}`} title={`Add a folder on ${targetName} by its path (Full Access)`} disabled={!connected} onClick={() => setAddingFolder(true)}><Icon name="plus" small /></button> : null}
++          {fullAccess && !companion ? <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label={`Add a folder on ${targetName}`} title={`Add a folder on ${targetName} by its path (Full Access)`} disabled={!connected} onClick={() => setAddingFolder(true)}><Icon name="plus" small /></button> : null}
+           <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Ask again" title="Ask again which folders it shares" disabled={shares.loading || !connected} onClick={() => void shares.refresh()}><Icon name="refresh" small /></button>
+         </span>
+           : <button type="button" className="btn btn-ghost btn-icon btn-sm" aria-label="Add a folder" title="Add a folder on this device" onClick={() => void addLocalFolder()}><Icon name="plus" small /></button>}
+@@ -292,7 +296,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
+       {targetHostRef && !sharedList.length ? <p className="nav-note">{!connected ? `${targetName} is not connected right now.` : shares.knowledge.state === "unknown" ? shares.message ?? `Asking ${targetName} which folders it shares…` : <>{peerShareGuidance(targetName, shares.knowledge, "read")}{onOpenDetails ? <> <button type="button" className="btn btn-link small" onClick={onOpenDetails}>Bridge details</button></> : null}</>}</p> : null}
+       {!targetHostRef && !localFolders.length ? <p className="nav-note">Add a folder on this device to see its sessions and start conversations there. <button type="button" className="btn btn-link small" onClick={() => void addLocalFolder()}>Add a folder…</button></p> : null}
+ 
+-      {targetHostRef ? <>
++      {targetHostRef && !companion ? <>
+         <div className="nav-section-head"><span>Other places</span></div>
+         <ul className="nav-places">
+           <PlaceItem label={`A folder by path on ${targetName}`} grants={<span>{fullAccess ? "Type its path · add it above for sessions" : "Type its path · no sessions"}</span>} selected={choice?.kind === "path"} onSelect={() => choose({ kind: "path" })}>
+@@ -314,7 +318,7 @@ export function AgentWorkspace({ room, agent, peers, members, onOpenDevice, onOp
+       if (chosen) choose({ kind: "shared", scopeRef: chosen.scopeRef });
+     }} /> : null}
+     {accessOpen && targetHostRef ? <Dialog title={`Access on ${targetName}`} description={`What this device may do on ${targetName}, authority by authority, and where each is decided. Nothing here can be granted from this device.`} onClose={() => setAccessOpen(false)}>
+-      <RemoteAccessSummary room={room} hostRef={targetHostRef} name={targetName} connected={connected} paired={(room.pairing_state ?? "pairing_required") === "paired"} sharing={shares.knowledge} waitedForAccept={waitedForAccept[targetHostRef] ?? null} onOpenDetails={onOpenDetails ? () => { setAccessOpen(false); onOpenDetails(); } : undefined} />
++      <RemoteAccessSummary room={room} hostRef={targetHostRef} name={targetName} connected={connected} paired={(room.pairing_state ?? "pairing_required") === "paired"} sharing={shares.knowledge} companion={companion} waitedForAccept={waitedForAccept[targetHostRef] ?? null} onOpenDetails={onOpenDetails ? () => { setAccessOpen(false); onOpenDetails(); } : undefined} />
+     </Dialog> : null}
+   </div></div>;
+ }
+@@ -416,8 +420,9 @@ const ACCESS_LABEL: Record<AccessLine["state"], string> = { ok: "Ready", needs_a
+ 
+ /** Per authority: what is known here, what the other device decides, and
+  * the exact steps there. No single "trust" switch. */
+-function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, waitedForAccept, onOpenDetails }: {
++function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, waitedForAccept, onOpenDetails, companion }: {
+   room: RoomInfo;
++  companion: boolean;
+   hostRef: string;
+   name: string;
+   connected: boolean;
+@@ -430,11 +435,12 @@ function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing,
+   const [shown, setShown] = useState<{ text: string; ok: boolean } | null>(null);
+   useEffect(() => {
+     let cancelled = false;
+-    void Promise.all([getDeviceProfile().catch(() => null), getDeviceIdentity().catch(() => null)]).then(([profile, identity]) => {
++    const profileRequest = companion ? Promise.resolve(null) : getDeviceProfile().catch(() => null);
++    void Promise.all([profileRequest, getDeviceIdentity().catch(() => null)]).then(([profile, identity]) => {
+       if (!cancelled) setMe({ name: profile?.device_name || "this device", fingerprint: identity?.displayFingerprint ?? null });
+     });
+     return () => { cancelled = true; };
+-  }, []);
++  }, [companion]);
+   const lines = remoteAccessGuidance({ remoteName: name, thisDeviceName: me.name, thisFingerprint: me.fingerprint, paired, connected, lastRunWaitedForAccept: waitedForAccept, sharing });
+ 
+   async function showDevice() {
+diff --git a/src/features/workspace/BridgeWorkspace.tsx b/src/features/workspace/BridgeWorkspace.tsx
+index ead97ac..b5e695c 100644
+--- a/src/features/workspace/BridgeWorkspace.tsx
++++ b/src/features/workspace/BridgeWorkspace.tsx
+@@ -108,7 +108,7 @@ function BridgeView({ room, items, queueItems, transfers, task, developerMode, d
+  * device's identity once per connection, so its user can share folders
+  * with this device or trust it without a step here. It grants nothing:
+  * that device's own user still decides everything. */
+-function usePresentIdentityToPeers(roomId: string, peers: ReturnType<typeof roomPeers>) {
++export function usePresentIdentityToPeers(roomId: string, peers: ReturnType<typeof roomPeers>) {
+   const shown = useRef(new Set<string>());
+   useEffect(() => {
+     for (const peer of peers) {
+diff --git a/src/lib/tauri.ts b/src/lib/tauri.ts
+index b90c2bc..6fb309a 100644
+--- a/src/lib/tauri.ts
++++ b/src/lib/tauri.ts
+@@ -661,8 +661,8 @@ export function openBridgePairing(roomId: string): Promise<RoomInfo> {
+  * device. The code must belong to this Bridge. Pairing a device other than
+  * the one this Bridge last verified is fresh trust: nothing granted before
+  * carries over. */
+-export function repairBridge(roomId: string, code: string): Promise<RoomInfo> {
+-  return invoke("repair_bridge", { roomId, code });
++export function repairBridge(roomId: string, code: string, address?: string): Promise<RoomInfo> {
++  return invoke("repair_bridge", { roomId, code, address: address ?? null });
+ }
+ 
+ export async function acceptNearbyJoin(requestId: string): Promise<RoomInfo> {
+diff --git a/vite.config.ts b/vite.config.ts
+index aac9e38..daca2df 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -1,11 +1,20 @@
+ import { defineConfig } from "vite";
+ import react from "@vitejs/plugin-react";
++import { fileURLToPath } from "node:url";
+ 
+ const host = process.env.TAURI_DEV_HOST;
+ 
+ export default defineConfig({
+   clearScreen: false,
+   plugins: [react()],
++  build: {
++    rollupOptions: {
++      input: {
++        desktop: fileURLToPath(new URL("./index.html", import.meta.url)),
++        mobile: fileURLToPath(new URL("./mobile.html", import.meta.url))
++      }
++    }
++  },
+   server: {
+     port: 1420,
+     strictPort: true,

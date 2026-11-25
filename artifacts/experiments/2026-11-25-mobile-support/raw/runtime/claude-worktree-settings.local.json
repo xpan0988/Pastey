@@ -1,0 +1,13 @@
+{
+  "model": "claude-sonnet-5-5",
+  "effortLevel": "xhigh",
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "deny": [
+      "Bash(git push)",
+      "Bash(git push *)",
+      "Bash(gh pr *)",
+      "Bash(gh release *)"
+    ]
+  }
+}

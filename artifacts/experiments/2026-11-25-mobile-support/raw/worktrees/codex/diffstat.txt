@@ -1,0 +1,18 @@
+ README.md                                        |  2 +
+ docs/layers/layer-4-connectivity.md              |  2 +-
+ src-tauri/Cargo.toml                             | 13 +++-
+ src-tauri/capabilities/default.json              |  1 +
+ src-tauri/src/bridge_lifecycle.rs                |  5 ++
+ src-tauri/src/commands.rs                        | 24 +++++++
+ src-tauri/src/host_runtime.rs                    | 41 ++++++++++-
+ src-tauri/src/main.rs                            | 87 ++----------------------
+ src-tauri/src/native_agent.rs                    | 18 +++--
+ src-tauri/src/native_agent/sessions/remote.rs    |  2 +-
+ src-tauri/src/room_control.rs                    | 21 ++++++
+ src-tauri/src/room_control/runtime_pair_tests.rs | 85 ++++++++++++++++++++---
+ src-tauri/src/transfer.rs                        | 26 +++++--
+ src/features/workspace/AgentWorkspace.tsx        | 44 ++++++------
+ src/features/workspace/BridgeWorkspace.tsx       |  2 +-
+ src/lib/tauri.ts                                 |  4 +-
+ vite.config.ts                                   |  9 +++
+ 17 files changed, 255 insertions(+), 131 deletions(-)
