@@ -186,7 +186,7 @@ pub(crate) fn check(runtime: &HostRuntime, id: &str) -> AppResult<Vec<MemberRead
                 }),
                 invited: member.invite.is_some(),
                 options_line: match (&member.options.model, &member.options.effort) {
-                    (None, None) => ("Model and effort: the Agent's own default".into(), FactBasisV1::Unknown),
+                    (None, None) => ("The Agent's own default".into(), FactBasisV1::Unknown),
                     (model, effort) => (
                         format!(
                             "Model {} · effort {}",

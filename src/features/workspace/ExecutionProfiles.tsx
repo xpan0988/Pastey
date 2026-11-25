@@ -47,7 +47,7 @@ function ProfileEditor({ initial, onChange }: {
       {presets.filter((profile) => profile.name !== "Ask").map((profile) => <button key={profile.name} type="button" className="btn btn-sm" onClick={() => update(JSON.stringify(profile, null, 2))}>Start from {profile.name}</button>)}
     </div>
     <Field label="Profile (native settings, as JSON)" htmlFor="execution-profile">
-      <textarea id="execution-profile" className="input mono xsmall" rows={10} value={text} spellCheck={false} onChange={(event) => update(event.target.value)} />
+      <textarea id="execution-profile" className="textarea mono xsmall" rows={12} style={{ minHeight: 220 }} value={text} spellCheck={false} onChange={(event) => update(event.target.value)} />
     </Field>
   </div>;
 }
@@ -184,7 +184,7 @@ export function PreferencesSettings() {
     <div className="card"><div className="card-body stack" style={{ gap: 10 }}>
       {current ? <span className="xsmall subtle">Version {current.version} · saved {formatTimestamp(current.updatedAt * 1000)}</span> : null}
       {PREFERENCE_FIELDS.map((field) => <Field key={field.key} label={field.label} htmlFor={`preferences-${field.key}`} hint={field.hint}>
-        <textarea id={`preferences-${field.key}`} className="input small" rows={3} maxLength={1200} value={draft[field.key]}
+        <textarea id={`preferences-${field.key}`} className="textarea small" rows={3} maxLength={1200} value={draft[field.key]}
           onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.value }))} />
       </Field>)}
     </div></div>

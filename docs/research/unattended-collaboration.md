@@ -359,6 +359,15 @@ Escalation content (what is needed, why it matters, the options, a recommendatio
 
 Not yet: notifying a paired device over its Bridge (it needs a new Room Control event; planned before E03, which needs two devices anyway), and Windows local notifications. Until then the program channel covers remote delivery with the user's own tools.
 
+### Check in the running app (2026-11-26)
+
+The debug bundle at `75a060d` was run with the user's real app data and driven through its own screens (a throwaway collaboration on two scratch folders, deleted afterwards; the default profile dialog opened and cancelled, nothing saved).
+- Settings → Agents shows Unattended collaboration, Preferences for Agents and When a collaboration needs you. The default-profile dialog lists exactly what each Agent gets, warns that auto-review is a judgement and not a boundary, and keeps Authorise disabled until consent is ticked.
+- A new collaboration opens in Preparing: both members ready, with sign-in checked live through `codex login status` and `claude auth status`, each check labelled checked now, configured or not known; "Plan together first" on by default; the facts each member would be told are listed. Member cards show model and effort and "Execution: Ask · nothing chosen · configured, not verified"; the menu offers Preferences… and Execution….
+- Two defects found and fixed: the profile JSON and preference fields rendered one line tall (wrong style class), and the readiness line read "Model and effort: Model and effort: …".
+
+Not yet run: E01-Retry (deferred: no Codex quota on 2026-11-26), E02, E03; paired-device notification and Windows local notifications (R6, second part).
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).
