@@ -437,6 +437,23 @@ export interface MemberReadiness {
 export interface PlanTask { id: string; title: string; owner: string; paths?: string[]; after?: string[]; deliver?: string }
 export interface PlanProposal { understanding?: string; tasks: PlanTask[]; integration?: string }
 
+/** How this device tells you a collaboration needs you. Notifications
+ * carry no authority: you still answer in Pastey. */
+export interface NotificationSettings { local: boolean; command: string[]; includeDetails: boolean }
+
+export function getNotificationSettings(): Promise<NotificationSettings> {
+  return invoke("get_notification_settings");
+}
+
+export function setNotificationSettings(settings: NotificationSettings): Promise<void> {
+  return invoke("set_notification_settings", { settings });
+}
+
+/** Sends a test notification; returns what failed. */
+export function testNotification(): Promise<string[]> {
+  return invoke("test_notification");
+}
+
 /** Adopts a plan revision without structural problems (your decision). */
 export function adoptCollaborationPlan(collaborationId: string, revision: number): Promise<CollaborationView> {
   return invoke("adopt_collaboration_plan", { collaborationId, revision });

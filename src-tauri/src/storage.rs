@@ -356,6 +356,13 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             updated_at INTEGER NOT NULL
         );
 
+        -- How this device tells its user that a collaboration needs them.
+        CREATE TABLE IF NOT EXISTS notification_settings (
+            id TEXT PRIMARY KEY,
+            record_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS collaboration_entries (
             id TEXT PRIMARY KEY,
             collaboration_id TEXT NOT NULL,
@@ -1815,6 +1822,29 @@ pub(crate) fn save_user_preferences(paths: &AppPaths, record_json: &str) -> AppR
     connection(paths)?.execute(
         r#"
         INSERT INTO user_preferences (id, record_json, updated_at) VALUES ('default', ?1, ?2)
+        ON CONFLICT(id) DO UPDATE SET
+            record_json = excluded.record_json,
+            updated_at = excluded.updated_at
+        "#,
+        params![record_json, now_ts()],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn load_notification_settings(paths: &AppPaths) -> AppResult<Option<String>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare("SELECT record_json FROM notification_settings WHERE id = 'default'")?;
+    let mut rows = statement.query([])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
+pub(crate) fn save_notification_settings(paths: &AppPaths, record_json: &str) -> AppResult<()> {
+    connection(paths)?.execute(
+        r#"
+        INSERT INTO notification_settings (id, record_json, updated_at) VALUES ('default', ?1, ?2)
         ON CONFLICT(id) DO UPDATE SET
             record_json = excluded.record_json,
             updated_at = excluded.updated_at

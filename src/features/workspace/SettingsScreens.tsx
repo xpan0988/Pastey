@@ -1,5 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
-import { ExecutionDefaultSettings, PreferencesSettings } from "./ExecutionProfiles";
+import { ExecutionDefaultSettings, NotificationSettingsSection, PreferencesSettings } from "./ExecutionProfiles";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { readAppearance, saveAppearance, type Appearance } from "../../lib/appearance";
@@ -247,6 +247,7 @@ function AgentSettings() {
     </section>
     <ExecutionDefaultSettings />
     <PreferencesSettings />
+    <NotificationSettingsSection />
     <ProviderSettings />
   </>;
 }

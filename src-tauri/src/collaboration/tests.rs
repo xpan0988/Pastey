@@ -1683,3 +1683,27 @@ fn the_user_may_adopt_a_valid_revision_and_claimed_files_crossed_are_flagged() {
     assert!(entries(&service, &id).iter().any(|entry| entry.needs_user()
         && matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("src-tauri/src/lib.rs (claimed by api's task split)") && !text.contains("src/app.tsx"))));
 }
+
+#[test]
+fn each_new_item_that_needs_the_user_is_notified_once() {
+    let fixture = FixtureV1::new("notify");
+    let (mut service, id) = service_with(&fixture);
+    // What already needed the user when Pastey started is not re-announced.
+    service.user_message(&id, "web", "Do it.").unwrap();
+    let plans = service.plan_starts(free);
+    service.started(&plans[0], "t1").unwrap();
+    service.turn_ended(&ended("t1", ProviderV1::ClaudeCode, &fixture.web, Some(&reply_to("user")))).unwrap();
+    assert!(service.take_new(service.needs_you_items(idle)).is_empty(), "seeded");
+    // A new question from a member, and a native approval, are each told once.
+    service.user_message(&id, "api", "Do it.").unwrap();
+    let plans = service.plan_starts(free);
+    service.started(&plans[0], "t2").unwrap();
+    service.turn_ended(&ended("t2", ProviderV1::Codex, &fixture.api, Some(&reply_to("user")))).unwrap();
+    let fresh = service.take_new(service.needs_you_items(waiting_on_approval));
+    let kinds: Vec<&str> = fresh.iter().map(|item| item.kind).collect();
+    assert!(kinds.contains(&"question"), "{kinds:?}");
+    assert!(kinds.contains(&"approval"), "{kinds:?}");
+    assert!(service.take_new(service.needs_you_items(waiting_on_approval)).is_empty(), "told once");
+    // Settings: a program must be named by its full path.
+    assert!(service.set_notification_settings(notify::NotificationSettingsV1 { command: vec!["notify.sh".into()], ..Default::default() }).is_err());
+}

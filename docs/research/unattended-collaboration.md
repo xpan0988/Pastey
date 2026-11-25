@@ -343,6 +343,22 @@ Boundary: Agents plan, negotiate, decide responsibilities and commit; Pastey rec
 
 Limits: plan-first is refused for a collaboration spanning another device, and plan entries stay on this device. Path overlap is literal-prefix based, so `src/**` and `src/a/**` overlap while sibling globs with different prefixes never do. "Done" is the Agent's statement; Pastey checks only that a named commit exists. Whether Agents plan well is their behaviour, measured in E02.
 
+### R6: notification and escalation (2026-11-25, first part)
+
+Boundary: the user learns, without watching Pastey, that something needs them; notification is separate from authority. No new dependency and no Pastey cloud.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| What is told | Each new item that needs the user, once: a member's question (message to `user`, or a wait on `user`), a message to approve, a problem (attention), and each native decision a running member turn waits for. Items that already needed the user when Pastey started are recorded, not re-announced | `each_new_item_that_needs_the_user_is_notified_once` |
+| Local channel | An OS notification on this device (macOS `osascript`, Linux `notify-send`; the text is passed as arguments, never as script); on by default | live: a test notification on this Mac (exit 0, quotes and `$(…)` shown as text) |
+| External channels | An optional program the user names by full path, run with one JSON argument (bounded, off every lock): the user's own tools can email, text or push. It receives only `{type, count, kinds}` unless the user allows details (collaboration, member, subject); internal ids never leave | `notify::tests::a_program_gets_only_that_something_needs_you_unless_details_are_allowed` |
+| Authority | Nothing in a notification can approve; the payload says so. Answers and approvals stay in Pastey: the local decision path (R0) and the paired device's existing digest-bound remote decision path | by construction |
+| UI | Settings → When a collaboration needs you (local on/off, program, details, Send a test) | build + type check |
+
+Escalation content (what is needed, why it matters, the options, a recommendation) is asked of Agents by the preference section (R4); Pastey forwards the subject.
+
+Not yet: notifying a paired device over its Bridge (it needs a new Room Control event; planned before E03, which needs two devices anyway), and Windows local notifications. Until then the program channel covers remote delivery with the user's own tools.
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).

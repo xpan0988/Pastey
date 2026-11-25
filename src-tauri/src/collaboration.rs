@@ -847,6 +847,12 @@ pub(crate) struct CollaborationServiceV1 {
     execution_default: Option<ExecutionDefaultV1>,
     /// This device's user's preference profile for Agents (R4).
     preferences: Option<preferences::PreferencesV1>,
+    /// How the user is told that something needs them (R6).
+    notification_settings: notify::NotificationSettingsV1,
+    /// Items already notified (process-local); the first look after start
+    /// only records what already needed the user.
+    notified: std::collections::HashSet<String>,
+    notified_seeded: bool,
 }
 
 fn now() -> i64 {
@@ -960,10 +966,17 @@ impl CollaborationServiceV1 {
             noted_waits: Default::default(),
             execution_default: None,
             preferences: None,
+            notification_settings: Default::default(),
+            notified: Default::default(),
+            notified_seeded: false,
         };
         let Some(paths) = service.paths.clone() else {
             return Ok(service);
         };
+        service.notification_settings = storage::load_notification_settings(&paths)?
+            .and_then(|json| serde_json::from_str::<notify::NotificationSettingsV1>(&json).ok())
+            .filter(|settings| settings.validate().is_ok())
+            .unwrap_or_default();
         service.preferences = storage::load_user_preferences(&paths)?
             .and_then(|json| serde_json::from_str::<preferences::PreferencesV1>(&json).ok());
         // A default that no longer reads as a valid profile is not used.
@@ -3338,6 +3351,70 @@ impl CollaborationServiceV1 {
         Ok(())
     }
 
+    pub(crate) fn notification_settings(&self) -> notify::NotificationSettingsV1 {
+        self.notification_settings.clone()
+    }
+
+    pub(crate) fn set_notification_settings(&mut self, settings: notify::NotificationSettingsV1) -> AppResult<()> {
+        settings.validate()?;
+        if let Some(paths) = self.paths.as_ref() {
+            storage::save_notification_settings(paths, &serde_json::to_string(&settings)?)?;
+        }
+        self.notification_settings = settings;
+        Ok(())
+    }
+
+    /// Everything that needs this device's user now, one item each (R6):
+    /// questions, messages to approve, problems, waits on the user, and the
+    /// native decisions running member turns wait for (`runtime`).
+    pub(crate) fn needs_you_items(&self, runtime: impl Fn(&Path) -> MemberRuntimeV1) -> Vec<notify::NeedsYouV1> {
+        let mut items = Vec::new();
+        for item in self.items.values().filter(|item| item.record.state != CollaborationStateV1::Ended) {
+            let name = item.record.name.clone();
+            for entry in item.entries.iter().filter(|entry| entry.needs_user()) {
+                let (kind, member, text) = match &entry.body {
+                    EntryBodyV1::Message { from, to, subject, .. } if to == USER_ALIAS => ("question", Some(from.clone()), subject.clone()),
+                    EntryBodyV1::Message { to, subject, .. } => ("message_to_approve", Some(to.clone()), subject.clone()),
+                    EntryBodyV1::Wait { reason, .. } => ("question", entry.member.clone(), reason.clone()),
+                    EntryBodyV1::Attention { text } => ("problem", entry.member.clone(), text.clone()),
+                    _ => ("problem", entry.member.clone(), String::new()),
+                };
+                items.push(notify::NeedsYouV1 { key: entry.id.clone(), collaboration: name.clone(), kind, member, text: short(&text, 160) });
+            }
+            for member in item.record.members.iter().filter(|member| !member.remote) {
+                let Some(live) = runtime(Path::new(&member.workspace)).live else { continue };
+                let pending: Vec<String> = live
+                    .decisions
+                    .iter()
+                    .filter(|review| review.state == crate::native_agent::NativeDecisionStateV1::Pending)
+                    .map(|review| review.review_ref.clone())
+                    .collect();
+                let keys = if pending.is_empty() && live.awaiting_decision { vec![String::from("waiting")] } else { pending };
+                for key in keys {
+                    items.push(notify::NeedsYouV1 {
+                        key: format!("{}:{key}", live.task_id),
+                        collaboration: name.clone(),
+                        kind: "approval",
+                        member: Some(member.alias.clone()),
+                        text: format!("{}'s turn waits for a decision only you can give.", member.alias),
+                    });
+                }
+            }
+        }
+        items
+    }
+
+    /// Which of `items` are new since the last look (each is told once).
+    /// The first look after Pastey starts only records them.
+    pub(crate) fn take_new(&mut self, items: Vec<notify::NeedsYouV1>) -> Vec<notify::NeedsYouV1> {
+        if !self.notified_seeded {
+            self.notified_seeded = true;
+            self.notified.extend(items.into_iter().map(|item| item.key));
+            return Vec::new();
+        }
+        items.into_iter().filter(|item| self.notified.insert(item.key.clone())).collect()
+    }
+
     /// Items waiting for this device's user, with the native decisions the
     /// members' running turns wait for (`runtime`).
     pub(crate) fn needs_you_total_with(&self, runtime: impl Fn(&Path) -> MemberRuntimeV1) -> usize {
@@ -4134,6 +4211,21 @@ pub(crate) fn drive(runtime: &HostRuntime) {
     };
     let _ = runtime.collaborations.lock().note_native_waits(&waits);
     let _ = runtime.collaborations.lock().settle_waits(now());
+    // What newly needs the user, told through the channels they chose, off
+    // every lock (R6). Nothing in a notification can approve anything.
+    let lookup = member_runtime(runtime);
+    let (fresh, settings) = {
+        let mut collaborations = runtime.collaborations.lock();
+        let items = collaborations.needs_you_items(&lookup);
+        (collaborations.take_new(items), collaborations.notification_settings())
+    };
+    if !fresh.is_empty() {
+        std::thread::spawn(move || {
+            for problem in notify::send(&settings, &fresh) {
+                crate::logging::write_error_line(&format!("[pastey collaboration] event=notify problem={problem}"));
+            }
+        });
+    }
     let plans = {
         let mut collaborations = runtime.collaborations.lock();
         let _ = collaborations.settle_grants(now());
@@ -4494,6 +4586,7 @@ fn redact_paths(text: &str, workspace: &Path) -> String {
         .collect()
 }
 
+pub(crate) mod notify;
 pub(crate) mod plan;
 pub(crate) mod preferences;
 pub(crate) mod readiness;

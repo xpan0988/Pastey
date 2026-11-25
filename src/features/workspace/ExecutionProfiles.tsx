@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   getUserPreferences, setUserPreferences, type PreferenceSections, type UserPreferences,
+  getNotificationSettings, setNotificationSettings, testNotification, type NotificationSettings,
   describeProfile, getExecutionDefault, listExecutionPresets, setExecutionDefault,
   type ExecutionChoice, type ExecutionDefault, type ExecutionProfile,
 } from "../../lib/collaboration";
@@ -186,6 +187,46 @@ export function PreferencesSettings() {
         <textarea id={`preferences-${field.key}`} className="input small" rows={3} maxLength={1200} value={draft[field.key]}
           onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.value }))} />
       </Field>)}
+    </div></div>
+  </section>;
+}
+
+/** Settings: how this device tells its user that a collaboration needs
+ * them. No Pastey cloud: a local notification, and optionally a program the
+ * user chose (which can email, text or push with the user's own tools). */
+export function NotificationSettingsSection() {
+  const [settings, setSettings] = useState<NotificationSettings | null>(null);
+  const [program, setProgram] = useState("");
+  const [message, setMessage] = useState<{ tone: "ok" | "bad"; text: string } | null>(null);
+  useEffect(() => {
+    void getNotificationSettings().then((read) => { setSettings(read); setProgram(read.command.join(" ")); }).catch(() => setSettings({ local: true, command: [], includeDetails: false }));
+  }, []);
+  if (!settings) return null;
+  const save = async (next: NotificationSettings) => {
+    setMessage(null);
+    try { await setNotificationSettings(next); setSettings(next); setMessage({ tone: "ok", text: "Saved." }); }
+    catch (cause) { setMessage({ tone: "bad", text: errorText(cause, "It could not be saved.") }); }
+  };
+  const command = program.trim() ? program.trim().split(/\s+/) : [];
+  return <section className="section" aria-label="Collaboration notifications">
+    <div className="section-head-row"><div className="section-head"><h2>When a collaboration needs you</h2>
+      <p>You are told once for each new question, approval, message to approve or problem. A notification only says that something needs you: you answer in Pastey, where every approval stays bound to the exact request.</p></div>
+      <button type="button" className="btn btn-sm" onClick={() => void testNotification().then((problems) => setMessage(problems.length ? { tone: "bad", text: problems.join("; ") } : { tone: "ok", text: "Test sent." }))}>Send a test</button></div>
+    {message ? <Notice tone={message.tone}>{message.text}</Notice> : null}
+    <div className="card"><div className="card-body stack" style={{ gap: 10 }}>
+      <label className="row small" style={{ gap: 8 }}>
+        <input type="checkbox" checked={settings.local} onChange={(event) => void save({ ...settings, local: event.target.checked })} />
+        <span>Show a notification on this device</span>
+      </label>
+      <Field label="Also run a program (full path, then arguments)" htmlFor="notify-program"
+        hint="It receives one JSON argument last. Use it to email, text or push with your own tools. Leave empty for none.">
+        <input id="notify-program" className="input input-sm mono" value={program} placeholder="/usr/local/bin/my-notify --to me" onChange={(event) => setProgram(event.target.value)}
+          onBlur={() => void save({ ...settings, command })} />
+      </Field>
+      <label className="row small" style={{ gap: 8 }}>
+        <input type="checkbox" checked={settings.includeDetails} onChange={(event) => void save({ ...settings, command, includeDetails: event.target.checked })} />
+        <span>Send the program what is needed (collaboration, member, subject). Otherwise it learns only that something needs you, and nothing leaves this device unless your program sends it.</span>
+      </label>
     </div></div>
   </section>;
 }

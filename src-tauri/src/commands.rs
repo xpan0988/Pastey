@@ -1612,6 +1612,49 @@ pub fn adopt_collaboration_plan(
     collaboration_view(&state, &collaboration_id)
 }
 
+/// How this device tells its user that a collaboration needs them.
+#[tauri::command]
+pub fn get_notification_settings(
+    state: State<'_, Arc<AppState>>,
+) -> crate::collaboration::notify::NotificationSettingsV1 {
+    state.collaborations.lock().notification_settings()
+}
+
+/// Sets them: a local notification, and an optional program the user
+/// chose (by full path), which gets only "something needs you" unless the
+/// user allowed details. A local command only.
+#[tauri::command]
+pub fn set_notification_settings(
+    settings: crate::collaboration::notify::NotificationSettingsV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state
+        .collaborations
+        .lock()
+        .set_notification_settings(settings)
+        .map_err(|error| error.message())
+}
+
+/// Sends a test notification through the chosen channels; what failed.
+#[tauri::command]
+pub async fn test_notification(state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    let settings = state.collaborations.lock().notification_settings();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::collaboration::notify::send(
+            &settings,
+            &[crate::collaboration::notify::NeedsYouV1 {
+                key: "test".into(),
+                collaboration: "Test".into(),
+                kind: "problem",
+                member: None,
+                text: "This is a test. Nothing needs you.".into(),
+            }],
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// Sets one collaboration's own preferences, beside the profile.
 #[tauri::command]
 pub fn set_collaboration_preferences(
