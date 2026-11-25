@@ -336,6 +336,7 @@ fn a_member_turns_published_blocks_reach_the_turn_listener_once_its_folder_is_fr
             "Review the pagination change",
             true,
             &NativeSessionOptionsV1::default(),
+            None,
         )
         .unwrap();
     let ended = receiver
@@ -372,6 +373,7 @@ fn a_long_turns_activity_shows_while_it_runs_and_reaches_the_listener_without_an
             "Move the table to cursors",
             true,
             &NativeSessionOptionsV1::default(),
+            None,
         )
         .unwrap();
     // While the turn runs: the plan, the last actions, counts and the
@@ -425,6 +427,7 @@ fn only_a_collaboration_member_turn_refuses_other_sessions_messages() {
             "Do the next task",
             false,
             &NativeSessionOptionsV1::default(),
+            None,
         )
         .unwrap();
     let status = wait_terminal(&service, &member.task_id);
@@ -442,6 +445,45 @@ fn only_a_collaboration_member_turn_refuses_other_sessions_messages() {
         session_after(&runs[1], "--resume "),
         session_after(&runs[0], "--session-id ")
     );
+}
+
+/// R1: a member's execution profile reaches Claude Code only on a member
+/// turn, as its own permission mode and per-run settings beside the refusal
+/// of other sessions' messages; an ordinary turn passes none of it.
+#[test]
+fn a_members_execution_profile_reaches_claude_code_as_native_settings() {
+    let fixture = FixtureV1::new("complete");
+    let (mut service, _) = fixture.service();
+    let profile = crate::native_agent::execution_profile::ExecutionProfileV1::unattended_engineering();
+    let member = service
+        .start_claude_code_member_task(
+            &fixture.workspace,
+            "Do the task",
+            true,
+            &NativeSessionOptionsV1::default(),
+            Some(&profile),
+        )
+        .unwrap();
+    assert_eq!(wait_terminal(&service, &member.task_id).state, NativeAgentTaskStateV1::Completed);
+    wait_released(&service, &fixture.workspace);
+    let ordinary = service
+        .start_claude_code_conversation_task(
+            &fixture.workspace,
+            "Do the next task",
+            false,
+            &NativeSessionOptionsV1::default(),
+        )
+        .unwrap();
+    wait_terminal(&service, &ordinary.task_id);
+    let runs = fixture.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(runs[0].contains("--permission-mode acceptEdits"), "{}", runs[0]);
+    assert!(runs[0].contains(r#""crossSessionInbound":"refuse""#), "{}", runs[0]);
+    assert!(runs[0].contains(r#""deny":["Bash(git push)","Bash(git push *)""#), "{}", runs[0]);
+    assert!(runs[0].contains(r#""allowUnsandboxedCommands":false"#), "{}", runs[0]);
+    assert!(!runs[0].contains("bypassPermissions"), "{}", runs[0]);
+    assert!(!runs[1].contains("--permission-mode"), "{}", runs[1]);
+    assert!(!runs[1].contains("--settings"), "{}", runs[1]);
 }
 
 #[test]
@@ -2088,7 +2130,7 @@ fn installed_codex_and_claude_code_exchange_an_approved_collaboration_message() 
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].alias, "web");
     let second = service
-        .start_claude_code_member_task(&web, &plans[0].prompt, true, &low)
+        .start_claude_code_member_task(&web, &plans[0].prompt, true, &low, None)
         .unwrap();
     collaborations.started(&plans[0], &second.task_id).unwrap();
     let ended = receiver.recv_timeout(Duration::from_secs(300)).expect("web's turn ended");
@@ -2213,7 +2255,7 @@ fn installed_codex_and_claude_code_take_automatic_turns_within_their_grants() {
         );
         let status = match plan.provider {
             ProviderV1::Codex => service.start_codex_conversation_task(&plan.workspace, &plan.prompt, false, &low),
-            ProviderV1::ClaudeCode => service.start_claude_code_member_task(&plan.workspace, &plan.prompt, false, &low),
+            ProviderV1::ClaudeCode => service.start_claude_code_member_task(&plan.workspace, &plan.prompt, false, &low, None),
         }
         .unwrap();
         collaborations.started(&plan, &status.task_id).unwrap();
@@ -2421,7 +2463,7 @@ fn installed_agents_joining_a_collaboration_read_its_briefing() {
         }
         let status = match provider {
             ProviderV1::Codex => service.start_codex_conversation_task(&docs, &plan.prompt, true, &low),
-            ProviderV1::ClaudeCode => service.start_claude_code_member_task(&docs, &plan.prompt, true, &low),
+            ProviderV1::ClaudeCode => service.start_claude_code_member_task(&docs, &plan.prompt, true, &low, None),
         }
         .unwrap();
         collaborations.started(plan, &status.task_id).unwrap();

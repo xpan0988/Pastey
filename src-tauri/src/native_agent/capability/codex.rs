@@ -764,6 +764,11 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
         conversation: Option<NativeConversationV1>,
     ) -> AppResult<StartedInvocationV1> {
         let (parsed, workspace) = parse_input(input)?;
+        // Set by Core only for a member turn of this Host's own collaboration.
+        let execution = conversation
+            .as_ref()
+            .and_then(|conversation| conversation.execution.as_ref())
+            .map(|profile| profile.codex.clone());
         let (key, continuation) = match conversation {
             Some(conversation) => {
                 if conversation.continue_existing != parsed.resume {
@@ -850,6 +855,7 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
                 session: existing,
                 prompt: parsed.task,
                 options: parsed.options,
+                execution,
             }),
         })
     }
@@ -971,6 +977,8 @@ struct CodexInvocationRunV1 {
     prompt: String,
     /// Codex's own model and effort for this turn, as its user chose them.
     options: NativeSessionOptionsV1,
+    /// A member's approval policy, reviewer and sandbox (R1).
+    execution: Option<crate::native_agent::execution_profile::CodexExecutionV1>,
 }
 
 impl CodexInvocationRunV1 {
@@ -1162,7 +1170,12 @@ impl NativeInvocationRunV1 for CodexInvocationRunV1 {
                 Err(outcome) => return outcome,
             },
         };
-        let report = controller.run_turn(&thread_id, &self.prompt, None, &self.options, progress);
+        let execution = self
+            .execution
+            .as_ref()
+            .map(|execution| execution.turn_params(&self.workspace))
+            .unwrap_or_default();
+        let report = controller.run_turn_with(&thread_id, &self.prompt, None, &self.options, &execution, progress);
         // Windows ends a stopped turn's session (`end_after_stop`): no later
         // task may reuse it. Elsewhere the session is kept, as before.
         #[cfg(windows)]
@@ -2656,6 +2669,20 @@ impl CodexAppServerV1 {
         options: &NativeSessionOptionsV1,
         progress: &dyn NativeInvocationProgressV1,
     ) -> CodexTurnReportV1 {
+        self.run_turn_with(thread_id, task, client_message_id, options, &[], progress)
+    }
+
+    /// `run_turn`, with `turn/start` fields of a member's execution profile
+    /// (`approvalPolicy`, `approvalsReviewer`, `sandboxPolicy`).
+    fn run_turn_with(
+        &self,
+        thread_id: &str,
+        task: &str,
+        client_message_id: Option<&str>,
+        options: &NativeSessionOptionsV1,
+        execution: &[(&'static str, Value)],
+        progress: &dyn NativeInvocationProgressV1,
+    ) -> CodexTurnReportV1 {
         let mut response = CodexResponseCaptureV1::default();
         let unknown = |response| CodexTurnReportV1 {
             outcome: NativeTurnOutcomeV1::Unknown,
@@ -2676,6 +2703,9 @@ impl CodexAppServerV1 {
         }
         if let Some(effort) = &options.effort {
             params["effort"] = json!(effort);
+        }
+        for (key, value) in execution {
+            params[*key] = value.clone();
         }
         if self
             .send(json!({"id": TURN_START_ID, "method": "turn/start", "params": params}))

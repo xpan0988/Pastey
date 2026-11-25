@@ -13,12 +13,14 @@ import {
   resumeCollaborationMember, sendCollaborationMessage, setCollaborationGrant, setCollaborationState, statusLabel, suggestAlias,
   turnOutcomeLabel, USER_ALIAS, validAlias, waitingByRecipient, withdrawCollaborationGrant, type CollaborationEntry,
   optionsLabel, pendingDecisions, setCollaborationMemberOptions, stopCollaborationMember, type MemberOptions,
+  executionSourceLabel, setCollaborationExecution, type ExecutionChoice,
   type CollaborationMember, type CollaborationMemberInput, type CollaborationProvider, type CollaborationSummary, type CollaborationView,
   type JournalFilter, type RunningTurn,
 } from "../../lib/collaboration";
 import { formatTimestamp } from "../../lib/format";
 import { Badge, Dialog, Dot, EmptyState, errorText, Field, Icon, ListRow, MenuButton, Notice, Segmented } from "./ui";
 import { NativeDecisionPanel } from "./NativeDecisionPanel";
+import { ExecutionChoiceDialog } from "./ExecutionProfiles";
 
 /** Device-wide: Agent collaborations of this device and their Journals. */
 export function CollaborationsScreen({ menuButton }: { menuButton?: ReactNode }) {
@@ -83,6 +85,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   const [confirming, setConfirming] = useState<"end" | "delete" | null>(null);
   const [granting, setGranting] = useState<CollaborationMember | null>(null);
   const [choosing, setChoosing] = useState<CollaborationMember | null>(null);
+  const [executing, setExecuting] = useState<{ alias: string | null; initial: ExecutionChoice } | null>(null);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<{ kind: "goal" } | { kind: "role"; member: CollaborationMember } | null>(null);
   const [removing, setRemoving] = useState<CollaborationMember | null>(null);
@@ -123,6 +126,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
           <MenuButton label="More collaboration actions">{(close) => <>
             {!ended && !guest && view.members.length < 6 ? <button type="button" role="menuitem" onClick={() => { close(); setInviting(true); }}><Icon name="device" /><span>Invite from another device…<small>A conversation on a device paired with this one</small></span></button> : null}
             {!ended && !guest ? <button type="button" role="menuitem" onClick={() => { close(); setEditing({ kind: "goal" }); }}><Icon name="file" /><span>Edit goal…<small>Members see it from their next turn</small></span></button> : null}
+            {!ended ? <button type="button" role="menuitem" onClick={() => { close(); setExecuting({ alias: null, initial: toChoice(view.execution) }); }}><Icon name="settings" /><span>Execution…<small>What its members may do without asking you</small></span></button> : null}
             {!ended ? <button type="button" role="menuitem" onClick={() => { close(); setConfirming("end"); }}><Icon name="close" /><span>{guest ? "Leave collaboration" : "End collaboration"}<small>{guest ? `This device's members leave; ${link?.deviceLabel} is told` : "Members become ordinary conversations; the Journal stays"}</small></span></button> : null}
             <button type="button" role="menuitem" onClick={() => { close(); setConfirming("delete"); }}><Icon name="flame" /><span>Delete…<small>Removes the Journal; conversations stay</small></span></button>
           </>}</MenuButton>
@@ -141,6 +145,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
             onEditRole={() => setEditing({ kind: "role", member })}
             onStop={() => void act(() => stopCollaborationMember(id, member.alias))}
             onOptions={() => setChoosing(member)}
+            onExecution={() => setExecuting({ alias: member.alias, initial: toChoice(member.execution) })}
             onRemove={view.members.length > 2 ? () => setRemoving(member) : undefined} />)}
         </div>
         {!ended ? <Composer members={view.members} link={link} disabled={pending} onSend={(to, text) => act(() => sendCollaborationMessage(id, to, text))} /> : null}
@@ -173,6 +178,11 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
           <button type="button" className="btn btn-sm btn-danger" disabled={pending} onClick={() => { const alias = removing.alias; setRemoving(null); void act(() => removeCollaborationMember(id, alias)); }}>Remove</button></>}>
         <span />
       </Dialog> : null}
+      {executing ? <ExecutionChoiceDialog
+        title={executing.alias ? `Execution for ${executing.alias}` : `Execution for ${view.name}`}
+        scope={executing.alias ? "member" : "collaboration"} initial={executing.initial} pending={pending}
+        onClose={() => setExecuting(null)}
+        onSave={(choice) => { const alias = executing.alias; setExecuting(null); void act(() => setCollaborationExecution(id, alias, choice)); }} /> : null}
       {choosing ? <OptionsDialog member={choosing} pending={pending} onClose={() => setChoosing(null)}
         onSave={(options) => { const alias = choosing.alias; setChoosing(null); void act(() => setCollaborationMemberOptions(id, alias, options.model ?? null, options.effort ?? null)); }} /> : null}
       {granting ? <GrantDialog member={granting} pending={pending} onClose={() => setGranting(null)}
@@ -197,13 +207,19 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   );
 }
 
+function toChoice(stored: CollaborationMember["execution"]): ExecutionChoice {
+  if (!stored) return { kind: "inherit" };
+  if (stored.kind === "ask") return { kind: "ask" };
+  return { kind: "profile", profile: stored.profile, confirmed: false };
+}
+
 function timeOfDay(seconds: number): string {
   return new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResume, onGrant, onWithdraw, onEditRole, onStop, onOptions, onRemove }: {
+function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResume, onGrant, onWithdraw, onEditRole, onStop, onOptions, onExecution, onRemove }: {
   member: CollaborationMember; link?: CollaborationLink; guest: boolean; waiting: string[]; disabled: boolean; onApprove: (ids: string[]) => void; onResume: () => void; onGrant: () => void; onWithdraw: () => void;
-  onEditRole: () => void; onStop: () => void; onOptions: () => void; onRemove?: () => void;
+  onEditRole: () => void; onStop: () => void; onOptions: () => void; onExecution: () => void; onRemove?: () => void;
 }) {
   if (member.remote) {
     // Runs on the linked device: its user there approves its turns and
@@ -230,6 +246,7 @@ function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResum
       {!disabled && !guest ? <span style={{ marginLeft: "auto" }}><MenuButton label={`More actions for ${member.alias}`}>{(close) => <>
         <button type="button" role="menuitem" onClick={() => { close(); onEditRole(); }}><Icon name="file" /><span>Edit role…</span></button>
         <button type="button" role="menuitem" onClick={() => { close(); onOptions(); }}><Icon name="settings" /><span>Model and effort…<small>For every turn the collaboration starts</small></span></button>
+        <button type="button" role="menuitem" onClick={() => { close(); onExecution(); }}><Icon name="settings" /><span>Execution…<small>What it may do without asking you</small></span></button>
         {onRemove ? <button type="button" role="menuitem" onClick={() => { close(); onRemove(); }}><Icon name="close" /><span>Remove from collaboration…<small>Its conversation stays</small></span></button> : null}
       </>}</MenuButton></span> : null}</div>
     <span className="xsmall subtle mono" title={member.workspace}>{folderName(member.workspace)}</span>
@@ -237,6 +254,9 @@ function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResum
     <span className="small muted">{memberStateLabel(member)}</span>
     <span className="xsmall subtle">{policyLabel(member, now, timeOfDay)}</span>
     <span className="xsmall subtle">{optionsLabel(member.options)}</span>
+    {member.effectiveExecution ? <span className="xsmall subtle" title={member.effectiveExecution.lines.join("\n")}>
+      Execution: {member.effectiveExecution.name} · {executionSourceLabel(member.effectiveExecution.source)} · configured, not verified
+    </span> : null}
     {member.live ? <LiveTurn live={member.live} automatic={member.autoTask === member.live.taskId} now={now} /> : null}
     {member.live && (member.live.decisions ?? []).length > 0
       ? <NativeDecisionPanel status={{ taskId: member.live.taskId, state: "running", nativeDecisions: member.live.decisions }} remote={false} hostName="this device" />
@@ -393,6 +413,7 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
         : action.type === "goal_changed" ? `You changed the goal: ${action.goal || "(none)"}`
         : action.type === "role_changed" ? `You changed ${action.alias}'s role: ${action.role || "(none)"}`
         : action.type === "accepted" ? `You accepted the invitation for ${action.alias}`
+        : action.type === "execution_changed" ? `You set ${action.alias ? `${action.alias}'s` : "the collaboration's"} execution to ${action.name === "inherit" ? (action.alias ? "the collaboration's choice" : "your default") : action.name}`
         : action.type === "options_changed" ? `You set ${action.alias}'s model to ${action.model ?? "its default"} and effort to ${action.effort ?? "its default"}`
         : `You ${action.confirmed ? "confirmed" : "rejected"} ${decided ?? "a member"}'s decisions`;
       const who = entry.host ? text.replace(/^You /, `The user on ${link?.deviceLabel ?? "the other device"} `) : text;

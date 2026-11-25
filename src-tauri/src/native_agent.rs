@@ -25,6 +25,7 @@ use crate::host_identity::HostSessionBinding;
 mod admission;
 pub(crate) mod agent_config;
 mod capability;
+pub(crate) mod execution_profile;
 pub(crate) mod model_catalog;
 pub(crate) mod sessions;
 pub(crate) use admission::NativeInvocationReviewV1;
@@ -1411,6 +1412,11 @@ pub(crate) struct NativeAgentServiceV1 {
     task_workspaces: HashMap<String, PathBuf>,
     task_digests: HashMap<String, String>,
     task_exclusivity: HashMap<String, ExclusivityKeyV1>,
+    /// The execution profile this Host's own collaboration chose for a task
+    /// it is starting (R1). Set only by the local member start functions,
+    /// read once at start, and applied only to a Locally owned
+    /// conversation: nothing a peer sends reaches it.
+    task_execution: HashMap<String, execution_profile::ExecutionProfileV1>,
     /// Each started task's `StartedInvocationV1::recovery`, durable with its
     /// envelope.
     task_recoveries: HashMap<String, OpaqueCapabilityPayloadV1>,
@@ -1506,6 +1512,7 @@ impl NativeAgentServiceV1 {
             task_workspaces: HashMap::new(),
             task_digests: HashMap::new(),
             task_exclusivity: HashMap::new(),
+            task_execution: HashMap::new(),
             task_recoveries: HashMap::new(),
             task_bridges: HashMap::new(),
             revoked_bridges: HashSet::new(),
@@ -4240,6 +4247,48 @@ impl NativeAgentServiceV1 {
         )
     }
 
+    /// A collaboration member's turn in its Codex conversation: as
+    /// `start_codex_conversation_task`, with the execution profile this
+    /// Host's user chose for the member (native approval policy, reviewer
+    /// and sandbox on `turn/start`).
+    pub(crate) fn start_codex_member_task(
+        &mut self,
+        workspace: &Path,
+        task: &str,
+        new_conversation: bool,
+        options: &NativeSessionOptionsV1,
+        execution: Option<&execution_profile::ExecutionProfileV1>,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
+            return invalid("Native Agent task is empty or exceeds its bound.");
+        }
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|_| AppError::InvalidInput("Native Agent workspace is unavailable.".into()))?;
+        if !workspace.is_dir() {
+            return invalid("Native Agent workspace must be a directory.");
+        }
+        let task_id = format!("native-agent:{}", Uuid::new_v4());
+        self.register_execution(&task_id, execution)?;
+        let started = self.start_codex_task_with_id_resume(&task_id, &workspace, task, !new_conversation, options);
+        self.task_execution.remove(&task_id);
+        started
+    }
+
+    /// Holds `execution` for the start of exactly `task_id` (taken at that
+    /// start). A profile that passes nothing is not held.
+    fn register_execution(
+        &mut self,
+        task_id: &str,
+        execution: Option<&execution_profile::ExecutionProfileV1>,
+    ) -> AppResult<()> {
+        if let Some(profile) = execution.filter(|profile| !profile.is_ask()) {
+            profile.validate()?;
+            self.task_execution.insert(task_id.to_owned(), profile.clone());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn start_codex_task_with_id(
         &mut self,
@@ -4416,8 +4465,20 @@ impl NativeAgentServiceV1 {
         task: &str,
         new_conversation: bool,
         options: &NativeSessionOptionsV1,
+        execution: Option<&execution_profile::ExecutionProfileV1>,
     ) -> AppResult<NativeAgentTaskStatusV1> {
-        self.start_claude_code_conversation_turn(workspace, task, new_conversation, options, true)
+        let task_id = format!("native-agent:{}", Uuid::new_v4());
+        self.register_execution(&task_id, execution)?;
+        let started = self.start_claude_code_conversation_turn_with_id(
+            &task_id,
+            workspace,
+            task,
+            new_conversation,
+            options,
+            true,
+        );
+        self.task_execution.remove(&task_id);
+        started
     }
 
     fn start_claude_code_conversation_turn(
@@ -5379,6 +5440,9 @@ impl NativeAgentServiceV1 {
             }
             _ => None,
         };
+        // Taken whatever happens: a profile never outlives the start it was
+        // registered for.
+        let execution = self.task_execution.remove(task_id);
         let native_conversation = match &conversation {
             Some((binding, continue_existing)) => Some(NativeConversationV1 {
                 key: binding.key.clone(),
@@ -5387,6 +5451,7 @@ impl NativeAgentServiceV1 {
                     (true, Some(paths)) => binding.saved_continuation(paths)?,
                     _ => None,
                 },
+                execution: execution.filter(|_| binding.owner == NativeConversationOwnerV1::Local),
             }),
             None => None,
         };
@@ -11914,6 +11979,79 @@ done
         h.service
             .cancel_bridge_task(GRANT_BRIDGE, "task-a9")
             .unwrap();
+        wait_for_workspace_release(&h.service, &workspace);
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    /// R1: a member's execution profile reaches Codex as `turn/start`'s own
+    /// approval policy, reviewer and sandbox, held for exactly that task's
+    /// start; a peer's task never carries one, whatever was registered.
+    #[test]
+    fn a_members_execution_profile_reaches_codex_turn_start_and_nothing_else() {
+        let (root, workspace, agent) = scripted_codex(&format!(
+            r#"{SCRIPTED_OPEN}    *'"id":3,'*) printf '%s\n' "$line" >> "$PWD/turn-starts"; {{ACK}}; {{COMPLETED}} ;;
+"#
+        ));
+        let mut service = NativeAgentServiceV1::default();
+        let profile = execution_profile::ExecutionProfileV1::unattended_engineering();
+        service.register_execution("task-member", Some(&profile)).unwrap();
+        let started = service
+            .start_codex_task_with_executable_options(
+                &agent,
+                "task-member",
+                &workspace,
+                "work",
+                false,
+                &NativeSessionOptionsV1::default(),
+            )
+            .unwrap();
+        assert_eq!(wait_for_terminal(&service, &started.task_id).state, NativeAgentTaskStateV1::Completed);
+        assert!(service.task_execution.is_empty(), "taken at start");
+        wait_for_workspace_release(&service, &workspace);
+        // The next turn of the same conversation was not registered.
+        let next = service
+            .start_codex_task_with_executable_options(
+                &agent,
+                "task-next",
+                &workspace,
+                "more",
+                true,
+                &NativeSessionOptionsV1::default(),
+            )
+            .unwrap();
+        wait_for_terminal(&service, &next.task_id);
+        let turns: Vec<Value> = fs::read_to_string(workspace.join("turn-starts"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        let first = &turns[0]["params"];
+        assert_eq!(first["approvalPolicy"], json!("on-request"));
+        assert_eq!(first["approvalsReviewer"], json!("auto_review"));
+        assert_eq!(first["sandboxPolicy"]["type"], json!("workspaceWrite"));
+        assert_eq!(first["sandboxPolicy"]["networkAccess"], json!(false));
+        assert_eq!(
+            first["sandboxPolicy"]["writableRoots"][0],
+            json!(workspace.canonicalize().unwrap().to_string_lossy())
+        );
+        let second = &turns[1]["params"];
+        assert!(second.get("approvalPolicy").is_none() && second.get("sandboxPolicy").is_none(), "{second}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A peer's invocation never takes a profile registered for its task id.
+    #[test]
+    fn a_registered_profile_never_reaches_a_bridge_owned_task() {
+        let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+        let workspace = h.workspace.clone();
+        let profile = execution_profile::ExecutionProfileV1::unattended_engineering();
+        h.service.register_execution("task-peer", Some(&profile)).unwrap();
+        h.invoke(&binding, Some(&device), "task-peer", &workspace, "work").unwrap();
+        // Taken at start, and not applied: the conversation is the Bridge's.
+        assert!(h.service.task_execution.is_empty());
+        wait_for_reviews(&h.service, "task-peer", 2);
+        h.service.cancel_bridge_task(GRANT_BRIDGE, "task-peer").unwrap();
         wait_for_workspace_release(&h.service, &workspace);
         let _ = fs::remove_dir_all(script_root);
     }

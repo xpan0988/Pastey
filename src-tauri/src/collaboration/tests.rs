@@ -1218,3 +1218,65 @@ fn paths_are_left_out_of_a_start_problem() {
     assert!(text.contains("its folder"), "{text}");
     assert_eq!(bound_text(&"é".repeat(600), 1024).len() <= 1024, true);
 }
+
+fn choice(kind: &str, profile: Option<ExecutionProfileV1>, confirmed: bool) -> ExecutionChoiceInputV1 {
+    ExecutionChoiceInputV1 { kind: kind.into(), profile, confirmed }
+}
+
+#[test]
+fn execution_profiles_resolve_member_then_collaboration_then_the_users_default() {
+    let fixture = FixtureV1::new("execution");
+    let paths = fixture.paths();
+    let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
+    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    let unattended = ExecutionProfileV1::unattended_engineering();
+    let source = |service: &CollaborationServiceV1, alias: &str| {
+        service
+            .view(&id, idle)
+            .unwrap()
+            .summary
+            .members
+            .into_iter()
+            .find(|member| member.member.alias == alias)
+            .unwrap()
+            .effective_execution
+    };
+    // Nothing chosen anywhere: nothing passed.
+    assert_eq!(source(&service, "web").source, ExecutionSourceV1::None);
+    assert_eq!(source(&service, "web").name, "Ask");
+    // A default needs the user's explicit consent, then every member
+    // inherits it, also after a restart.
+    assert!(service.set_execution_default(Some(unattended.clone()), false).is_err());
+    service.set_execution_default(Some(unattended.clone()), true).unwrap();
+    assert_eq!(source(&service, "web").source, ExecutionSourceV1::Default);
+    assert!(source(&service, "web").lines.iter().any(|line| line.contains("Denied: Bash(git push)")));
+    assert!(source(&service, "api").lines.iter().any(|line| line.contains("not a boundary")), "auto-review is labelled a judgement");
+    service.user_message(&id, "web", "Do it.").unwrap();
+    assert_eq!(service.plan_starts(free)[0].execution.as_ref(), Some(&unattended));
+    let reloaded = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
+    assert_eq!(reloaded.execution_default().map(|default| default.profile), Some(unattended.clone()));
+    // The collaboration can ask instead; a member can choose its own.
+    service.set_execution(&id, None, choice("ask", None, false)).unwrap();
+    assert_eq!(source(&service, "web").source, ExecutionSourceV1::Collaboration);
+    assert!(service.plan_starts(free)[0].execution.is_none());
+    assert!(service.set_execution(&id, Some("web"), choice("profile", Some(unattended.clone()), false)).is_err());
+    service.set_execution(&id, Some("web"), choice("profile", Some(unattended.clone()), true)).unwrap();
+    assert_eq!(source(&service, "web").source, ExecutionSourceV1::Member);
+    assert_eq!(source(&service, "api").source, ExecutionSourceV1::Collaboration);
+    // A profile that could escape the sandbox is refused at any level.
+    let mut wide = unattended.clone();
+    wide.codex.sandbox = Some("danger-full-access".into());
+    assert!(service.set_execution(&id, None, choice("profile", Some(wide.clone()), true)).is_err());
+    assert!(service.set_execution_default(Some(wide), true).is_err());
+    // Revoking the default leaves nothing behind it.
+    service.set_execution(&id, None, choice("inherit", None, false)).unwrap();
+    service.set_execution_default(None, false).unwrap();
+    assert_eq!(source(&service, "api").source, ExecutionSourceV1::None);
+    assert!(CollaborationServiceV1::new(Some(paths)).unwrap().execution_default().is_none());
+    // Each change is the user's, recorded on this device only.
+    let changes = entries(&service, &id)
+        .into_iter()
+        .filter(|entry| matches!(&entry.body, EntryBodyV1::User { action: UserActionV1::ExecutionChanged { .. } }))
+        .count();
+    assert_eq!(changes, 3);
+}

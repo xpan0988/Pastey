@@ -259,6 +259,28 @@ Boundary: make every state E01 hit visible and controllable, with no new authori
 
 Limits: the Journal note of a native wait is written by the scheduler (on a turn's end or its 30 s tick); the live count needs no tick. The trust rule for worktrees is inferred from one observation in E01 (Claude Code 2.1.318), not from documentation. No OS notification yet (R6). Not yet exercised against real Codex or Claude Code in the app.
 
+### R1: execution profile (2026-11-25)
+
+Boundary: carry user-authorised native settings to member turns; build no approval logic. Inspected first: a paired peer sends the same `CodexInvocationInputV1` as local starts, so a profile in invocation input would let a peer widen a Host's sandbox; Claude Code peers send a narrower input. The profile therefore never enters input.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| Profile type | `native_agent/execution_profile.rs`: Claude Code (permission mode, allow/deny rules, sandbox, allowed hosts, extra writable folders) and Codex (approval policy, reviewer, sandbox, network, writable roots); strict validation refuses `bypassPermissions`, `dangerFullAccess`, `untrusted`, multi-line rules, path-like hosts, root/home folders, `..` | `execution_profile::tests` |
+| Presets | Ask (nothing passed) and Unattended engineering (Claude: `acceptEdits`, sandbox with auto-allow, registries only, `~/.cargo` `~/.npm` `~/.rustup` writable, push/PR/release/publish/sudo denied; Codex: `workspaceWrite` + `~/.cargo` `~/.npm`, network off, `on-request` decided by `auto_review`) | same |
+| Core path | Held per task (`register_execution`), taken at that start, attached only to a Local conversation | `a_members_execution_profile_reaches_codex_turn_start_and_nothing_else`, `a_registered_profile_never_reaches_a_bridge_owned_task` |
+| Adapters | Claude Code: `--permission-mode` and one merged `--settings` (only on a member turn); Codex: fields added to `turn/start` (`run_turn_with`) | `a_members_execution_profile_reaches_claude_code_as_native_settings` and the Codex test above |
+| Hierarchy | User default (table `execution_defaults`, present only while authorised) → collaboration choice → member choice (`inherit`, `ask`, `profile`); consent required for every profile; resolved per turn, also for turns the user types in a member's conversation; `user` entries record changes on this device only | `execution_profiles_resolve_member_then_collaboration_then_the_users_default` |
+| UI | Settings → Unattended collaboration (set up, change, revoke); Execution… on a collaboration and on a member; the card shows the effective profile, its source and "configured, not verified"; consent shows exactly what each Agent gets and that auto-review is a judgement | build + type check |
+
+Live checks against the installed runtimes (observer probes, low effort, scratch folder):
+- **Claude Code 2.1.318** (`claude-haiku-5-5`, `--permission-mode acceptEdits`, the preset's settings): `cargo --version` ran sandboxed without a prompt; `git push origin main` was denied by the deny rule (`permission_denials`). US$0.004.
+- **Codex 0.170.0** (`codex app-server`, `turn/start` with `approvalPolicy: on-request`, `approvalsReviewer: auto_review`, `sandboxPolicy: workspaceWrite`, network off, effort low): fields accepted; `cargo --version` exit 0 with no request; `curl https://example.com` failed in the sandbox (exit 6) and Codex **did not escalate**, so `auto_review` was never asked. The thread's own default in an untrusted folder was `readOnly`, reviewer `user`.
+
+Limits and open decision:
+- **Codex cannot fetch dependencies under the preset.** Network off makes registry access fail rather than escalate; 0.170's only native switch is `networkAccess: true`, which is all outbound traffic (domain lists exist only as the experimental `features.network_proxy`, not settable per turn as measured). Whether "Unattended engineering" should turn Codex's network on is a security choice left to the user; the profile can be edited to do it.
+- Claude Code's effort and `auto` mode are not observable from its output; the preset avoids `auto` and uses the sandbox as the boundary.
+- Codex keeps turn overrides on the thread (see Layer 5).
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).

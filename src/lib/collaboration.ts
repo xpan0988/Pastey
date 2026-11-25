@@ -61,6 +61,50 @@ export interface RunningTurn {
   decisions?: NativeDecisionReview[];
 }
 
+/** Native permission, sandbox and approval settings a member's turns run
+ * with. Pastey passes them to the Agent's own mechanisms; it approves
+ * nothing itself. */
+export interface ExecutionProfile {
+  name: string;
+  claude: {
+    permissionMode?: string;
+    allow?: string[];
+    deny?: string[];
+    sandbox?: boolean;
+    sandboxAutoAllow?: boolean;
+    allowedDomains?: string[];
+    allowWrite?: string[];
+  };
+  codex: {
+    approvalPolicy?: string;
+    approvalsReviewer?: string;
+    sandbox?: string;
+    networkAccess?: boolean;
+    writableRoots?: string[];
+  };
+}
+
+/** The user's authorised default for every collaboration member. */
+export interface ExecutionDefault {
+  profile: ExecutionProfile;
+  authorizedAt: number;
+}
+
+export type ExecutionSource = "member" | "collaboration" | "default" | "none";
+
+/** What a member's next turn runs with: configured, not verified. */
+export interface EffectiveExecution {
+  name: string;
+  source: ExecutionSource;
+  lines: string[];
+  authorizedAt?: number;
+}
+
+export type ExecutionChoice =
+  | { kind: "inherit" }
+  | { kind: "ask" }
+  | { kind: "profile"; profile: ExecutionProfile; confirmed: boolean };
+
 /** The native model and effort of every turn the collaboration starts for
  * a member (absent: the Agent's own default). */
 export interface MemberOptions {
@@ -90,6 +134,10 @@ export interface CollaborationMember {
   invite?: { scopeRef: string; sent: boolean };
   /** Model and effort of the turns the collaboration starts for it. */
   options?: MemberOptions;
+  /** Its own execution choice (absent: the collaboration's). */
+  execution?: { kind: "ask" } | { kind: "profile"; profile: ExecutionProfile; authorizedAt: number };
+  /** What its next turn runs with (views only). */
+  effectiveExecution?: EffectiveExecution;
 }
 
 /** The other device a collaboration spans. */
@@ -110,6 +158,8 @@ export interface CollaborationSummary {
   link?: CollaborationLink;
   needsYou: number;
   lastActivityAt: number;
+  /** Its members' execution choice (absent: your default). */
+  execution?: { kind: "ask" } | { kind: "profile"; profile: ExecutionProfile; authorizedAt: number };
 }
 
 export interface PublishedSummary {
@@ -132,7 +182,9 @@ export type CollaborationUserAction =
   /** This device's user accepted the invitation for `alias`. */
   | { type: "accepted"; alias: string }
   /** The model and effort of `alias`'s turns changed. */
-  | { type: "options_changed"; alias: string; model?: string; effort?: string };
+  | { type: "options_changed"; alias: string; model?: string; effort?: string }
+  /** The execution choice of the collaboration, or of `alias`, changed. */
+  | { type: "execution_changed"; alias?: string; name: string };
 
 /** Paths that differ between two scans of a member's folder (each list at
  * most 20; `total` counts all). */
@@ -328,6 +380,54 @@ export function answerCollaborationInvitation(collaborationId: string, alias: st
 
 export function collaborationNeedsYouCount(): Promise<number> {
   return invoke("collaboration_needs_you_count");
+}
+
+export function listExecutionPresets(): Promise<ExecutionProfile[]> {
+  return invoke("list_execution_presets");
+}
+
+export function getExecutionDefault(): Promise<ExecutionDefault | null> {
+  return invoke("get_execution_default");
+}
+
+/** Authorises (after the user confirmed exactly what it passes) or revokes
+ * (`null`) the default every collaboration member inherits. */
+export function setExecutionDefault(profile: ExecutionProfile | null, confirmed: boolean): Promise<ExecutionDefault | null> {
+  return invoke("set_execution_default", { profile, confirmed });
+}
+
+/** Sets a collaboration's execution choice, or one member's (`alias`). */
+export function setCollaborationExecution(collaborationId: string, alias: string | null, choice: ExecutionChoice): Promise<CollaborationView> {
+  return invoke("set_collaboration_execution", { collaborationId, alias, choice });
+}
+
+/** Where a member's effective profile comes from, in words. */
+export function executionSourceLabel(source: ExecutionSource): string {
+  switch (source) {
+    case "member": return "chosen for this member";
+    case "collaboration": return "chosen for this collaboration";
+    case "default": return "your default";
+    case "none": return "nothing chosen";
+  }
+}
+
+/** What a profile passes to each Agent, in plain lines (mirrors Rust's
+ * `ExecutionProfileV1::describe`, for consent before anything is stored). */
+export function describeProfile(profile: ExecutionProfile, provider: CollaborationProvider): string[] {
+  if (provider === "claude_code") {
+    const claude = profile.claude;
+    const lines: string[] = [];
+    if (claude.permissionMode) lines.push(`Permission mode: ${claude.permissionMode}${claude.permissionMode === "auto" ? " (a classifier's judgement, not a boundary)" : ""}`);
+    if (claude.sandbox) lines.push(`Sandbox on: commands write only in the member's folder${(claude.allowWrite ?? []).length ? ` and ${(claude.allowWrite ?? []).join(", ")}` : ""}; network to ${(claude.allowedDomains ?? []).length ? (claude.allowedDomains ?? []).join(", ") : "no host"}${claude.sandboxAutoAllow ? "; sandboxed commands run without a prompt" : ""}`);
+    if ((claude.allow ?? []).length) lines.push(`Allowed: ${(claude.allow ?? []).join(", ")}`);
+    if ((claude.deny ?? []).length) lines.push(`Denied: ${(claude.deny ?? []).join(", ")}`);
+    return lines.length ? lines : ["Nothing passed: Claude Code's own settings; a headless turn declines what would prompt."];
+  }
+  const codex = profile.codex;
+  const lines: string[] = [];
+  if (codex.sandbox) lines.push(`Sandbox: ${codex.sandbox}${(codex.writableRoots ?? []).length ? ` (also writes ${(codex.writableRoots ?? []).join(", ")})` : ""}; network ${codex.networkAccess ? "on" : "off"}`);
+  if (codex.approvalPolicy) lines.push(`Approvals: ${codex.approvalPolicy}${codex.approvalsReviewer === "auto_review" ? ", decided by Codex's auto-review (a model's judgement, not a boundary)" : codex.approvalsReviewer === "user" ? ", asked of you" : ""}`);
+  return lines.length ? lines : ["Nothing passed: Codex's own configuration."];
 }
 
 /** Stops the turn running for this device's member: Stop's own

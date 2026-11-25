@@ -43,6 +43,7 @@ use crate::native_agent::{
     CLAUDE_CODE_CONVERSATION_CAPABILITY, CODEX_CAPABILITY_ID, CONVERSATION_UNAVAILABLE_CODE,
     MAX_MESSAGE_BODY_BYTES,
 };
+use crate::native_agent::execution_profile::ExecutionProfileV1;
 use crate::storage::{self, AppPaths};
 
 pub(crate) mod manifest;
@@ -167,6 +168,9 @@ pub(crate) struct MemberV1 {
     /// the collaboration starts for it (empty: the Agent's own default).
     #[serde(default, skip_serializing_if = "NativeSessionOptionsV1::is_empty")]
     pub(crate) options: NativeSessionOptionsV1,
+    /// This member's own execution choice (absent: the collaboration's).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution: Option<ExecutionChoiceV1>,
 }
 
 /// The auto grant: `turns` automatic turns until `expires_at` (seconds).
@@ -182,6 +186,87 @@ pub(crate) struct AutoGrantV1 {
 impl AutoGrantV1 {
     fn usable(&self, now: i64) -> bool {
         self.used < self.turns && now < self.expires_at
+    }
+}
+
+/// How a collaboration or a member chooses its execution profile. Absent
+/// (`None` where it is held): inherit from the level above.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum ExecutionChoiceV1 {
+    /// Nothing passed: each Agent's own configuration.
+    Ask,
+    /// This profile, authorised by this device's user at `authorized_at`.
+    Profile {
+        profile: ExecutionProfileV1,
+        #[serde(rename = "authorizedAt")]
+        authorized_at: i64,
+    },
+}
+
+/// This device's user's default for every collaboration member, once
+/// authorised (stored; revoking deletes it).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExecutionDefaultV1 {
+    pub(crate) profile: ExecutionProfileV1,
+    pub(crate) authorized_at: i64,
+}
+
+/// Where a member's effective profile comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionSourceV1 {
+    Member,
+    Collaboration,
+    Default,
+    /// No level chose one: nothing is passed.
+    None,
+}
+
+/// A member's effective execution profile, as views show it: configured,
+/// not verified.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EffectiveExecutionV1 {
+    pub(crate) name: String,
+    pub(crate) source: ExecutionSourceV1,
+    pub(crate) lines: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) authorized_at: Option<i64>,
+}
+
+/// A choice this device's user makes in the UI. A profile needs their
+/// explicit consent to exactly what it passes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ExecutionChoiceInputV1 {
+    /// `inherit`, `ask` or `profile`.
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) profile: Option<ExecutionProfileV1>,
+    #[serde(default)]
+    pub(crate) confirmed: bool,
+}
+
+impl ExecutionChoiceInputV1 {
+    /// `None`: inherit.
+    fn resolve(self, now: i64) -> AppResult<Option<ExecutionChoiceV1>> {
+        match self.kind.as_str() {
+            "inherit" => Ok(None),
+            "ask" => Ok(Some(ExecutionChoiceV1::Ask)),
+            "profile" => {
+                let profile = self
+                    .profile
+                    .ok_or_else(|| AppError::InvalidInput("Choose a profile.".into()))?;
+                profile.validate()?;
+                if !self.confirmed {
+                    return invalid("An execution profile is used only after you confirm what it lets the Agents do.");
+                }
+                Ok(Some(ExecutionChoiceV1::Profile { profile, authorized_at: now }))
+            }
+            _ => invalid("Unknown execution choice."),
+        }
     }
 }
 
@@ -271,6 +356,9 @@ pub(crate) struct CollaborationRecordV1 {
     /// The other device it spans (M4: at most one), over one Bridge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) link: Option<remote::BridgeLinkV1>,
+    /// Its members' execution choice (absent: the user's default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) execution: Option<ExecutionChoiceV1>,
 }
 
 /// Where an entry's content comes from.
@@ -308,6 +396,13 @@ pub(crate) enum UserActionV1 {
     Decided { entry: String, confirmed: bool },
     /// This device's user accepted the invitation for `alias`.
     Accepted { alias: String },
+    /// The execution choice of the collaboration (`alias` absent) or of a
+    /// member changed: `name` of the profile now chosen, `inherit` or `Ask`.
+    ExecutionChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+        name: String,
+    },
     /// The model and effort of `alias`'s turns changed (empty: the Agent's
     /// own default).
     OptionsChanged {
@@ -472,6 +567,8 @@ pub(crate) struct StartPlanV1 {
     pub(crate) automatic: bool,
     /// The member's chosen model and effort.
     pub(crate) options: NativeSessionOptionsV1,
+    /// The member's effective execution profile (absent: nothing passed).
+    pub(crate) execution: Option<ExecutionProfileV1>,
 }
 
 /// What the runtime knows of a member's folder now.
@@ -494,6 +591,8 @@ pub(crate) struct MemberViewV1 {
     /// The turn running in its folder now, with its reported activity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) live: Option<RunningTurnV1>,
+    /// What its next turn runs with (configured, not verified).
+    pub(crate) effective_execution: EffectiveExecutionV1,
 }
 
 /// The linked device, as views show it.
@@ -519,6 +618,9 @@ pub(crate) struct CollaborationSummaryV1 {
     pub(crate) link: Option<LinkViewV1>,
     pub(crate) needs_you: usize,
     pub(crate) last_activity_at: i64,
+    /// Its members' execution choice (absent: the user's default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) execution: Option<ExecutionChoiceV1>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -595,6 +697,8 @@ pub(crate) struct CollaborationServiceV1 {
     /// Running turns whose native wait is already in the Journal
     /// (process-local: no native turn survives a restart).
     noted_waits: std::collections::HashSet<String>,
+    /// This device's user's authorised default execution profile.
+    execution_default: Option<ExecutionDefaultV1>,
 }
 
 fn now() -> i64 {
@@ -696,10 +800,15 @@ impl CollaborationServiceV1 {
             declines: Vec::new(),
             syncing: Arc::default(),
             noted_waits: Default::default(),
+            execution_default: None,
         };
         let Some(paths) = service.paths.clone() else {
             return Ok(service);
         };
+        // A default that no longer reads as a valid profile is not used.
+        service.execution_default = storage::load_execution_default(&paths)?
+            .and_then(|json| serde_json::from_str::<ExecutionDefaultV1>(&json).ok())
+            .filter(|default| default.profile.validate().is_ok());
         for stored in storage::load_collaborations(&paths)? {
             // A sealed record whose Bridge key is gone (Burn) is deleted; one
             // unreadable for another reason never keeps Pastey from starting.
@@ -833,7 +942,9 @@ impl CollaborationServiceV1 {
         // like its folder: they stay here.
         let device_private = matches!(
             &body,
-            EntryBodyV1::User { action: UserActionV1::OptionsChanged { .. } }
+            EntryBodyV1::User {
+                action: UserActionV1::OptionsChanged { .. } | UserActionV1::ExecutionChanged { .. }
+            }
         );
         let outbox = item
             .record
@@ -948,6 +1059,7 @@ impl CollaborationServiceV1 {
             remote: false,
             invite: None,
             options: input.options.clone(),
+            execution: None,
         })
     }
 
@@ -993,6 +1105,7 @@ impl CollaborationServiceV1 {
         }
         let id = format!("collaboration:{}", Uuid::new_v4());
         let record = CollaborationRecordV1 {
+            execution: None,
             schema_version: SCHEMA_VERSION.into(),
             id: id.clone(),
             name: name.to_owned(),
@@ -1989,6 +2102,7 @@ impl CollaborationServiceV1 {
                     entry_ids,
                     automatic,
                     options: member.options.clone(),
+                    execution: self.effective_execution(item, member).0,
                 });
             }
         }
@@ -2170,6 +2284,120 @@ impl CollaborationServiceV1 {
             .collect()
     }
 
+    /// The execution profile `member`'s next turn runs with, and how views
+    /// show it: the member's own choice, else the collaboration's, else the
+    /// user's authorised default, else nothing passed.
+    fn effective_execution(&self, item: &CollaborationV1, member: &MemberV1) -> (Option<ExecutionProfileV1>, EffectiveExecutionV1) {
+        let claude_code = member.provider == ProviderV1::ClaudeCode;
+        let (choice, source) = match (&member.execution, &item.record.execution, &self.execution_default) {
+            (Some(choice), _, _) => (Some(choice.clone()), ExecutionSourceV1::Member),
+            (None, Some(choice), _) => (Some(choice.clone()), ExecutionSourceV1::Collaboration),
+            (None, None, Some(default)) => (
+                Some(ExecutionChoiceV1::Profile {
+                    profile: default.profile.clone(),
+                    authorized_at: default.authorized_at,
+                }),
+                ExecutionSourceV1::Default,
+            ),
+            (None, None, None) => (None, ExecutionSourceV1::None),
+        };
+        match choice {
+            Some(ExecutionChoiceV1::Profile { profile, authorized_at }) if !member.remote => {
+                let view = EffectiveExecutionV1 {
+                    name: profile.name.clone(),
+                    source,
+                    lines: profile.describe(claude_code),
+                    authorized_at: Some(authorized_at),
+                };
+                (Some(profile), view)
+            }
+            _ => (
+                None,
+                EffectiveExecutionV1 {
+                    name: "Ask".into(),
+                    source,
+                    lines: ExecutionProfileV1::ask().describe(claude_code),
+                    authorized_at: None,
+                },
+            ),
+        }
+    }
+
+    /// The execution profile of this device's member that is `provider`'s
+    /// conversation in `workspace`, if any: a turn its user types there runs
+    /// with it too.
+    pub(crate) fn member_execution(&self, provider: ProviderV1, workspace: &Path) -> Option<ExecutionProfileV1> {
+        let workspace = workspace.canonicalize().ok()?;
+        let (id, alias) = self.member_of(provider, &workspace)?;
+        let item = self.items.get(&id)?;
+        if item.record.state == CollaborationStateV1::Ended {
+            return None;
+        }
+        self.effective_execution(item, item.member(&alias)?).0
+    }
+
+    /// The user's authorised default, if any.
+    pub(crate) fn execution_default(&self) -> Option<ExecutionDefaultV1> {
+        self.execution_default.clone()
+    }
+
+    /// Authorises (`Some`, after the user confirmed exactly what it
+    /// passes) or revokes (`None`) the default every collaboration member
+    /// inherits. It applies from each member's next turn.
+    pub(crate) fn set_execution_default(&mut self, profile: Option<ExecutionProfileV1>, confirmed: bool) -> AppResult<()> {
+        let default = match profile {
+            Some(profile) => {
+                profile.validate()?;
+                if !confirmed {
+                    return invalid("An execution profile is used only after you confirm what it lets the Agents do.");
+                }
+                Some(ExecutionDefaultV1 { profile, authorized_at: now() })
+            }
+            None => None,
+        };
+        if let Some(paths) = self.paths.as_ref() {
+            let json = default.as_ref().map(serde_json::to_string).transpose()?;
+            storage::save_execution_default(paths, json.as_deref())?;
+        }
+        self.execution_default = default;
+        Ok(())
+    }
+
+    /// Sets the collaboration's execution choice (`alias` absent) or one
+    /// of this device's members'. A user entry records it on this device.
+    pub(crate) fn set_execution(&mut self, id: &str, alias: Option<&str>, choice: ExecutionChoiceInputV1) -> AppResult<()> {
+        let choice = choice.resolve(now())?;
+        let name = match &choice {
+            None => "inherit".to_owned(),
+            Some(ExecutionChoiceV1::Ask) => "Ask".to_owned(),
+            Some(ExecutionChoiceV1::Profile { profile, .. }) => profile.name.clone(),
+        };
+        let item = self.item_mut(id)?;
+        match alias {
+            Some(alias) => {
+                let Some(member) = item.member_mut(alias).filter(|member| !member.remote) else {
+                    return invalid("That member is not on this device.");
+                };
+                member.execution = choice;
+            }
+            None => item.record.execution = choice,
+        }
+        self.save_record(id)?;
+        self.append(
+            id,
+            alias,
+            BasisV1::User,
+            EntryBodyV1::User {
+                action: UserActionV1::ExecutionChanged {
+                    alias: alias.map(str::to_owned),
+                    name,
+                },
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// This device's member `alias`'s folder (for Stop and live state).
     pub(crate) fn local_member_folder(&self, id: &str, alias: &str) -> AppResult<PathBuf> {
         let item = self.item(id)?;
@@ -2279,6 +2507,7 @@ impl CollaborationServiceV1 {
                         busy,
                         waiting: item.waiting_for(&member.alias),
                         live,
+                        effective_execution: self.effective_execution(item, member).1,
                     }
                 })
                 .collect(),
@@ -2303,6 +2532,7 @@ impl CollaborationServiceV1 {
                         .sum::<usize>()
                 },
             last_activity_at: item.last_activity_at(),
+            execution: item.record.execution.clone(),
         }
     }
 
@@ -3002,17 +3232,19 @@ pub(crate) fn drive(runtime: &HostRuntime) {
         let result = {
             let mut natives = runtime.native_agents.lock();
             match plan.provider {
-                ProviderV1::Codex => natives.start_codex_conversation_task(
+                ProviderV1::Codex => natives.start_codex_member_task(
                     &plan.workspace,
                     &plan.prompt,
                     false,
                     &turn_options(&plan.options),
+                    plan.execution.as_ref(),
                 ),
                 ProviderV1::ClaudeCode => natives.start_claude_code_member_task(
                     &plan.workspace,
                     &plan.prompt,
                     false,
                     &turn_options(&plan.options),
+                    plan.execution.as_ref(),
                 ),
             }
         };

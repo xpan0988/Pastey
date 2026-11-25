@@ -1297,22 +1297,30 @@ pub fn start_native_codex_task(
 ) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
     // A collaboration member's turn carries the collaboration note (and its
     // first, the briefing); its folder is scanned for file state.
-    let (task, _) = crate::collaboration::user_turn_task(
+    let (task, member) = crate::collaboration::user_turn_task(
         &state,
         crate::collaboration::ProviderV1::Codex,
         std::path::Path::new(&workspace),
         &task,
     );
-    state
-        .native_agents
-        .lock()
-        .start_codex_conversation_task(
-            std::path::Path::new(&workspace),
-            &task,
-            new_conversation.unwrap_or(false),
-            &options.unwrap_or_default(),
-        )
-        .map_err(|error| error.message())
+    let execution = member
+        .then(|| {
+            state
+                .collaborations
+                .lock()
+                .member_execution(crate::collaboration::ProviderV1::Codex, std::path::Path::new(&workspace))
+        })
+        .flatten();
+    let mut natives = state.native_agents.lock();
+    let path = std::path::Path::new(&workspace);
+    let new_conversation = new_conversation.unwrap_or(false);
+    let options = options.unwrap_or_default();
+    if member {
+        natives.start_codex_member_task(path, &task, new_conversation, &options, execution.as_ref())
+    } else {
+        natives.start_codex_conversation_task(path, &task, new_conversation, &options)
+    }
+    .map_err(|error| error.message())
 }
 
 /// Runs Claude Code in a folder of this device: continuing this device's
@@ -1335,12 +1343,20 @@ pub fn start_native_claude_code_task(
         std::path::Path::new(&workspace),
         &task,
     );
+    let execution = member
+        .then(|| {
+            state
+                .collaborations
+                .lock()
+                .member_execution(crate::collaboration::ProviderV1::ClaudeCode, std::path::Path::new(&workspace))
+        })
+        .flatten();
     let mut natives = state.native_agents.lock();
     let workspace = std::path::Path::new(&workspace);
     let new_conversation = new_conversation.unwrap_or(false);
     let options = options.unwrap_or_default();
     if member {
-        natives.start_claude_code_member_task(workspace, &task, new_conversation, &options)
+        natives.start_claude_code_member_task(workspace, &task, new_conversation, &options, execution.as_ref())
     } else {
         natives.start_claude_code_conversation_task(workspace, &task, new_conversation, &options)
     }
@@ -1466,6 +1482,55 @@ pub fn stop_collaboration_member(
             .cancel_task(&running.task_id)
             .map_err(|error| error.message())?;
     }
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// The execution presets Pastey offers (native settings only).
+#[tauri::command]
+pub fn list_execution_presets() -> Vec<crate::native_agent::execution_profile::ExecutionProfileV1> {
+    vec![
+        crate::native_agent::execution_profile::ExecutionProfileV1::ask(),
+        crate::native_agent::execution_profile::ExecutionProfileV1::unattended_engineering(),
+    ]
+}
+
+/// This device's user's authorised default execution profile, if any.
+#[tauri::command]
+pub fn get_execution_default(
+    state: State<'_, Arc<AppState>>,
+) -> Option<crate::collaboration::ExecutionDefaultV1> {
+    state.collaborations.lock().execution_default()
+}
+
+/// Authorises (with `confirmed`, after the user saw exactly what it passes)
+/// or revokes (`profile` absent) the default every collaboration member
+/// inherits. A local command only: nothing a peer sends reaches it.
+#[tauri::command]
+pub fn set_execution_default(
+    profile: Option<crate::native_agent::execution_profile::ExecutionProfileV1>,
+    confirmed: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Option<crate::collaboration::ExecutionDefaultV1>, String> {
+    let mut collaborations = state.collaborations.lock();
+    collaborations
+        .set_execution_default(profile, confirmed)
+        .map_err(|error| error.message())?;
+    Ok(collaborations.execution_default())
+}
+
+/// Sets a collaboration's execution choice, or one member's (`alias`).
+#[tauri::command]
+pub fn set_collaboration_execution(
+    collaboration_id: String,
+    alias: Option<String>,
+    choice: crate::collaboration::ExecutionChoiceInputV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .set_execution(&collaboration_id, alias.as_deref(), choice)
+        .map_err(|error| error.message())?;
     collaboration_view(&state, &collaboration_id)
 }
 

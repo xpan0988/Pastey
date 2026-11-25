@@ -226,6 +226,10 @@ pub(crate) struct NativeConversationV1 {
     /// conversation began, kept durably by Core. Present only when the
     /// invocation continues.
     pub(crate) continuation: Option<OpaqueCapabilityPayloadV1>,
+    /// The native permission, sandbox and approval settings this Host's
+    /// own user chose for this run (a collaboration member's turn); absent
+    /// for everything else. Set by Core only, never from input.
+    pub(crate) execution: Option<super::execution_profile::ExecutionProfileV1>,
 }
 
 pub(crate) struct StartedInvocationV1 {

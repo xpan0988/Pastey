@@ -1,4 +1,5 @@
 import { open } from "@tauri-apps/plugin-dialog";
+import { ExecutionDefaultSettings } from "./ExecutionProfiles";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { readAppearance, saveAppearance, type Appearance } from "../../lib/appearance";
@@ -244,6 +245,7 @@ function AgentSettings() {
         <div className="setting-row"><span><strong>Developer Mode terminals</strong><small>Each terminal request needs a separate Accept on the device it opens on, unless that device gave the requester Full Access.</small></span><span className="value">Reviewed unless Full Access</span></div>
       </div>
     </section>
+    <ExecutionDefaultSettings />
     <ProviderSettings />
   </>;
 }

@@ -906,6 +906,13 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
                 options: parsed.options,
                 existing: None,
                 refuse_peer_messages: parsed.refuse_peer_messages,
+                // A member's own profile: only with the member's refusal of
+                // other sessions' messages, which only local input sets.
+                execution: conversation
+                    .as_ref()
+                    .filter(|_| parsed.refuse_peer_messages)
+                    .and_then(|conversation| conversation.execution.as_ref())
+                    .map(|profile| profile.claude.clone()),
             }),
         })
     }
@@ -1071,6 +1078,7 @@ impl HeadlessContinuationV1 {
                 expected_marker: turn.expected_marker,
             }),
             refuse_peer_messages: false,
+            execution: None,
         }))
     }
 
@@ -1163,6 +1171,9 @@ struct ConversationRunV1 {
     /// Passes `--settings` refusing the user's other sessions' messages
     /// (a collaboration member's turn).
     refuse_peer_messages: bool,
+    /// The permission mode, rules and sandbox this Host's user chose for a
+    /// collaboration member (Core sets it only for a Local conversation).
+    execution: Option<crate::native_agent::execution_profile::ClaudeExecutionV1>,
 }
 
 /// An existing session a run continues, as its user chose it.
@@ -1283,6 +1294,22 @@ fn claude_activity(event: &Value, pending_edits: &mut HashMap<String, Vec<PathBu
 }
 
 impl ConversationRunV1 {
+    /// This run's `--settings`, if it passes any.
+    fn run_settings(&self) -> Option<String> {
+        if !self.refuse_peer_messages {
+            return None;
+        }
+        let mut settings: Value = serde_json::from_str(REFUSE_PEER_MESSAGES_SETTINGS).ok()?;
+        if let Some(extra) = self.execution.as_ref().map(|execution| execution.settings()) {
+            if let (Some(target), Some(extra)) = (settings.as_object_mut(), extra.as_object()) {
+                for (key, value) in extra {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        Some(settings.to_string())
+    }
+
     fn launch(&self) -> std::io::Result<ClaudeProcessV1> {
         let session_flag = match self.continuity {
             NativeConversationContinuityV1::New => "--session-id",
@@ -1307,11 +1334,18 @@ impl ConversationRunV1 {
         if let Some(effort) = self.options.effort.as_deref() {
             args.extend(["--effort", effort]);
         }
+        // The member's permission mode (never `bypassPermissions`).
+        if let Some(mode) = self.execution.as_ref().and_then(|execution| execution.permission_mode_arg()) {
+            args.extend(["--permission-mode", mode]);
+        }
         // Measured with 2.1.318 (tools/collab-probe): with this a `-p` run
         // takes no message from the user's other Claude Code sessions;
         // without it one arrives between tool calls of the running turn.
-        if self.refuse_peer_messages {
-            args.extend(["--settings", REFUSE_PEER_MESSAGES_SETTINGS]);
+        // A member's rules and sandbox ride in the same per-run settings,
+        // applied above the user's own files and below managed settings.
+        let settings = self.run_settings();
+        if let Some(settings) = settings.as_deref() {
+            args.extend(["--settings", settings]);
         }
         match &self.launcher {
             #[cfg(unix)]

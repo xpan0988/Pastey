@@ -341,6 +341,14 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             updated_at INTEGER NOT NULL
         );
 
+        -- This device's user's default execution profile for collaboration
+        -- members (one row, present only while authorised).
+        CREATE TABLE IF NOT EXISTS execution_defaults (
+            id TEXT PRIMARY KEY,
+            record_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS collaboration_entries (
             id TEXT PRIMARY KEY,
             collaboration_id TEXT NOT NULL,
@@ -1749,6 +1757,39 @@ pub(crate) fn save_collaboration(paths: &AppPaths, id: &str, record_json: &str) 
         "#,
         params![id, record_json, now_ts()],
     )?;
+    Ok(())
+}
+
+/// The user's default execution profile record, if authorised.
+pub(crate) fn load_execution_default(paths: &AppPaths) -> AppResult<Option<String>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare("SELECT record_json FROM execution_defaults WHERE id = 'default'")?;
+    let mut rows = statement.query([])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
+/// Stores (`Some`) or revokes (`None`) the user's default execution profile.
+pub(crate) fn save_execution_default(paths: &AppPaths, record_json: Option<&str>) -> AppResult<()> {
+    let conn = connection(paths)?;
+    match record_json {
+        Some(json) => {
+            conn.execute(
+                r#"
+                INSERT INTO execution_defaults (id, record_json, updated_at) VALUES ('default', ?1, ?2)
+                ON CONFLICT(id) DO UPDATE SET
+                    record_json = excluded.record_json,
+                    updated_at = excluded.updated_at
+                "#,
+                params![json, now_ts()],
+            )?;
+        }
+        None => {
+            conn.execute("DELETE FROM execution_defaults WHERE id = 'default'", [])?;
+        }
+    }
     Ok(())
 }
 
