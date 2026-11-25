@@ -1298,10 +1298,10 @@ fn a_new_collaboration_starts_no_turn_until_every_member_is_ready() {
         checks: Vec::new(),
         facts: vec![readiness::FactV1 { text: format!("{alias} can run cargo"), basis: readiness::FactBasisV1::Probed }],
     };
-    assert!(service.release(&id, &[ready("api", true), ready("web", false)]).is_err());
-    assert!(service.release(&id, &[ready("api", true)]).is_err(), "every member must be covered");
+    assert!(service.release(&id, &[ready("api", true), ready("web", false)], false).is_err());
+    assert!(service.release(&id, &[ready("api", true)], false).is_err(), "every member must be covered");
     assert!(service.plan_starts(free).is_empty());
-    service.release(&id, &[ready("api", true), ready("web", true)]).unwrap();
+    service.release(&id, &[ready("api", true), ready("web", true)], false).unwrap();
     // Released: both start together, and each one's prompt tells it what
     // the other can do, with how that is known.
     let plans = service.plan_starts(free);
@@ -1560,4 +1560,126 @@ fn preferences_reach_each_member_once_per_version_and_grant_nothing() {
     assert!(service
         .set_preferences(preferences::PreferencesInputV1 { restrictions: "x".repeat(preferences::MAX_SECTION_CHARS + 1), ..Default::default() })
         .is_err());
+}
+
+fn plan_first(fixture: &FixtureV1) -> (CollaborationServiceV1, String) {
+    let mut service = CollaborationServiceV1::new(None).unwrap();
+    let id = service.create("mobile", "Investigate, design, and implement mobile support", fixture.members()).unwrap();
+    let ready = |alias: &str| readiness::MemberReadinessV1 { alias: alias.into(), provider: ProviderV1::Codex, ready: true, checks: Vec::new(), facts: Vec::new() };
+    service.release(&id, &[ready("api"), ready("web")], true).unwrap();
+    // Both may edit (so a plan's file claims are authorised).
+    service.set_execution_default(Some(ExecutionProfileV1::unattended_engineering()), true).unwrap();
+    service.set_grant(&id, "api", 20, 24, crate::storage::now_ts()).unwrap();
+    service.set_grant(&id, "web", 20, 24, crate::storage::now_ts()).unwrap();
+    (service, id)
+}
+
+const PROPOSAL: &str = "```pastey-plan\nunderstanding: a phone is a Bridge peer\ntask split: Split the crate | owner=api | paths=src-tauri/** | deliver=lib crate\ntask ui: Phone layout | owner=web | paths=src/** | after=split\nintegration: web merges api's branch\n```\n";
+
+#[test]
+fn members_plan_read_only_converge_on_one_valid_plan_and_then_implement() {
+    let fixture = FixtureV1::new("plan-first");
+    let (mut service, id) = plan_first(&fixture);
+    service.user_message(&id, "api", "Investigate, design, and implement mobile support.").unwrap();
+    service.user_message(&id, "web", "Investigate, design, and implement mobile support.").unwrap();
+    let plans = service.plan_starts(free);
+    assert_eq!(plans.len(), 2);
+    for plan in &plans {
+        let execution = plan.execution.as_ref().unwrap();
+        // Planning turns run in each Agent's own read-only mode, deny rules kept.
+        assert_eq!(execution.claude.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(execution.codex.sandbox.as_deref(), Some("read-only"));
+        assert!(execution.claude.deny.iter().any(|rule| rule.contains("git push")));
+        assert!(plan.prompt.contains("[Planning phase"), "{}", plan.prompt);
+    }
+    // api proposes; web reads only so far.
+    service.started(&plans[0], "p1").unwrap();
+    service.started(&plans[1], "p2").unwrap();
+    service.turn_ended(&ended("p1", ProviderV1::Codex, &fixture.api, Some(PROPOSAL))).unwrap();
+    service.turn_ended(&ended("p2", ProviderV1::ClaudeCode, &fixture.web, Some("Reading."))).unwrap();
+    assert_eq!(service.item(&id).unwrap().record.phase, PhaseV1::Planning, "one acceptance is not agreement");
+    // web is told about r1 and accepts it: converged, adopted.
+    let next = service.plan_starts(free);
+    let web = next.iter().find(|plan| plan.alias == "web").unwrap();
+    assert!(web.prompt.contains("Plan proposal r1 from api"), "{}", web.prompt);
+    service.started(web, "p3").unwrap();
+    service.turn_ended(&ended("p3", ProviderV1::ClaudeCode, &fixture.web, Some("Agreed.\n\n```pastey-plan accept=r1\n```\n"))).unwrap();
+    let record = &service.item(&id).unwrap().record;
+    assert_eq!((record.phase, record.adopted), (PhaseV1::Implementing, Some(1)));
+    // Implementation turns: normal execution again, each told its commitments.
+    let implementing = service.plan_starts(free);
+    let api = implementing.iter().find(|plan| plan.alias == "api").unwrap();
+    assert_eq!(api.execution.as_ref().unwrap().codex.sandbox.as_deref(), Some("workspace-write"));
+    assert!(api.prompt.contains("Your commitments: split"), "{}", api.prompt);
+    assert!(api.prompt.contains("Ready to start now: split"), "{}", api.prompt);
+    let web = implementing.iter().find(|plan| plan.alias == "web").unwrap();
+    assert!(web.prompt.contains("Ready to start now: none"), "{}", web.prompt);
+    // api finishes split: web is told its task is ready.
+    service.started(api, "i1").unwrap();
+    service
+        .turn_ended(&ended("i1", ProviderV1::Codex, &fixture.api, Some("Done.\n\n```pastey-plan\ndone: split artifact=exp/api@0123456789abcdef\n```\n")))
+        .unwrap();
+    let ready: Vec<EntryV1> = entries(&service, &id)
+        .into_iter()
+        .filter(|entry| matches!(&entry.body, EntryBodyV1::Message { from, subject, to, .. } if from == PASTEY_ALIAS && subject == "Ready: task ui" && to == "web"))
+        .collect();
+    assert_eq!(ready.len(), 1);
+    // The commit was checked (this folder is no repository: not found).
+    assert!(entries(&service, &id).iter().any(|entry| matches!(&entry.body,
+        EntryBodyV1::PlanProgress { verified, .. } if verified.iter().any(|line| line.contains("0123456789abcdef")))));
+}
+
+#[test]
+fn a_plan_that_does_not_converge_pauses_and_conflicting_work_is_never_released() {
+    let fixture = FixtureV1::new("plan-stuck");
+    let (mut service, id) = plan_first(&fixture);
+    service.user_message(&id, "api", "Go.").unwrap();
+    // Overlapping claims: both want src/**.
+    let overlapping = PROPOSAL.replace("paths=src-tauri/**", "paths=src/**");
+    let mut round = 0;
+    while service.item(&id).unwrap().record.state == CollaborationStateV1::Active {
+        let plans = service.plan_starts(free);
+        assert!(!plans.is_empty(), "stalled without pausing");
+        for plan in plans {
+            round += 1;
+            let task = format!("r{round}");
+            service.started(&plan, &task).unwrap();
+            let (provider, workspace) = if plan.alias == "api" { (ProviderV1::Codex, &fixture.api) } else { (ProviderV1::ClaudeCode, &fixture.web) };
+            // Everyone even accepts the latest: problems keep it from adoption.
+            let reply = if plan.alias == "api" { overlapping.clone() } else { "```pastey-plan accept=r1\n```\n".to_owned() };
+            service.turn_ended(&ended(&task, provider, workspace, Some(&reply))).unwrap();
+            assert_ne!(service.item(&id).unwrap().record.phase, PhaseV1::Implementing);
+        }
+        assert!(round < 20);
+    }
+    assert_eq!(service.item(&id).unwrap().record.state, CollaborationStateV1::Paused);
+    assert!(entries(&service, &id).iter().any(|entry| entry.needs_user()
+        && matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("did not converge") && text.contains("both claim"))));
+    // The user may adopt only a revision without problems.
+    assert!(service.adopt_by_user(&id, 1).is_err());
+}
+
+#[test]
+fn the_user_may_adopt_a_valid_revision_and_claimed_files_crossed_are_flagged() {
+    let fixture = FixtureV1::new("plan-adopt");
+    let (mut service, id) = plan_first(&fixture);
+    service.user_message(&id, "api", "Go.").unwrap();
+    let plans = service.plan_starts(free);
+    service.started(&plans[0], "p1").unwrap();
+    service.turn_ended(&ended("p1", ProviderV1::Codex, &fixture.api, Some(PROPOSAL))).unwrap();
+    service.adopt_by_user(&id, 1).unwrap();
+    assert!(entries(&service, &id).iter().any(|entry| entry.basis == BasisV1::User
+        && matches!(entry.body, EntryBodyV1::PlanAdopted { revision: 1, by_user: true })));
+    // web edits a file api's task claims: flagged, not reverted.
+    let plans = service.plan_starts(free);
+    let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
+    service.started(web, "i1").unwrap();
+    let mut activity = crate::native_agent::TaskActivityV1::new(crate::storage::now_ts());
+    activity.files = vec!["src-tauri/src/lib.rs".into(), "src/app.tsx".into()];
+    activity.files_changed = 2;
+    service
+        .turn_ended(&TurnEndedV1 { activity: Some(activity), ..ended("i1", ProviderV1::ClaudeCode, &fixture.web, Some("Done.")) })
+        .unwrap();
+    assert!(entries(&service, &id).iter().any(|entry| entry.needs_user()
+        && matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("src-tauri/src/lib.rs (claimed by api's task split)") && !text.contains("src/app.tsx"))));
 }

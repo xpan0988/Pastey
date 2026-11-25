@@ -304,6 +304,12 @@ fn read_wire_entry(value: &Value) -> AppResult<IncomingV1> {
         },
         EntryBodyV1::Member { alias, role, .. } => valid_alias(alias) && role.chars().count() <= MAX_ROLE_CHARS,
         EntryBodyV1::Grant { alias, .. } => valid_alias(alias),
+        // Plans stay on the device of a collaboration that planned (plan
+        // first is refused for a linked one): a peer's is refused.
+        EntryBodyV1::PlanProposed { .. }
+        | EntryBodyV1::PlanAccepted { .. }
+        | EntryBodyV1::PlanAdopted { .. }
+        | EntryBodyV1::PlanProgress { .. } => false,
         EntryBodyV1::Wait { on, reason, .. } => {
             (on == USER_ALIAS || valid_alias(on)) && reason.chars().count() <= MAX_SUBJECT_CHARS
         }
@@ -449,6 +455,8 @@ impl CollaborationServiceV1 {
             execution: None,
             facts: Vec::new(),
             preferences_seen: String::new(),
+            planning_turns: 0,
+            stance: None,
             alias: alias.clone(),
             provider: input.provider,
             workspace: String::new(),
@@ -747,6 +755,8 @@ impl CollaborationServiceV1 {
             execution: None,
             facts: Vec::new(),
             preferences_seen: String::new(),
+            planning_turns: 0,
+            stance: None,
                 alias: member.alias.clone(),
                 provider: member.provider,
                 workspace: String::new(),
@@ -765,6 +775,8 @@ impl CollaborationServiceV1 {
             execution: None,
             facts: Vec::new(),
             preferences_seen: String::new(),
+            planning_turns: 0,
+            stance: None,
             alias: invitation.member.alias.clone(),
             provider: invitation.member.provider,
             workspace: workspace.to_string_lossy().into_owned(),
@@ -783,6 +795,9 @@ impl CollaborationServiceV1 {
             released: true,
             no_progress: 0,
             preferences_note: String::new(),
+            plan_first: false,
+            phase: super::PhaseV1::Implementing,
+            adopted: None,
             schema_version: SCHEMA_VERSION.into(),
             id: invitation.collaboration_id.clone(),
             name: invitation.name.clone(),
@@ -995,6 +1010,8 @@ impl CollaborationServiceV1 {
             execution: None,
             facts: Vec::new(),
             preferences_seen: String::new(),
+            planning_turns: 0,
+            stance: None,
                             alias: alias.clone(),
                             provider: *provider,
                             workspace: String::new(),

@@ -177,6 +177,11 @@ export interface CollaborationSummary {
   released?: boolean;
   /** This collaboration's own preferences, beside your profile. */
   preferencesNote?: string;
+  /** Plan-first: whether members plan together first, where they are, and
+   * the adopted shared plan's revision. */
+  planFirst?: boolean;
+  phase?: "planning" | "implementing";
+  adopted?: number;
 }
 
 export interface PublishedSummary {
@@ -243,6 +248,12 @@ export type CollaborationEntryBody =
   | ({ type: "files_outside"; alias: string } & FileChanges)
   | { type: "grant"; alias: string; change: "granted"; turns: number; expiresAt: number }
   | { type: "grant"; alias: string; change: "ended"; reason: GrantEnd }
+  /** Plan-first (R5): a proposal (with Pastey's checks), an acceptance, the
+   * adopted shared plan, and progress on it. */
+  | { type: "plan_proposed"; revision: number; proposal: PlanProposal; problems?: string[] }
+  | { type: "plan_accepted"; revision: number }
+  | { type: "plan_adopted"; revision: number; byUser?: boolean }
+  | { type: "plan_progress"; items: Array<{ task: string; done: boolean; detail?: string }>; verified?: string[] }
   /** A member declared it cannot go on until `on` answers (R3). */
   | { type: "wait"; on: string; reason: string; until: number };
 
@@ -423,14 +434,22 @@ export interface MemberReadiness {
   facts: MemberFact[];
 }
 
+export interface PlanTask { id: string; title: string; owner: string; paths?: string[]; after?: string[]; deliver?: string }
+export interface PlanProposal { understanding?: string; tasks: PlanTask[]; integration?: string }
+
+/** Adopts a plan revision without structural problems (your decision). */
+export function adoptCollaborationPlan(collaborationId: string, revision: number): Promise<CollaborationView> {
+  return invoke("adopt_collaboration_plan", { collaborationId, revision });
+}
+
 /** Checks every member now, without a model call (a few seconds). */
 export function checkCollaborationReadiness(collaborationId: string): Promise<MemberReadiness[]> {
   return invoke("check_collaboration_readiness", { collaborationId });
 }
 
 /** Releases the collaboration once every member is ready (checked again). */
-export function releaseCollaboration(collaborationId: string): Promise<CollaborationView> {
-  return invoke("release_collaboration", { collaborationId });
+export function releaseCollaboration(collaborationId: string, planFirst: boolean): Promise<CollaborationView> {
+  return invoke("release_collaboration", { collaborationId, planFirst });
 }
 
 /** Your preference profile for Agents: guidance they interpret, never

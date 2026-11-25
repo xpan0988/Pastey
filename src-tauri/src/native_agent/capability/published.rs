@@ -23,6 +23,9 @@ const MAX_ALIAS_CHARS: usize = 32;
 const MESSAGE_FENCE: &str = "```pastey-message";
 const SUMMARY_FENCE: &str = "```pastey-summary";
 const WAIT_FENCE: &str = "```pastey-wait";
+const PLAN_FENCE: &str = "```pastey-plan";
+/// A plan block's bound: a whole proposal of up to 30 tasks.
+pub(crate) const MAX_PLAN_BYTES: usize = 6 * 1024;
 /// A declared wait lasts at least this and at most a day (minutes).
 pub(crate) const MIN_WAIT_MINUTES: u32 = 5;
 pub(crate) const MAX_WAIT_MINUTES: u32 = 24 * 60;
@@ -61,6 +64,15 @@ pub(crate) struct PublishedWaitV1 {
     pub(crate) minutes: u32,
 }
 
+/// A `pastey-plan` block as the Agent wrote it (R5): the collaboration
+/// reads it; here it is only bounded and checked for faithful rendering.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublishedPlanV1 {
+    pub(crate) info: String,
+    pub(crate) body: String,
+}
+
 /// The blocks one final reply published, and why any were not taken.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +82,8 @@ pub(crate) struct PublishedBlocksV1 {
     pub(crate) summary: Option<PublishedSummaryV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) wait: Option<PublishedWaitV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) plan: Option<PublishedPlanV1>,
     /// Plain-language reasons, one per block (or rule) that was refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) problems: Vec<String>,
@@ -77,7 +91,11 @@ pub(crate) struct PublishedBlocksV1 {
 
 impl PublishedBlocksV1 {
     pub(crate) fn is_empty(&self) -> bool {
-        self.messages.is_empty() && self.summary.is_none() && self.wait.is_none() && self.problems.is_empty()
+        self.messages.is_empty()
+            && self.summary.is_none()
+            && self.wait.is_none()
+            && self.plan.is_none()
+            && self.problems.is_empty()
     }
 }
 
@@ -87,6 +105,7 @@ enum KindV1 {
     Message,
     Summary,
     Wait,
+    Plan,
 }
 
 struct BlockV1<'a> {
@@ -115,6 +134,8 @@ fn blocks(text: &str) -> Vec<BlockV1<'_>> {
                     (KindV1::Summary, rest)
                 } else if let Some(rest) = bare.strip_prefix(WAIT_FENCE) {
                     (KindV1::Wait, rest)
+                } else if let Some(rest) = bare.strip_prefix(PLAN_FENCE) {
+                    (KindV1::Plan, rest)
                 } else {
                     continue;
                 };
@@ -336,6 +357,16 @@ pub(crate) fn extract(text: &str) -> PublishedBlocksV1 {
             published
                 .problems
                 .push("a block contains characters that could hide what it says".into());
+            continue;
+        }
+        if block.kind == KindV1::Plan {
+            if published.plan.is_some() {
+                published.problems.push("a reply may carry only one plan block; later ones were ignored".into());
+            } else if block.body.len() > MAX_PLAN_BYTES {
+                published.problems.push(format!("a plan block is {} bytes, over {MAX_PLAN_BYTES}", block.body.len()));
+            } else {
+                published.plan = Some(PublishedPlanV1 { info: block.info.to_owned(), body: block.body.to_owned() });
+            }
             continue;
         }
         if block.kind == KindV1::Wait {

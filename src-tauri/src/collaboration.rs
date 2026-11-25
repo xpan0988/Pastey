@@ -63,6 +63,9 @@ const MAX_ROLE_CHARS: usize = 200;
 const MAX_ALIAS_CHARS: usize = 32;
 /// The user's own alias: "you" would read as the Agent itself in a prompt.
 pub(crate) const USER_ALIAS: &str = "user";
+/// The sender of the collaboration's own record (R5: a plan adopted, a
+/// task's dependencies done); never a member alias.
+pub(crate) const PASTEY_ALIAS: &str = "pastey";
 /// A message's hop is one more than the highest hop its sending turn
 /// received; beyond this it is not delivered.
 const HOP_LIMIT: u8 = 4;
@@ -179,6 +182,12 @@ pub(crate) struct MemberV1 {
     /// carries them in full again only when they changed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) preferences_seen: String,
+    /// Planning turns it took in the current planning round (R5).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) planning_turns: u8,
+    /// The plan revision it accepted last (R5); its own proposal counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stance: Option<u32>,
 }
 
 /// The auto grant: `turns` automatic turns until `expires_at` (seconds).
@@ -378,6 +387,30 @@ pub(crate) struct CollaborationRecordV1 {
     /// This collaboration's own preferences, beside the user's profile (R4).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) preferences_note: String,
+    /// Members plan together and converge before implementing (R5).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) plan_first: bool,
+    #[serde(default, skip_serializing_if = "PhaseV1::is_implementing")]
+    pub(crate) phase: PhaseV1,
+    /// The shared plan's revision, once adopted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) adopted: Option<u32>,
+}
+
+/// Where a plan-first collaboration is (R5).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PhaseV1 {
+    /// Members plan, read only, until they converge on one valid plan.
+    Planning,
+    #[default]
+    Implementing,
+}
+
+impl PhaseV1 {
+    fn is_implementing(&self) -> bool {
+        *self == Self::Implementing
+    }
 }
 
 fn is_zero(count: &u8) -> bool {
@@ -524,6 +557,29 @@ pub(crate) enum EntryBodyV1 {
         on: String,
         reason: String,
         until: i64,
+    },
+    /// A member's plan proposal for the whole collaboration (R5): the
+    /// proposal is its statement; `problems` are Pastey's checks of it.
+    PlanProposed {
+        revision: u32,
+        proposal: plan::ProposalV1,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        problems: Vec<String>,
+    },
+    /// A member accepted revision `revision` and committed to its own tasks.
+    PlanAccepted { revision: u32 },
+    /// Every member accepted `revision` and it validated (or the user
+    /// adopted it): the shared plan.
+    PlanAdopted {
+        revision: u32,
+        #[serde(default, rename = "byUser")]
+        by_user: bool,
+    },
+    /// Implementation progress a member reported, with what Pastey verified.
+    PlanProgress {
+        items: Vec<plan::ProgressV1>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        verified: Vec<String>,
     },
     /// A member's auto grant began or ended.
     Grant {
@@ -706,6 +762,11 @@ pub(crate) struct CollaborationSummaryV1 {
     /// This collaboration's own preferences (R4).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub(crate) preferences_note: String,
+    /// R5: whether it plans first, where it is, and the adopted revision.
+    pub(crate) plan_first: bool,
+    pub(crate) phase: PhaseV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) adopted: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1047,6 +1108,10 @@ impl CollaborationServiceV1 {
                     | UserActionV1::ExecutionChanged { .. }
                     | UserActionV1::PreferencesChanged { .. }
             } | EntryBodyV1::Wait { .. }
+                | EntryBodyV1::PlanProposed { .. }
+                | EntryBodyV1::PlanAccepted { .. }
+                | EntryBodyV1::PlanAdopted { .. }
+                | EntryBodyV1::PlanProgress { .. }
         );
         let outbox = item
             .record
@@ -1123,7 +1188,7 @@ impl CollaborationServiceV1 {
     /// would join) and every other collaboration.
     fn accept_member(&self, others: &[MemberV1], input: MemberInputV1) -> AppResult<MemberV1> {
         let alias = input.alias.trim().to_owned();
-        if !valid_alias(&alias) || alias == USER_ALIAS {
+        if !valid_alias(&alias) || alias == USER_ALIAS || alias == PASTEY_ALIAS {
             return invalid(format!(
                 "\"{alias}\" is not a usable alias: use lowercase letters, digits, - and _, and not \"{USER_ALIAS}\"."
             ));
@@ -1164,6 +1229,8 @@ impl CollaborationServiceV1 {
             execution: None,
             facts: Vec::new(),
             preferences_seen: String::new(),
+            planning_turns: 0,
+            stance: None,
         })
     }
 
@@ -1177,7 +1244,8 @@ impl CollaborationServiceV1 {
         let member = item.member(&alias)?;
         // The user's preferences, when this member has not had them.
         let (preferences, _) = self.preferences_for(item, member);
-        let note = if preferences.is_empty() { note(&item.record, member) } else { format!("{preferences}\n{}", note(&item.record, member)) };
+        let context = join_sections(&preferences, &plan_section(item, member));
+        let note = if context.is_empty() { note(&item.record, member) } else { format!("{context}\n{}", note(&item.record, member)) };
         if !first_turn(item, member) {
             return Some(note);
         }
@@ -1216,6 +1284,9 @@ impl CollaborationServiceV1 {
             released: false,
             no_progress: 0,
             preferences_note: String::new(),
+            plan_first: false,
+            phase: PhaseV1::Implementing,
+            adopted: None,
             schema_version: SCHEMA_VERSION.into(),
             id: id.clone(),
             name: name.to_owned(),
@@ -1285,8 +1356,14 @@ impl CollaborationServiceV1 {
         }
         item.record.state = state;
         if state == CollaborationStateV1::Active {
-            // The user looked: progress is counted afresh.
+            // The user looked: progress is counted afresh, and a planning
+            // round that ran out gets another.
             item.record.no_progress = 0;
+            if item.record.phase == PhaseV1::Planning {
+                for member in &mut item.record.members {
+                    member.planning_turns = 0;
+                }
+            }
         }
         if state == CollaborationStateV1::Ended {
             // Nothing is delivered any more, and no grant outlives it.
@@ -1979,6 +2056,10 @@ impl CollaborationServiceV1 {
             Some(FileStateV1::Observed { changes }) => changes.total,
             _ => ended.activity.as_ref().map_or(0, |activity| activity.files_changed),
         };
+        let changed_paths: Vec<String> = match &files {
+            Some(FileStateV1::Observed { changes }) => changes.paths().cloned().collect(),
+            _ => ended.activity.as_ref().map(|activity| activity.files.clone()).unwrap_or_default(),
+        };
         if automatic {
             let member = self.item_mut(&id)?.member_mut(&alias).expect("member exists");
             member.auto_task = None;
@@ -2098,6 +2179,9 @@ impl CollaborationServiceV1 {
                 if let Some(wait) = blocks.wait {
                     self.declare_wait(&id, &alias, wait)?;
                 }
+                if let Some(raw) = blocks.plan {
+                    progressed |= self.take_plan_block(&id, &alias, &raw.info, &raw.body)?;
+                }
                 for problem in blocks.problems {
                     self.attention(&id, Some(&alias), format!("Pastey did not take a block from {alias}: {problem}."))?;
                 }
@@ -2106,8 +2190,379 @@ impl CollaborationServiceV1 {
         if automatic && !not_started {
             self.count_progress(&id, progressed)?;
         }
+        if !not_started && origin == TurnOriginV1::Collaboration && self.item(&id)?.record.phase == PhaseV1::Planning {
+            if let Some(member) = self.item_mut(&id)?.member_mut(&alias) {
+                member.planning_turns = member.planning_turns.saturating_add(1);
+            }
+            self.save_record(&id)?;
+        }
+        self.check_claims(&id, &alias, &changed_paths)?;
+        self.settle_planning(&id)?;
         self.settle_grants(now())?;
         Ok(true)
+    }
+
+    /// Takes a member's `pastey-plan` block (R5). Returns whether it moved
+    /// the plan on (a proposal, an acceptance or progress).
+    fn take_plan_block(&mut self, id: &str, alias: &str, info: &str, body: &str) -> AppResult<bool> {
+        if !self.item(id)?.record.plan_first {
+            self.attention(id, Some(alias), format!("Pastey did not take a plan block from {alias}: this collaboration does not plan first."))?;
+            return Ok(false);
+        }
+        let block = match plan::parse(info, body) {
+            Ok(block) => block,
+            Err(problem) => {
+                self.attention(id, Some(alias), format!("Pastey did not take a plan block from {alias}: {problem}."))?;
+                return Ok(false);
+            }
+        };
+        match block {
+            plan::PlanBlockV1::Proposal(proposal) => {
+                let revision = latest_revision(self.item(id)?).map_or(1, |(latest, ..)| latest + 1);
+                let owners = self.owners(id)?;
+                let abilities: Vec<plan::OwnerAbilityV1<'_>> = owners
+                    .iter()
+                    .map(|(alias, can_edit)| plan::OwnerAbilityV1 { alias, can_edit: *can_edit })
+                    .collect();
+                let problems = plan::problems(&proposal, &abilities);
+                let rendered = plan::render(revision, &proposal, &[]).replacen("Shared plan", "Plan proposal", 1);
+                self.append(
+                    id,
+                    Some(alias),
+                    BasisV1::Claim,
+                    EntryBodyV1::PlanProposed { revision, proposal, problems: problems.clone() },
+                    None,
+                )?;
+                let item = self.item_mut(id)?;
+                if item.record.phase == PhaseV1::Implementing {
+                    // Replanning: everyone plans again, with a fresh budget.
+                    item.record.phase = PhaseV1::Planning;
+                    for member in &mut item.record.members {
+                        member.planning_turns = 0;
+                    }
+                }
+                if let Some(member) = item.member_mut(alias) {
+                    member.stance = Some(revision);
+                }
+                let others: Vec<String> = item.record.members.iter().filter(|member| member.alias != alias).map(|member| member.alias.clone()).collect();
+                self.save_record(id)?;
+                let checks = if problems.is_empty() { "Pastey's checks: no structural problem.".to_owned() } else { format!("Pastey's checks found: {}", problems.join("; ")) };
+                for other in others {
+                    self.pastey_message(
+                        id,
+                        &other,
+                        &format!("Plan proposal r{revision} from {alias}"),
+                        &format!("{rendered}{checks}\nAccept it as it stands with ```pastey-plan accept=r{revision}``` (and so commit to your tasks in it), or propose a revision."),
+                    )?;
+                }
+                Ok(true)
+            }
+            plan::PlanBlockV1::Accept(wanted) => {
+                if revision(self.item(id)?, wanted).is_none() {
+                    self.attention(id, Some(alias), format!("{alias} accepted plan r{wanted}, which does not exist."))?;
+                    return Ok(false);
+                }
+                if let Some(member) = self.item_mut(id)?.member_mut(alias) {
+                    member.stance = Some(wanted);
+                }
+                self.save_record(id)?;
+                self.append(id, Some(alias), BasisV1::Claim, EntryBodyV1::PlanAccepted { revision: wanted }, None)?;
+                Ok(true)
+            }
+            plan::PlanBlockV1::Progress(items) => self.take_progress(id, alias, items),
+        }
+    }
+
+    /// Which members may edit files, as their execution profiles say (R5's
+    /// authorisation check of a plan).
+    fn owners(&self, id: &str) -> AppResult<Vec<(String, bool)>> {
+        let item = self.item(id)?;
+        Ok(item
+            .record
+            .members
+            .iter()
+            .map(|member| {
+                let can_edit = match (member.provider, self.effective_execution(item, member).0) {
+                    // Headless Claude Code declines edits unless a mode allows them.
+                    (ProviderV1::ClaudeCode, None) => false,
+                    (ProviderV1::ClaudeCode, Some(profile)) => matches!(profile.claude.permission_mode.as_deref(), Some("acceptEdits") | Some("auto")),
+                    (ProviderV1::Codex, Some(profile)) => profile.codex.sandbox.as_deref() != Some("read-only"),
+                    (ProviderV1::Codex, None) => true,
+                };
+                (member.alias.clone(), can_edit)
+            })
+            .collect())
+    }
+
+    /// A message from the collaboration's own record to `to`, delivered as
+    /// any message to it is (its grant, or the user's approval).
+    fn pastey_message(&mut self, id: &str, to: &str, subject: &str, body: &str) -> AppResult<()> {
+        let status = self.delivery_status(id, PASTEY_ALIAS, to, 0)?;
+        self.append(
+            id,
+            None,
+            BasisV1::Fact,
+            EntryBodyV1::Message {
+                from: PASTEY_ALIAS.into(),
+                to: to.into(),
+                subject: subject.into(),
+                body: bound_text(body, crate::native_agent::MAX_MESSAGE_BODY_BYTES),
+                hop: 0,
+            },
+            Some(status),
+        )
+        .map(|_| ())
+    }
+
+    /// Adopts revision `wanted` as the shared plan: implementation starts,
+    /// and every member is told its commitments.
+    fn adopt(&mut self, id: &str, wanted: u32, by_user: bool) -> AppResult<()> {
+        let (proposal, _, _) = revision(self.item(id)?, wanted)
+            .map(|(proposal, problems, by)| (proposal.clone(), problems.clone(), by))
+            .ok_or_else(|| AppError::InvalidInput("That plan revision does not exist.".into()))?;
+        let item = self.item_mut(id)?;
+        item.record.phase = PhaseV1::Implementing;
+        item.record.adopted = Some(wanted);
+        let members: Vec<String> = item.record.members.iter().map(|member| member.alias.clone()).collect();
+        self.save_record(id)?;
+        self.append(
+            id,
+            None,
+            if by_user { BasisV1::User } else { BasisV1::Fact },
+            EntryBodyV1::PlanAdopted { revision: wanted, by_user },
+            None,
+        )?;
+        let rendered = plan::render(wanted, &proposal, &[]);
+        for alias in members {
+            let mine: Vec<&str> = proposal.tasks.iter().filter(|task| task.owner == alias).map(|task| task.id.as_str()).collect();
+            let ready: Vec<&str> = proposal
+                .tasks
+                .iter()
+                .filter(|task| task.owner == alias && task.after.is_empty())
+                .map(|task| task.id.as_str())
+                .collect();
+            self.pastey_message(
+                id,
+                &alias,
+                &format!("Shared plan r{wanted} adopted{}", if by_user { " by the user" } else { "" }),
+                &format!(
+                    "{rendered}Your commitments: {}. Ready to start now: {}. Tasks that depend on others wait until their owners report them done.",
+                    if mine.is_empty() { "none".to_owned() } else { mine.join(", ") },
+                    if ready.is_empty() { "none".to_owned() } else { ready.join(", ") },
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Convergence and budget (R5): every member accepting the latest valid
+    /// revision adopts it; a member out of planning turns first pauses the
+    /// collaboration. Running out is never agreement.
+    fn settle_planning(&mut self, id: &str) -> AppResult<()> {
+        let item = self.item(id)?;
+        if !item.record.plan_first || item.record.phase != PhaseV1::Planning || item.record.state != CollaborationStateV1::Active {
+            return Ok(());
+        }
+        let Some((latest, _, problems)) = latest_revision(item) else {
+            return self.planning_budget(id);
+        };
+        let converged = problems.is_empty() && item.record.members.iter().all(|member| member.stance == Some(latest));
+        if converged {
+            return self.adopt(id, latest, false);
+        }
+        self.planning_budget(id)?;
+        self.planning_nudge(id)
+    }
+
+    /// When planning has not converged and no member has anything to act on
+    /// (every one accepted a revision with problems, say), nobody would take
+    /// another turn: each member is told the state, so planning goes on
+    /// until it converges or its budget pauses it.
+    fn planning_nudge(&mut self, id: &str) -> AppResult<()> {
+        let item = self.item(id)?;
+        if item.record.state != CollaborationStateV1::Active || item.record.phase != PhaseV1::Planning {
+            return Ok(());
+        }
+        let busy = item
+            .record
+            .members
+            .iter()
+            .any(|member| item.waiting_for(&member.alias) > 0 || item.scheduled_for(&member.alias) || member.auto_task.is_some());
+        if busy {
+            return Ok(());
+        }
+        let Some((latest, _, problems)) = latest_revision(item) else { return Ok(()) };
+        let state = format!(
+            "Planning has not converged. The latest proposal is r{latest}{}. {}. Propose a revision that fixes this, or accept the latest if you agree.",
+            if problems.is_empty() { String::new() } else { format!(", and Pastey's checks found: {}", problems.join("; ")) },
+            item.record
+                .members
+                .iter()
+                .map(|member| match member.stance {
+                    Some(accepted) if accepted == latest => format!("{} accepts it", member.alias),
+                    _ => format!("{} has not accepted it", member.alias),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let members: Vec<String> = item.record.members.iter().filter(|member| !member.remote).map(|member| member.alias.clone()).collect();
+        for alias in members {
+            self.pastey_message(id, &alias, "Planning has not converged", &state)?;
+        }
+        Ok(())
+    }
+
+    fn planning_budget(&mut self, id: &str) -> AppResult<()> {
+        let item = self.item(id)?;
+        if !item.record.members.iter().any(|member| member.planning_turns >= plan::PLANNING_TURNS_PER_MEMBER) {
+            return Ok(());
+        }
+        let state = match latest_revision(item) {
+            None => "no plan was proposed".to_owned(),
+            Some((latest, _, problems)) => format!(
+                "the latest proposal is r{latest}{}; {}",
+                if problems.is_empty() { String::new() } else { format!(" (with problems: {})", problems.join("; ")) },
+                item.record
+                    .members
+                    .iter()
+                    .map(|member| match member.stance {
+                        Some(accepted) if accepted == latest => format!("{} accepts it", member.alias),
+                        _ => format!("{} does not", member.alias),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        self.set_state(id, CollaborationStateV1::Paused)?;
+        self.attention(
+            id,
+            None,
+            bound_text(
+                &format!(
+                    "Paused: planning did not converge within {} turns per member: {state}. Adopt a revision without problems, answer a member, or resume for another planning round. Nothing was implemented.",
+                    plan::PLANNING_TURNS_PER_MEMBER
+                ),
+                MAX_ATTENTION_BYTES,
+            ),
+        )
+    }
+
+    /// The user adopts revision `wanted` (an explicitly authorised way to
+    /// end a planning round that did not converge). Only a revision without
+    /// structural problems.
+    pub(crate) fn adopt_by_user(&mut self, id: &str, wanted: u32) -> AppResult<()> {
+        let item = self.item(id)?;
+        if item.record.phase != PhaseV1::Planning {
+            return invalid("This collaboration is not planning.");
+        }
+        let problems = revision(item, wanted)
+            .map(|(_, problems, _)| problems.clone())
+            .ok_or_else(|| AppError::InvalidInput("That plan revision does not exist.".into()))?;
+        if !problems.is_empty() {
+            return invalid(format!("Revision r{wanted} has problems: {}.", problems.join("; ")));
+        }
+        self.adopt(id, wanted, true)?;
+        if self.item(id)?.record.state == CollaborationStateV1::Paused {
+            self.set_state(id, CollaborationStateV1::Active)?;
+        }
+        Ok(())
+    }
+
+    /// Progress on the shared plan: commits named as artifacts are checked
+    /// in the member's own repository; owners of tasks whose dependencies
+    /// are now all done are told.
+    fn take_progress(&mut self, id: &str, alias: &str, items: Vec<plan::ProgressV1>) -> AppResult<bool> {
+        let item = self.item(id)?;
+        let Some((proposal, _, _)) = item.record.adopted.and_then(|adopted| revision(item, adopted)).map(|(proposal, p, by)| (proposal.clone(), p.clone(), by)) else {
+            self.attention(id, Some(alias), format!("Pastey did not take progress from {alias}: no shared plan is adopted."))?;
+            return Ok(false);
+        };
+        let workspace = item.member(alias).filter(|member| !member.remote).map(|member| PathBuf::from(&member.workspace));
+        let mut verified = Vec::new();
+        let mut taken = Vec::new();
+        for progress in items {
+            if !proposal.tasks.iter().any(|task| task.id == progress.task) {
+                self.attention(id, Some(alias), format!("{alias} reported progress on \"{}\", which is not in the shared plan.", progress.task))?;
+                continue;
+            }
+            if progress.done {
+                if let (Some((_, commit)), Some(folder)) = (progress.detail.split_once('@'), workspace.as_ref()) {
+                    verified.push(verify_commit(folder, commit.trim(), &progress.task));
+                }
+            }
+            taken.push(progress);
+        }
+        if taken.is_empty() {
+            return Ok(false);
+        }
+        self.append(id, Some(alias), BasisV1::Claim, EntryBodyV1::PlanProgress { items: taken, verified }, None)?;
+        let done: Vec<String> = progress_reports(self.item(id)?)
+            .into_iter()
+            .filter(|(_, item)| item.done)
+            .map(|(_, item)| item.task)
+            .collect();
+        let notified: Vec<String> = self
+            .item(id)?
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.body {
+                EntryBodyV1::Message { from, subject, .. } if from == PASTEY_ALIAS && subject.starts_with("Ready: task ") => {
+                    Some(subject.trim_start_matches("Ready: task ").to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        for task in &proposal.tasks {
+            let ready = !task.after.is_empty()
+                && task.after.iter().all(|dependency| done.contains(dependency))
+                && !done.contains(&task.id)
+                && !notified.contains(&task.id);
+            if ready {
+                self.pastey_message(
+                    id,
+                    &task.owner,
+                    &format!("Ready: task {}", task.id),
+                    &format!(
+                        "Everything task {} ({}) depends on is reported done: {}. It is yours to do now.",
+                        task.id,
+                        task.title,
+                        task.after.join(", ")
+                    ),
+                )?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Flags a turn's changed files that another member's task claims in the
+    /// adopted plan (R5). Nothing is reverted.
+    fn check_claims(&mut self, id: &str, alias: &str, changed: &[String]) -> AppResult<()> {
+        let item = self.item(id)?;
+        if !item.record.plan_first || item.record.phase != PhaseV1::Implementing || changed.is_empty() {
+            return Ok(());
+        }
+        let Some((proposal, _, _)) = item.record.adopted.and_then(|adopted| revision(item, adopted)) else { return Ok(()) };
+        let mut crossings: Vec<String> = Vec::new();
+        for path in changed {
+            for task in proposal.tasks.iter().filter(|task| task.owner != alias) {
+                if task.paths.iter().any(|claim| plan::claims_overlap(claim, path)) {
+                    crossings.push(format!("{path} (claimed by {}'s task {})", task.owner, task.id));
+                    break;
+                }
+            }
+        }
+        if crossings.is_empty() {
+            return Ok(());
+        }
+        crossings.truncate(5);
+        self.attention(
+            id,
+            Some(alias),
+            bound_text(
+                &format!("{alias} changed files another member's task claims: {}. Nothing was reverted.", crossings.join(", ")),
+                MAX_ATTENTION_BYTES,
+            ),
+        )
     }
 
     /// Sets every open wait `which` selects to `status`.
@@ -2353,7 +2808,8 @@ impl CollaborationServiceV1 {
                     )
                 });
                 let (prefs_text, prefs_digest) = self.preferences_for(item, member);
-                let (prompt, entry_ids) = prompt(item, member, &deliverable, &prefs_text, now);
+                let context = join_sections(&prefs_text, &plan_section(item, member));
+                let (prompt, entry_ids) = prompt(item, member, &deliverable, &context, now);
                 if entry_ids.is_empty() {
                     continue;
                 }
@@ -2372,7 +2828,12 @@ impl CollaborationServiceV1 {
                     entry_ids,
                     automatic,
                     options: member.options.clone(),
-                    execution: self.effective_execution(item, member).0,
+                    execution: match item.record.phase {
+                        // Planning turns read and plan only, in each Agent's
+                        // own read-only mode, whatever else it may do.
+                        PhaseV1::Planning => Some(planning_profile(self.effective_execution(item, member).0)),
+                        PhaseV1::Implementing => self.effective_execution(item, member).0,
+                    },
                     preferences_digest: prefs_digest,
                 });
             }
@@ -2625,10 +3086,13 @@ impl CollaborationServiceV1 {
     /// Releases collaboration `id` once every member is ready (`readiness`
     /// from `readiness::check`, just now): each member's facts are kept for
     /// the note, and member turns may start.
-    pub(crate) fn release(&mut self, id: &str, readiness: &[readiness::MemberReadinessV1]) -> AppResult<()> {
+    pub(crate) fn release(&mut self, id: &str, readiness: &[readiness::MemberReadinessV1], plan_first: bool) -> AppResult<()> {
         let item = self.item_mut(id)?;
         if item.record.state == CollaborationStateV1::Ended {
             return invalid("This collaboration has ended.");
+        }
+        if plan_first && item.record.link.is_some() {
+            return invalid("Planning together first is not available yet for a collaboration that spans another device.");
         }
         if item.record.released {
             return Ok(());
@@ -2649,6 +3113,10 @@ impl CollaborationServiceV1 {
             }
         }
         item.record.released = true;
+        if plan_first {
+            item.record.plan_first = true;
+            item.record.phase = PhaseV1::Planning;
+        }
         self.save_record(id)?;
         self.append(id, None, BasisV1::User, EntryBodyV1::User { action: UserActionV1::Released }, None)
             .map(|_| ())
@@ -2945,6 +3413,9 @@ impl CollaborationServiceV1 {
             execution: item.record.execution.clone(),
             released: item.record.released,
             preferences_note: item.record.preferences_note.clone(),
+            plan_first: item.record.plan_first,
+            phase: item.record.phase,
+            adopted: item.record.adopted,
         }
     }
 
@@ -2993,6 +3464,8 @@ fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], prefe
             (format!("From: {USER_ALIAS} on {device} (the person working on that device)\n\n{body}\n"), false)
         } else if from == USER_ALIAS {
             (format!("From: {USER_ALIAS} (the person you work for)\n\n{body}\n"), false)
+        } else if from == PASTEY_ALIAS {
+            (format!("From: {PASTEY_ALIAS} (the collaboration's own record, not an Agent)\nsubject: {subject}\n\n{body}\n"), false)
         } else {
             let provider = record
                 .members
@@ -3789,6 +4262,132 @@ fn condition_of(
     wait.unwrap_or(MemberConditionV1::Idle)
 }
 
+/// Whether `commit` exists in the repository at `folder`, as a plain fact
+/// line for the Journal (bounded; read only).
+fn verify_commit(folder: &Path, commit: &str, task: &str) -> String {
+    let valid = !commit.is_empty() && commit.len() <= 64 && commit.chars().all(|c| c.is_ascii_hexdigit());
+    if !valid {
+        return format!("task {task}: \"{commit}\" is not a commit id; not checked");
+    }
+    let found = crate::native_agent::run_bounded(
+        Path::new("git"),
+        &["-C", &folder.to_string_lossy(), "cat-file", "-e", &format!("{commit}^{{commit}}")],
+        std::time::Duration::from_secs(5),
+    );
+    match found {
+        Some((true, _)) => format!("task {task}: commit {commit} exists in its repository"),
+        Some((false, _)) => format!("task {task}: commit {commit} was not found in its repository"),
+        None => format!("task {task}: commit {commit} could not be checked"),
+    }
+}
+
+fn join_sections(first: &str, second: &str) -> String {
+    match (first.is_empty(), second.is_empty()) {
+        (true, _) => second.to_owned(),
+        (_, true) => first.to_owned(),
+        _ => format!("{first}\n{second}"),
+    }
+}
+
+/// The profile of a planning turn: `profile` narrowed to each Agent's own
+/// read-only mode (Claude Code `plan`, Codex `read-only`); its deny rules
+/// stay. Never wider than `profile`.
+fn planning_profile(profile: Option<ExecutionProfileV1>) -> ExecutionProfileV1 {
+    let mut planning = profile.unwrap_or_else(ExecutionProfileV1::ask);
+    planning.name = format!("{} (planning: read only)", planning.name);
+    planning.claude.permission_mode = Some("plan".into());
+    planning.claude.sandbox_auto_allow = false;
+    planning.claude.allow_write.clear();
+    planning.claude.allow.clear();
+    planning.codex.sandbox = Some("read-only".into());
+    planning.codex.writable_roots.clear();
+    planning.codex.network_access = false;
+    planning
+}
+
+/// The latest plan proposal: revision, proposal, problems.
+fn latest_revision(item: &CollaborationV1) -> Option<(u32, &plan::ProposalV1, &Vec<String>)> {
+    item.entries.iter().rev().find_map(|entry| match &entry.body {
+        EntryBodyV1::PlanProposed { revision, proposal, problems } => Some((*revision, proposal, problems)),
+        _ => None,
+    })
+}
+
+fn revision(item: &CollaborationV1, wanted: u32) -> Option<(&plan::ProposalV1, &Vec<String>, String)> {
+    item.entries.iter().find_map(|entry| match &entry.body {
+        EntryBodyV1::PlanProposed { revision, proposal, problems } if *revision == wanted => {
+            Some((proposal, problems, entry.member.clone().unwrap_or_default()))
+        }
+        _ => None,
+    })
+}
+
+/// Every task progress report, with who reported it, oldest first.
+fn progress_reports(item: &CollaborationV1) -> Vec<(String, plan::ProgressV1)> {
+    item.entries
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            EntryBodyV1::PlanProgress { items, .. } => Some(items.iter().map(move |item| (entry.member.clone().unwrap_or_default(), item.clone()))),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// What a plan-first collaboration tells `member` on every turn (R5).
+fn plan_section(item: &CollaborationV1, member: &MemberV1) -> String {
+    if !item.record.plan_first {
+        return String::new();
+    }
+    match (item.record.phase, item.record.adopted) {
+        (PhaseV1::Planning, _) => {
+            let mut text = format!(
+                "[Planning phase: plan together before anyone implements. Read what you need; do not edit files (your turns run read only). You have {} of {} planning turns left.\n\
+                 Propose a plan for the whole collaboration, or accept one, by ending your answer with a block (after any messages):\n\
+                 ```pastey-plan\n\
+                 understanding: <the objective as you understand it>\n\
+                 task <id>: <what> | owner=<member> | paths=<path claims, comma separated> | after=<task ids> | deliver=<what it hands over>\n\
+                 integration: <how separately built work comes together>\n\
+                 ```\n\
+                 or, to accept revision rN as it stands and commit to your tasks in it: ```pastey-plan accept=rN``` (a block with an empty body).\n\
+                 Implementation starts when every member accepted the same revision and Pastey found no structural problem in it. Negotiate with messages; decide responsibilities between you.]\n",
+                plan::PLANNING_TURNS_PER_MEMBER.saturating_sub(member.planning_turns),
+                plan::PLANNING_TURNS_PER_MEMBER,
+            );
+            if let Some((revision, proposal, problems)) = latest_revision(item) {
+                text.push_str(&plan::render(revision, proposal, &[]).replacen("Shared plan", "Latest proposal", 1));
+                if problems.is_empty() {
+                    text.push_str("Pastey's checks: no structural problem.\n");
+                } else {
+                    text.push_str(&format!("Pastey's checks found: {}\n", problems.join("; ")));
+                }
+                let stances: Vec<String> = item
+                    .record
+                    .members
+                    .iter()
+                    .map(|other| match other.stance {
+                        Some(accepted) if accepted == revision => format!("{} accepts r{revision}", other.alias),
+                        Some(accepted) => format!("{} last accepted r{accepted}", other.alias),
+                        None => format!("{} has not accepted any", other.alias),
+                    })
+                    .collect();
+                text.push_str(&format!("Stances: {}.\n", stances.join(", ")));
+            }
+            text
+        }
+        (PhaseV1::Implementing, Some(adopted)) => {
+            let Some((proposal, _, _)) = revision(item, adopted) else { return String::new() };
+            let mine: Vec<&str> = proposal.tasks.iter().filter(|task| task.owner == member.alias).map(|task| task.id.as_str()).collect();
+            format!(
+                "{}Your commitments: {}.\nReport progress by ending an answer with ```pastey-plan``` lines `done: <task> artifact=<branch>@<commit>` or `blocked: <task> <why>`; owners of tasks that depend on yours are told when theirs are ready. To change the plan, propose a new revision (planning starts again).\n",
+                plan::render(adopted, proposal, &progress_reports(item)),
+                if mine.is_empty() { "none (help only when asked)".to_owned() } else { mine.join(", ") },
+            )
+        }
+        _ => String::new(),
+    }
+}
+
 /// The decisions of summaries the user confirmed (and did not later
 /// reject), each shortened, oldest first.
 fn confirmed_decisions(item: &CollaborationV1) -> Vec<String> {
@@ -3895,6 +4494,7 @@ fn redact_paths(text: &str, workspace: &Path) -> String {
         .collect()
 }
 
+pub(crate) mod plan;
 pub(crate) mod preferences;
 pub(crate) mod readiness;
 

@@ -38,11 +38,12 @@ use capability::codex::codex_compatibility_at;
 pub(crate) use capability::NativeSessionRefV1 as LocalNativeSessionRefV1;
 pub(crate) use capability::OpaqueCapabilityPayloadV1;
 pub(crate) use capability::renders_faithfully;
+pub(crate) use capability::run_bounded;
 pub(crate) use capability::activity::TaskActivityV1;
 #[cfg(test)]
 pub(crate) use capability::activity::NativeActivityV1;
 pub(crate) use capability::published::{
-    PublishedMessageV1, PublishedSummaryV1, PublishedWaitV1, MAX_MESSAGE_BODY_BYTES,
+    PublishedMessageV1, PublishedPlanV1, PublishedSummaryV1, PublishedWaitV1, MAX_MESSAGE_BODY_BYTES,
 };
 use capability::{
     codex::CodexNativeAdapterV1, ExclusivityKeyV1, NativeCapabilityAdapterV1, NativeConversationV1,

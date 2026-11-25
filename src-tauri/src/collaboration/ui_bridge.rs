@@ -188,6 +188,7 @@ fn mock_app(runtime: Arc<HostRuntime>) -> tauri::App<tauri::test::MockRuntime> {
             crate::commands::get_user_preferences,
             crate::commands::set_user_preferences,
             crate::commands::set_collaboration_preferences,
+            crate::commands::adopt_collaboration_plan,
             crate::commands::respond_remote_native_decision,
             crate::commands::stop_bridge_native_agent_task,
             crate::commands::propose_remote_native_codex_workspace_movement,

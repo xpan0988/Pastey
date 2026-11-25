@@ -325,6 +325,24 @@ Boundary: Pastey stores, versions and delivers the user's preferences; native Ag
 
 Limits: whether Agents follow the profile is their behaviour, measured in E02, not something Pastey checks. Restrictions written only as preferences are not enforced.
 
+### R5: plan-first collaboration (2026-11-25)
+
+Boundary: Agents plan, negotiate, decide responsibilities and commit; Pastey records, checks structure, enforces the phases and tells members what changed. No roles, no assignment, no ordering by Pastey; the representation is tasks only, not a project-management system. This amends the collaboration design's non-goal "not a task board", as decided: claims, dependencies, commitments and states, all Agent-authored.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| Plan blocks | One `pastey-plan` block: a proposal (`understanding:`, `task <id>: <what> \| owner= \| paths= \| after= \| deliver=`, `integration:`), an acceptance (`accept=rN`, committing to one's own tasks), or progress (`done: <task> artifact=<branch>@<commit>`, `blocked: <task> <why>`); at most 6 KiB, 30 tasks; paths only inside the owner's folder | `plan::tests` |
+| Lifecycle | Start offers "Plan together first" (default on). Planning: members' turns run in their native read-only modes (Claude Code `plan`, Codex `read-only`; deny rules kept, never wider than the member's profile) and the note shows the latest proposal, Pastey's checks, every member's stance and planning turns left. Each proposal becomes revision rN and is sent to the other members; an acceptance moves the member's stance | `members_plan_read_only_converge_on_one_valid_plan_and_then_implement` |
+| Mechanical validation | Unique task ids; owners are members; dependencies exist and form no cycle (Kahn); no two owners' path claims overlap (literal prefixes, conservative); an owner whose execution profile cannot edit is not given file claims | `plan::tests::validation_finds_overlaps_cycles_missing_owners_and_authorization` |
+| Convergence | Adopted only when every member's stance is the latest revision and it has no problem; then every member is told its commitments and which tasks it may start now (messages from `pastey`, delivered under its grant or the user's approval) | first test |
+| No convergence | 3 planning turns per member: when one runs out, the collaboration pauses with the state (latest revision, its problems, who accepts it); nothing is implemented. The user may adopt a revision without problems (a `user` entry), or resume for another round. If planning stalls with nobody to act (all accepted a revision with problems), every member is told the state, so planning continues until it converges or pauses | `a_plan_that_does_not_converge_pauses_and_conflicting_work_is_never_released`, `the_user_may_adopt_a_valid_revision_and_claimed_files_crossed_are_flagged` |
+| Asynchronous implementation | Tasks with no dependency start at once; a `done` report tells the owner of each task whose dependencies are now all done; a `done` artifact `<branch>@<commit>` is checked read only (`git cat-file -e`) in the reporter's repository and recorded as found or not | first test |
+| Claims | Files a turn changed that another member's task claims are flagged (not reverted) | third test |
+| Replanning | A proposal during implementation returns the collaboration to planning with a fresh budget | covered by the lifecycle rules |
+| UI | Start's "Plan together first"; a plan card (phase, latest or adopted plan, checks, task states, Adopt rN for a revision without problems); Journal lines for proposals, acceptances, adoption and progress | build + type check |
+
+Limits: plan-first is refused for a collaboration spanning another device, and plan entries stay on this device. Path overlap is literal-prefix based, so `src/**` and `src/a/**` overlap while sibling globs with different prefixes never do. "Done" is the Agent's statement; Pastey checks only that a named commit exists. Whether Agents plan well is their behaviour, measured in E02.
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).

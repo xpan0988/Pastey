@@ -1555,6 +1555,7 @@ pub async fn check_collaboration_readiness(
 #[tauri::command]
 pub async fn release_collaboration(
     collaboration_id: String,
+    plan_first: Option<bool>,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::collaboration::CollaborationViewV1, String> {
     let state = state.inner().clone();
@@ -1563,7 +1564,7 @@ pub async fn release_collaboration(
         state
             .collaborations
             .lock()
-            .release(&collaboration_id, &readiness)
+            .release(&collaboration_id, &readiness, plan_first.unwrap_or(false))
             .map_err(|error| error.message())?;
         drive_collaborations(&state);
         collaboration_view(&state, &collaboration_id)
@@ -1592,6 +1593,23 @@ pub fn set_user_preferences(
         .lock()
         .set_preferences(preferences)
         .map_err(|error| error.message())
+}
+
+/// The user adopts a plan revision without structural problems, ending a
+/// planning round that did not converge (an explicit decision).
+#[tauri::command]
+pub fn adopt_collaboration_plan(
+    collaboration_id: String,
+    revision: u32,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    state
+        .collaborations
+        .lock()
+        .adopt_by_user(&collaboration_id, revision)
+        .map_err(|error| error.message())?;
+    drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
 }
 
 /// Sets one collaboration's own preferences, beside the profile.

@@ -14,7 +14,7 @@ import {
   turnOutcomeLabel, USER_ALIAS, validAlias, waitingByRecipient, withdrawCollaborationGrant, type CollaborationEntry,
   optionsLabel, pendingDecisions, setCollaborationMemberOptions, stopCollaborationMember, type MemberOptions,
   executionSourceLabel, setCollaborationExecution, type ExecutionChoice,
-  checkCollaborationReadiness, releaseCollaboration, type MemberReadiness, setCollaborationPreferences,
+  checkCollaborationReadiness, releaseCollaboration, type MemberReadiness, setCollaborationPreferences, adoptCollaborationPlan,
   type CollaborationMember, type CollaborationMemberInput, type CollaborationProvider, type CollaborationSummary, type CollaborationView,
   type JournalFilter, type RunningTurn,
 } from "../../lib/collaboration";
@@ -137,6 +137,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
         {error ? <Notice tone="bad">{error}</Notice> : null}
         {view.state === "paused" ? <Notice tone="warn" title="Paused">No member turn starts. Messages still arrive and wait.</Notice> : null}
         {!ended && view.released === false ? <ReadinessPanel id={id} disabled={pending} onReleased={setView} /> : null}
+        {!ended && view.planFirst ? <PlanPanel view={view} disabled={pending} onAdopt={(revision) => void act(() => adoptCollaborationPlan(id, revision))} /> : null}
         {ended ? <Notice title="Ended">Its members are ordinary conversations again. The Journal stays until you delete it.</Notice> : null}
         {link ? <LinkNotice link={link} ended={ended} /> : null}
         <div className="row row-wrap" style={{ gap: 12, alignItems: "stretch" }}>
@@ -219,6 +220,7 @@ const BASIS_WORD: Record<string, string> = { configured: "configured", probed: "
  * need no model call; facts say how each is known. */
 function ReadinessPanel({ id, disabled, onReleased }: { id: string; disabled: boolean; onReleased: (view: CollaborationView) => void }) {
   const [results, setResults] = useState<MemberReadiness[] | null>(null);
+  const [planFirst, setPlanFirst] = useState(true);
   const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const check = async () => {
@@ -233,8 +235,12 @@ function ReadinessPanel({ id, disabled, onReleased }: { id: string; disabled: bo
       <span className="small muted" style={{ flex: 1 }}>No member turn starts until every member is ready. Messages you send now wait, and all members start together.</span>
       <button type="button" className="btn btn-sm" disabled={checking} onClick={() => void check()}>{checking ? "Checking…" : "Check again"}</button>
       <button type="button" className="btn btn-sm btn-primary" disabled={disabled || checking || !allReady}
-        onClick={() => void releaseCollaboration(id).then(onReleased).catch((cause) => setError(errorText(cause, "It could not start.")))}>Start collaboration</button>
+        onClick={() => void releaseCollaboration(id, planFirst).then(onReleased).catch((cause) => setError(errorText(cause, "It could not start.")))}>Start collaboration</button>
     </div>
+    <label className="row small" style={{ gap: 8 }}>
+      <input type="checkbox" checked={planFirst} onChange={(event) => setPlanFirst(event.target.checked)} />
+      <span>Plan together first: members plan read only and must all accept one plan Pastey finds no structural problem in before anyone implements.</span>
+    </label>
     {error ? <Notice tone="bad">{error}</Notice> : null}
     {results === null ? <span className="small subtle">Checking each member…</span> : results.map((result) => <div key={result.alias} className="stack" style={{ gap: 4 }}>
       <span className="small"><strong>{result.alias}</strong> · {providerLabel(result.provider)} · {result.ready ? "ready" : "not ready"}</span>
@@ -247,6 +253,33 @@ function ReadinessPanel({ id, disabled, onReleased }: { id: string; disabled: bo
         <ul style={{ margin: 0, paddingLeft: 16 }}>{result.facts.map((fact, index) => <li key={index}>{fact.text} <span className="subtle">({BASIS_WORD[fact.basis]})</span></li>)}</ul>
       </details> : null}
     </div>)}
+  </div></div>;
+}
+
+/** Plan-first: where planning stands, the latest proposal and the adopted
+ * shared plan, read from the Journal. */
+function PlanPanel({ view, disabled, onAdopt }: { view: CollaborationView; disabled: boolean; onAdopt: (revision: number) => void }) {
+  const proposals = view.entries.flatMap((entry) => entry.body.type === "plan_proposed" ? [{ entry, body: entry.body }] : []);
+  const latest = proposals[proposals.length - 1];
+  const shown = view.phase === "implementing" && view.adopted !== undefined ? proposals.find((item) => item.body.revision === view.adopted) : latest;
+  const done = new Set(view.entries.flatMap((entry) => entry.body.type === "plan_progress" ? entry.body.items.filter((item) => item.done).map((item) => item.task) : []));
+  return <div className="card"><div className="card-body stack" style={{ gap: 8 }}>
+    <div className="row row-wrap" style={{ gap: 8, alignItems: "center" }}>
+      <strong>{view.phase === "planning" ? "Planning" : `Shared plan r${view.adopted}`}</strong>
+      <span className="small muted" style={{ flex: 1 }}>{view.phase === "planning"
+        ? "Members plan read only; implementation starts when every member accepts one plan without structural problems."
+        : "Each member works on its own tasks; owners of dependent tasks are told when theirs are ready."}</span>
+      {view.phase === "planning" && latest && !(latest.body.problems ?? []).length
+        ? <button type="button" className="btn btn-sm" disabled={disabled} title="Your decision: adopt this revision even though not every member accepted it."
+            onClick={() => onAdopt(latest.body.revision)}>Adopt r{latest.body.revision}</button> : null}
+    </div>
+    {!shown ? <span className="small subtle">No plan proposed yet.</span> : <>
+      <span className="xsmall subtle">r{shown.body.revision} by {shown.entry.member}{shown.body.proposal.understanding ? ` · ${shown.body.proposal.understanding}` : ""}</span>
+      <ul className="xsmall" style={{ margin: 0, paddingLeft: 16 }}>
+        {shown.body.proposal.tasks.map((task) => <li key={task.id}>{done.has(task.id) ? "✓ " : ""}<strong>{task.id}</strong> · {task.owner} · {task.title}{(task.after ?? []).length ? ` · after ${(task.after ?? []).join(", ")}` : ""}{(task.paths ?? []).length ? ` · ${(task.paths ?? []).join(", ")}` : ""}</li>)}
+      </ul>
+      {(shown.body.problems ?? []).length ? <Notice tone="warn">Pastey's checks: {(shown.body.problems ?? []).join("; ")}</Notice> : null}
+    </>}
   </div></div>;
 }
 
@@ -443,6 +476,16 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
         </div> : null}
       </div></div>;
     }
+    case "plan_proposed":
+      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> proposed plan r{body.revision}: {body.proposal.tasks.length} tasks{body.proposal.understanding ? ` · ${body.proposal.understanding}` : ""}</span>
+        {(body.problems ?? []).length ? <span className="xsmall" style={{ color: "var(--danger)" }}>Pastey's checks: {(body.problems ?? []).join("; ")}</span> : <span className="xsmall subtle">Pastey's checks: no structural problem</span>}{meta}</div>;
+    case "plan_accepted":
+      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> accepted plan r{body.revision} and committed to its tasks in it</span>{meta}</div>;
+    case "plan_adopted":
+      return <div className="stack" style={{ gap: 2 }}><span className="small">Shared plan r{body.revision} adopted {body.byUser ? "by you" : "— every member accepted it"}; implementation starts</span>{meta}</div>;
+    case "plan_progress":
+      return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> reported: {body.items.map((item) => `${item.task} ${item.done ? "done" : "blocked"}${item.detail ? ` (${item.detail})` : ""}`).join("; ")}</span>
+        {(body.verified ?? []).map((line) => <span key={line} className="xsmall subtle">Pastey checked: {line}</span>)}{meta}</div>;
     case "wait":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> waits for <strong>{body.on}</strong>: {body.reason} <span className="subtle">(until {timeOfDay(body.until)})</span></span>{meta}</div>;
     case "attention":
