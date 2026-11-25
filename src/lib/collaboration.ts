@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { NativeDecisionReview } from "./tauri";
 
 /** Agent collaborations on this device (`src-tauri/src/collaboration.rs`).
  * Members are Pastey conversations, one per provider per folder. A message
@@ -53,6 +54,18 @@ export interface RunningTurn {
   taskId: string;
   capabilityId: string;
   activity?: TaskActivity | null;
+  /** The native Agent is blocked until its own client answers a request
+   * (an approval Pastey never gives by itself). */
+  awaitingDecision?: boolean;
+  /** The native requests of this turn, as reviews this user may decide. */
+  decisions?: NativeDecisionReview[];
+}
+
+/** The native model and effort of every turn the collaboration starts for
+ * a member (absent: the Agent's own default). */
+export interface MemberOptions {
+  model?: string;
+  effort?: string;
 }
 
 export interface CollaborationMember {
@@ -75,6 +88,8 @@ export interface CollaborationMember {
   remote?: boolean;
   /** Invited on the linked device, not yet accepted there. */
   invite?: { scopeRef: string; sent: boolean };
+  /** Model and effort of the turns the collaboration starts for it. */
+  options?: MemberOptions;
 }
 
 /** The other device a collaboration spans. */
@@ -115,7 +130,9 @@ export type CollaborationUserAction =
   /** The user confirmed or rejected the decisions of summary `entry`. */
   | { type: "decided"; entry: string; confirmed: boolean }
   /** This device's user accepted the invitation for `alias`. */
-  | { type: "accepted"; alias: string };
+  | { type: "accepted"; alias: string }
+  /** The model and effort of `alias`'s turns changed. */
+  | { type: "options_changed"; alias: string; model?: string; effort?: string };
 
 /** Paths that differ between two scans of a member's folder (each list at
  * most 20; `total` counts all). */
@@ -215,6 +232,7 @@ export interface CollaborationMemberInput {
   provider: CollaborationProvider;
   workspace: string;
   role: string;
+  options?: MemberOptions;
 }
 
 /** The user's alias in a collaboration. */
@@ -310,6 +328,27 @@ export function answerCollaborationInvitation(collaborationId: string, alias: st
 
 export function collaborationNeedsYouCount(): Promise<number> {
   return invoke("collaboration_needs_you_count");
+}
+
+/** Stops the turn running for this device's member: Stop's own
+ * cancellation. Its outcome shows when the turn really ends. */
+export function stopCollaborationMember(collaborationId: string, alias: string): Promise<CollaborationView> {
+  return invoke("stop_collaboration_member", { collaborationId, alias });
+}
+
+/** Sets the model and effort of every turn the collaboration starts for a
+ * member of this device (empty: the Agent's own default). */
+export function setCollaborationMemberOptions(collaborationId: string, alias: string, model: string | null, effort: string | null): Promise<CollaborationView> {
+  return invoke("set_collaboration_member_options", { collaborationId, alias, model, effort });
+}
+
+/** The native decisions a member's running turn waits for: each pending
+ * review, or one when the Agent waits on a request Pastey cannot show. */
+export function pendingDecisions(member: CollaborationMember): number {
+  const live = member.live;
+  if (!live) return 0;
+  const pending = (live.decisions ?? []).filter((review) => review.state === "pending").length;
+  return pending === 0 && live.awaitingDecision ? 1 : pending;
 }
 
 // --- view model (pure) ------------------------------------------------------
@@ -479,9 +518,19 @@ export function outboxLabel(entry: CollaborationEntry, link: CollaborationLink |
 export function memberStateLabel(member: CollaborationMember): string {
   if (member.invite) return member.invite.sent ? "Invited · waiting for its device's user" : "Invited · not yet sent";
   if (member.remote) return member.waiting > 0 ? `${member.waiting} waiting` : "On the other device";
-  if (member.paused) return "Paused";
+  if (pendingDecisions(member) > 0) return "Waiting for your approval";
+  if (member.paused) return member.busy ? "Paused · its last turn is still ending" : "Paused";
+  if (member.busy && !member.live) return "Busy · a turn is ending, or another task holds its folder";
   if (member.busy) return "Working";
   return member.waiting > 0 ? `${member.waiting} waiting` : "Idle";
+}
+
+/** What a member's turns run with, as this device's user chose. */
+export function optionsLabel(options: MemberOptions | undefined): string {
+  const model = options?.model?.trim();
+  const effort = options?.effort?.trim();
+  if (!model && !effort) return "Model and effort: the Agent's own default";
+  return `Model ${model || "default"} · effort ${effort || "default"}`;
 }
 
 /** A usable alias from a folder name: lowercase letters, digits, - and _,

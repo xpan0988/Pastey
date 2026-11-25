@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { respondRemoteNativeDecision, type NativeAgentTaskStatus, type NativeDecision, type NativeDecisionReview } from "../../lib/tauri";
+import { respondLocalNativeDecision, respondRemoteNativeDecision, type NativeAgentTaskStatus, type NativeDecision, type NativeDecisionReview } from "../../lib/tauri";
 import { nativeDecisionPresentation, nativeFileChangeLabel, type NativeDecisionDelivery } from "../../lib/nativeDecisions";
 
 /** Native requests of one task awaiting the user who started it. Request
@@ -8,8 +8,12 @@ import { nativeDecisionPresentation, nativeFileChangeLabel, type NativeDecisionD
  * Deny appear only where the executing device offers them, and each sends
  * one explicit decision for exactly what is shown. */
 export function NativeDecisionPanel({ status, roomId, remote, hostName }: {
-  status: NativeAgentTaskStatus;
-  roomId: string;
+  /** The task, or (for a turn running on this device) just its id, state and
+   * reviews. */
+  status: Pick<NativeAgentTaskStatus, "taskId" | "state" | "nativeDecisions">;
+  /** The Bridge of a task this device requested on another device; absent
+   * for a task this device owns, decided here. */
+  roomId?: string;
   remote: boolean;
   hostName: string;
 }) {
@@ -27,7 +31,11 @@ export function NativeDecisionPanel({ status, roomId, remote, hostName }: {
     setError(null);
     setDelivery((current) => ({ ...current, [review.reviewRef]: "sending" }));
     try {
-      await respondRemoteNativeDecision(roomId, status.taskId, review.reviewRef, review.contentDigest, decision);
+      if (roomId === undefined) {
+        await respondLocalNativeDecision(status.taskId, review.reviewRef, review.contentDigest, decision);
+      } else {
+        await respondRemoteNativeDecision(roomId, status.taskId, review.reviewRef, review.contentDigest, decision);
+      }
       setDelivery((current) => ({ ...current, [review.reviewRef]: "sent" }));
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : String(nextError));

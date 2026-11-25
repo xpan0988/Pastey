@@ -242,6 +242,23 @@ Measures for each: human interventions; time to first delivered message; deliver
 
 Recorded per milestone as it lands.
 
+### R0: correctness and lifecycle closure (2026-11-25)
+
+Boundary: make every state E01 hit visible and controllable, with no new authority and no new concept. Inspected first: `NativeDecisionReviewV1` already reached each task's status, and `cancel_task` / `stop_tasks_with_code` already existed; what was missing was a local decision path and the collaboration reading those facts.
+
+| Item | Change | Evidence |
+| --- | --- | --- |
+| Native approval visibility | `RunningTurnV1` carries `awaitingDecision` and the turn's reviews; the member card reads "Waiting for your approval" and shows the existing review panel; a turn waiting on a request Pastey cannot show says so | `collaboration::tests::a_running_turn_waiting_for_a_native_decision_needs_the_user` |
+| Local decisions | A Locally owned task's reviews keep Approve once / Deny (`ObservedTaskProgressV1::local_decisions`); `respond_local_native_decision` → `submit_local_native_decision`, refused for Bridge-owned tasks; peers still cannot decide a Local task; same digest, expiry and once-only rules (shared `decide_review`) | `native_agent::tests::a_local_task_takes_this_hosts_users_decision_and_only_that` (scripted Codex: decline reaches Codex once; stale digest, second answer, peer and Bridge-owned cases refused) |
+| Needs you | Sidebar count and the view's Needs you include pending native decisions of running member turns (`needs_you_total_with`); each wait is recorded once in the Journal as a Pastey fact (not a second item) | same collaboration test |
+| Member Stop | `stop_collaboration_member`: Stop's own cancellation of the running turn; the card shows "Busy · a turn is ending" until the native turn really ends; a collaboration turn that was stopped pauses its member (existing rule) | `ending_names_the_turns_the_collaboration_started_to_stop`; existing `stop_pauses_a_member_with_a_grant_and_its_turn_counts` |
+| End stops its turns | Ending asks the turns the collaboration started (scheduled and automatic) to stop; a turn the user typed in a member's conversation is left alone | same |
+| Start-failure diagnostics | A definite non-start (adapter `NotStarted` / refused start) pauses the member at once with the adapter's own reason (folder paths left out, bounded to what a linked device accepts) as an Open attention; no immediate retry (E01: three attempts in one second) | `a_turn_that_never_ran_pauses_its_member_with_the_reason_and_gives_up_after_three`, `paths_are_left_out_of_a_start_problem` |
+| Worktree trust | Claude Code's trust recorded for a worktree's main checkout counts (`main_checkout` from the worktree's `.git` file) | `claude_code::conversation::tests::a_worktree_of_a_trusted_checkout_counts_as_trusted` |
+| Model and effort | Stored per member (`MemberV1.options`), validated, passed on every turn the collaboration starts (Claude Code keeps no effort across `--resume`); a `user` entry records changes and stays on this device (like folders); member menu "Model and effort…" | `a_members_model_and_effort_reach_every_turn_the_collaboration_starts` |
+
+Limits: the Journal note of a native wait is written by the scheduler (on a turn's end or its 30 s tick); the live count needs no tick. The trust rule for worktrees is inferred from one observation in E01 (Claude Code 2.1.318), not from documentation. No OS notification yet (R6). Not yet exercised against real Codex or Claude Code in the app.
+
 ## Sources
 
 - Claude Code: [permissions](https://code.claude.com/docs/en/permissions), [permission modes](https://code.claude.com/docs/en/permission-modes) (partly read), [headless](https://code.claude.com/docs/en/headless), [hooks](https://code.claude.com/docs/en/hooks) (partly read), [sandboxing](https://code.claude.com/docs/en/sandboxing) (partly read), [settings](https://code.claude.com/docs/en/settings), [agent teams](https://code.claude.com/docs/en/agent-teams), [agents](https://code.claude.com/docs/en/agents), [dynamic workflows](https://code.claude.com/docs/en/workflows), [subagents](https://code.claude.com/docs/en/sub-agents) (partly read), [cross-session messaging](https://code.claude.com/docs/en/cross-session-messaging), [agent view](https://code.claude.com/docs/en/agent-view) (partly read), [common workflows](https://code.claude.com/docs/en/common-workflows).

@@ -659,13 +659,53 @@ fn trust_problem(workspace: &Path, global_config: Option<&Path>) -> Option<Strin
             break;
         }
     }
-    if found.is_empty() || claude_code_trusts(global_config, &[top, workspace]) {
+    // A git worktree shares its repository with the main checkout, and
+    // Claude Code resolves a worktree's project settings to that checkout:
+    // trust recorded for it counts here too (measured with 2.1.318: Claude
+    // Code shows no trust prompt in a worktree of a trusted checkout and
+    // records nothing for the worktree).
+    let main = main_checkout(top);
+    let mut trusted_folders = vec![top, workspace];
+    if let Some(main) = main.as_deref() {
+        trusted_folders.push(main);
+    }
+    if found.is_empty() || claude_code_trusts(global_config, &trusted_folders) {
         return None;
     }
     Some(format!(
         "This folder has Claude Code project configuration that can run commands ({}), and Claude Code has not been told to trust the folder. Pastey runs Claude Code without its trust prompt, so it does not start it here. Open the folder in Claude Code once (run `claude` there) and accept its trust prompt, then try again.",
         found.join(", ")
     ))
+}
+
+/// The main checkout of the git worktree whose root is `top`, if it is one:
+/// its `.git` is a file naming `<main>/.git/worktrees/<name>`. A bare
+/// repository, or anything else, has none.
+fn main_checkout(top: &Path) -> Option<PathBuf> {
+    let marker = top.join(".git");
+    if !marker.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(&marker)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut text)
+        .ok()?;
+    let gitdir = text.lines().find_map(|line| line.strip_prefix("gitdir:"))?.trim();
+    let gitdir = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        top.join(gitdir)
+    };
+    let gitdir = gitdir.canonicalize().ok()?;
+    let worktrees = gitdir.parent()?;
+    let common = worktrees.parent()?;
+    if worktrees.file_name()? != "worktrees" || common.file_name()? != ".git" {
+        return None;
+    }
+    let main = common.parent()?.canonicalize().ok()?;
+    main.is_dir().then_some(main)
 }
 
 /// Claude Code's own trust record for any of `folders` (canonical):

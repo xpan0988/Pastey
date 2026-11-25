@@ -26,12 +26,14 @@ impl FixtureV1 {
     fn members(&self) -> Vec<MemberInputV1> {
         vec![
             MemberInputV1 {
+                options: Default::default(),
                 alias: "api".into(),
                 provider: ProviderV1::Codex,
                 workspace: self.api.to_string_lossy().into(),
                 role: "owns api/".into(),
             },
             MemberInputV1 {
+                options: Default::default(),
                 alias: "web".into(),
                 provider: ProviderV1::ClaudeCode,
                 workspace: self.web.to_string_lossy().into(),
@@ -275,35 +277,57 @@ fn the_users_own_message_needs_no_approval_and_goes_first() {
 }
 
 #[test]
-fn a_turn_that_never_ran_returns_its_messages_and_gives_up_after_three() {
+fn a_turn_that_never_ran_pauses_its_member_with_the_reason_and_gives_up_after_three() {
     let fixture = FixtureV1::new("nonstart");
     let (mut service, id) = service_with(&fixture);
     service.user_message(&id, "web", "Do it.").unwrap();
+    let problem = format!(
+        "This folder has Claude Code project configuration that can run commands (.claude/settings.json in {}), and Claude Code has not been told to trust the folder.",
+        fixture.root.display()
+    );
     for attempt in 0..MAX_START_ATTEMPTS {
         let plans = service.plan_starts(free);
         assert_eq!(plans.len(), 1, "attempt {attempt}");
         let task = format!("t{attempt}");
         service.started(&plans[0], &task).unwrap();
         service
-            .turn_ended(&TurnEndedV1 {
-                state: NativeAgentTaskStateV1::Failed,
-                code: Some(START_FAILED_CODE.into()),
-                output: None,
-                ..ended(&task, ProviderV1::ClaudeCode, &fixture.web, None)
-            })
+            .turn_ended_explained(
+                &TurnEndedV1 {
+                    state: NativeAgentTaskStateV1::Failed,
+                    code: Some(START_FAILED_CODE.into()),
+                    output: None,
+                    ..ended(&task, ProviderV1::ClaudeCode, &fixture.web, None)
+                },
+                None,
+                Some(&problem),
+            )
             .unwrap();
+        // E01: the same refusal was tried three times in one second. Now
+        // the member waits for its user, with the reason, at once.
+        assert!(service.plan_starts(free).is_empty(), "attempt {attempt}: paused");
+        assert!(member(&service, &id, "web").paused);
+        service.resume_member(&id, "web").unwrap();
     }
     assert!(service.plan_starts(free).is_empty());
-    assert!(entries(&service, &id)
+    let all = entries(&service, &id);
+    assert!(all.iter().any(|entry| matches!(entry.status, Some(StatusV1::Undeliverable { .. }))));
+    let reasons: Vec<&String> = all
         .iter()
-        .any(|entry| matches!(entry.status, Some(StatusV1::Undeliverable { .. }))));
-    // A refusal before anything started counts the same way.
+        .filter_map(|entry| match &entry.body {
+            EntryBodyV1::Attention { text } if text.contains("could not start") => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reasons.len(), MAX_START_ATTEMPTS as usize);
+    assert!(reasons[0].contains("trust"), "{}", reasons[0]);
+    assert!(!reasons[0].contains(&*fixture.root.to_string_lossy()), "no folder path: {}", reasons[0]);
+    assert!(all.iter().filter(|entry| entry.needs_user()).count() >= 1);
+    // A refusal before anything started pauses the same way.
     service.user_message(&id, "api", "Again.").unwrap();
-    for _ in 0..MAX_START_ATTEMPTS {
-        let plans = service.plan_starts(free);
-        service.start_refused(&plans[0], "Claude Code is not signed in").unwrap();
-    }
+    let plans = service.plan_starts(free);
+    service.start_refused(&plans[0], "Claude Code is not signed in").unwrap();
     assert!(service.plan_starts(free).is_empty());
+    assert!(member(&service, &id, "api").paused);
     assert!(entries(&service, &id).iter().any(|entry| matches!(
         &entry.body,
         EntryBodyV1::Attention { text } if text.contains("not signed in")
@@ -526,6 +550,7 @@ fn the_hop_limit_holds_across_three_members_under_auto() {
     let qa = qa.canonicalize().unwrap();
     let mut members = fixture.members();
     members.push(MemberInputV1 {
+        options: Default::default(),
         alias: "qa".into(),
         provider: ProviderV1::Codex,
         workspace: qa.to_string_lossy().into(),
@@ -802,6 +827,7 @@ fn folder(fixture: &FixtureV1, name: &str) -> PathBuf {
 
 fn docs_member(workspace: &Path) -> MemberInputV1 {
     MemberInputV1 {
+        options: Default::default(),
         alias: "docs".into(),
         provider: ProviderV1::Codex,
         workspace: workspace.to_string_lossy().into(),
@@ -1095,4 +1121,100 @@ fn file_state_comes_from_scans_at_each_turns_start_and_end() {
         .map(|listing| listing.count())
         .unwrap_or(0);
     assert_eq!(left, 0);
+}
+
+#[test]
+fn a_members_model_and_effort_reach_every_turn_the_collaboration_starts() {
+    let fixture = FixtureV1::new("options");
+    let paths = fixture.paths();
+    let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
+    let id = service.create("orders-v2", "Cursor pagination", fixture.members()).unwrap();
+    let options = crate::native_agent::NativeSessionOptionsV1 {
+        model: Some("claude-sonnet-5-5".into()),
+        effort: Some("xhigh".into()),
+    };
+    service.set_member_options(&id, "web", options.clone()).unwrap();
+    // Unchanged options write nothing more.
+    service.set_member_options(&id, "web", options.clone()).unwrap();
+    assert_eq!(
+        entries(&service, &id)
+            .iter()
+            .filter(|entry| matches!(&entry.body, EntryBodyV1::User { action: UserActionV1::OptionsChanged { .. } }))
+            .count(),
+        1
+    );
+    service.user_message(&id, "web", "Do it.").unwrap();
+    let plans = service.plan_starts(free);
+    assert_eq!(plans[0].options, options);
+    // Survives a restart.
+    let reloaded = CollaborationServiceV1::new(Some(paths)).unwrap();
+    assert_eq!(member(&reloaded, &id, "web").options, options);
+    // Invalid identifiers are refused.
+    assert!(service
+        .set_member_options(&id, "web", crate::native_agent::NativeSessionOptionsV1 { model: Some("-x".into()), effort: None })
+        .is_err());
+}
+
+fn waiting_on_approval(_: &Path) -> MemberRuntimeV1 {
+    MemberRuntimeV1 {
+        busy: true,
+        live: Some(crate::native_agent::RunningTurnV1 {
+            task_id: "t1".into(),
+            capability_id: CODEX_CAPABILITY_ID.into(),
+            activity: None,
+            awaiting_decision: true,
+            decisions: Vec::new(),
+        }),
+    }
+}
+
+#[test]
+fn a_running_turn_waiting_for_a_native_decision_needs_the_user() {
+    let fixture = FixtureV1::new("native-wait");
+    let (mut service, id) = service_with(&fixture);
+    assert_eq!(service.needs_you_total_with(idle), 0);
+    // E01: codex waited 47 minutes on an approval while showing "Working".
+    assert_eq!(service.needs_you_total_with(waiting_on_approval), 2, "one per waiting member");
+    assert_eq!(service.view(&id, waiting_on_approval).unwrap().summary.needs_you, 2);
+    // Recorded once per turn in the Journal, as a Pastey fact that is not
+    // itself a second item to answer.
+    let waits = vec![(fixture.api.clone(), "t1".to_owned())];
+    service.note_native_waits(&waits).unwrap();
+    service.note_native_waits(&waits).unwrap();
+    let noted: Vec<EntryV1> = entries(&service, &id)
+        .into_iter()
+        .filter(|entry| matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("waits for a decision")))
+        .collect();
+    assert_eq!(noted.len(), 1);
+    assert_eq!(noted[0].member.as_deref(), Some("api"));
+    assert!(!noted[0].needs_user());
+    // An ended collaboration asks nothing.
+    service.set_state(&id, CollaborationStateV1::Ended).unwrap();
+    assert_eq!(service.needs_you_total_with(waiting_on_approval), 0);
+}
+
+#[test]
+fn ending_names_the_turns_the_collaboration_started_to_stop() {
+    let fixture = FixtureV1::new("end-stop");
+    let (mut service, id) = service_with(&fixture);
+    service.user_message(&id, "web", "Do it.").unwrap();
+    let plans = service.plan_starts(free);
+    service.started(&plans[0], "t-web").unwrap();
+    assert_eq!(service.started_turns(&id).unwrap(), vec!["t-web".to_owned()]);
+    assert_eq!(service.local_member_folder(&id, "web").unwrap(), fixture.web);
+    assert!(service.local_member_folder(&id, "nobody").is_err());
+}
+
+#[test]
+fn paths_are_left_out_of_a_start_problem() {
+    let folder = Path::new("/Users/someone/project");
+    let text = redact_paths(
+        "Configuration (.claude/settings.json in /Users/someone/project) and (.mcp.json in /Users/someone). Also C:\\Users\\x\\y, ~/z.",
+        folder,
+    );
+    assert!(!text.contains("/Users"), "{text}");
+    assert!(!text.contains("C:\\"), "{text}");
+    assert!(!text.contains("~/"), "{text}");
+    assert!(text.contains("its folder"), "{text}");
+    assert_eq!(bound_text(&"é".repeat(600), 1024).len() <= 1024, true);
 }

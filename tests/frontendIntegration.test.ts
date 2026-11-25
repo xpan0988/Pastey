@@ -10,7 +10,7 @@ import { uniqueNearbyDevices } from "../src/features/workspace/workspaceViewMode
 import {
   activityCounts, changedPaths, currentStep, elapsedLabel, fileChangesLabel, fileStateLabel, grantUsable, journalCount, journalEntries,
   memberStateLabel, needsUser, originLabel, outboxLabel, policyLabel, statusLabel, suggestAlias, summaryDecider, summaryDecision, turnOutcomeLabel, validAlias,
-  waitingByRecipient, type CollaborationEntry, type CollaborationMember,
+  waitingByRecipient, type CollaborationEntry, type CollaborationMember, pendingDecisions, optionsLabel,
 } from "../src/lib/collaboration";
 import {
   CLAUDE_CODE_AGENT_ID,
@@ -2368,7 +2368,17 @@ test("a collaboration's Journal reads three ways, and only open items need the u
   assert.equal(turnOutcomeLabel("failed", "native_agent_start_failed"), "did not start");
   assert.equal(turnOutcomeLabel("cancelled"), "stopped");
   assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: false, busy: false, waiting: 2 }), "2 waiting");
-  assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: true, busy: true, waiting: 0 }), "Paused");
+  assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: true, busy: true, waiting: 0 }), "Paused · its last turn is still ending");
+  assert.equal(memberStateLabel({ alias: "web", provider: "claude_code", workspace: "/w", role: "", paused: true, busy: false, waiting: 0 }), "Paused");
+  // E01: a member blocked on a native approval read "Working" for 47 minutes.
+  const live = { taskId: "t1", capabilityId: "agent.coding.codex", awaitingDecision: true, decisions: [] };
+  const blocked: CollaborationMember = { alias: "api", provider: "codex", workspace: "/a", role: "", paused: false, busy: true, waiting: 0, live };
+  assert.equal(pendingDecisions(blocked), 1);
+  assert.equal(memberStateLabel(blocked), "Waiting for your approval");
+  assert.equal(memberStateLabel({ ...blocked, live: undefined }), "Busy · a turn is ending, or another task holds its folder");
+  assert.equal(memberStateLabel({ ...blocked, live: { ...live, awaitingDecision: false } }), "Working");
+  assert.equal(optionsLabel(undefined), "Model and effort: the Agent's own default");
+  assert.equal(optionsLabel({ model: "gpt-6.2-sol", effort: "high" }), "Model gpt-6.2-sol · effort high");
 });
 
 test("an auto grant shows its turns left until it is used up or expires, and a live turn reads from reported facts", () => {

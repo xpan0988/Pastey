@@ -803,6 +803,13 @@ pub(crate) struct RunningTurnV1 {
     pub(crate) task_id: String,
     pub(crate) capability_id: String,
     pub(crate) activity: Option<TaskActivityV1>,
+    /// The native capability is blocked until its own client answers a
+    /// request (an approval Pastey never answers by itself).
+    #[serde(default)]
+    pub(crate) awaiting_decision: bool,
+    /// The native requests of this turn, as its reviews show them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) decisions: Vec<NativeDecisionReviewV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1134,6 +1141,10 @@ struct ObservedTaskProgressV1 {
     /// Whether a proven requesting device may decide this task's native
     /// requests. Otherwise none is offered: nobody could give the answer.
     remote_decisions: bool,
+    /// Whether this Host's own user may decide them: the task is owned
+    /// Locally (started here by this user or this user's collaboration),
+    /// never by a Bridge.
+    local_decisions: bool,
     conversation: Option<NativeConversationBindingV1>,
     durable_paths: Option<crate::storage::AppPaths>,
     /// For a conversation of this Host's own user: the adapter that names
@@ -1193,7 +1204,10 @@ impl NativeInvocationProgressV1 for ObservedTaskProgressV1 {
     }
 
     fn native_decision_updated(&self, mut review: NativeDecisionReviewV1) {
-        if !self.remote_decisions && (review.can_accept || review.can_decline) {
+        if !self.remote_decisions
+            && !self.local_decisions
+            && (review.can_accept || review.can_decline)
+        {
             review.can_accept = false;
             review.can_decline = false;
             review.unavailable_reason = Some("native_decision_requester_unverified".into());
@@ -2085,6 +2099,7 @@ impl NativeAgentServiceV1 {
             tasks: self.tasks.clone(),
             task_id: task_id.to_owned(),
             remote_decisions: false,
+            local_decisions: false,
             conversation: None,
             durable_paths: self.durable_paths.clone(),
             local_session: None,
@@ -4413,6 +4428,25 @@ impl NativeAgentServiceV1 {
         options: &NativeSessionOptionsV1,
         refuse_peer_messages: bool,
     ) -> AppResult<NativeAgentTaskStatusV1> {
+        self.start_claude_code_conversation_turn_with_id(
+            &format!("native-agent:{}", Uuid::new_v4()),
+            workspace,
+            task,
+            new_conversation,
+            options,
+            refuse_peer_messages,
+        )
+    }
+
+    fn start_claude_code_conversation_turn_with_id(
+        &mut self,
+        task_id: &str,
+        workspace: &Path,
+        task: &str,
+        new_conversation: bool,
+        options: &NativeSessionOptionsV1,
+        refuse_peer_messages: bool,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         if task.trim().is_empty() || task.len() > MAX_TASK_BYTES {
             return invalid("Native Agent task is empty or exceeds its bound.");
         }
@@ -4431,7 +4465,7 @@ impl NativeAgentServiceV1 {
         )?;
         self.start_local_invocation(
             capability::claude_code::conversation::CLAUDE_CODE_CONVERSATION_ID,
-            &format!("native-agent:{}", Uuid::new_v4()),
+            task_id,
             &input,
         )
     }
@@ -4632,6 +4666,33 @@ impl NativeAgentServiceV1 {
         {
             return invalid("Only the device that started this task can decide its requests.");
         }
+        self.decide_review(request, now)
+    }
+
+    /// This Host's own user's explicit decision on one native request of a
+    /// task owned Locally: one this user, or this user's collaboration,
+    /// started here. A task owned by a Bridge is decided only by its
+    /// requesting device (`submit_native_decision`). The same review rules
+    /// apply: pending, unexpired, exactly this content, offering this
+    /// decision; answered at most once. Never called by policy or model
+    /// output: only from this Host's local command.
+    pub(crate) fn submit_local_native_decision(
+        &mut self,
+        request: &NativeAgentDecisionV1,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
+        validate_decision(request)?;
+        if self.task_owner(&request.task_id)? != Some(TaskOwnerV1::Local) {
+            return invalid("Only the device that started this task can decide its requests.");
+        }
+        self.decide_review(request, now)
+    }
+
+    fn decide_review(
+        &mut self,
+        request: &NativeAgentDecisionV1,
+        now: i64,
+    ) -> AppResult<NativeAgentTaskStatusV1> {
         let agent_id = {
             let tasks = self.tasks.lock().map_err(|_| {
                 AppError::InvalidInput("Native Agent task store is unavailable.".into())
@@ -5384,6 +5445,7 @@ impl NativeAgentServiceV1 {
             tasks: self.tasks.clone(),
             task_id: task_id.clone(),
             remote_decisions: self.task_requesters.contains_key(&task_id),
+            local_decisions: self.task_owner(&task_id)? == Some(TaskOwnerV1::Local),
             conversation: conversation.map(|(binding, _)| binding),
             durable_paths: self.durable_paths.clone(),
             local_session,
@@ -5575,6 +5637,8 @@ impl NativeAgentServiceV1 {
             .and_then(|activities| activities.get(&task_id).cloned());
         Some(RunningTurnV1 {
             capability_id: status.agent_id.clone(),
+            awaiting_decision: status.code.as_deref() == Some(AWAITING_NATIVE_DECISION_CODE),
+            decisions: status.native_decisions.clone(),
             task_id,
             activity,
         })
@@ -11851,6 +11915,84 @@ done
             .cancel_bridge_task(GRANT_BRIDGE, "task-a9")
             .unwrap();
         wait_for_workspace_release(&h.service, &workspace);
+        let _ = fs::remove_dir_all(script_root);
+    }
+
+    /// E01: a collaboration turn this device started waited 47 minutes on
+    /// an approval nobody could give. A task this Host owns takes its own
+    /// user's decision through the local command; a Bridge-owned task never
+    /// does, and a peer never decides a Local task.
+    #[test]
+    fn a_local_task_takes_this_hosts_users_decision_and_only_that() {
+        let (mut h, script_root, binding, device) = approval_fixture(APPROVAL_TURN);
+        let workspace = h.workspace.parent().unwrap().join("Local");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let task_id = "task-local".to_owned();
+        h.service
+            .start_local_invocation(
+                CODEX_CAPABILITY_ID,
+                &task_id,
+                &capability::codex::codex_input(&workspace, "work", true).unwrap(),
+            )
+            .unwrap();
+        let reviews = wait_for_reviews(&h.service, &task_id, 2);
+        let command = review_of_kind(&reviews, NativeDecisionKindV1::CommandExecution);
+        assert!(command.can_accept && command.can_decline, "{command:?}");
+        assert_eq!(command.unavailable_reason, None);
+        // A peer cannot decide this Host's own task.
+        assert!(h
+            .decide(&binding, Some(&device), &task_id, &command, NativeDecisionV1::Accept)
+            .is_err());
+        let request = |review: &NativeDecisionReviewV1, task: &str, decision| NativeAgentDecisionV1 {
+            schema_version: NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+            decision_id: Uuid::new_v4().to_string(),
+            task_id: task.into(),
+            target_host_ref: "local".into(),
+            review_ref: review.review_ref.clone(),
+            content_digest: review.content_digest.clone(),
+            decision,
+        };
+        // Content that changed since it was shown is refused.
+        let mut stale = request(&command, &task_id, NativeDecisionV1::Accept);
+        stale.content_digest = "0".repeat(64);
+        assert!(h.service.submit_local_native_decision(&stale, crate::storage::now_ts()).is_err());
+        h.service
+            .submit_local_native_decision(
+                &request(&command, &task_id, NativeDecisionV1::Decline),
+                crate::storage::now_ts(),
+            )
+            .unwrap();
+        wait_for_review_state(&h.service, &task_id, &command.review_ref, NativeDecisionStateV1::Resolved);
+        assert_eq!(
+            answers(&workspace),
+            [r#"{"id":"approval-cmd","result":{"decision":"decline"}}"#]
+        );
+        // Answered at most once.
+        assert!(h
+            .service
+            .submit_local_native_decision(
+                &request(&command, &task_id, NativeDecisionV1::Accept),
+                crate::storage::now_ts(),
+            )
+            .is_err());
+        h.service.cancel_task(&task_id).unwrap();
+        wait_for_workspace_release(&h.service, &workspace);
+
+        // A task a Bridge owns is never decided locally.
+        let remote = h.workspace.clone();
+        h.invoke(&binding, Some(&device), "task-a10", &remote, "work").unwrap();
+        let reviews = wait_for_reviews(&h.service, "task-a10", 2);
+        let command = review_of_kind(&reviews, NativeDecisionKindV1::CommandExecution);
+        assert!(h
+            .service
+            .submit_local_native_decision(
+                &request(&command, "task-a10", NativeDecisionV1::Accept),
+                crate::storage::now_ts(),
+            )
+            .is_err());
+        h.service.cancel_bridge_task(GRANT_BRIDGE, "task-a10").unwrap();
+        wait_for_workspace_release(&h.service, &remote);
         let _ = fs::remove_dir_all(script_root);
     }
 

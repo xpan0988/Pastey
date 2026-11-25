@@ -835,6 +835,40 @@ fn a_repository_s_configuration_and_trust_count_for_its_subfolders() {
     assert_eq!(start(&fixture).state, NativeAgentTaskStateV1::Completed);
 }
 
+/// A git worktree of a checkout Claude Code trusts starts (E01: Claude
+/// Code itself shows no trust prompt there and records nothing for it); a
+/// worktree of an untrusted checkout is still refused.
+#[test]
+fn a_worktree_of_a_trusted_checkout_counts_as_trusted() {
+    let fixture = FixtureV1::new("complete");
+    let base = fixture.workspace.clone();
+    let main = base.join("main");
+    let worktree = base.join("worktree");
+    fs::create_dir_all(main.join(".git/worktrees/worktree")).unwrap();
+    fs::create_dir_all(worktree.join(".claude")).unwrap();
+    fs::write(worktree.join(".claude/settings.json"), "{}").unwrap();
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", main.join(".git/worktrees/worktree").display()),
+    )
+    .unwrap();
+    let start = |fixture: &FixtureV1| {
+        let (mut service, _) = fixture.service();
+        let started = service
+            .start_claude_code_conversation_task(
+                &worktree,
+                "Do the task",
+                true,
+                &crate::native_agent::NativeSessionOptionsV1::default(),
+            )
+            .unwrap();
+        wait_terminal(&service, &started.task_id)
+    };
+    assert_eq!(start(&fixture).code.as_deref(), Some("native_agent_start_failed"));
+    fixture.trust(&main.canonicalize().unwrap());
+    assert_eq!(start(&fixture).state, NativeAgentTaskStateV1::Completed);
+}
+
 #[test]
 fn stop_interrupts_the_run_and_releases_the_folder_once_it_ends() {
     let fixture = FixtureV1::new("hang");
@@ -2004,12 +2038,14 @@ fn installed_codex_and_claude_code_exchange_an_approved_collaboration_message() 
             "Move GET /v2/orders to cursor pagination",
             vec![
                 MemberInputV1 {
+                    options: Default::default(),
                     alias: "api".into(),
                     provider: ProviderV1::Codex,
                     workspace: api.to_string_lossy().into(),
                     role: "owns the API (this folder)".into(),
                 },
                 MemberInputV1 {
+                    options: Default::default(),
                     alias: "web".into(),
                     provider: ProviderV1::ClaudeCode,
                     workspace: web.to_string_lossy().into(),
@@ -2116,12 +2152,14 @@ fn installed_codex_and_claude_code_take_automatic_turns_within_their_grants() {
             "Move GET /v2/orders to cursor pagination",
             vec![
                 MemberInputV1 {
+                    options: Default::default(),
                     alias: "api".into(),
                     provider: ProviderV1::Codex,
                     workspace: api.to_string_lossy().into(),
                     role: "owns the API (this folder)".into(),
                 },
                 MemberInputV1 {
+                    options: Default::default(),
                     alias: "web".into(),
                     provider: ProviderV1::ClaudeCode,
                     workspace: web.to_string_lossy().into(),
@@ -2279,12 +2317,14 @@ fn installed_agents_joining_a_collaboration_read_its_briefing() {
                 "Move GET /v2/orders to cursor pagination",
                 vec![
                     MemberInputV1 {
+                        options: Default::default(),
                         alias: "api".into(),
                         provider: ProviderV1::Codex,
                         workspace: api.to_string_lossy().into(),
                         role: "owns the orders service (orders.py); does not edit the web client".into(),
                     },
                     MemberInputV1 {
+                        options: Default::default(),
                         alias: "web".into(),
                         provider: ProviderV1::ClaudeCode,
                         workspace: web.to_string_lossy().into(),
@@ -2363,6 +2403,7 @@ fn installed_agents_joining_a_collaboration_read_its_briefing() {
             .add_member(
                 &id,
                 MemberInputV1 {
+                    options: Default::default(),
                     alias: "docs".into(),
                     provider,
                     workspace: docs.to_string_lossy().into(),

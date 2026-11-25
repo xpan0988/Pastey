@@ -1415,12 +1415,79 @@ pub fn set_collaboration_state(
     collaboration_state: crate::collaboration::CollaborationStateV1,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    // Ending asks the turns the collaboration started to stop, through
+    // Stop's own cancellation (their outcome shows when they really end).
+    let started = if collaboration_state == crate::collaboration::CollaborationStateV1::Ended {
+        state
+            .collaborations
+            .lock()
+            .started_turns(&collaboration_id)
+            .map_err(|error| error.message())?
+    } else {
+        Vec::new()
+    };
     state
         .collaborations
         .lock()
         .set_state(&collaboration_id, collaboration_state)
         .map_err(|error| error.message())?;
+    if !started.is_empty() {
+        state
+            .native_agents
+            .lock()
+            .stop_tasks_with_code(&started, "native_agent_cancel_requested");
+    }
     drive_collaborations(&state);
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Stops the turn running for this device's member `alias`, through Stop's
+/// own cancellation: Pastey's authority over the turn ends now, the native
+/// interrupt is requested, and the folder is released when the turn really
+/// ends (the member card shows it until then). A turn the collaboration
+/// started pauses the member.
+#[tauri::command]
+pub fn stop_collaboration_member(
+    collaboration_id: String,
+    alias: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    let folder = state
+        .collaborations
+        .lock()
+        .local_member_folder(&collaboration_id, &alias)
+        .map_err(|error| error.message())?;
+    {
+        let mut natives = state.native_agents.lock();
+        let running = natives
+            .running_turn(&folder)
+            .ok_or_else(|| format!("No turn of {alias} is running."))?;
+        natives
+            .cancel_task(&running.task_id)
+            .map_err(|error| error.message())?;
+    }
+    collaboration_view(&state, &collaboration_id)
+}
+
+/// Sets the model and effort of every turn the collaboration starts for
+/// this device's member `alias` (empty: the Agent's own default).
+#[tauri::command]
+pub fn set_collaboration_member_options(
+    collaboration_id: String,
+    alias: String,
+    model: Option<String>,
+    effort: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::collaboration::CollaborationViewV1, String> {
+    let options = crate::native_agent::NativeSessionOptionsV1 {
+        model: model.filter(|model| !model.trim().is_empty()),
+        effort: effort.filter(|effort| !effort.trim().is_empty()),
+    };
+    state
+        .collaborations
+        .lock()
+        .set_member_options(&collaboration_id, &alias, options)
+        .map_err(|error| error.message())?;
     collaboration_view(&state, &collaboration_id)
 }
 
@@ -1539,7 +1606,8 @@ pub fn withdraw_collaboration_grant(
 /// Items in every collaboration that wait for this device's user.
 #[tauri::command]
 pub fn collaboration_needs_you_count(state: State<'_, Arc<AppState>>) -> usize {
-    state.collaborations.lock().needs_you_total()
+    let runtime = crate::collaboration::member_runtime(&state);
+    state.collaborations.lock().needs_you_total_with(runtime)
 }
 
 /// The native session (provider and id, as session discovery names it) a
@@ -1846,6 +1914,35 @@ pub async fn present_device_identity(
         .map_err(|error| error.message())?;
     present_device_identity_over(state.inner().clone(), session.binding())
         .await
+        .map_err(|error| error.message())
+}
+
+/// This device's user's explicit decision on one native request of a task
+/// this device owns (started here, by this user or this user's
+/// collaboration). A task a Bridge owns is decided only by its requesting
+/// device. Pastey gives the decision to the native capability only after
+/// checking the review again; the task's status reports what it confirmed.
+#[tauri::command]
+pub fn respond_local_native_decision(
+    task_id: String,
+    review_ref: String,
+    content_digest: String,
+    decision: crate::native_agent::NativeDecisionV1,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::native_agent::NativeAgentTaskStatusV1, String> {
+    let request = crate::native_agent::NativeAgentDecisionV1 {
+        schema_version: crate::native_agent::NATIVE_AGENT_PROTOCOL_SCHEMA.into(),
+        decision_id: uuid::Uuid::new_v4().to_string(),
+        task_id,
+        target_host_ref: state.local_host_ref.as_str().into(),
+        review_ref,
+        content_digest,
+        decision,
+    };
+    state
+        .native_agents
+        .lock()
+        .submit_local_native_decision(&request, crate::storage::now_ts())
         .map_err(|error| error.message())
 }
 

@@ -287,6 +287,12 @@ fn read_wire_entry(value: &Value) -> AppResult<IncomingV1> {
             UserActionV1::MemberResumed { alias } => valid_alias(alias),
             UserActionV1::Decided { entry, .. } => valid_id(entry, "entry:"),
             UserActionV1::Accepted { .. } | UserActionV1::Paused | UserActionV1::Resumed | UserActionV1::Ended => true,
+            UserActionV1::OptionsChanged { alias, model, effort } => {
+                valid_alias(alias)
+                    && crate::native_agent::NativeSessionOptionsV1 { model: model.clone(), effort: effort.clone() }
+                        .validate()
+                        .is_ok()
+            }
         },
         EntryBodyV1::Member { alias, role, .. } => valid_alias(alias) && role.chars().count() <= MAX_ROLE_CHARS,
         EntryBodyV1::Grant { alias, .. } => valid_alias(alias),
@@ -428,6 +434,7 @@ impl CollaborationServiceV1 {
             });
         }
         item.record.members.push(MemberV1 {
+            options: Default::default(),
             alias: alias.clone(),
             provider: input.provider,
             workspace: String::new(),
@@ -722,6 +729,7 @@ impl CollaborationServiceV1 {
             .members
             .iter()
             .map(|member| MemberV1 {
+                options: Default::default(),
                 alias: member.alias.clone(),
                 provider: member.provider,
                 workspace: String::new(),
@@ -736,6 +744,7 @@ impl CollaborationServiceV1 {
             })
             .collect();
         members.push(MemberV1 {
+            options: Default::default(),
             alias: invitation.member.alias.clone(),
             provider: invitation.member.provider,
             workspace: workspace.to_string_lossy().into_owned(),
@@ -957,6 +966,7 @@ impl CollaborationServiceV1 {
                             member.remote = true;
                         }
                         None => item.record.members.push(MemberV1 {
+                            options: Default::default(),
                             alias: alias.clone(),
                             provider: *provider,
                             workspace: String::new(),

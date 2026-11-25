@@ -12,11 +12,13 @@ import {
   journalEntries, listCollaborations, MAX_AUTO_HOURS, MAX_AUTO_TURNS, memberStateLabel, policyLabel, providerLabel,
   resumeCollaborationMember, sendCollaborationMessage, setCollaborationGrant, setCollaborationState, statusLabel, suggestAlias,
   turnOutcomeLabel, USER_ALIAS, validAlias, waitingByRecipient, withdrawCollaborationGrant, type CollaborationEntry,
+  optionsLabel, pendingDecisions, setCollaborationMemberOptions, stopCollaborationMember, type MemberOptions,
   type CollaborationMember, type CollaborationMemberInput, type CollaborationProvider, type CollaborationSummary, type CollaborationView,
   type JournalFilter, type RunningTurn,
 } from "../../lib/collaboration";
 import { formatTimestamp } from "../../lib/format";
 import { Badge, Dialog, Dot, EmptyState, errorText, Field, Icon, ListRow, MenuButton, Notice, Segmented } from "./ui";
+import { NativeDecisionPanel } from "./NativeDecisionPanel";
 
 /** Device-wide: Agent collaborations of this device and their Journals. */
 export function CollaborationsScreen({ menuButton }: { menuButton?: ReactNode }) {
@@ -80,6 +82,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   const [pending, setPending] = useState(false);
   const [confirming, setConfirming] = useState<"end" | "delete" | null>(null);
   const [granting, setGranting] = useState<CollaborationMember | null>(null);
+  const [choosing, setChoosing] = useState<CollaborationMember | null>(null);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<{ kind: "goal" } | { kind: "role"; member: CollaborationMember } | null>(null);
   const [removing, setRemoving] = useState<CollaborationMember | null>(null);
@@ -108,7 +111,7 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
   const waiting = waitingByRecipient(view.entries);
   const shown = journalEntries(view.entries, filter);
   const filters: ReadonlyArray<{ value: JournalFilter; label: string }> = (["activity", "summaries", "needs-you"] as const).map((value) => ({
-    value, label: `${value === "activity" ? "Activity" : value === "summaries" ? "Summaries" : "Needs you"} ${journalCount(view.entries, value)}`,
+    value, label: `${value === "activity" ? "Activity" : value === "summaries" ? "Summaries" : "Needs you"} ${journalCount(view.entries, value) + (value === "needs-you" && view.state !== "ended" ? view.members.reduce((sum, member) => sum + pendingDecisions(member), 0) : 0)}`,
   }));
   return (
     <section className="page">
@@ -136,10 +139,15 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
             onGrant={() => setGranting(member)}
             onWithdraw={() => void act(() => withdrawCollaborationGrant(id, member.alias))}
             onEditRole={() => setEditing({ kind: "role", member })}
+            onStop={() => void act(() => stopCollaborationMember(id, member.alias))}
+            onOptions={() => setChoosing(member)}
             onRemove={view.members.length > 2 ? () => setRemoving(member) : undefined} />)}
         </div>
         {!ended ? <Composer members={view.members} link={link} disabled={pending} onSend={(to, text) => act(() => sendCollaborationMessage(id, to, text))} /> : null}
         <Segmented label="Show" value={filter} onChange={setFilter} options={filters} />
+        {filter === "needs-you" && !ended && view.members.some((member) => pendingDecisions(member) > 0)
+          ? <Notice tone="warn" title="An Agent waits for your approval">{view.members.filter((member) => pendingDecisions(member) > 0).map((member) => member.alias).join(", ")}: answer on the member's card above, or stop the turn.</Notice>
+          : null}
         {shown.length === 0 ? <EmptyState title={filter === "needs-you" ? "Nothing needs you" : "Nothing yet"}>
           {filter === "summaries" ? "An Agent writes a summary when its turn finishes a stage, makes a decision or gets blocked." : "Turns, messages and summaries appear here as they happen."}
         </EmptyState> : <div className="stack">
@@ -165,6 +173,8 @@ function CollaborationDetail({ id, menuButton, onBack }: { id: string; menuButto
           <button type="button" className="btn btn-sm btn-danger" disabled={pending} onClick={() => { const alias = removing.alias; setRemoving(null); void act(() => removeCollaborationMember(id, alias)); }}>Remove</button></>}>
         <span />
       </Dialog> : null}
+      {choosing ? <OptionsDialog member={choosing} pending={pending} onClose={() => setChoosing(null)}
+        onSave={(options) => { const alias = choosing.alias; setChoosing(null); void act(() => setCollaborationMemberOptions(id, alias, options.model ?? null, options.effort ?? null)); }} /> : null}
       {granting ? <GrantDialog member={granting} pending={pending} onClose={() => setGranting(null)}
         onGrant={(turns, hours) => { const alias = granting.alias; setGranting(null); void act(() => setCollaborationGrant(id, alias, turns, hours)); }} /> : null}
       {confirming ? <Dialog title={confirming === "end" ? `${guest ? "Leave" : "End"} ${view.name}?` : `Delete ${view.name}?`} onClose={() => setConfirming(null)}
@@ -191,9 +201,9 @@ function timeOfDay(seconds: number): string {
   return new Date(seconds * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResume, onGrant, onWithdraw, onEditRole, onRemove }: {
+function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResume, onGrant, onWithdraw, onEditRole, onStop, onOptions, onRemove }: {
   member: CollaborationMember; link?: CollaborationLink; guest: boolean; waiting: string[]; disabled: boolean; onApprove: (ids: string[]) => void; onResume: () => void; onGrant: () => void; onWithdraw: () => void;
-  onEditRole: () => void; onRemove?: () => void;
+  onEditRole: () => void; onStop: () => void; onOptions: () => void; onRemove?: () => void;
 }) {
   if (member.remote) {
     // Runs on the linked device: its user there approves its turns and
@@ -211,23 +221,33 @@ function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResum
       <span className="xsmall subtle">Its turns and automatic turns are allowed on that device.</span>
     </div></div>;
   }
-  const tone = member.paused ? "warn" : member.busy ? "live" : "neutral";
+  const decisions = pendingDecisions(member);
+  const tone = decisions > 0 || member.paused ? "warn" : member.busy ? "live" : "neutral";
   const now = Date.now() / 1000;
   const automatic = grantUsable(member.grant, now);
   return <div className="card" style={{ flex: "1 1 260px", minWidth: 240 }}><div className="card-body stack" style={{ gap: 6 }}>
     <div className="row" style={{ gap: 8 }}><Dot tone={tone} pulse={member.busy && !member.paused} /><strong>{member.alias}</strong><span className="small muted">{providerLabel(member.provider)}</span>
       {!disabled && !guest ? <span style={{ marginLeft: "auto" }}><MenuButton label={`More actions for ${member.alias}`}>{(close) => <>
         <button type="button" role="menuitem" onClick={() => { close(); onEditRole(); }}><Icon name="file" /><span>Edit role…</span></button>
+        <button type="button" role="menuitem" onClick={() => { close(); onOptions(); }}><Icon name="settings" /><span>Model and effort…<small>For every turn the collaboration starts</small></span></button>
         {onRemove ? <button type="button" role="menuitem" onClick={() => { close(); onRemove(); }}><Icon name="close" /><span>Remove from collaboration…<small>Its conversation stays</small></span></button> : null}
       </>}</MenuButton></span> : null}</div>
     <span className="xsmall subtle mono" title={member.workspace}>{folderName(member.workspace)}</span>
     {member.role ? <span className="small">{member.role}</span> : null}
     <span className="small muted">{memberStateLabel(member)}</span>
     <span className="xsmall subtle">{policyLabel(member, now, timeOfDay)}</span>
+    <span className="xsmall subtle">{optionsLabel(member.options)}</span>
     {member.live ? <LiveTurn live={member.live} automatic={member.autoTask === member.live.taskId} now={now} /> : null}
+    {member.live && (member.live.decisions ?? []).length > 0
+      ? <NativeDecisionPanel status={{ taskId: member.live.taskId, state: "running", nativeDecisions: member.live.decisions }} remote={false} hostName="this device" />
+      : null}
+    {member.live?.awaitingDecision && (member.live.decisions ?? []).length === 0
+      ? <Notice tone="warn">{providerLabel(member.provider)} waits for an answer Pastey cannot show here. Stop the turn, or answer it in {providerLabel(member.provider)} itself.</Notice>
+      : null}
     <div className="row row-wrap" style={{ gap: 6 }}>
       {waiting.length > 0 ? <button type="button" className="btn btn-sm btn-primary" disabled={disabled} onClick={() => onApprove(waiting)}>Approve {waiting.length} for {member.alias}</button> : null}
       {member.paused ? <button type="button" className="btn btn-sm" disabled={disabled} onClick={onResume}>Resume {member.alias}</button> : null}
+      {member.live && !guest ? <button type="button" className="btn btn-sm btn-danger" disabled={disabled} onClick={onStop} title="Interrupts the running turn. It does not undo what the Agent already did.">Stop {member.alias}</button> : null}
       {automatic
         ? <button type="button" className="btn btn-sm btn-ghost" disabled={disabled} onClick={onWithdraw}>Stop automatic turns</button>
         : <button type="button" className="btn btn-sm btn-ghost" disabled={disabled} onClick={onGrant}>Allow automatic turns…</button>}
@@ -250,6 +270,24 @@ function LiveTurn({ live, automatic, now }: { live: RunningTurn; automatic: bool
     {counts ? <span className="xsmall subtle" title="Reported by the Agent's harness">{counts}</span> : null}
     {activity && activity.files.length > 0 ? <span className="xsmall subtle mono" title={activity.files.join("\n")}>{activity.files.slice(0, 3).join(", ")}{activity.filesChanged > 3 ? ` +${activity.filesChanged - 3}` : ""}</span> : null}
   </div>;
+}
+
+function OptionsDialog({ member, pending, onClose, onSave }: { member: CollaborationMember; pending: boolean; onClose: () => void; onSave: (options: MemberOptions) => void }) {
+  const [model, setModel] = useState(member.options?.model ?? "");
+  const [effort, setEffort] = useState(member.options?.effort ?? "");
+  const efforts = member.provider === "claude_code" ? ["low", "medium", "high", "xhigh", "max"] : ["minimal", "low", "medium", "high", "xhigh"];
+  return <Dialog title={`Model and effort for ${member.alias}`} onClose={onClose}
+    description={`Every turn the collaboration starts for ${member.alias} runs with these. Empty uses ${providerLabel(member.provider)}'s own default on this device. ${providerLabel(member.provider)} checks the names; an unknown one fails that turn.`}
+    footer={<><button type="button" className="btn btn-sm" onClick={onClose}>Cancel</button>
+      <button type="button" className="btn btn-sm btn-primary" disabled={pending} onClick={() => onSave({ model: model.trim() || undefined, effort: effort || undefined })}>Save</button></>}>
+    <div className="row row-wrap" style={{ gap: 12 }}>
+      <Field label="Model" htmlFor="member-model"><input id="member-model" className="input input-sm" value={model} placeholder="Agent default" maxLength={64} onChange={(event) => setModel(event.target.value)} /></Field>
+      <Field label="Effort" htmlFor="member-effort"><select id="member-effort" className="select select-sm" value={effort} onChange={(event) => setEffort(event.target.value)}>
+        <option value="">Agent default</option>
+        {efforts.map((value) => <option key={value} value={value}>{value}</option>)}
+      </select></Field>
+    </div>
+  </Dialog>;
 }
 
 function GrantDialog({ member, pending, onClose, onGrant }: { member: CollaborationMember; pending: boolean; onClose: () => void; onGrant: (turns: number, hours: number) => void }) {
@@ -355,6 +393,7 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
         : action.type === "goal_changed" ? `You changed the goal: ${action.goal || "(none)"}`
         : action.type === "role_changed" ? `You changed ${action.alias}'s role: ${action.role || "(none)"}`
         : action.type === "accepted" ? `You accepted the invitation for ${action.alias}`
+        : action.type === "options_changed" ? `You set ${action.alias}'s model to ${action.model ?? "its default"} and effort to ${action.effort ?? "its default"}`
         : `You ${action.confirmed ? "confirmed" : "rejected"} ${decided ?? "a member"}'s decisions`;
       const who = entry.host ? text.replace(/^You /, `The user on ${link?.deviceLabel ?? "the other device"} `) : text;
       return <div className="stack" style={{ gap: 2 }}><span className="small">{who}</span>{meta}</div>;

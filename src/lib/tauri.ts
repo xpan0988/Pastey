@@ -434,6 +434,14 @@ export function cancelRemoteNativeAgentTask(
   return invoke("cancel_remote_native_agent_task", { roomId, peerSessionId, targetHostRef, taskId });
 }
 
+/** This device's user's explicit decision on one native request of a task
+ * this device owns (started here, by this user or their collaboration). */
+export function respondLocalNativeDecision(
+  taskId: string, reviewRef: string, contentDigest: string, decision: NativeDecision,
+): Promise<NativeAgentTaskStatus> {
+  return invoke("respond_local_native_decision", { taskId, reviewRef, contentDigest, decision });
+}
+
 /** Sends this user's explicit decision on one native request of their task
  * running on another device. Delivery is not application: the task's status
  * reports what the native Agent confirmed. */

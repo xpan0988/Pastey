@@ -82,6 +82,7 @@ async fn linked() -> LinkedV1 {
             "orders-v2",
             "Move GET /v2/orders to cursor pagination",
             vec![MemberInputV1 {
+                options: Default::default(),
                 alias: "api".into(),
                 provider: ProviderV1::Codex,
                 workspace: api.to_string_lossy().into(),
@@ -318,6 +319,7 @@ async fn only_a_shared_folder_can_be_invited_and_declining_tells_the_inviter() {
             "orders-v2",
             "",
             vec![MemberInputV1 {
+                options: Default::default(),
                 alias: "api".into(),
                 provider: ProviderV1::Codex,
                 workspace: api.canonicalize().unwrap().to_string_lossy().into(),

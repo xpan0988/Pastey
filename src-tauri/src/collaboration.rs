@@ -163,6 +163,10 @@ pub(crate) struct MemberV1 {
     /// that invited it only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) invite: Option<remote::MemberInviteV1>,
+    /// The native model and effort this device's user chose for every turn
+    /// the collaboration starts for it (empty: the Agent's own default).
+    #[serde(default, skip_serializing_if = "NativeSessionOptionsV1::is_empty")]
+    pub(crate) options: NativeSessionOptionsV1,
 }
 
 /// The auto grant: `turns` automatic turns until `expires_at` (seconds).
@@ -238,6 +242,9 @@ pub(crate) struct MemberInputV1 {
     pub(crate) workspace: String,
     #[serde(default)]
     pub(crate) role: String,
+    /// Model and effort for every turn the collaboration starts for it.
+    #[serde(default)]
+    pub(crate) options: NativeSessionOptionsV1,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +308,15 @@ pub(crate) enum UserActionV1 {
     Decided { entry: String, confirmed: bool },
     /// This device's user accepted the invitation for `alias`.
     Accepted { alias: String },
+    /// The model and effort of `alias`'s turns changed (empty: the Agent's
+    /// own default).
+    OptionsChanged {
+        alias: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -454,6 +470,8 @@ pub(crate) struct StartPlanV1 {
     pub(crate) entry_ids: Vec<String>,
     /// It carries messages nobody approved: it uses one automatic turn.
     pub(crate) automatic: bool,
+    /// The member's chosen model and effort.
+    pub(crate) options: NativeSessionOptionsV1,
 }
 
 /// What the runtime knows of a member's folder now.
@@ -574,6 +592,9 @@ pub(crate) struct CollaborationServiceV1 {
     declines: Vec<(String, String, serde_json::Value)>,
     /// One outbox pass at a time on this Host (`remote::sync`).
     pub(crate) syncing: Arc<std::sync::atomic::AtomicBool>,
+    /// Running turns whose native wait is already in the Journal
+    /// (process-local: no native turn survives a restart).
+    noted_waits: std::collections::HashSet<String>,
 }
 
 fn now() -> i64 {
@@ -674,6 +695,7 @@ impl CollaborationServiceV1 {
             invitations: BTreeMap::new(),
             declines: Vec::new(),
             syncing: Arc::default(),
+            noted_waits: Default::default(),
         };
         let Some(paths) = service.paths.clone() else {
             return Ok(service);
@@ -807,11 +829,17 @@ impl CollaborationServiceV1 {
         let item = self.item_mut(id)?;
         // Written here in a collaboration that spans another device: it goes
         // there too.
+        // A member's model and effort are this device's own configuration,
+        // like its folder: they stay here.
+        let device_private = matches!(
+            &body,
+            EntryBodyV1::User { action: UserActionV1::OptionsChanged { .. } }
+        );
         let outbox = item
             .record
             .link
             .as_ref()
-            .filter(|link| link.accepted)
+            .filter(|link| link.accepted && !device_private)
             .map(|_| remote::OutboxV1::Pending);
         let entry = EntryV1 {
             id: format!("entry:{}", Uuid::new_v4()),
@@ -906,6 +934,7 @@ impl CollaborationServiceV1 {
                 input.provider.label()
             ));
         }
+        input.options.validate()?;
         Ok(MemberV1 {
             alias,
             provider: input.provider,
@@ -918,6 +947,7 @@ impl CollaborationServiceV1 {
             joined_seq: 0,
             remote: false,
             invite: None,
+            options: input.options.clone(),
         })
     }
 
@@ -1300,6 +1330,35 @@ impl CollaborationServiceV1 {
 
     /// The user confirms or rejects the decisions a summary records. The
     /// latest choice counts; briefings and digests show it.
+    /// Sets the model and effort every turn the collaboration starts for
+    /// this device's member `alias` uses. A user entry records it.
+    pub(crate) fn set_member_options(&mut self, id: &str, alias: &str, options: NativeSessionOptionsV1) -> AppResult<()> {
+        options.validate()?;
+        let item = self.item_mut(id)?;
+        let Some(member) = item.member_mut(alias).filter(|member| !member.remote) else {
+            return invalid("That member is not on this device.");
+        };
+        if member.options == options {
+            return Ok(());
+        }
+        member.options = options.clone();
+        self.save_record(id)?;
+        self.append(
+            id,
+            Some(alias),
+            BasisV1::User,
+            EntryBodyV1::User {
+                action: UserActionV1::OptionsChanged {
+                    alias: alias.into(),
+                    model: options.model,
+                    effort: options.effort,
+                },
+            },
+            None,
+        )
+        .map(|_| ())
+    }
+
     pub(crate) fn decide(&mut self, id: &str, entry_id: &str, confirmed: bool) -> AppResult<()> {
         let item = self.item(id)?;
         let has_decisions = item.entries.iter().any(|entry| {
@@ -1610,6 +1669,18 @@ impl CollaborationServiceV1 {
     /// end (`end_scan`): the turn's file state compares it with the scan at
     /// its start.
     pub(crate) fn turn_ended_observed(&mut self, ended: &TurnEndedV1, end_scan: Option<ScanV1>) -> AppResult<bool> {
+        self.turn_ended_explained(ended, end_scan, None)
+    }
+
+    /// `turn_ended_observed`, with what the native capability said when it
+    /// did not start the turn (`start_problem`, Host-private text: shown
+    /// with folder paths left out).
+    pub(crate) fn turn_ended_explained(
+        &mut self,
+        ended: &TurnEndedV1,
+        end_scan: Option<ScanV1>,
+        start_problem: Option<&str>,
+    ) -> AppResult<bool> {
         let (Some(provider), Some(workspace)) = (
             ProviderV1::of_capability(&ended.capability_id),
             ended.workspace.as_deref(),
@@ -1713,6 +1784,27 @@ impl CollaborationServiceV1 {
                 }
             };
             self.set_status(&id, entry_id, status)?;
+        }
+        if origin == TurnOriginV1::Collaboration && not_started {
+            // A definite non-start is not retried at once: the same refusal
+            // (an untrusted folder, a missing CLI, a session another client
+            // holds) would only repeat. The member waits for its user, with
+            // the reason; its messages stay deliverable.
+            let reason = start_problem
+                .map(|problem| redact_paths(problem, workspace))
+                .unwrap_or_else(|| "the Agent gave no reason".into());
+            if let Some(member) = self.item_mut(&id)?.member_mut(&alias) {
+                member.paused = true;
+            }
+            self.save_record(&id)?;
+            self.attention(
+                &id,
+                Some(&alias),
+                bound_text(
+                    &format!("{alias}'s turn could not start: {reason} Resume {alias} once that is fixed; its messages wait."),
+                    MAX_ATTENTION_BYTES,
+                ),
+            )?;
         }
         if origin == TurnOriginV1::Collaboration && !not_started {
             let pause = match ended.state {
@@ -1896,6 +1988,7 @@ impl CollaborationServiceV1 {
                     prompt,
                     entry_ids,
                     automatic,
+                    options: member.options.clone(),
                 });
             }
         }
@@ -1976,13 +2069,22 @@ impl CollaborationServiceV1 {
             };
             self.set_status(&plan.collaboration_id, entry_id, status)?;
         }
-        if given_up {
-            self.attention(
-                &plan.collaboration_id,
-                Some(&plan.alias),
-                format!("Messages for {} were not delivered: {reason}.", plan.alias),
-            )?;
+        // The same refusal would only repeat: the member waits for its user.
+        let workspace = plan.workspace.clone();
+        if let Some(member) = self.item_mut(&plan.collaboration_id)?.member_mut(&plan.alias) {
+            member.paused = true;
         }
+        self.save_record(&plan.collaboration_id)?;
+        let reason = redact_paths(reason, &workspace);
+        let text = if given_up {
+            format!("Messages for {} were not delivered: {reason}", plan.alias)
+        } else {
+            format!(
+                "{alias}'s turn could not start: {reason} Resume {alias} once that is fixed; its messages wait.",
+                alias = plan.alias
+            )
+        };
+        self.attention(&plan.collaboration_id, Some(&plan.alias), bound_text(&text, MAX_ATTENTION_BYTES))?;
         Ok(())
     }
 
@@ -2068,6 +2170,90 @@ impl CollaborationServiceV1 {
             .collect()
     }
 
+    /// This device's member `alias`'s folder (for Stop and live state).
+    pub(crate) fn local_member_folder(&self, id: &str, alias: &str) -> AppResult<PathBuf> {
+        let item = self.item(id)?;
+        match item.member(alias) {
+            Some(member) if !member.remote => Ok(PathBuf::from(&member.workspace)),
+            Some(_) => invalid("That member runs on the other device; its user stops it there."),
+            None => invalid(format!("There is no member \"{alias}\".")),
+        }
+    }
+
+    /// The turns this collaboration started that Pastey has not seen end:
+    /// what ending it asks to stop. A turn the user started in a member's
+    /// conversation is the user's own and is left alone.
+    pub(crate) fn started_turns(&self, id: &str) -> AppResult<Vec<String>> {
+        let item = self.item(id)?;
+        let mut tasks: Vec<String> = item
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.status {
+                Some(StatusV1::Scheduled { task_id, .. }) => Some(task_id.clone()),
+                _ => None,
+            })
+            .chain(item.record.members.iter().filter_map(|member| member.auto_task.clone()))
+            .collect();
+        tasks.sort();
+        tasks.dedup();
+        Ok(tasks)
+    }
+
+    /// Records, once per turn, that a member's running turn waits for a
+    /// native decision only this device's user can give (`waits`: folder,
+    /// task). The live count in views comes from the runtime itself; this
+    /// keeps the fact in the Journal.
+    pub(crate) fn note_native_waits(&mut self, waits: &[(PathBuf, String)]) -> AppResult<()> {
+        for (folder, task_id) in waits {
+            if !self.noted_waits.insert(task_id.clone()) {
+                continue;
+            }
+            let found = self.items.values().find_map(|item| {
+                item.record
+                    .members
+                    .iter()
+                    .find(|member| !member.remote && Path::new(&member.workspace) == folder)
+                    .filter(|_| item.record.state != CollaborationStateV1::Ended)
+                    .map(|member| (item.record.id.clone(), member.alias.clone(), member.provider))
+            });
+            if let Some((id, alias, provider)) = found {
+                self.append(
+                    &id,
+                    Some(&alias),
+                    BasisV1::Fact,
+                    EntryBodyV1::Attention {
+                        text: format!(
+                            "{alias}'s turn waits for a decision {} asked of you (an approval Pastey never gives by itself). Answer it on {alias}'s card, or stop the turn.",
+                            provider.label()
+                        ),
+                    },
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Items waiting for this device's user, with the native decisions the
+    /// members' running turns wait for (`runtime`).
+    pub(crate) fn needs_you_total_with(&self, runtime: impl Fn(&Path) -> MemberRuntimeV1) -> usize {
+        self.items
+            .values()
+            .filter(|item| item.record.state != CollaborationStateV1::Ended)
+            .map(|item| {
+                item.entries.iter().filter(|entry| entry.needs_user()).count()
+                    + item
+                        .record
+                        .members
+                        .iter()
+                        .filter(|member| !member.remote)
+                        .map(|member| pending_decisions(&runtime(Path::new(&member.workspace))))
+                        .sum::<usize>()
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
     pub(crate) fn needs_you_total(&self) -> usize {
         self.items
             .values()
@@ -2105,7 +2291,17 @@ impl CollaborationServiceV1 {
                     .filter(|entry| entry.outbox == Some(remote::OutboxV1::Pending))
                     .count(),
             }),
-            needs_you: item.entries.iter().filter(|entry| entry.needs_user()).count(),
+            needs_you: item.entries.iter().filter(|entry| entry.needs_user()).count()
+                + if item.record.state == CollaborationStateV1::Ended {
+                    0
+                } else {
+                    item.record
+                        .members
+                        .iter()
+                        .filter(|member| !member.remote)
+                        .map(|member| pending_decisions(&runtime(Path::new(&member.workspace))))
+                        .sum::<usize>()
+                },
             last_activity_at: item.last_activity_at(),
         }
     }
@@ -2753,10 +2949,17 @@ pub(crate) fn start_scheduler(runtime: &Arc<HostRuntime>) {
                 // The folder is scanned with no lock held.
                 let folder = runtime.collaborations.lock().ended_folder(&ended);
                 let scan = folder.map(|folder| manifest::scan(&folder));
+                // Why a turn did not start, as the native capability said
+                // (read before the collaborations lock: one lock at a time).
+                let start_problem = (ended.state == NativeAgentTaskStateV1::Failed
+                    && matches!(ended.code.as_deref(), Some(START_FAILED_CODE) | Some(CONVERSATION_UNAVAILABLE_CODE)))
+                .then(|| runtime.native_agents.lock().task_status(&ended.task_id).ok())
+                .flatten()
+                .and_then(|status| status.result);
                 runtime
                     .collaborations
                     .lock()
-                    .turn_ended_observed(&ended, scan)
+                    .turn_ended_explained(&ended, scan, start_problem.as_deref())
                     .unwrap_or(false)
             }
             None => true,
@@ -2775,6 +2978,19 @@ pub(crate) fn drive(runtime: &HostRuntime) {
     // folder is no longer shared with the device that created it pauses.
     remote::settle(runtime);
     remote::pause_unshared(runtime);
+    // Running member turns that wait for a native decision of this user.
+    let waits: Vec<(PathBuf, String)> = {
+        let workspaces = runtime.collaborations.lock().member_workspaces();
+        let natives = runtime.native_agents.lock();
+        workspaces
+            .into_iter()
+            .filter_map(|workspace| {
+                let live = natives.running_turn(&workspace)?;
+                live.awaiting_decision.then(|| (workspace, live.task_id))
+            })
+            .collect()
+    };
+    let _ = runtime.collaborations.lock().note_native_waits(&waits);
     let plans = {
         let mut collaborations = runtime.collaborations.lock();
         let _ = collaborations.settle_grants(now());
@@ -2790,13 +3006,13 @@ pub(crate) fn drive(runtime: &HostRuntime) {
                     &plan.workspace,
                     &plan.prompt,
                     false,
-                    &turn_options(),
+                    &turn_options(&plan.options),
                 ),
                 ProviderV1::ClaudeCode => natives.start_claude_code_member_task(
                     &plan.workspace,
                     &plan.prompt,
                     false,
-                    &turn_options(),
+                    &turn_options(&plan.options),
                 ),
             }
         };
@@ -2851,6 +3067,62 @@ pub(crate) fn member_runtime(runtime: &HostRuntime) -> impl Fn(&Path) -> MemberR
     move |workspace: &Path| known.get(workspace).cloned().unwrap_or_default()
 }
 
+/// The native decisions a member's running turn waits for: each review
+/// still pending, or one when the capability waits on a request Pastey
+/// cannot show (a permission request, a question).
+pub(crate) fn pending_decisions(runtime: &MemberRuntimeV1) -> usize {
+    let Some(live) = runtime.live.as_ref() else { return 0 };
+    let pending = live
+        .decisions
+        .iter()
+        .filter(|review| review.state == crate::native_agent::NativeDecisionStateV1::Pending)
+        .count();
+    if pending == 0 && live.awaiting_decision {
+        1
+    } else {
+        pending
+    }
+}
+
+/// Attention text stays within what a linked device accepts.
+const MAX_ATTENTION_BYTES: usize = 1024;
+
+/// `text` cut to `bytes` on a character boundary, with an ellipsis.
+fn bound_text(text: &str, bytes: usize) -> String {
+    if text.len() <= bytes {
+        return text.to_owned();
+    }
+    let mut end = bytes.saturating_sub(3);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// A native capability's own message with folder paths left out: the
+/// member's folder reads "its folder", any other absolute path "a folder".
+/// Journal text may reach a linked device, which accepts no absolute path.
+fn redact_paths(text: &str, workspace: &Path) -> String {
+    let folder = workspace.to_string_lossy();
+    let text = if folder.is_empty() { text.to_owned() } else { text.replace(folder.as_ref(), "its folder") };
+    text.split_inclusive(char::is_whitespace)
+        .map(|word| {
+            let trimmed = word.trim_start_matches(['(', '"', '\'', '`']);
+            let absolute = trimmed.starts_with('/')
+                || trimmed.starts_with("~/")
+                || trimmed.starts_with("\\\\")
+                || (trimmed.len() > 2 && trimmed.as_bytes()[1] == b':' && matches!(trimmed.as_bytes()[2], b'\\' | b'/'));
+            if absolute {
+                let trailing: String = word.chars().rev().take_while(|c| c.is_whitespace() || matches!(c, ')' | '.' | ',' | '"' | '\'' | '`' | ';')).collect::<Vec<_>>().into_iter().rev().collect();
+                let leading = &word[..word.len() - trimmed.len()];
+                format!("{leading}a folder{trailing}")
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;
 #[cfg(all(test, unix))]
@@ -2860,10 +3132,14 @@ mod ui_bridge;
 #[cfg(test)]
 pub(crate) static TURN_OPTIONS_FOR_TESTS: std::sync::Mutex<Option<NativeSessionOptionsV1>> = std::sync::Mutex::new(None);
 
-fn turn_options() -> NativeSessionOptionsV1 {
+/// The model and effort of a turn the collaboration starts: the member's
+/// own choice (Claude Code keeps no effort across `--resume`, and a Codex
+/// app-server restart forgets a turn's override, so it is passed on every
+/// turn). Tests may set one for every turn.
+fn turn_options(member: &NativeSessionOptionsV1) -> NativeSessionOptionsV1 {
     #[cfg(test)]
     if let Some(options) = TURN_OPTIONS_FOR_TESTS.lock().ok().and_then(|options| options.clone()) {
         return options;
     }
-    NativeSessionOptionsV1::default()
+    member.clone()
 }
