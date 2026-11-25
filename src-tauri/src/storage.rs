@@ -363,6 +363,13 @@ pub fn init_database(paths: &AppPaths) -> AppResult<()> {
             updated_at INTEGER NOT NULL
         );
 
+        -- Folders where this device's user let Codex members reach the
+        -- network from inside their sandbox (one row per folder).
+        CREATE TABLE IF NOT EXISTS codex_network_folders (
+            path TEXT PRIMARY KEY,
+            authorized_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS collaboration_entries (
             id TEXT PRIMARY KEY,
             collaboration_id TEXT NOT NULL,
@@ -1851,6 +1858,30 @@ pub(crate) fn save_notification_settings(paths: &AppPaths, record_json: &str) ->
         "#,
         params![record_json, now_ts()],
     )?;
+    Ok(())
+}
+
+/// Folders where Codex members may use the network, with when.
+pub(crate) fn load_codex_network_folders(paths: &AppPaths) -> AppResult<Vec<(String, i64)>> {
+    let conn = connection(paths)?;
+    let mut statement = conn.prepare("SELECT path, authorized_at FROM codex_network_folders ORDER BY path")?;
+    let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+pub(crate) fn save_codex_network_folder(paths: &AppPaths, path: &str, authorized_at: Option<i64>) -> AppResult<()> {
+    let conn = connection(paths)?;
+    match authorized_at {
+        Some(at) => {
+            conn.execute(
+                "INSERT INTO codex_network_folders (path, authorized_at) VALUES (?1, ?2) ON CONFLICT(path) DO UPDATE SET authorized_at = excluded.authorized_at",
+                params![path, at],
+            )?;
+        }
+        None => {
+            conn.execute("DELETE FROM codex_network_folders WHERE path = ?1", params![path])?;
+        }
+    }
     Ok(())
 }
 

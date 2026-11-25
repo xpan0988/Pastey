@@ -192,6 +192,8 @@ fn mock_app(runtime: Arc<HostRuntime>) -> tauri::App<tauri::test::MockRuntime> {
             crate::commands::get_notification_settings,
             crate::commands::set_notification_settings,
             crate::commands::test_notification,
+            crate::commands::list_codex_network_folders,
+            crate::commands::set_codex_network_folder,
             crate::commands::respond_remote_native_decision,
             crate::commands::stop_bridge_native_agent_task,
             crate::commands::propose_remote_native_codex_workspace_movement,

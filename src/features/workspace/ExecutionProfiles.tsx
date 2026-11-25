@@ -1,7 +1,9 @@
+import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
 import {
   getUserPreferences, setUserPreferences, type PreferenceSections, type UserPreferences,
   getNotificationSettings, setNotificationSettings, testNotification, type NotificationSettings,
+  listCodexNetworkFolders, setCodexNetworkFolder,
   describeProfile, getExecutionDefault, listExecutionPresets, setExecutionDefault,
   type ExecutionChoice, type ExecutionDefault, type ExecutionProfile,
 } from "../../lib/collaboration";
@@ -228,5 +230,53 @@ export function NotificationSettingsSection() {
         <span>Send the program what is needed (collaboration, member, subject). Otherwise it learns only that something needs you, and nothing leaves this device unless your program sends it.</span>
       </label>
     </div></div>
+  </section>;
+}
+
+/** Settings: folders where Codex collaboration members may use the network
+ * from inside their sandbox. Codex 0.170 can only allow all outbound
+ * traffic, so it is never in a preset: each folder is the user's own grant. */
+export function CodexNetworkFolders() {
+  const [folders, setFolders] = useState<Array<[string, number]> | null>(null);
+  const [pending, setPending] = useState<string | null>(null);
+  const [confirmed, setConfirmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const load = () => void listCodexNetworkFolders().then(setFolders).catch(() => setFolders([]));
+  useEffect(load, []);
+  const choose = async () => {
+    const picked = await open({ directory: true, multiple: false });
+    if (typeof picked === "string") { setPending(picked); setConfirmed(false); setError(null); }
+  };
+  const allow = async () => {
+    if (!pending) return;
+    try { await setCodexNetworkFolder(pending, true, confirmed); setPending(null); load(); }
+    catch (cause) { setError(errorText(cause, "It could not be allowed.")); }
+  };
+  return <section className="section" aria-label="Codex network by folder">
+    <div className="section-head-row"><div className="section-head"><h2>Network for Codex, by folder</h2>
+      <p>Codex members work with network off. Codex can only allow all outbound traffic, not a list of hosts, so you allow it one project folder at a time (subfolders included). It applies inside Codex's sandbox, from each member's next turn; planning turns stay offline.</p></div>
+      <button type="button" className="btn btn-sm" onClick={() => void choose()}>Allow a folder…</button></div>
+    {error ? <Notice tone="bad">{error}</Notice> : null}
+    <div className="card"><div className="card-body stack" style={{ gap: 6 }}>
+      {folders === null ? <span className="small subtle">Reading…</span>
+        : folders.length === 0 ? <span className="small">No folder: Codex members never reach the network.</span>
+        : folders.map(([path, at]) => <div key={path} className="row" style={{ gap: 8 }}>
+          <span className="small mono" style={{ flex: 1 }}>{path}</span>
+          <span className="xsmall subtle">allowed {formatTimestamp(at * 1000)}</span>
+          <button type="button" className="btn btn-sm btn-ghost" onClick={() => void setCodexNetworkFolder(path, false, false).then(load)}>Withdraw</button>
+        </div>)}
+    </div></div>
+    {pending ? <Dialog title="Allow Codex network in this folder?" onClose={() => setPending(null)}
+      description={pending}
+      footer={<><button type="button" className="btn btn-sm" onClick={() => setPending(null)}>Cancel</button>
+        <button type="button" className="btn btn-sm btn-primary" disabled={!confirmed} onClick={() => void allow()}>Allow</button></>}>
+      <div className="stack" style={{ gap: 8 }}>
+        <Notice tone="warn">Codex members working in this folder or inside it may reach any host on the internet from inside their sandbox: package registries, but also anything else. Codex's own approvals and auto-review still apply to what leaves the sandbox. Your execution profile's other settings are unchanged.</Notice>
+        <label className="row small" style={{ gap: 8 }}>
+          <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+          <span>I allow Codex members in this folder to use the network.</span>
+        </label>
+      </div>
+    </Dialog> : null}
   </section>;
 }

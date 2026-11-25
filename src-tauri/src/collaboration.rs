@@ -849,6 +849,10 @@ pub(crate) struct CollaborationServiceV1 {
     preferences: Option<preferences::PreferencesV1>,
     /// How the user is told that something needs them (R6).
     notification_settings: notify::NotificationSettingsV1,
+    /// Folders (canonical) where this device's user let Codex members reach
+    /// the network from inside their sandbox, with when; a member's folder
+    /// counts if it is one of them or inside one.
+    codex_network_folders: Vec<(PathBuf, i64)>,
     /// Items already notified (process-local); the first look after start
     /// only records what already needed the user.
     notified: std::collections::HashSet<String>,
@@ -967,6 +971,7 @@ impl CollaborationServiceV1 {
             execution_default: None,
             preferences: None,
             notification_settings: Default::default(),
+            codex_network_folders: Vec::new(),
             notified: Default::default(),
             notified_seeded: false,
         };
@@ -977,6 +982,10 @@ impl CollaborationServiceV1 {
             .and_then(|json| serde_json::from_str::<notify::NotificationSettingsV1>(&json).ok())
             .filter(|settings| settings.validate().is_ok())
             .unwrap_or_default();
+        service.codex_network_folders = storage::load_codex_network_folders(&paths)?
+            .into_iter()
+            .map(|(path, at)| (PathBuf::from(path), at))
+            .collect();
         service.preferences = storage::load_user_preferences(&paths)?
             .and_then(|json| serde_json::from_str::<preferences::PreferencesV1>(&json).ok());
         // A default that no longer reads as a valid profile is not used.
@@ -3053,11 +3062,28 @@ impl CollaborationServiceV1 {
             (None, None, None) => (None, ExecutionSourceV1::None),
         };
         match choice {
-            Some(ExecutionChoiceV1::Profile { profile, authorized_at }) if !member.remote => {
+            Some(ExecutionChoiceV1::Profile { mut profile, authorized_at }) if !member.remote => {
+                // Network for Codex is never in a preset: only this user's
+                // grant for the member's folder turns it on, and only inside
+                // a sandbox the profile chose.
+                let network_grant = (member.provider == ProviderV1::Codex && profile.codex.sandbox.is_some())
+                    .then(|| self.codex_network_grant(Path::new(&member.workspace)))
+                    .flatten();
+                if network_grant.is_some() {
+                    profile.codex.network_access = true;
+                }
+                let mut lines = profile.describe(claude_code);
+                if let Some((folder, at)) = network_grant {
+                    lines.push(format!(
+                        "Network on: you allowed Codex to reach any host from {} (authorised {})",
+                        folder.display(),
+                        chrono_free_date(at)
+                    ));
+                }
                 let view = EffectiveExecutionV1 {
                     name: profile.name.clone(),
                     source,
-                    lines: profile.describe(claude_code),
+                    lines,
                     authorized_at: Some(authorized_at),
                 };
                 (Some(profile), view)
@@ -3072,6 +3098,52 @@ impl CollaborationServiceV1 {
                 },
             ),
         }
+    }
+
+    /// The grant covering `workspace`, if any: the folder itself or one
+    /// above it.
+    fn codex_network_grant(&self, workspace: &Path) -> Option<(PathBuf, i64)> {
+        self.codex_network_folders
+            .iter()
+            .filter(|(folder, _)| workspace.starts_with(folder))
+            .max_by_key(|(folder, _)| folder.as_os_str().len())
+            .cloned()
+    }
+
+    /// Folders where Codex members may use the network, with when.
+    pub(crate) fn codex_network_folders(&self) -> Vec<(PathBuf, i64)> {
+        self.codex_network_folders.clone()
+    }
+
+    /// Lets Codex members working in `folder` (or inside it) reach the
+    /// network from inside their sandbox, after the user confirmed that this
+    /// is all outbound traffic; or (`allow` false) withdraws it. Applies from
+    /// each member's next turn.
+    pub(crate) fn set_codex_network_folder(&mut self, folder: &str, allow: bool, confirmed: bool) -> AppResult<()> {
+        let path = Path::new(folder);
+        let canonical = if allow {
+            let canonical = path
+                .canonicalize()
+                .map_err(|_| AppError::InvalidInput("That folder is unavailable.".into()))?;
+            if !canonical.is_dir() || canonical.parent().is_none() || dirs::home_dir().is_some_and(|home| home == canonical) {
+                return invalid("Choose a project folder, not the root or your home folder.");
+            }
+            if !confirmed {
+                return invalid("Network for Codex is turned on only after you confirm it lets Codex reach any host from that folder.");
+            }
+            canonical
+        } else {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        };
+        self.codex_network_folders.retain(|(known, _)| *known != canonical);
+        let at = allow.then(now);
+        if let Some(at) = at {
+            self.codex_network_folders.push((canonical.clone(), at));
+        }
+        if let Some(paths) = self.paths.as_ref() {
+            storage::save_codex_network_folder(paths, &canonical.to_string_lossy(), at)?;
+        }
+        Ok(())
     }
 
     /// The execution profile of this device's member that is `provider`'s
@@ -4352,6 +4424,22 @@ fn condition_of(
         _ => None,
     });
     wait.unwrap_or(MemberConditionV1::Idle)
+}
+
+/// A date as YYYY-MM-DD (UTC) from seconds, with no date library.
+fn chrono_free_date(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 /// Whether `commit` exists in the repository at `folder`, as a plain fact

@@ -1612,6 +1612,36 @@ pub fn adopt_collaboration_plan(
     collaboration_view(&state, &collaboration_id)
 }
 
+/// Folders where Codex collaboration members may use the network from
+/// inside their sandbox: `[path, authorised at]`.
+#[tauri::command]
+pub fn list_codex_network_folders(state: State<'_, Arc<AppState>>) -> Vec<(String, i64)> {
+    state
+        .collaborations
+        .lock()
+        .codex_network_folders()
+        .into_iter()
+        .map(|(path, at)| (path.to_string_lossy().into_owned(), at))
+        .collect()
+}
+
+/// Allows (after the user confirmed it means any host) or withdraws network
+/// for Codex members in one folder and those inside it. A local command
+/// only: nothing a peer sends reaches it.
+#[tauri::command]
+pub fn set_codex_network_folder(
+    folder: String,
+    allow: bool,
+    confirmed: bool,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    state
+        .collaborations
+        .lock()
+        .set_codex_network_folder(&folder, allow, confirmed)
+        .map_err(|error| error.message())
+}
+
 /// How this device tells its user that a collaboration needs them.
 #[tauri::command]
 pub fn get_notification_settings(

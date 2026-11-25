@@ -1707,3 +1707,38 @@ fn each_new_item_that_needs_the_user_is_notified_once() {
     // Settings: a program must be named by its full path.
     assert!(service.set_notification_settings(notify::NotificationSettingsV1 { command: vec!["notify.sh".into()], ..Default::default() }).is_err());
 }
+
+#[test]
+fn codex_network_is_on_only_in_folders_the_user_allowed() {
+    let fixture = FixtureV1::new("network-folders");
+    let paths = fixture.paths();
+    let mut service = CollaborationServiceV1::new(Some(paths.clone())).unwrap();
+    let id = service.create_released("mobile", "", fixture.members()).unwrap();
+    service.set_execution_default(Some(ExecutionProfileV1::unattended_engineering()), true).unwrap();
+    let api_network = |service: &mut CollaborationServiceV1| {
+        service.user_message(&id, "api", "Go.").ok();
+        service.plan_starts(free).into_iter().find(|plan| plan.alias == "api").unwrap().execution.unwrap().codex.network_access
+    };
+    // The preset keeps it off.
+    assert!(!api_network(&mut service));
+    // A grant needs consent, and not the home folder or the root.
+    assert!(service.set_codex_network_folder(&fixture.api.to_string_lossy(), true, false).is_err());
+    assert!(service.set_codex_network_folder("/", true, true).is_err());
+    // A grant on a folder above the member's counts for it, not for web.
+    service.set_codex_network_folder(&fixture.root.to_string_lossy(), true, true).unwrap();
+    assert!(api_network(&mut service));
+    let view = service.view(&id, idle).unwrap();
+    let api = view.summary.members.iter().find(|member| member.member.alias == "api").unwrap();
+    assert!(api.effective_execution.lines.iter().any(|line| line.contains("Network on: you allowed Codex")));
+    let web = view.summary.members.iter().find(|member| member.member.alias == "web").unwrap();
+    assert!(!web.effective_execution.lines.iter().any(|line| line.contains("Network on")), "Claude Code keeps its own host list");
+    // It survives a restart; withdrawing it turns it off.
+    assert_eq!(CollaborationServiceV1::new(Some(paths)).unwrap().codex_network_folders().len(), 1);
+    service.set_codex_network_folder(&fixture.root.to_string_lossy(), false, false).unwrap();
+    assert!(!api_network(&mut service));
+    // Asking (no profile) passes nothing, so no grant can add network.
+    service.set_codex_network_folder(&fixture.api.to_string_lossy(), true, true).unwrap();
+    service.set_execution(&id, None, choice("ask", None, false)).unwrap();
+    service.user_message(&id, "api", "Again.").unwrap();
+    assert!(service.plan_starts(free).into_iter().find(|plan| plan.alias == "api").unwrap().execution.is_none());
+}

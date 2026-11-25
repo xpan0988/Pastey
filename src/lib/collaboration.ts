@@ -437,6 +437,16 @@ export interface MemberReadiness {
 export interface PlanTask { id: string; title: string; owner: string; paths?: string[]; after?: string[]; deliver?: string }
 export interface PlanProposal { understanding?: string; tasks: PlanTask[]; integration?: string }
 
+/** Folders where Codex members may reach the network from inside their
+ * sandbox: [path, authorised at]. Never part of a preset. */
+export function listCodexNetworkFolders(): Promise<Array<[string, number]>> {
+  return invoke("list_codex_network_folders");
+}
+
+export function setCodexNetworkFolder(folder: string, allow: boolean, confirmed: boolean): Promise<void> {
+  return invoke("set_codex_network_folder", { folder, allow, confirmed });
+}
+
 /** How this device tells you a collaboration needs you. Notifications
  * carry no authority: you still answer in Pastey. */
 export interface NotificationSettings { local: boolean; command: string[]; includeDetails: boolean }
