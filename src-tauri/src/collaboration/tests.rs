@@ -1563,8 +1563,20 @@ fn preferences_reach_each_member_once_per_version_and_grant_nothing() {
 }
 
 fn plan_first(fixture: &FixtureV1) -> (CollaborationServiceV1, String) {
+    plan_first_with(fixture.members())
+}
+
+/// Plan-first with both members in one folder (api's): their claims can
+/// collide, unlike claims in separate folders.
+fn plan_first_shared(fixture: &FixtureV1) -> (CollaborationServiceV1, String) {
+    let mut members = fixture.members();
+    members[1].workspace = fixture.api.to_string_lossy().into();
+    plan_first_with(members)
+}
+
+fn plan_first_with(members: Vec<MemberInputV1>) -> (CollaborationServiceV1, String) {
     let mut service = CollaborationServiceV1::new(None).unwrap();
-    let id = service.create("mobile", "Investigate, design, and implement mobile support", fixture.members()).unwrap();
+    let id = service.create("mobile", "Investigate, design, and implement mobile support", members).unwrap();
     let ready = |alias: &str| readiness::MemberReadinessV1 { alias: alias.into(), provider: ProviderV1::Codex, ready: true, checks: Vec::new(), facts: Vec::new() };
     service.release(&id, &[ready("api"), ready("web")], true).unwrap();
     // Both may edit (so a plan's file claims are authorised).
@@ -1632,7 +1644,7 @@ fn members_plan_read_only_converge_on_one_valid_plan_and_then_implement() {
 #[test]
 fn a_plan_that_does_not_converge_pauses_and_conflicting_work_is_never_released() {
     let fixture = FixtureV1::new("plan-stuck");
-    let (mut service, id) = plan_first(&fixture);
+    let (mut service, id) = plan_first_shared(&fixture);
     service.user_message(&id, "api", "Go.").unwrap();
     // Overlapping claims: both want src/**.
     let overlapping = PROPOSAL.replace("paths=src-tauri/**", "paths=src/**");
@@ -1644,7 +1656,7 @@ fn a_plan_that_does_not_converge_pauses_and_conflicting_work_is_never_released()
             round += 1;
             let task = format!("r{round}");
             service.started(&plan, &task).unwrap();
-            let (provider, workspace) = if plan.alias == "api" { (ProviderV1::Codex, &fixture.api) } else { (ProviderV1::ClaudeCode, &fixture.web) };
+            let (provider, workspace) = if plan.alias == "api" { (ProviderV1::Codex, &fixture.api) } else { (ProviderV1::ClaudeCode, &fixture.api) };
             // Everyone even accepts the latest: problems keep it from adoption.
             let reply = if plan.alias == "api" { overlapping.clone() } else { "```pastey-plan accept=r1\n```\n".to_owned() };
             service.turn_ended(&ended(&task, provider, workspace, Some(&reply))).unwrap();
@@ -1662,7 +1674,7 @@ fn a_plan_that_does_not_converge_pauses_and_conflicting_work_is_never_released()
 #[test]
 fn the_user_may_adopt_a_valid_revision_and_claimed_files_crossed_are_flagged() {
     let fixture = FixtureV1::new("plan-adopt");
-    let (mut service, id) = plan_first(&fixture);
+    let (mut service, id) = plan_first_shared(&fixture);
     service.user_message(&id, "api", "Go.").unwrap();
     let plans = service.plan_starts(free);
     service.started(&plans[0], "p1").unwrap();
@@ -1678,7 +1690,7 @@ fn the_user_may_adopt_a_valid_revision_and_claimed_files_crossed_are_flagged() {
     activity.files = vec!["src-tauri/src/lib.rs".into(), "src/app.tsx".into()];
     activity.files_changed = 2;
     service
-        .turn_ended(&TurnEndedV1 { activity: Some(activity), ..ended("i1", ProviderV1::ClaudeCode, &fixture.web, Some("Done.")) })
+        .turn_ended(&TurnEndedV1 { activity: Some(activity), ..ended("i1", ProviderV1::ClaudeCode, &fixture.api, Some("Done.")) })
         .unwrap();
     assert!(entries(&service, &id).iter().any(|entry| entry.needs_user()
         && matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("src-tauri/src/lib.rs (claimed by api's task split)") && !text.contains("src/app.tsx"))));
@@ -1742,3 +1754,44 @@ fn codex_network_is_on_only_in_folders_the_user_allowed() {
     service.user_message(&id, "api", "Again.").unwrap();
     assert!(service.plan_starts(free).into_iter().find(|plan| plan.alias == "api").unwrap().execution.is_none());
 }
+
+#[test]
+fn claims_in_separate_folders_never_cross_and_a_refused_plan_block_reaches_its_author() {
+    // P02: two clones each wrote their own results/ledger.jsonl and were
+    // flagged; and claude's refused plan block was never repaired.
+    let fixture = FixtureV1::new("plan-folders");
+    let (mut service, id) = plan_first(&fixture);
+    service.user_message(&id, "api", "Go.").unwrap();
+    service.user_message(&id, "web", "Go.").unwrap();
+    let plans = service.plan_starts(free);
+    let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
+    service.started(web, "w1").unwrap();
+    let refused = "```pastey-plan\ntask A: Gadgets | owner=web | paths=/Users/me/web/work\n```\n";
+    service.turn_ended(&ended("w1", ProviderV1::ClaudeCode, &fixture.web, Some(refused))).unwrap();
+    let api = plans.iter().find(|plan| plan.alias == "api").unwrap();
+    service.started(api, "a1").unwrap();
+    let ledger = "```pastey-plan\ntask s: Schedule | owner=api | paths=work/api/**,results/ledger.jsonl\ntask g: Gadgets | owner=web | paths=work/web/**,results/ledger.jsonl\n```\n";
+    service.turn_ended(&ended("a1", ProviderV1::Codex, &fixture.api, Some(ledger))).unwrap();
+    assert!(entries(&service, &id).iter().any(|entry| matches!(&entry.body,
+        EntryBodyV1::PlanProposed { revision: 1, problems, .. } if problems.is_empty())), "separate folders: no overlap");
+    // web's next prompt says what of its last reply was not taken, and why.
+    let plans = service.plan_starts(free);
+    let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
+    assert!(web.prompt.contains("- your last reply: Pastey did not take a plan block: task A claims \"/Users/me/web/work\": paths are relative to the owner's own folder. Nothing in that block reached anyone"), "{}", web.prompt);
+    service.started(web, "w2").unwrap();
+    service.turn_ended(&ended("w2", ProviderV1::ClaudeCode, &fixture.web, Some("```pastey-plan accept=r1\n```\n"))).unwrap();
+    assert_eq!(service.item(&id).unwrap().record.phase, PhaseV1::Implementing);
+    // Implementing: web writes its own ledger, which api's task also names.
+    let plans = service.plan_starts(free);
+    let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
+    assert!(!web.prompt.contains("your last reply"), "told once: {}", web.prompt);
+    service.started(web, "w3").unwrap();
+    let mut activity = crate::native_agent::TaskActivityV1::new(crate::storage::now_ts());
+    activity.files = vec!["results/ledger.jsonl".into()];
+    activity.files_changed = 1;
+    service
+        .turn_ended(&TurnEndedV1 { activity: Some(activity), ..ended("w3", ProviderV1::ClaudeCode, &fixture.web, Some("Done.")) })
+        .unwrap();
+    assert!(!entries(&service, &id).iter().any(|entry| matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("another member's task claims"))));
+}
+

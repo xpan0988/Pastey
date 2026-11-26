@@ -2245,7 +2245,7 @@ impl CollaborationServiceV1 {
                 let owners = self.owners(id)?;
                 let abilities: Vec<plan::OwnerAbilityV1<'_>> = owners
                     .iter()
-                    .map(|(alias, can_edit)| plan::OwnerAbilityV1 { alias, can_edit: *can_edit })
+                    .map(|(alias, can_edit, folder)| plan::OwnerAbilityV1 { alias, can_edit: *can_edit, folder: folder.as_deref() })
                     .collect();
                 let problems = plan::problems(&proposal, &abilities);
                 let rendered = plan::render(revision, &proposal, &[]).replacen("Shared plan", "Plan proposal", 1);
@@ -2297,8 +2297,9 @@ impl CollaborationServiceV1 {
     }
 
     /// Which members may edit files, as their execution profiles say (R5's
-    /// authorisation check of a plan).
-    fn owners(&self, id: &str) -> AppResult<Vec<(String, bool)>> {
+    /// authorisation check of a plan), and each one's folder on this device
+    /// (none for a member on the linked device): claims are relative to it.
+    fn owners(&self, id: &str) -> AppResult<Vec<(String, bool, Option<String>)>> {
         let item = self.item(id)?;
         Ok(item
             .record
@@ -2312,7 +2313,7 @@ impl CollaborationServiceV1 {
                     (ProviderV1::Codex, Some(profile)) => profile.codex.sandbox.as_deref() != Some("read-only"),
                     (ProviderV1::Codex, None) => true,
                 };
-                (member.alias.clone(), can_edit)
+                (member.alias.clone(), can_edit, member_folder(member).map(str::to_owned))
             })
             .collect())
     }
@@ -2565,10 +2566,13 @@ impl CollaborationServiceV1 {
             return Ok(());
         }
         let Some((proposal, _, _)) = item.record.adopted.and_then(|adopted| revision(item, adopted)) else { return Ok(()) };
+        let folder_of = |who: &str| item.member(who).and_then(member_folder);
+        let here = folder_of(alias);
         let mut crossings: Vec<String> = Vec::new();
         for path in changed {
             for task in proposal.tasks.iter().filter(|task| task.owner != alias) {
-                if task.paths.iter().any(|claim| plan::claims_overlap(claim, path)) {
+                let there = folder_of(&task.owner);
+                if task.paths.iter().any(|claim| plan::claims_meet(there, claim, here, path)) {
                     crossings.push(format!("{path} (claimed by {}'s task {})", task.owner, task.id));
                     break;
                 }
@@ -3704,6 +3708,15 @@ fn short(text: &str, chars: usize) -> String {
     }
 }
 
+/// How every refusal of a member's block begins, so its author's next
+/// digest can tell it what was not taken.
+const REFUSED_BLOCK: &str = "Pastey did not take ";
+
+/// A member's folder on this device, if it has one here.
+fn member_folder(member: &MemberV1) -> Option<&str> {
+    (!member.remote && !member.workspace.is_empty()).then_some(member.workspace.as_str())
+}
+
 /// What changed since `member`'s last turn, compiled from the Journal with
 /// no model: other members' turns and changed files (Pastey facts and
 /// runtime reports), the subjects of their summaries and of their questions
@@ -3785,6 +3798,16 @@ fn digest(item: &CollaborationV1, member: &MemberV1) -> String {
                 lines.push(format!(
                     "- {alias} {}",
                     if *change == MemberChangeV1::Joined { "joined" } else { "left" }
+                ));
+            }
+            // A block of this member's own last reply that Pastey refused:
+            // its author is told directly, not only the user (P02: a refused
+            // plan block was never repaired).
+            EntryBodyV1::Attention { text } if entry.member.as_deref() == Some(member.alias.as_str()) && text.starts_with(REFUSED_BLOCK) => {
+                let reason = text.replacen(&format!(" from {}:", member.alias), ":", 1);
+                lines.push(format!(
+                    "- your last reply: {} Nothing in that block reached anyone; correct it and send it again if it still matters.",
+                    short(&reason, 300)
                 ));
             }
             EntryBodyV1::FilesOutside { alias, changes } if *alias == member.alias => {

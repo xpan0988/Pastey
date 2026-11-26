@@ -118,11 +118,20 @@ pub(crate) fn parse(info: &str, body: &str) -> Result<PlanBlockV1, String> {
             if task.title.is_empty() || task.owner.is_empty() {
                 return Err(format!("task {id} needs a title and an `owner=`"));
             }
-            if [&task.title, &task.deliver].iter().any(|field| field.chars().count() > MAX_FIELD_CHARS)
-                || task.paths.len() > MAX_PATHS_PER_TASK
-                || task.paths.iter().any(|path| path.starts_with('/') || path.split('/').any(|part| part == ".."))
-            {
-                return Err(format!("task {id} is over its bounds, or claims a path outside its folder"));
+            for (name, field) in [("title", &task.title), ("deliver", &task.deliver)] {
+                let chars = field.chars().count();
+                if chars > MAX_FIELD_CHARS {
+                    return Err(format!("task {id}'s {name} is {chars} characters, over {MAX_FIELD_CHARS}"));
+                }
+            }
+            if task.paths.len() > MAX_PATHS_PER_TASK {
+                return Err(format!("task {id} claims {} paths, over {MAX_PATHS_PER_TASK}", task.paths.len()));
+            }
+            if let Some(path) = task.paths.iter().find(|path| path.starts_with('/') || path.starts_with('~')) {
+                return Err(format!("task {id} claims \"{path}\": paths are relative to the owner's own folder"));
+            }
+            if let Some(path) = task.paths.iter().find(|path| path.split('/').any(|part| part == "..")) {
+                return Err(format!("task {id} claims \"{path}\", which leaves the owner's folder"));
             }
             proposal.tasks.push(task);
         } else if let Some(rest) = line.strip_prefix("understanding:") {
@@ -173,11 +182,29 @@ pub(crate) fn claims_overlap(left: &str, right: &str) -> bool {
     }
 }
 
+/// Whether a claim (or changed path) in one member's folder can name the
+/// same file as a claim in another's. Claims are relative to their owner's
+/// folder, so members in different folders (separate clones or worktrees)
+/// never collide however their claims read (P02: both members' own
+/// `results/ledger.jsonl` were flagged). A folder this device does not know
+/// (a member on the linked device) is compared literally, conservatively.
+pub(crate) fn claims_meet(left_folder: Option<&str>, left: &str, right_folder: Option<&str>, right: &str) -> bool {
+    match (left_folder.filter(|folder| !folder.is_empty()), right_folder.filter(|folder| !folder.is_empty())) {
+        (Some(a), Some(b)) => {
+            let place = |folder: &str, claim: &str| format!("{}/{}", folder.trim_end_matches('/'), claim.trim_start_matches("./"));
+            claims_overlap(&place(a, left), &place(b, right))
+        }
+        _ => claims_overlap(left, right),
+    }
+}
+
 /// What can and cannot be checked about a member's ability for a task.
 pub(crate) struct OwnerAbilityV1<'a> {
     pub(crate) alias: &'a str,
     /// It may edit files in its folder (as its execution profile says).
     pub(crate) can_edit: bool,
+    /// Its folder on this device, if known: claims are relative to it.
+    pub(crate) folder: Option<&'a str>,
 }
 
 /// Every structural problem with `proposal` for these `owners`, in plain
@@ -206,13 +233,15 @@ pub(crate) fn problems(proposal: &ProposalV1, owners: &[OwnerAbilityV1<'_>]) -> 
     if let Some(cycle) = dependency_cycle(proposal) {
         problems.push(format!("tasks depend on each other in a cycle: {}", cycle.join(" → ")));
     }
+    let folder = |alias: &str| owners.iter().find(|owner| owner.alias == alias).and_then(|owner| owner.folder);
     for (index, task) in proposal.tasks.iter().enumerate() {
         for other in &proposal.tasks[index + 1..] {
             if task.owner == other.owner {
                 continue;
             }
+            let (here, there) = (folder(&task.owner), folder(&other.owner));
             for left in &task.paths {
-                if let Some(right) = other.paths.iter().find(|right| claims_overlap(left, right)) {
+                if let Some(right) = other.paths.iter().find(|right| claims_meet(here, left, there, right)) {
                     problems.push(format!(
                         "{} ({}) and {} ({}) both claim {left} / {right}",
                         task.id, task.owner, other.id, other.owner
@@ -298,7 +327,7 @@ mod tests {
     const PROPOSAL: &str = "understanding: phone is a Bridge peer\ntask split: Split the crate | owner=codex | paths=src-tauri/src/lib.rs,src-tauri/src/main.rs | deliver=lib crate compiles\ntask ui: Phone layout | owner=claude | paths=src/** | after=split\nintegration: claude merges split first";
 
     fn owners() -> Vec<OwnerAbilityV1<'static>> {
-        vec![OwnerAbilityV1 { alias: "codex", can_edit: true }, OwnerAbilityV1 { alias: "claude", can_edit: true }]
+        vec![OwnerAbilityV1 { alias: "codex", can_edit: true, folder: None }, OwnerAbilityV1 { alias: "claude", can_edit: true, folder: None }]
     }
 
     #[test]
@@ -327,7 +356,7 @@ mod tests {
         proposal.tasks[1].paths.push("src-tauri/**".into());
         proposal.tasks[0].after.push("ui".into());
         proposal.tasks.push(TaskV1 { id: "docs".into(), title: "Docs".into(), owner: "gemini".into(), ..TaskV1::default() });
-        let found = problems(&proposal, &[OwnerAbilityV1 { alias: "codex", can_edit: false }, OwnerAbilityV1 { alias: "claude", can_edit: true }]);
+        let found = problems(&proposal, &[OwnerAbilityV1 { alias: "codex", can_edit: false, folder: None }, OwnerAbilityV1 { alias: "claude", can_edit: true, folder: None }]);
         let text = found.join("\n");
         assert!(text.contains("both claim src-tauri/src/lib.rs / src-tauri/**"), "{text}");
         assert!(text.contains("cycle"), "{text}");
@@ -336,5 +365,43 @@ mod tests {
         assert!(claims_overlap("src/**", "src/lib/a.ts"));
         assert!(!claims_overlap("src/**", "src-tauri/src/lib.rs"));
         assert!(!claims_overlap("docs/a.md", "docs/b.md"));
+    }
+
+    #[test]
+    fn claims_in_different_folders_never_collide() {
+        // P02: separate clones each wrote their own results/ledger.jsonl.
+        let PlanBlockV1::Proposal(proposal) = parse(
+            "",
+            "task a: Schedule | owner=codex | paths=work/codex/**,results/ledger.jsonl\ntask b: Gadgets | owner=claude | paths=work/claude/**,results/ledger.jsonl",
+        )
+        .unwrap() else { panic!() };
+        let apart = [
+            OwnerAbilityV1 { alias: "codex", can_edit: true, folder: Some("/ws/codex") },
+            OwnerAbilityV1 { alias: "claude", can_edit: true, folder: Some("/ws/claude") },
+        ];
+        assert!(problems(&proposal, &apart).is_empty());
+        let shared = [
+            OwnerAbilityV1 { alias: "codex", can_edit: true, folder: Some("/repo") },
+            OwnerAbilityV1 { alias: "claude", can_edit: true, folder: Some("/repo/") },
+        ];
+        assert!(problems(&proposal, &shared).join("\n").contains("both claim results/ledger.jsonl"));
+        // One folder inside the other: the inner claim is rebased.
+        assert!(claims_meet(Some("/repo"), "app/src/**", Some("/repo/app"), "src/main.rs"));
+        assert!(!claims_meet(Some("/repo"), "docs/**", Some("/repo/app"), "docs/a.md"));
+        // A folder this device does not know is compared literally.
+        assert!(claims_meet(None, "results/ledger.jsonl", Some("/ws/claude"), "results/ledger.jsonl"));
+    }
+
+    #[test]
+    fn a_refused_task_line_names_what_to_fix() {
+        let long = "x".repeat(MAX_FIELD_CHARS + 1);
+        assert_eq!(
+            parse("", &format!("task A: {long} | owner=claude")).unwrap_err(),
+            format!("task A's title is {} characters, over {MAX_FIELD_CHARS}", MAX_FIELD_CHARS + 1)
+        );
+        assert!(parse("", "task A: t | owner=claude | paths=/Users/x/ws/claude/work").unwrap_err().contains("relative to the owner's own folder"));
+        assert!(parse("", "task A: t | owner=claude | paths=../codex/work").unwrap_err().contains("leaves the owner's folder"));
+        let many = (0..=MAX_PATHS_PER_TASK).map(|n| format!("p{n}")).collect::<Vec<_>>().join(",");
+        assert!(parse("", &format!("task A: t | owner=claude | paths={many}")).unwrap_err().contains("paths, over"));
     }
 }
