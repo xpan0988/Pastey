@@ -935,6 +935,7 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
          - Send a message only when a member must know or do something. Never send an acknowledgement or thanks: Pastey tells the sender when your turn ends.\n\
          - Add a summary only when this turn finished a stage, made a decision or got blocked. Leave out fields with nothing to say.\n\
          - At most 3 messages and 1 summary, all at the very end of your answer.\n\
+         - To quote fenced code in a message, open the block with four backticks (````pastey-message to=<member>) and close it with a line of four.\n\
          [End of Pastey note]\n",
         name = record.name,
         goal = if record.goal.trim().is_empty() { "(none given)" } else { record.goal.trim() },

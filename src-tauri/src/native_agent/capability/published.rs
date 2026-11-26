@@ -116,42 +116,92 @@ struct BlockV1<'a> {
     body: &'a str,
 }
 
-/// Every `pastey-message` or `pastey-summary` block that opens at the start
-/// of a line and closes with a line that is exactly "```".
+/// The length of the backtick run that starts `line`.
+fn backticks(line: &str) -> usize {
+    line.bytes().take_while(|&b| b == b'`').count()
+}
+
+/// A block being read: where it starts, its kind and info, how many
+/// backticks opened it, and how many fenced code blocks inside it are open.
+struct OpenBlockV1<'a> {
+    start: usize,
+    body_start: usize,
+    kind: KindV1,
+    info: &'a str,
+    fence: usize,
+    nested: usize,
+}
+
+/// Every `pastey-*` block that opens at the start of a line with three or
+/// more backticks and closes with a line of only backticks.
+///
+/// A body may quote fenced code (P01: a message carrying a source file was
+/// cut at the code's closing fence and dropped). With an opening fence of
+/// four or more backticks, only a line of at least that many closes the
+/// block. With three, a fence that names a language (```` ```python ````)
+/// opens a nested block, and the bare ```` ``` ```` after it closes that,
+/// not the message.
 fn blocks(text: &str) -> Vec<BlockV1<'_>> {
     let mut found = Vec::new();
     let mut offset = 0;
-    let mut open: Option<(usize, usize, KindV1, &str)> = None;
+    let mut open: Option<OpenBlockV1<'_>> = None;
     for line in text.split_inclusive('\n') {
         let start = offset;
         offset += line.len();
         let bare = line.trim_end_matches(['\n', '\r']);
-        match open {
+        let ticks = backticks(bare);
+        match open.as_mut() {
             None => {
-                let (kind, rest) = if let Some(rest) = bare.strip_prefix(MESSAGE_FENCE) {
+                if ticks < 3 {
+                    continue;
+                }
+                let tagged = &bare[ticks - 3..];
+                let (kind, rest) = if let Some(rest) = tagged.strip_prefix(MESSAGE_FENCE) {
                     (KindV1::Message, rest)
-                } else if let Some(rest) = bare.strip_prefix(SUMMARY_FENCE) {
+                } else if let Some(rest) = tagged.strip_prefix(SUMMARY_FENCE) {
                     (KindV1::Summary, rest)
-                } else if let Some(rest) = bare.strip_prefix(WAIT_FENCE) {
+                } else if let Some(rest) = tagged.strip_prefix(WAIT_FENCE) {
                     (KindV1::Wait, rest)
-                } else if let Some(rest) = bare.strip_prefix(PLAN_FENCE) {
+                } else if let Some(rest) = tagged.strip_prefix(PLAN_FENCE) {
                     (KindV1::Plan, rest)
                 } else {
                     continue;
                 };
                 // `pastey-messages` or similar is not this fence.
                 if rest.is_empty() || rest.starts_with([' ', '\t']) {
-                    open = Some((start, offset, kind, rest.trim()));
+                    open = Some(OpenBlockV1 {
+                        start,
+                        body_start: offset,
+                        kind,
+                        info: rest.trim(),
+                        fence: ticks,
+                        nested: 0,
+                    });
                 }
             }
-            Some((block_start, body_start, kind, info)) => {
-                if bare.trim_end() == "```" {
-                    let body = text[body_start..start].trim_end_matches(['\n', '\r']);
+            Some(block) => {
+                let only_ticks = ticks >= 3 && bare[ticks..].trim().is_empty();
+                let closes = if block.fence > 3 {
+                    only_ticks && ticks >= block.fence
+                } else if only_ticks && block.nested > 0 {
+                    block.nested -= 1;
+                    false
+                } else if only_ticks {
+                    true
+                } else {
+                    if ticks == 3 {
+                        // A fence with a language opens quoted code.
+                        block.nested += 1;
+                    }
+                    false
+                };
+                if closes {
+                    let body = text[block.body_start..start].trim_end_matches(['\n', '\r']);
                     found.push(BlockV1 {
-                        start: block_start,
+                        start: block.start,
                         end: offset,
-                        kind,
-                        info,
+                        kind: block.kind,
+                        info: block.info,
                         body,
                     });
                     open = None;
@@ -350,7 +400,7 @@ pub(crate) fn extract(text: &str) -> PublishedBlocksV1 {
     if tail.len() < total {
         published
             .problems
-            .push("a block that was not at the end of the reply was ignored".into());
+            .push("a block that was not at the end of the reply was ignored, so nothing in it was delivered".into());
     }
     for block in &tail {
         if !renders_faithfully(block.info) || !renders_faithfully(block.body) {
@@ -528,5 +578,28 @@ mod tests {
     fn a_user_alias_is_a_recipient_like_any_other() {
         let text = MESSAGE.replace("to=web", "to=user");
         assert_eq!(extract(&text).messages[0].to, "user");
+    }
+
+    #[test]
+    fn a_message_may_quote_fenced_code() {
+        // P01: a message carrying a source file was cut at the code's own
+        // closing fence, and the rest dropped as "not at the end".
+        let text = "Reproduced.\n\n```pastey-message to=codex\nsubject: My sources\n\nThe gadget:\n\n```python\nclass Gen2(Gen):\n    pass\n```\n\n`stage2.py` is the same schedule.\n```\n\n```pastey-summary\ndone: sent sources\n```\n";
+        let blocks = extract(text);
+        assert!(blocks.problems.is_empty(), "{:?}", blocks.problems);
+        assert_eq!(blocks.messages.len(), 1);
+        assert!(blocks.messages[0].body.contains("```python\nclass Gen2(Gen):"));
+        assert!(blocks.messages[0].body.ends_with("`stage2.py` is the same schedule."));
+        assert_eq!(blocks.summary.unwrap().done.as_deref(), Some("sent sources"));
+    }
+
+    #[test]
+    fn a_longer_fence_closes_only_on_as_many_backticks() {
+        let text = "````pastey-message to=web\nsubject: Snippet\n\n```\nplain fence\n```\n````\n";
+        let blocks = extract(text);
+        assert!(blocks.problems.is_empty(), "{:?}", blocks.problems);
+        assert_eq!(blocks.messages[0].body, "```\nplain fence\n```");
+        // Three backticks never open a block that only four may close.
+        assert!(extract("````pastey-message to=web\nsubject: x\n\nbody\n```\n").messages.is_empty());
     }
 }
