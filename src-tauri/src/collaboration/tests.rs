@@ -1795,3 +1795,51 @@ fn claims_in_separate_folders_never_cross_and_a_refused_plan_block_reaches_its_a
     assert!(!entries(&service, &id).iter().any(|entry| matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("another member's task claims"))));
 }
 
+
+#[test]
+fn a_grant_counts_only_implementation_turns_and_a_stale_acceptance_reaches_only_its_author() {
+    // P01–P03: planning turns and the adoption notice used the grant meant
+    // for implementation; a turn begun while planning accepted after the
+    // plan was adopted.
+    let fixture = FixtureV1::new("plan-grant");
+    let (mut service, id) = plan_first(&fixture);
+    let now = crate::storage::now_ts();
+    service.set_grant(&id, "api", 1, 24, now).unwrap();
+    service.set_grant(&id, "web", 1, 24, now).unwrap();
+    let used = |service: &CollaborationServiceV1, alias: &str| service.item(&id).unwrap().member(alias).unwrap().grant.as_ref().unwrap().used;
+    service.user_message(&id, "api", "Go.").unwrap();
+    let plans = service.plan_starts(free);
+    service.started(&plans[0], "p1").unwrap();
+    service.turn_ended(&ended("p1", ProviderV1::Codex, &fixture.api, Some(PROPOSAL))).unwrap();
+    // web's automatic planning turn needs the grant but uses none of it.
+    let plans = service.plan_starts(free);
+    let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
+    assert!(web.automatic);
+    service.started(web, "p2").unwrap();
+    assert_eq!(used(&service, "web"), 0);
+    service.turn_ended(&ended("p2", ProviderV1::ClaudeCode, &fixture.web, Some("```pastey-plan accept=r1\n```\n"))).unwrap();
+    assert_eq!(service.item(&id).unwrap().record.phase, PhaseV1::Implementing);
+    // The first implementation turn (the adoption notice) is counted.
+    let plans = service.plan_starts(free);
+    let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
+    service.started(web, "i1").unwrap();
+    assert_eq!(used(&service, "web"), 1);
+    // A stale acceptance of another revision is not taken, needs nobody,
+    // and its author is told once.
+    service.turn_ended(&ended("i1", ProviderV1::ClaudeCode, &fixture.web, Some("```pastey-plan accept=r2\n```\n"))).unwrap();
+    let all = entries(&service, &id);
+    let told = all.iter().find(|entry| matches!(&entry.body, EntryBodyV1::Attention { text } if text.contains("r1 is already the shared plan"))).unwrap();
+    assert!(!told.needs_user());
+    assert_eq!(service.item(&id).unwrap().member("web").unwrap().stance, Some(1));
+    // Accepting the shared plan again records nothing.
+    let plans = service.plan_starts(free);
+    let api = plans.iter().find(|plan| plan.alias == "api").unwrap();
+    service.started(api, "i2").unwrap();
+    service.turn_ended(&ended("i2", ProviderV1::Codex, &fixture.api, Some("```pastey-plan accept=r1\n```\n"))).unwrap();
+    let accepted = entries(&service, &id).iter().filter(|entry| matches!(entry.body, EntryBodyV1::PlanAccepted { .. })).count();
+    assert_eq!(accepted, 1, "only web's acceptance before adoption");
+    service.user_message(&id, "web", "Next.").unwrap();
+    let plans = service.plan_starts(free);
+    let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
+    assert!(web.prompt.contains("- your last reply: Pastey did not take a plan acceptance: r1 is already the shared plan"), "{}", web.prompt);
+}

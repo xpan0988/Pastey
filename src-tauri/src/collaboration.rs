@@ -151,6 +151,11 @@ pub(crate) struct MemberV1 {
     /// The automatic turn running now, until Pastey sees it end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_task: Option<String>,
+    /// That automatic turn used one of the grant's turns: a planning turn
+    /// does not (R5 bounds planning on its own), so a grant counts only
+    /// implementation turns.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) auto_counted: bool,
     /// When its automatic turns started within the last hour (the device's
     /// hourly bound).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1170,6 +1175,13 @@ impl CollaborationServiceV1 {
         .map(|_| ())
     }
 
+    /// A Pastey fact for `alias` alone: its next digest says it (a refusal
+    /// beginning with `REFUSED_BLOCK`), and it does not need the user.
+    fn tell_author(&mut self, id: &str, alias: &str, text: impl Into<String>) -> AppResult<()> {
+        self.append(id, Some(alias), BasisV1::Fact, EntryBodyV1::Attention { text: text.into() }, None)
+            .map(|_| ())
+    }
+
     fn set_status(&mut self, id: &str, entry_id: &str, status: StatusV1) -> AppResult<()> {
         let item = self.item_mut(id)?;
         let Some(entry) = item.entries.iter_mut().find(|entry| entry.id == entry_id) else {
@@ -1244,6 +1256,7 @@ impl CollaborationServiceV1 {
             paused: false,
             grant: None,
             auto_task: None,
+            auto_counted: false,
             auto_starts: Vec::new(),
             joined_seq: 0,
             remote: false,
@@ -2086,9 +2099,10 @@ impl CollaborationServiceV1 {
         if automatic {
             let member = self.item_mut(&id)?.member_mut(&alias).expect("member exists");
             member.auto_task = None;
+            let counted = std::mem::take(&mut member.auto_counted);
             if not_started || failed_at_once {
                 // Nothing ran: the turn is given back.
-                if let Some(grant) = member.grant.as_mut() {
+                if let Some(grant) = member.grant.as_mut().filter(|_| counted) {
                     grant.used = grant.used.saturating_sub(1);
                 }
                 member.auto_starts.pop();
@@ -2281,6 +2295,21 @@ impl CollaborationServiceV1 {
                 Ok(true)
             }
             plan::PlanBlockV1::Accept(wanted) => {
+                // After adoption an acceptance is stale: a turn that began
+                // while planning ends after the plan converged (P01, P03).
+                // Accepting the shared plan again changes nothing; accepting
+                // another revision is not taken, and only its author is told.
+                let item = self.item(id)?;
+                if let (PhaseV1::Implementing, Some(adopted)) = (item.record.phase, item.record.adopted) {
+                    if wanted != adopted {
+                        self.tell_author(
+                            id,
+                            alias,
+                            format!("{REFUSED_BLOCK}a plan acceptance from {alias}: r{adopted} is already the shared plan, so accepting r{wanted} changes nothing. To change the plan, propose a revision."),
+                        )?;
+                    }
+                    return Ok(false);
+                }
                 if revision(self.item(id)?, wanted).is_none() {
                     self.attention(id, Some(alias), format!("{alias} accepted plan r{wanted}, which does not exist."))?;
                     return Ok(false);
@@ -2905,10 +2934,15 @@ impl CollaborationServiceV1 {
         }
         if plan.automatic {
             let item = self.item_mut(&plan.collaboration_id)?;
+            // A planning turn needs a live grant but does not use one of its
+            // turns (P01–P03: planning and the adoption notice ate into the
+            // turns the user meant for implementation).
+            let counted = item.record.phase != PhaseV1::Planning;
             if let Some(member) = item.member_mut(&plan.alias) {
-                if let Some(grant) = member.grant.as_mut() {
+                if let Some(grant) = member.grant.as_mut().filter(|_| counted) {
                     grant.used = grant.used.saturating_add(1);
                 }
+                member.auto_counted = counted;
                 member.auto_task = Some(task_id.into());
                 member.auto_starts.retain(|at| now - *at < HOUR);
                 member.auto_starts.push(now);
@@ -3011,7 +3045,8 @@ impl CollaborationServiceV1 {
                     let member = self.item_mut(&id)?.member_mut(&alias).expect("member exists");
                     if member.auto_task.as_deref() == Some(task_id.as_str()) {
                         member.auto_task = None;
-                        if let Some(grant) = member.grant.as_mut() {
+                        let counted = std::mem::take(&mut member.auto_counted);
+                        if let Some(grant) = member.grant.as_mut().filter(|_| counted) {
                             grant.used = grant.used.saturating_sub(1);
                         }
                         member.auto_starts.pop();
