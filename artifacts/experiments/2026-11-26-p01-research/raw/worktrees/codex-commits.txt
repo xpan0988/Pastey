@@ -1,0 +1,4 @@
+cf9b1e4 Reduce verified 99-Toffoli oracle to 65 qubits
+c29f6a2 Verify 99-Toffoli live-norm L3 oracle
+a2bde2b Verify retained-input L3 phase oracle
+97c9b59 p01: withhold operator notes from participants
