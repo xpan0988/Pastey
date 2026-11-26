@@ -1,0 +1,54 @@
+[
+ {
+  "claude": {
+   "sandbox": false,
+   "sandboxAutoAllow": false
+  },
+  "codex": {
+   "networkAccess": false
+  },
+  "name": "Ask"
+ },
+ {
+  "claude": {
+   "allowWrite": [
+    "~/.cargo",
+    "~/.npm",
+    "~/.rustup"
+   ],
+   "allowedDomains": [
+    "registry.npmjs.org",
+    "*.npmjs.org",
+    "crates.io",
+    "*.crates.io",
+    "static.rust-lang.org",
+    "github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com"
+   ],
+   "deny": [
+    "Bash(git push)",
+    "Bash(git push *)",
+    "Bash(gh pr *)",
+    "Bash(gh release *)",
+    "Bash(npm publish *)",
+    "Bash(cargo publish *)",
+    "Bash(sudo *)"
+   ],
+   "permissionMode": "acceptEdits",
+   "sandbox": true,
+   "sandboxAutoAllow": true
+  },
+  "codex": {
+   "approvalPolicy": "on-request",
+   "approvalsReviewer": "auto_review",
+   "networkAccess": false,
+   "sandbox": "workspace-write",
+   "writableRoots": [
+    "~/.cargo",
+    "~/.npm"
+   ]
+  },
+  "name": "Unattended engineering"
+ }
+]

@@ -1,0 +1,4 @@
+a92932c Reproduce Claude multiplier in verified L3 stage
+2c8959a Verify 96-Toffoli 67-qubit L3 circuit
+ce16424 Verify closed-form L3 phase oracle schedules
+2d2056c p02: withhold operator notes from participants
