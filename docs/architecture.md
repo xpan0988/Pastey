@@ -1,12 +1,16 @@
-# Pastey architecture
+# Maris architecture
 
-Pastey is cross-device infrastructure for general-capability Agents. A Host is a device and execution locality; a capability is an ability that Host exposes; and an Agent is an intelligence or execution participant that makes or proposes task decisions over capabilities and resources. A general-capability Agent is not architecturally confined to one Host, tool, provider, model, capability family, or local execution environment. Hosts expose capabilities and resources, Agents reason over them, and Pastey makes authorized decisions executable across devices.
+Maris is cross-device infrastructure for general-capability Agents. A Host is a device and execution locality; a capability is an ability that Host exposes; and an Agent is an intelligence or execution participant that makes or proposes task decisions over capabilities and resources. A general-capability Agent is not architecturally confined to one Host, tool, provider, model, capability family, or local execution environment. Hosts expose capabilities and resources, Agents reason over them, and Maris makes authorized decisions executable across devices.
 
-Pastey 2.0 has a capability-neutral Native Agent path for Codex and local Claude Code conversations, and a distinct Generic Managed Worker path. Bridge traffic can use the LAN, an overlay address or the optional internet carrier (direct P2P with relay fallback). Source code, validators and tests are authoritative. See [development](development.md#automated-local-and-physical-evidence) for physical acceptance and its limits.
+Maris has a capability-neutral Native Agent path for Codex and local Claude Code conversations, and a distinct Generic Managed Worker path. Bridge traffic can use the LAN, an overlay address or the optional internet carrier (direct P2P with relay fallback). Source code, validators and tests are authoritative. See [development](development.md#automated-local-and-physical-evidence) for physical acceptance and its limits.
+
+## Product name and internal codename
+
+The product was renamed from Pastey to Maris without changing behavior. Only names a person sees changed: the app and installer names, the window and tray, screens and user-facing errors, the documentation, the text Agents read, and the client name Codex records. Internally the codename is still `pastey`. Protocol constants (ALPN, key-derivation and authentication labels, schema and media-type names, request headers, capability ids, the `Pastey Shared` location value), the bundle identifier `dev.localfirst.pastey`, data, log and temporary paths, browser storage keys, the collaboration alias and `pastey-*` reply blocks, environment variables, command-line arguments, Tauri events, and the npm package, Cargo crate and executable names all keep it, so a Maris device keeps its data and stays compatible with devices running Pastey 2.0. Unify the names only in a major version that changes the protocol anyway, together with a data migration.
 
 ## Agent execution across Hosts
 
-An Agent or product flow can identify the capability a task needs, select its owning Host, and place execution there. If the necessary resources are already on that Host, the capability works locally. If capability and resource placement differ, Pastey can authorize explicit movement, execute on the selected Host, then handle result continuation or consequences. Factual capability observations inform selection but never grant it. The currently implemented Native Agent and managed paths have different authority and execution contracts; neither path implies arbitrary future capabilities work today.
+An Agent or product flow can identify the capability a task needs, select its owning Host, and place execution there. If the necessary resources are already on that Host, the capability works locally. If capability and resource placement differ, Maris can authorize explicit movement, execute on the selected Host, then handle result continuation or consequences. Factual capability observations inform selection but never grant it. The currently implemented Native Agent and managed paths have different authority and execution contracts; neither path implies arbitrary future capabilities work today.
 
 ## System and dependency direction
 
@@ -31,13 +35,13 @@ The native capability owns HOW: its provider or runtime, native session,
 interpretation of its own input, tools, reasoning, execution,
 capability-specific safety, and native outcome.
 
-Pastey owns WHERE and authority: discovery, Host and session identity,
+Maris owns WHERE and authority: discovery, Host and session identity,
 routing, executor admission, task ownership, lifecycle observation,
 cancellation, Burn, reconciliation, cross-Host movement, and durable outer
 facts.
 ```
 
-Pastey can detect/observe a native Agent, qualify only enough to use its native
+Maris can detect/observe a native Agent, qualify only enough to use its native
 interface, open or resume its Host-private session, send a task, observe its
 bounded lifecycle/result, and cancel where that interface supports it. It does
 not broker the Agent provider or authentication, translate native tools into
@@ -53,7 +57,7 @@ Agent + workspace so related tasks preserve the Agent's native context while an
 unrelated workspace is never silently reused. Native session identifiers and
 internal conversation mechanics are not Plan semantics.
 
-Inside Pastey the native lifecycle is capability-neutral. A capability plugs in
+Inside Maris the native lifecycle is capability-neutral. A capability plugs in
 as an adapter registered under its capability ID; the adapter owns its input,
 start, stop, and terminal output, while Core owns task identity, ownership,
 admission, status, cancellation, reconciliation, restart recovery, Bridge
@@ -92,7 +96,7 @@ authenticated current Bridge session
 
 Managed resources and Transfer are introduced only when a workspace or result
 must cross a Host boundary. For a local workspace selected with a remote native
-Agent, Pastey creates one requester movement Review that says it will send the
+Agent, Maris creates one requester movement Review that says it will send the
 workspace, ask the Agent Host to run the task, and return the result.
 Requester movement approval covers that outbound Transfer, the request for the
 remote task, the return Transfer, and unchanged-source apply; it is never
@@ -111,9 +115,9 @@ is captured as an exact `RegularFileSet` baseline at approval; package framing,
 encrypted transport, and landing reuse the ordinary managed-object Transfer
 seams. The Agent sees only the Host-private task workspace on its Host.
 
-The return is scanned because it must cross Hosts. Pastey revalidates the
+The return is scanned because it must cross Hosts. Maris revalidates the
 approved source immediately before its bounded staged apply. If it changed,
-Pastey retains the exact returned workspace under Host-private conflict storage
+Maris retains the exact returned workspace under Host-private conflict storage
 and enters consequence recovery without overwriting the source. The native
 task remains `Completed` if its execution completed; movement completion and
 result apply remain separate facts. Cross-Host movement is rejected before
@@ -143,7 +147,7 @@ and any malformed or mismatched terminal notification stay non-DONE.
   local command of the controlled Host's user after informed consent. It
   replaces each Accept and nothing else: it never answers a native
   capability's own approvals, runs a capability local to its Host, admits a
-  managed Plan, or raises the Pastey process's own rights, which everything
+  managed Plan, or raises the Maris process's own rights, which everything
   it starts inherits. Revoking it refuses new requests at once, closes the
   terminals it opened and asks the tasks it admitted to stop, without
   claiming a stop it cannot confirm.
@@ -155,7 +159,7 @@ and any malformed or mismatched terminal notification stay non-DONE.
   exactly the authority its Bridge owns.
 - Core does not interpret native capability input or output.
 - The native capability owns HOW. A robot, VLA, or vendor device runtime is
-  treated the same way: Pastey owns discovery, authority, routing, and
+  treated the same way: Maris owns discovery, authority, routing, and
   lifecycle, while the native or vendor runtime owns control loops, motion,
   device safety, and HOW.
 - An unknown outcome is never promoted to success, and restart never reruns
@@ -183,7 +187,7 @@ user / product UI
         |
 Natural-v2 proposal or deterministic v2 Composer
         |
-Pastey Core: validate → seal revision/hash → Review → approval
+Maris Core: validate → seal revision/hash → Review → approval
         |
 requester whole-Plan readiness → local/remote prepare and admission → commit
         |
@@ -211,7 +215,7 @@ Execution locality does not change this chain. Core resolves each authored parti
 
 `HostRuntime` is the UI-independent Host service owner. It owns Host identity, current session resolution, managed-object bindings, Plan stores, admission, effect authority, resource/process/network backends, Worker/provider services, native-v2 coordination, lifecycle revocation, and Developer Terminal state. Tauri is the desktop invoke/event/task adapter; extracting `HostRuntime` did not create a Headless Host. Layer 4 alone resolves a durable remote `HostRef` to exactly one live current Bridge session: it filters historical lifecycle rows, proves the exact transport key, validates current Room Control/server state, and returns an opaque session carrying the resulting `HostSessionBinding`. Orchestration and acceptance harnesses do not inspect Bridge persistence or probe routes themselves.
 
-`HostRef` is Pastey's durable logical Host identity, and `PlanParticipantRef` names a role within one immutable Plan. Local execution freshness is a `LocalRuntimeRef` bound only to the current durable Host and process generation; it has no peer, route, session, or session-pair fields. `HostSessionBinding` is reserved for a remote Host's exact current Layer 4 Bridge/session route. These identities are not interchangeable:
+`HostRef` is Maris's durable logical Host identity, and `PlanParticipantRef` names a role within one immutable Plan. Local execution freshness is a `LocalRuntimeRef` bound only to the current durable Host and process generation; it has no peer, route, session, or session-pair fields. `HostSessionBinding` is reserved for a remote Host's exact current Layer 4 Bridge/session route. These identities are not interchangeable:
 
 - a participant must resolve to the authored `HostRef`;
 - admission and later results must carry the same immutable Plan/revision/approval/attempt and the appropriate current freshness proof;
@@ -286,7 +290,7 @@ human controller enters Developer Mode
 
 The grant is bound to the controller and target Developer Host identities, exact terminal/session binding, Bridge, terminal session, expiry, and one PTY start. A route is necessary but insufficient. The requester cannot choose executable, argv, cwd, environment, or privilege escalation. Unix uses a Host-selected allowed shell in a real PTY; Windows uses PowerShell through ConPTY.
 
-When the target Host's user gave the controlling device **Full Access** ([Layer 5](layers/layer-5-agent.md#full-access)) and that device proved its identity in exactly the session the request arrived on, the target admits the pending request itself, without a Host-local interaction, and creates the same one-use `DeveloperTerminalGrant` (checked again just before the PTY starts; any failure leaves the request pending for Accept). Everything else is unchanged: the grant's binding, 30-minute lifetime, one PTY start, revocation events, and the Host-selected shell. The target's Bridge view shows such a terminal with **Close terminal**, and revoking Full Access closes it; the controller is told `host_closed`. The shell has exactly the Pastey process's rights: Full Access never raises them, but if Pastey itself runs as administrator, so does the shell, and the consent dialog says so first.
+When the target Host's user gave the controlling device **Full Access** ([Layer 5](layers/layer-5-agent.md#full-access)) and that device proved its identity in exactly the session the request arrived on, the target admits the pending request itself, without a Host-local interaction, and creates the same one-use `DeveloperTerminalGrant` (checked again just before the PTY starts; any failure leaves the request pending for Accept). Everything else is unchanged: the grant's binding, 30-minute lifetime, one PTY start, revocation events, and the Host-selected shell. The target's Bridge view shows such a terminal with **Close terminal**, and revoking Full Access closes it; the controller is told `host_closed`. The shell has exactly the Maris process's rights: Full Access never raises them, but if Maris itself runs as administrator, so does the shell, and the consent dialog says so first.
 
 Terminal messages use the authenticated encrypted Room Control transport but a distinct `developer_terminal` protocol branch. They do not enter ordinary Bridge item history. Wrong, stale, replayed, out-of-order, oversized, or late frames fail closed. Current bounds and protocol names live in [reference](reference.md).
 

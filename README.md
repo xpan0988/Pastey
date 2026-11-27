@@ -1,36 +1,36 @@
-# Pastey
+# Maris
 
-Pastey is cross-device infrastructure for general-capability Agents.
+Maris (formerly Pastey) is cross-device infrastructure for general-capability Agents.
 
-Hosts expose capabilities and resources. Agents can reason about which capabilities a task needs and where they live. Pastey supplies the execution substrate for using those capabilities across devices; task resources move explicitly when their location differs from the chosen execution Host.
+Hosts expose capabilities and resources. Agents can reason about which capabilities a task needs and where they live. Maris supplies the execution substrate for using those capabilities across devices; task resources move explicitly when their location differs from the chosen execution Host.
 
-## What Pastey is
+## What Maris is
 
-A **Host** is a device and execution locality represented by Pastey. A **capability** is an ability exposed by a Host, such as a native Agent or managed execution. An **Agent** is an intelligence or execution participant that can make or propose task decisions over capabilities and resources.
+A **Host** is a device and execution locality represented by Maris. A **capability** is an ability exposed by a Host, such as a native Agent or managed execution. An **Agent** is an intelligence or execution participant that can make or propose task decisions over capabilities and resources.
 
-**General-capability** describes an architectural direction: an Agent's usable execution surface need not be confined to one device, Host, tool, model or provider, capability family, or local execution environment. It can reason over heterogeneous Host capabilities and resources. This does not claim AGI, a universal model, or support for arbitrary Agents and capabilities today. Pastey is the cross-device substrate, not the Agent's intelligence.
+**General-capability** describes an architectural direction: an Agent's usable execution surface need not be confined to one device, Host, tool, model or provider, capability family, or local execution environment. It can reason over heterogeneous Host capabilities and resources. This does not claim AGI, a universal model, or support for arbitrary Agents and capabilities today. Maris is the cross-device substrate, not the Agent's intelligence.
 
 ## How it works
 
-Pastey observes available Hosts and bounded capability facts. A task can select a capability and its owning Host, then execute where that capability lives. If the needed resources already reside there, no movement is needed. If they reside elsewhere, the reviewed task can explicitly move them and use the resulting output for a later step. Observation alone never selects a Host or grants execution authority.
+Maris observes available Hosts and bounded capability facts. A task can select a capability and its owning Host, then execute where that capability lives. If the needed resources already reside there, no movement is needed. If they reside elsewhere, the reviewed task can explicitly move them and use the resulting output for a later step. Observation alone never selects a Host or grants execution authority.
 
 ## Current implementation
 
-Pastey 2.0 has a current-session Bridge that works on the LAN and, optionally, across networks (an overlay address, or an internet carrier with direct P2P and relay fallback); factual Host and capability observations; a Native Agent lifecycle for native Host capabilities, with Codex and Claude Code as native Agents; and a separate Generic Managed Worker path. Native work can run in the selected Host's original workspace or, after requester movement approval, use encrypted outbound workspace movement, native execution, exact result Return, and requester-side apply. A remote invocation or moved workspace needs the executing Host’s Accept or an active Full Access grant. The managed path has immutable Plans, Review and approval, managed Host admission, Search / Transform / Transfer / Execute steps, explicit cross-Host movement, and Core-owned result acceptance. These four steps are the **current managed semantic model**, not universal verbs for every Host capability.
+Maris has a current-session Bridge that works on the LAN and, optionally, across networks (an overlay address, or an internet carrier with direct P2P and relay fallback); factual Host and capability observations; a Native Agent lifecycle for native Host capabilities, with Codex and Claude Code as native Agents; and a separate Generic Managed Worker path. Native work can run in the selected Host's original workspace or, after requester movement approval, use encrypted outbound workspace movement, native execution, exact result Return, and requester-side apply. A remote invocation or moved workspace needs the executing Host’s Accept or an active Full Access grant. The managed path has immutable Plans, Review and approval, managed Host admission, Search / Transform / Transfer / Execute steps, explicit cross-Host movement, and Core-owned result acceptance. These four steps are the **current managed semantic model**, not universal verbs for every Host capability.
 
 ## Native capabilities
 
-Mature capabilities remain native to the Host that owns them, and the native capability owns HOW: its provider or runtime, native session, interpretation of its own input, tools, reasoning, execution, capability-specific safety, and outcome. Pastey owns discovery, Host and session identity, routing, executor admission, task authority, lifecycle observation, cancellation, Burn, reconciliation, and cross-Host movement. Codex is one adapter behind this boundary, not the architecture. A native capability is not a Generic Managed Worker and does not enter the managed object model for ordinary Host-local work.
+Mature capabilities remain native to the Host that owns them, and the native capability owns HOW: its provider or runtime, native session, interpretation of its own input, tools, reasoning, execution, capability-specific safety, and outcome. Maris owns discovery, Host and session identity, routing, executor admission, task authority, lifecycle observation, cancellation, Burn, reconciliation, and cross-Host movement. Codex is one adapter behind this boundary, not the architecture. A native capability is not a Generic Managed Worker and does not enter the managed object model for ordinary Host-local work.
 
-Each capability plugs into a capability-neutral native lifecycle through an adapter; its invocation input and output are opaque to Pastey. Bridge membership proves who is talking and capability availability proves the Host can run the capability, but neither lets a peer run it: the executing Host must Accept a remote request in a one-shot executor Review unless it has already granted that peer Full Access, and every task stays owned by the Host-local user or the Bridge that created it. Burn revokes everything a Bridge authorized.
+Each capability plugs into a capability-neutral native lifecycle through an adapter; its invocation input and output are opaque to Maris. Bridge membership proves who is talking and capability availability proves the Host can run the capability, but neither lets a peer run it: the executing Host must Accept a remote request in a one-shot executor Review unless it has already granted that peer Full Access, and every task stays owned by the Host-local user or the Bridge that created it. Burn revokes everything a Bridge authorized.
 
 ## Managed execution
 
-The separate Generic Managed Worker acts on one already authorized step. Core validates the Plan and exact object flow, admits the Host, bounds effects, and accepts evidence and results. Search finds a managed object, Transform creates its next revision at the same Host, Transfer moves the exact revision between explicit Hosts, and Execute runs the exact revision without creating lineage. **Transfer is the only current managed primitive that changes ManagedObject location.** Movement supports the task when capability and resource placement differ; it is not Pastey's product definition.
+The separate Generic Managed Worker acts on one already authorized step. Core validates the Plan and exact object flow, admits the Host, bounds effects, and accepts evidence and results. Search finds a managed object, Transform creates its next revision at the same Host, Transfer moves the exact revision between explicit Hosts, and Execute runs the exact revision without creating lineage. **Transfer is the only current managed primitive that changes ManagedObject location.** Movement supports the task when capability and resource placement differ; it is not Maris's product definition.
 
 ## Reliability and current scope
 
-Native task completion is separate from result capture, Return, and apply. Pastey retains durable task and movement facts, rejects ambiguous outcomes as completion, supports cancellation and reconciliation, and preserves returned results when the approved source changed. Managed work has exact attempt, step, evidence, and continuation boundaries. Source-level checks and deterministic two-Host validation cover these paths. The current implementation does not support arbitrary Host capabilities, arbitrary Agents, or a Headless Host. See [development](docs/development.md) for the evidence boundaries.
+Native task completion is separate from result capture, Return, and apply. Maris retains durable task and movement facts, rejects ambiguous outcomes as completion, supports cancellation and reconciliation, and preserves returned results when the approved source changed. Managed work has exact attempt, step, evidence, and continuation boundaries. Source-level checks and deterministic two-Host validation cover these paths. The current implementation does not support arbitrary Host capabilities, arbitrary Agents, or a Headless Host. See [development](docs/development.md) for the evidence boundaries.
 
 ## Current status on main
 
@@ -46,26 +46,28 @@ Download from [Releases](https://github.com/xpan0988/Pastey/releases/latest):
 
 | Platform | File | Notes |
 |---|---|---|
-| macOS, Apple Silicon | `pastey_<version>_aarch64.dmg` | Tested on current macOS. There is no Intel build. |
-| Windows 11 x64 | `pastey_<version>_x64-setup.exe` | Installs for the current user. This is the installer used in physical testing. |
-| Windows 11 x64 | `pastey_<version>_x64_en-US.msi` | Installs for all users. Not used in physical testing. |
+| macOS, Apple Silicon | `maris_<version>_aarch64.dmg` | Tested on current macOS. There is no Intel build. |
+| Windows 11 x64 | `maris_<version>_x64-setup.exe` | Installs for the current user. This is the installer used in physical testing. |
+| Windows 11 x64 | `maris_<version>_x64_en-US.msi` | Installs for all users. Not used in physical testing. |
 
-The builds are not code-signed or notarized. On macOS, if Pastey is blocked on first open, choose System Settings → Privacy & Security → Open Anyway; if macOS instead says the app is damaged, run `xattr -dr com.apple.quarantine /Applications/pastey.app` once, then open it. On Windows, if SmartScreen says it protected your PC, choose More info → Run anyway.
+The builds are not code-signed or notarized. On macOS, if Maris is blocked on first open, choose System Settings → Privacy & Security → Open Anyway; if macOS instead says the app is damaged, run `xattr -dr com.apple.quarantine /Applications/Maris.app` once, then open it. On Windows, if SmartScreen says it protected your PC, choose More info → Run anyway.
 
 To run Agents across devices:
 
-- Install the same Pastey version on both devices and pair them once by code on the same network.
+- Install the same Maris version on both devices and pair them once by code on the same network.
 - On the device that runs Codex, install Codex and sign in: the Codex CLI, or the ChatGPT desktop app with its bundled Codex. Continuing an existing Codex thread needs a Codex that keeps thread writer locks (0.163.0-alpha.10.2 or later).
 - To reach a device on another network, turn on Settings → General → Across the internet on both devices. It uses n0's public relays (for development and hobby use) unless you set your own.
-- For unattended use of a Windows PC, see [Unattended Windows readiness](docs/reference.md#unattended-windows-readiness): Pastey has no background service and must be started at sign-in.
+- For unattended use of a Windows PC, see [Unattended Windows readiness](docs/reference.md#unattended-windows-readiness): Maris has no background service and must be started at sign-in.
 
 To use Claude Code, install and sign in to the standalone Claude Code CLI (2.1.317 or later on macOS, 2.1.319 or later on Windows). In **Agents → This device → New conversation**, select Claude Code. If the workspace has Claude Code project settings, open the folder in Claude Code and accept its trust prompt first. Another device can run or continue Claude Code here only in a folder you share with it (Bridge details → Workspaces) and only after your Accept or under its Full Access; it uses this device's own Claude Code sign-in and settings.
+
+**Upgrading from Pastey:** Maris keeps Pastey's data, pairings and Full Access grants. On macOS, quit Pastey, install Maris, and delete `/Applications/pastey.app`: the old app is not replaced. On Windows the `.msi` upgrades an installed Pastey in place; the `.exe` installs Maris beside it, so uninstall Pastey afterwards and leave "Delete the application data" unticked, because Maris uses the same data. See the [changelog](CHANGELOG.md) for details.
 
 **Upgrading from 1.x or a 2.0 beta:** install over the existing app with the same kind of installer (on Windows, do not mix the `.exe` and the `.msi`). Update both devices: earlier versions cannot pair with or reconnect to 2.0.0. A Bridge from an earlier version stays disconnected, with its content kept, until the two devices pair it again from its network panel. Unattended Codex permissions from earlier builds are removed; give Full Access on the controlled device instead.
 
 ## Documentation
 
-- [How Pastey works](docs/architecture.md)
+- [How Maris works](docs/architecture.md)
 - [Native and managed Agent execution in Layer 5](docs/layers/layer-5-agent.md)
 - [Development, validation, and release](docs/development.md)
 - [Concrete reference and configuration facts](docs/reference.md)
