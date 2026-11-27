@@ -95,7 +95,7 @@ Invoke-PasteyAcceptanceStage -StageNumber 1 -Body {
     }
 
     $package = Get-Content -LiteralPath (Join-Path $Context.RepositoryRoot "package.json") -Raw | ConvertFrom-Json
-    $expectedInstaller = "pastey_$($package.version)_x64-setup.exe"
+    $expectedInstaller = "Maris_$($package.version)_x64-setup.exe"
     $installers = @($bundles | Where-Object { $_.Name -ieq $expectedInstaller })
     if ($installers.Count -ne 1) {
         Stop-PasteyAcceptanceFailed "Expected exactly one NSIS installer named $expectedInstaller; found $($installers.Count)."
@@ -113,14 +113,15 @@ Invoke-PasteyAcceptanceStage -StageNumber 1 -Body {
         }
     }
     if ($null -eq $installation) {
-        Stop-PasteyAcceptanceFailed "The installer succeeded but the current-user Pastey installation could not be resolved."
+        Stop-PasteyAcceptanceFailed "The installer succeeded but the current-user Maris installation could not be resolved."
     }
     Write-Host "INSTALLED_PASTEY=$($installation.Executable)"
     Write-Host "INSTALL_STATE_SOURCE=$($installation.Source)"
+    Assert-PasteyLegacyNotRunning -Installation $installation
     foreach ($helperName in @("codex-command-runner.exe", "codex-windows-sandbox-setup.exe")) {
         $helper = Resolve-PasteyInstalledHelper -Installation $installation -FileName $helperName
         if ($null -eq $helper) {
-            Stop-PasteyAcceptanceFailed "Installed Pastey cannot resolve required helper $helperName."
+            Stop-PasteyAcceptanceFailed "Installed Maris cannot resolve required helper $helperName."
         }
         Write-Host "INSTALLED_HELPER=$helper"
     }

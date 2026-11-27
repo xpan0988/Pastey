@@ -89,7 +89,7 @@ function Assert-PasteyNonElevated {
 
 function Assert-PasteyElevated {
     if (-not (Test-PasteyAdministrator)) {
-        Stop-PasteyAcceptanceBlocked "This stage requires an Administrator PowerShell under the Pastey installation owner."
+        Stop-PasteyAcceptanceBlocked "This stage requires an Administrator PowerShell under the Maris installation owner."
     }
 }
 
@@ -159,7 +159,16 @@ function ConvertFrom-PasteyDisplayIcon {
     return (($value -split ",", 2)[0]).Trim().Trim('"')
 }
 
+# The product is installed as Maris; its executable keeps the internal name
+# pastey.exe. Pastey is the same product before the rename: its installer
+# registered it as "pastey", and a Maris .exe install does not replace it.
+$script:PasteyProductName = "Maris"
+$script:PasteyLegacyProductName = "pastey"
+$script:PasteyExecutableName = "pastey.exe"
+
 function Resolve-PasteyInstallation {
+    param([string]$ProductName = $script:PasteyProductName)
+
     $candidates = New-Object System.Collections.Generic.List[object]
     $uninstallRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
     if (Test-Path -LiteralPath $uninstallRoot) {
@@ -169,7 +178,7 @@ function Resolve-PasteyInstallation {
                 continue
             }
             $displayNameProperty = $record.PSObject.Properties["DisplayName"]
-            if ($null -eq $displayNameProperty -or [string]$displayNameProperty.Value -ine "pastey") {
+            if ($null -eq $displayNameProperty -or [string]$displayNameProperty.Value -ine $ProductName) {
                 continue
             }
             $displayIconProperty = $record.PSObject.Properties["DisplayIcon"]
@@ -181,7 +190,7 @@ function Resolve-PasteyInstallation {
             $installLocationProperty = $record.PSObject.Properties["InstallLocation"]
             $location = if ($null -eq $installLocationProperty) { $null } else { [string]$installLocationProperty.Value }
             if (-not [string]::IsNullOrWhiteSpace($location) -and (Test-Path -LiteralPath $location -PathType Container)) {
-                $found = Get-ChildItem -LiteralPath $location -Filter "pastey.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                $found = Get-ChildItem -LiteralPath $location -Filter $script:PasteyExecutableName -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
                 if ($null -ne $found) {
                     $null = $candidates.Add([pscustomobject]@{ Path = $found.FullName; Source = $entry.PSPath })
                 }
@@ -189,16 +198,19 @@ function Resolve-PasteyInstallation {
         }
     }
 
-    $appPathKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\pastey.exe"
+    # The other sources name no product, and both products use the same
+    # executable name, so they count only inside a folder named for this one.
+    $appPathKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths\$($script:PasteyExecutableName)"
     if (Test-Path -LiteralPath $appPathKey) {
         $appPath = (Get-Item -LiteralPath $appPathKey).GetValue("")
-        if (-not [string]::IsNullOrWhiteSpace([string]$appPath)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$appPath) -and
+            (Split-Path -Leaf (Split-Path -Parent ([string]$appPath))) -ieq $ProductName) {
             $null = $candidates.Add([pscustomobject]@{ Path = [string]$appPath; Source = $appPathKey })
         }
     }
 
     if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        foreach ($relative in @("pastey\pastey.exe", "Programs\pastey\pastey.exe")) {
+        foreach ($relative in @("$ProductName\$($script:PasteyExecutableName)", "Programs\$ProductName\$($script:PasteyExecutableName)")) {
             $null = $candidates.Add([pscustomobject]@{
                 Path = Join-Path $env:LOCALAPPDATA $relative
                 Source = "current-user LocalAppData"
@@ -219,13 +231,38 @@ function Resolve-PasteyInstallation {
     return $null
 }
 
+function Assert-PasteyLegacyNotRunning {
+    param([Parameter(Mandatory = $true)]$Installation)
+
+    # A Pastey install left beside Maris shares this device's data folder, so
+    # a run of it while Maris is under acceptance would act on the same data.
+    $legacy = Resolve-PasteyInstallation -ProductName $script:PasteyLegacyProductName
+    if ($null -eq $legacy) {
+        Write-Host "LEGACY_PASTEY_INSTALLED=False"
+        return
+    }
+    Write-Host "LEGACY_PASTEY_INSTALLED=$($legacy.Executable)"
+    if ($legacy.Executable -ieq $Installation.Executable) {
+        Stop-PasteyAcceptanceFailed "The Maris and Pastey installations resolve to the same executable $($legacy.Executable)."
+    }
+    $running = @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($script:PasteyExecutableName)) -ErrorAction SilentlyContinue | Where-Object {
+        $path = $null
+        try { $path = $_.Path } catch { }
+        $null -ne $path -and $path -ieq $legacy.Executable
+    })
+    if ($running.Count -gt 0) {
+        Stop-PasteyAcceptanceBlocked "Pastey is still running from $($legacy.Executable) and shares this device's data with Maris. Quit it (and uninstall it, leaving its application data) before acceptance."
+    }
+}
+
 function Get-PasteyInstalledProduct {
     $install = Resolve-PasteyInstallation
     if ($null -eq $install) {
-        Stop-PasteyAcceptanceBlocked "No current-user Pastey installation could be resolved from Windows installation state."
+        Stop-PasteyAcceptanceBlocked "No current-user Maris installation could be resolved from Windows installation state."
     }
     Write-Host "INSTALLED_PASTEY=$($install.Executable)"
     Write-Host "INSTALL_STATE_SOURCE=$($install.Source)"
+    Assert-PasteyLegacyNotRunning -Installation $install
     return $install
 }
 

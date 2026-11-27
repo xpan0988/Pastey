@@ -35,6 +35,8 @@ Some Rust tests bind local TCP ports and open a PTY; a sandboxed shell must allo
 
 Native Windows acceptance is five stop-on-failure scripts run from the repository root. Each run writes a self-contained log and safe sandbox diagnostics under the gitignored `artifacts/windows-acceptance/` directory and ends with a stable `PASTEY_ACCEPTANCE_STAGE_<N>_(PASS|FAIL|BLOCKED)` token. Exit codes are `0` for PASS, `1` when the intended stage ran and failed, and `2` when required product or Host state is absent.
 
+The stages accept the product installed as Maris (`Maris_<version>_x64-setup.exe`, Windows app name `Maris`, executable `pastey.exe` under `%LOCALAPPDATA%\Maris`). A Pastey installation left beside it is reported as `LEGACY_PASTEY_INSTALLED`, and a stage is BLOCKED while that Pastey is running, because both use the same data folder.
+
 1. In a normal, non-elevated PowerShell, build, package, and install the current production bundle:
 
    ```powershell
