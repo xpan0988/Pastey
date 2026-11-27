@@ -134,6 +134,12 @@ pub fn install_crash_reporting(app_version: &str) {
     }));
 }
 
+/// The run marker in a logs folder: present while a run is under way, or
+/// after one that ended uncleanly.
+pub(crate) fn run_marker_path(logs_dir: &Path) -> PathBuf {
+    logs_dir.join(RUN_MARKER_FILE_NAME)
+}
+
 /// Removes the run marker on an orderly exit.
 pub fn record_clean_exit() {
     if let Some(logs_dir) = log_state().lock().logs_dir.clone() {

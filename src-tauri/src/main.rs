@@ -47,6 +47,7 @@ mod regular_file_set_transfer;
 mod room_control;
 mod safe_file_identity;
 mod session_read_access;
+mod single_instance;
 mod storage;
 mod transfer;
 mod transfer_orchestration;
@@ -183,6 +184,16 @@ fn main() {
         .setup(|app| {
             let shortcut_label = default_shortcut_label();
             let paths = desktop_app_paths(app.handle())?;
+            // Before anything reads or recovers the data: another copy may
+            // be using it.
+            match single_instance::claim(&paths.app_data_dir, &paths.logs_dir) {
+                // Held until the process ends.
+                Ok(claim) => std::mem::forget(claim),
+                Err(refusal) => {
+                    refuse_start(app.handle(), &refusal);
+                    return Ok(());
+                }
+            }
             let state = HostRuntime::initialize(
                 paths,
                 shortcut_label,
@@ -539,6 +550,24 @@ fn toggle_main_window(app: &AppHandle, target: &str) -> AppResult<()> {
     }
 
     Ok(())
+}
+
+/// Tells the user why this copy will not start, then quits. Logging was never
+/// set up, so the exit leaves the running copy's run marker alone.
+fn refuse_start(app: &AppHandle, refusal: &single_instance::StartRefusal) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let message = refusal.message();
+    eprintln!("pastey: not starting ({}): {message}", refusal.log_code());
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    let exit_handle = app.clone();
+    app.dialog()
+        .message(message)
+        .title("Maris")
+        .kind(MessageDialogKind::Error)
+        .buttons(MessageDialogButtons::Ok)
+        .show(move |_| exit_handle.exit(1));
 }
 
 fn default_shortcut() -> Shortcut {
