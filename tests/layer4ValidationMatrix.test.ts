@@ -9,7 +9,7 @@ test("Layer 4 validation matrix documents required route and authority boundarie
   assert.match(development, /## Transfer and Layer 4 validation/);
   assert.match(development, /run-layer4-validation-matrix/);
   assert.match(development, /single-machine dual-instance smoke/);
-  assert.match(development, /two-device smoke/);
+  assert.match(development, /packaged regression run on two devices/);
 
   assert.match(bridge, /selected peer/);
   assert.match(bridge, /selected peers/);
