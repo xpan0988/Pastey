@@ -2270,6 +2270,18 @@ mod tests {
             requester,
             receiver,
         ));
+        // The location value Plans carry between devices kept the old product
+        // name; only its display says Maris Shared, so that is not a value.
+        assert!(!supported_transfer_destination(
+            &super::super::TransferDestination::UserSelectedLocation {
+                device_ref: receiver.into(),
+                user_visible_location_scope: super::super::SafeLocationDescription::from(
+                    "Maris Shared",
+                ),
+            },
+            requester,
+            receiver,
+        ));
     }
 
     #[test]

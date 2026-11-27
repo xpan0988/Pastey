@@ -1719,6 +1719,10 @@ mod tests {
         .unwrap();
         assert_eq!(result.status, "completed");
         assert_eq!(discovered.len(), 4);
+        // The shared folder is shown under the product's name; its scope label
+        // `pastey_shared` is what crosses devices, and it is unchanged.
+        assert!(result.candidates.iter().any(|candidate| candidate.redacted_location == "Maris Shared/validation.mp4"),
+            "{:?}", result.candidates.iter().map(|candidate| &candidate.redacted_location).collect::<Vec<_>>());
         fs::remove_dir_all(paths.app_data_dir).unwrap();
     }
 
