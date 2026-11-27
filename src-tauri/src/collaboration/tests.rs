@@ -227,7 +227,7 @@ fn an_approved_message_starts_the_recipients_next_turn_once_its_folder_is_free()
     assert_eq!(plan.alias, "web");
     assert_eq!(plan.provider, ProviderV1::ClaudeCode);
     assert_eq!(plan.workspace, fixture.web);
-    assert!(plan.prompt.starts_with("[Pastey collaboration \"orders-v2\" · 1 message for you]"));
+    assert!(plan.prompt.starts_with("[Maris collaboration \"orders-v2\" · 1 message for you]"));
     assert!(plan.prompt.contains("From: api (Codex) · hop 1\nsubject: Orders API now uses cursors"));
     assert!(plan.prompt.contains("not from your user"));
     assert!(plan.prompt.contains("You are the member \"web\" (Claude Code)"));
@@ -809,7 +809,7 @@ fn a_prompt_tells_the_member_what_changed_since_its_last_turn() {
     // Before the digest, the messages; after it, the note.
     let digest = prompt.find("Since your last turn").unwrap();
     assert!(prompt.find("--- end ---").unwrap() < digest);
-    assert!(digest < prompt.find("[Pastey collaboration \"orders-v2\"]").unwrap());
+    assert!(digest < prompt.find("[Maris collaboration \"orders-v2\"]").unwrap());
     // api's prompt has nothing new since its own turn.
     service.user_message(&id, "api", "Thanks.").unwrap();
     let plans = service.plan_starts(free);
@@ -887,13 +887,13 @@ fn a_member_added_later_gets_the_briefing_on_its_first_turn_only() {
     let plan = plans.iter().find(|plan| plan.alias == "docs").unwrap();
     let prompt = &plan.prompt;
     assert!(prompt.len() <= MAX_PROMPT_BYTES);
-    assert!(prompt.contains("[Pastey briefing for docs: what happened in \"orders-v2\" before your first turn]"), "{prompt}");
-    assert!(prompt.contains("Open items (Pastey's record):\n"), "{prompt}");
+    assert!(prompt.contains("[Maris briefing for docs: what happened in \"orders-v2\" before your first turn]"), "{prompt}");
+    assert!(prompt.contains("Open items (Maris's record):\n"), "{prompt}");
     assert!(prompt.contains("- message from api to web, waiting for the user's approval: \"Orders API now uses cursors\""), "{prompt}");
     assert!(prompt.contains("- api asked user, not yet answered (statement): \"Keep offset behind a flag?\""), "{prompt}");
     assert!(prompt.contains("Each member's latest summary:\n- api, just now (statement): done: reviewed pagination; open: web still uses offset"), "{prompt}");
     assert!(prompt.contains("- api (statement, confirmed by the user (user)): nextCursor is opaque base64; offset is rejected with 400"), "{prompt}");
-    assert!(prompt.contains("Recent turns, oldest first (Pastey's record):\n- api: completed just now; completed just now"), "{prompt}");
+    assert!(prompt.contains("Recent turns, oldest first (Maris's record):\n- api: completed just now; completed just now"), "{prompt}");
     // Then the user's message, then the note with the roles.
     assert!(prompt.contains("From: user (the person you work for)\n\nRead the briefing and list the open items."));
     assert!(prompt.contains("- docs (you), a Codex session: owns the API docs"));
@@ -908,7 +908,7 @@ fn a_member_added_later_gets_the_briefing_on_its_first_turn_only() {
     service.user_message(&id, "docs", "Anything new?").unwrap();
     let plans = service.plan_starts(free);
     let again = plans.iter().find(|plan| plan.alias == "docs").unwrap();
-    assert!(!again.prompt.contains("[Pastey briefing"), "{}", again.prompt);
+    assert!(!again.prompt.contains("[Maris briefing"), "{}", again.prompt);
 }
 
 #[test]
@@ -933,7 +933,7 @@ fn a_briefing_stays_within_its_bound_and_says_when_nothing_happened() {
             .unwrap();
     }
     let context = service.turn_context(ProviderV1::Codex, &docs, "hello").unwrap();
-    let briefing_end = context.find("[End of Pastey briefing]").unwrap();
+    let briefing_end = context.find("[End of Maris briefing]").unwrap();
     assert!(briefing_end <= MAX_BRIEFING_BYTES, "{briefing_end}");
     // One section never takes it all: 20 waiting and 40 identical notices
     // read as 15 lines and a count.
@@ -944,17 +944,17 @@ fn a_briefing_stays_within_its_bound_and_says_when_nothing_happened() {
     // with a pointer, and the whole stays within the bound.
     let task = "y".repeat(9000);
     let context = service.turn_context(ProviderV1::Codex, &docs, &task).unwrap();
-    assert!(context.contains("[Pastey briefing"));
+    assert!(context.contains("[Maris briefing"));
     assert!(context.contains("(more in the Journal; ask a member or user)"), "{context}");
     assert!(context.len() + task.len() <= MAX_PROMPT_BYTES);
     // A user's task that leaves no room: the note only.
     let big = "y".repeat(MAX_PROMPT_BYTES - 1500);
     let context = service.turn_context(ProviderV1::Codex, &docs, &big).unwrap();
-    assert!(!context.contains("[Pastey briefing"));
-    assert!(context.starts_with("[Pastey collaboration"));
+    assert!(!context.contains("[Maris briefing"));
+    assert!(context.starts_with("[Maris collaboration"));
     // A member that has had a turn gets the note only.
     let api = service.turn_context(ProviderV1::Codex, &fixture.api, "hello").unwrap();
-    assert!(api.starts_with("[Pastey collaboration"));
+    assert!(api.starts_with("[Maris collaboration"));
 }
 
 #[test]
@@ -991,7 +991,7 @@ fn removing_a_member_ends_its_grant_and_what_waited_for_it() {
     back.alias = "web2".into();
     service.add_member(&id, back, None).unwrap();
     let context = service.turn_context(ProviderV1::ClaudeCode, &fixture.web, "hi").unwrap();
-    assert!(context.contains("[Pastey briefing for web2"), "{context}");
+    assert!(context.contains("[Maris briefing for web2"), "{context}");
     assert!(context.contains("web (no longer a member)"), "{context}");
 }
 
@@ -1777,7 +1777,7 @@ fn claims_in_separate_folders_never_cross_and_a_refused_plan_block_reaches_its_a
     // web's next prompt says what of its last reply was not taken, and why.
     let plans = service.plan_starts(free);
     let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
-    assert!(web.prompt.contains("- your last reply: Pastey did not take a plan block: task A claims \"/Users/me/web/work\": paths are relative to the owner's own folder. Nothing in that block reached anyone"), "{}", web.prompt);
+    assert!(web.prompt.contains("- your last reply: Maris did not take a plan block: task A claims \"/Users/me/web/work\": paths are relative to the owner's own folder. Nothing in that block reached anyone"), "{}", web.prompt);
     service.started(web, "w2").unwrap();
     service.turn_ended(&ended("w2", ProviderV1::ClaudeCode, &fixture.web, Some("```pastey-plan accept=r1\n```\n"))).unwrap();
     assert_eq!(service.item(&id).unwrap().record.phase, PhaseV1::Implementing);
@@ -1841,5 +1841,18 @@ fn a_grant_counts_only_implementation_turns_and_a_stale_acceptance_reaches_only_
     service.user_message(&id, "web", "Next.").unwrap();
     let plans = service.plan_starts(free);
     let web = plans.iter().find(|plan| plan.alias == "web").unwrap();
-    assert!(web.prompt.contains("- your last reply: Pastey did not take a plan acceptance: r1 is already the shared plan"), "{}", web.prompt);
+    assert!(web.prompt.contains("- your last reply: Maris did not take a plan acceptance: r1 is already the shared plan"), "{}", web.prompt);
+}
+
+#[test]
+fn a_refusal_recorded_under_the_old_product_name_still_reaches_its_author() {
+    assert_eq!(
+        refused_block("Pastey did not take a plan block from web: r1 is already the shared plan").as_deref(),
+        Some("Maris did not take a plan block from web: r1 is already the shared plan"),
+    );
+    assert_eq!(
+        refused_block("Maris did not take a wait from web: x").as_deref(),
+        Some("Maris did not take a wait from web: x"),
+    );
+    assert_eq!(refused_block("web's turn failed"), None);
 }

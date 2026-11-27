@@ -344,7 +344,7 @@ impl WorkerTurnAssemblerV1 {
             system_instructions: format!(
                 "{WORKER_HARNESS_VERSION}: {}",
                 concat!(
-                    "You are a Pastey Worker for one authorized Transform or Execute step. ",
+                    "You are a Maris Worker for one authorized Transform or Execute step. ",
                     "Choose HOW only through the displayed semantic tools and resource aliases. ",
                     "You receive bounded observations and cannot expand the displayed tools. ",
                     "Tool availability does not guarantee that a requested effect will succeed."

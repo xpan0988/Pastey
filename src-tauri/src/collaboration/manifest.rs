@@ -209,7 +209,7 @@ pub(crate) fn turn_file_state(start: Option<&ScanV1>, end: &ScanV1) -> FileState
             changes: diff(before, after),
         },
         (None, _) => FileStateV1::Unavailable {
-            reason: "Pastey did not scan the folder when the turn started".into(),
+            reason: "Maris did not scan the folder when the turn started".into(),
         },
         (Some(Err(reason)), _) | (_, Err(reason)) => FileStateV1::Unavailable {
             reason: reason.clone(),

@@ -711,10 +711,12 @@ fn turn_observation(turn: Option<&Value>) -> LastTurnObservationV1 {
     }
 }
 
-fn origin(originator: Option<&str>) -> &'static str {
+pub(super) fn origin(originator: Option<&str>) -> &'static str {
     match originator {
         Some("Codex Desktop") => "desktop",
-        Some("Pastey") => "pastey",
+        // Threads this app started: named Maris since the rename, Pastey
+        // before it. The origin value itself stays `pastey` (it crosses Bridges).
+        Some("Maris" | "Pastey") => "pastey",
         Some(name) if name.contains("cli") || name.contains("tui") || name.contains("exec") => {
             "cli"
         }

@@ -302,7 +302,7 @@ pub(crate) fn facts_section(members: &[MemberV1]) -> String {
         return String::new();
     }
     let mut section = String::from(
-        "What each member can do (Pastey's facts from its readiness check, with how each is known; do not assume more):\n",
+        "What each member can do (Maris's facts from its readiness check, with how each is known; do not assume more):\n",
     );
     for member in members {
         if member.facts.is_empty() {

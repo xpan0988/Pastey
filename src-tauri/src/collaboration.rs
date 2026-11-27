@@ -913,7 +913,7 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
         ));
     }
     format!(
-        "[Pastey collaboration \"{name}\"]\n\
+        "[Maris collaboration \"{name}\"]\n\
          Goal: {goal}\n\
          You are the member \"{alias}\" ({provider}). The members are:\n\
          {members}\
@@ -937,11 +937,11 @@ fn note(record: &CollaborationRecordV1, member: &MemberV1) -> String {
          next: <what you plan to do next>\n\
          ```\n\n\
          Rules:\n\
-         - Send a message only when a member must know or do something. Never send an acknowledgement or thanks: Pastey tells the sender when your turn ends.\n\
+         - Send a message only when a member must know or do something. Never send an acknowledgement or thanks: Maris tells the sender when your turn ends.\n\
          - Add a summary only when this turn finished a stage, made a decision or got blocked. Leave out fields with nothing to say.\n\
          - At most 3 messages and 1 summary, all at the very end of your answer.\n\
          - To quote fenced code in a message, open the block with four backticks (````pastey-message to=<member>) and close it with a line of four.\n\
-         [End of Pastey note]\n",
+         [End of Maris note]\n",
         name = record.name,
         goal = if record.goal.trim().is_empty() { "(none given)" } else { record.goal.trim() },
         alias = member.alias,
@@ -2220,7 +2220,7 @@ impl CollaborationServiceV1 {
                     progressed |= self.take_plan_block(&id, &alias, &raw.info, &raw.body)?;
                 }
                 for problem in blocks.problems {
-                    self.attention(&id, Some(&alias), format!("Pastey did not take a block from {alias}: {problem}."))?;
+                    self.attention(&id, Some(&alias), format!("Maris did not take a block from {alias}: {problem}."))?;
                 }
             }
         }
@@ -2243,13 +2243,13 @@ impl CollaborationServiceV1 {
     /// the plan on (a proposal, an acceptance or progress).
     fn take_plan_block(&mut self, id: &str, alias: &str, info: &str, body: &str) -> AppResult<bool> {
         if !self.item(id)?.record.plan_first {
-            self.attention(id, Some(alias), format!("Pastey did not take a plan block from {alias}: this collaboration does not plan first."))?;
+            self.attention(id, Some(alias), format!("Maris did not take a plan block from {alias}: this collaboration does not plan first."))?;
             return Ok(false);
         }
         let block = match plan::parse(info, body) {
             Ok(block) => block,
             Err(problem) => {
-                self.attention(id, Some(alias), format!("Pastey did not take a plan block from {alias}: {problem}."))?;
+                self.attention(id, Some(alias), format!("Maris did not take a plan block from {alias}: {problem}."))?;
                 return Ok(false);
             }
         };
@@ -2283,7 +2283,7 @@ impl CollaborationServiceV1 {
                 }
                 let others: Vec<String> = item.record.members.iter().filter(|member| member.alias != alias).map(|member| member.alias.clone()).collect();
                 self.save_record(id)?;
-                let checks = if problems.is_empty() { "Pastey's checks: no structural problem.".to_owned() } else { format!("Pastey's checks found: {}", problems.join("; ")) };
+                let checks = if problems.is_empty() { "Maris's checks: no structural problem.".to_owned() } else { format!("Maris's checks found: {}", problems.join("; ")) };
                 for other in others {
                     self.pastey_message(
                         id,
@@ -2447,7 +2447,7 @@ impl CollaborationServiceV1 {
         let Some((latest, _, problems)) = latest_revision(item) else { return Ok(()) };
         let state = format!(
             "Planning has not converged. The latest proposal is r{latest}{}. {}. Propose a revision that fixes this, or accept the latest if you agree.",
-            if problems.is_empty() { String::new() } else { format!(", and Pastey's checks found: {}", problems.join("; ")) },
+            if problems.is_empty() { String::new() } else { format!(", and Maris's checks found: {}", problems.join("; ")) },
             item.record
                 .members
                 .iter()
@@ -2527,7 +2527,7 @@ impl CollaborationServiceV1 {
     fn take_progress(&mut self, id: &str, alias: &str, items: Vec<plan::ProgressV1>) -> AppResult<bool> {
         let item = self.item(id)?;
         let Some((proposal, _, _)) = item.record.adopted.and_then(|adopted| revision(item, adopted)).map(|(proposal, p, by)| (proposal.clone(), p.clone(), by)) else {
-            self.attention(id, Some(alias), format!("Pastey did not take progress from {alias}: no shared plan is adopted."))?;
+            self.attention(id, Some(alias), format!("Maris did not take progress from {alias}: no shared plan is adopted."))?;
             return Ok(false);
         };
         let workspace = item.member(alias).filter(|member| !member.remote).map(|member| PathBuf::from(&member.workspace));
@@ -2650,7 +2650,7 @@ impl CollaborationServiceV1 {
             return self.attention(
                 id,
                 Some(alias),
-                format!("Pastey did not take a wait from {alias}: \"{}\" is not another member.", wait.on),
+                format!("Maris did not take a wait from {alias}: \"{}\" is not another member.", wait.on),
             );
         }
         let status = if wait.on == USER_ALIAS { StatusV1::Open } else { StatusV1::Pending };
@@ -3419,7 +3419,7 @@ impl CollaborationServiceV1 {
                     BasisV1::Fact,
                     EntryBodyV1::Attention {
                         text: format!(
-                            "{alias}'s turn waits for a decision {} asked of you (an approval Pastey never gives by itself). Answer it on {alias}'s card, or stop the turn.",
+                            "{alias}'s turn waits for a decision {} asked of you (an approval Maris never gives by itself). Answer it on {alias}'s card, or stop the turn.",
                             provider.label()
                         ),
                     },
@@ -3697,7 +3697,7 @@ fn prompt(item: &CollaborationV1, member: &MemberV1, entries: &[&EntryV1], prefe
     }
     let count = blocks.len();
     let mut text = format!(
-        "[Pastey collaboration \"{}\" · {count} message{} for you]\n",
+        "[Maris collaboration \"{}\" · {count} message{} for you]\n",
         record.name,
         if count == 1 { "" } else { "s" }
     );
@@ -3745,7 +3745,20 @@ fn short(text: &str, chars: usize) -> String {
 
 /// How every refusal of a member's block begins, so its author's next
 /// digest can tell it what was not taken.
-const REFUSED_BLOCK: &str = "Pastey did not take ";
+const REFUSED_BLOCK: &str = "Maris did not take ";
+/// The same beginning in Journal entries written before the product was
+/// renamed from Pastey to Maris.
+const LEGACY_REFUSED_BLOCK: &str = "Pastey did not take ";
+
+/// A refusal of a member's block, as it is now worded, whether its Journal
+/// entry was written under the current name or the old one.
+fn refused_block(text: &str) -> Option<String> {
+    if text.starts_with(REFUSED_BLOCK) {
+        return Some(text.to_owned());
+    }
+    text.strip_prefix(LEGACY_REFUSED_BLOCK)
+        .map(|rest| format!("{REFUSED_BLOCK}{rest}"))
+}
 
 /// A member's folder on this device, if it has one here.
 fn member_folder(member: &MemberV1) -> Option<&str> {
@@ -3838,7 +3851,8 @@ fn digest(item: &CollaborationV1, member: &MemberV1) -> String {
             // A block of this member's own last reply that Pastey refused:
             // its author is told directly, not only the user (P02: a refused
             // plan block was never repaired).
-            EntryBodyV1::Attention { text } if entry.member.as_deref() == Some(member.alias.as_str()) && text.starts_with(REFUSED_BLOCK) => {
+            EntryBodyV1::Attention { text } if entry.member.as_deref() == Some(member.alias.as_str()) && refused_block(text).is_some() => {
+                let text = refused_block(text).unwrap_or_default();
                 let reason = text.replacen(&format!(" from {}:", member.alias), ":", 1);
                 lines.push(format!(
                     "- your last reply: {} Nothing in that block reached anyone; correct it and send it again if it still matters.",
@@ -3985,8 +3999,8 @@ fn briefing(item: &CollaborationV1, member: &MemberV1, budget: usize, now: i64) 
     };
     let mut out = BoundedTextV1 {
         text: format!(
-            "[Pastey briefing for {alias}: what happened in \"{}\" before your first turn]\n\
-             Pastey compiled this from the collaboration's Journal; no model wrote it. \"(statement)\" marks what an Agent wrote, which may be wrong. \"(user)\" marks the person you work for. Other members work in their own folders, on their own devices or not; paths below are relative to the folder named.\n",
+            "[Maris briefing for {alias}: what happened in \"{}\" before your first turn]\n\
+             Maris compiled this from the collaboration's Journal; no model wrote it. \"(statement)\" marks what an Agent wrote, which may be wrong. \"(user)\" marks the person you work for. Other members work in their own folders, on their own devices or not; paths below are relative to the folder named.\n",
             record.name
         ),
         budget,
@@ -4051,7 +4065,7 @@ fn briefing(item: &CollaborationV1, member: &MemberV1, budget: usize, now: i64) 
     if open.is_empty() {
         open.push("- none".into());
     }
-    out.section("Open items (Pastey's record):", open);
+    out.section("Open items (Maris's record):", open);
 
     // 2. Each member's latest summary: Agent statements.
     let mut latest: Vec<&EntryV1> = Vec::new();
@@ -4155,7 +4169,7 @@ fn briefing(item: &CollaborationV1, member: &MemberV1, budget: usize, now: i64) 
             format!("- {}: {}", author_label(author), recent.join("; "))
         })
         .collect();
-    out.section("Recent turns, oldest first (Pastey's record):", turns);
+    out.section("Recent turns, oldest first (Maris's record):", turns);
 
     // 5. File state: paths changed in each folder, and during whose turn.
     let mut folders: Vec<String> = Vec::new();
@@ -4199,7 +4213,7 @@ fn briefing(item: &CollaborationV1, member: &MemberV1, budget: usize, now: i64) 
         ));
     }
     out.section(
-        "Files changed since the collaboration started (Pastey's scans; paths only, read files with your own tools):",
+        "Files changed since the collaboration started (Maris's scans; paths only, read files with your own tools):",
         folders,
     );
     if item.entries.iter().all(|entry| {
@@ -4210,7 +4224,7 @@ fn briefing(item: &CollaborationV1, member: &MemberV1, budget: usize, now: i64) 
     }) {
         out.push("\nNothing has happened in this collaboration yet.");
     }
-    out.text.push_str("[End of Pastey briefing]\n\n");
+    out.text.push_str("[End of Maris briefing]\n\n");
     out.text
 }
 
@@ -4589,16 +4603,16 @@ fn plan_section(item: &CollaborationV1, member: &MemberV1) -> String {
                  integration: <how separately built work comes together>\n\
                  ```\n\
                  or, to accept revision rN as it stands and commit to your tasks in it: ```pastey-plan accept=rN``` (a block with an empty body).\n\
-                 Implementation starts when every member accepted the same revision and Pastey found no structural problem in it. Negotiate with messages; decide responsibilities between you.]\n",
+                 Implementation starts when every member accepted the same revision and Maris found no structural problem in it. Negotiate with messages; decide responsibilities between you.]\n",
                 plan::PLANNING_TURNS_PER_MEMBER.saturating_sub(member.planning_turns),
                 plan::PLANNING_TURNS_PER_MEMBER,
             );
             if let Some((revision, proposal, problems)) = latest_revision(item) {
                 text.push_str(&plan::render(revision, proposal, &[]).replacen("Shared plan", "Latest proposal", 1));
                 if problems.is_empty() {
-                    text.push_str("Pastey's checks: no structural problem.\n");
+                    text.push_str("Maris's checks: no structural problem.\n");
                 } else {
-                    text.push_str(&format!("Pastey's checks found: {}\n", problems.join("; ")));
+                    text.push_str(&format!("Maris's checks found: {}\n", problems.join("; ")));
                 }
                 let stances: Vec<String> = item
                     .record

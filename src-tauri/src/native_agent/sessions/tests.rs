@@ -1301,3 +1301,10 @@ fn claude_code_sessions_report_their_latest_reply_and_the_default_stays_unknown(
     );
     let _ = fs::remove_dir_all(root);
 }
+
+#[test]
+fn codex_threads_this_app_started_are_its_own_under_either_name() {
+    assert_eq!(codex::origin(Some("Maris")), "pastey");
+    assert_eq!(codex::origin(Some("Pastey")), "pastey");
+    assert_eq!(codex::origin(Some("Codex Desktop")), "desktop");
+}

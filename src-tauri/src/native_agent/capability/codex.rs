@@ -167,6 +167,9 @@ fn semver_prerelease_cmp(left: &str, right: &str) -> Option<std::cmp::Ordering> 
 pub(in crate::native_agent) const LISTED_SOURCE_KINDS: [&str; 4] =
     ["cli", "vscode", "exec", "appServer"];
 const INITIALIZE_ID: u64 = 1;
+/// The client name this app gives Codex, which Codex records as a thread's
+/// originator (it was `Pastey` before the rename; both are recognized).
+const CODEX_CLIENT_NAME: &str = "Maris";
 const THREAD_START_ID: u64 = 2;
 const TURN_START_ID: u64 = 3;
 const TURN_INTERRUPT_ID: u64 = 4;
@@ -2522,7 +2525,7 @@ impl CodexAppServerV1 {
             #[cfg(windows)]
             job: Some(job),
         };
-        controller.send(json!({"id": INITIALIZE_ID, "method": "initialize", "params": {"clientInfo": {"name": "Pastey", "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
+        controller.send(json!({"id": INITIALIZE_ID, "method": "initialize", "params": {"clientInfo": {"name": CODEX_CLIENT_NAME, "version": env!("CARGO_PKG_VERSION")}, "capabilities": {}}}))?;
         let initialized = controller.await_result(
             INITIALIZE_ID,
             Instant::now() + NATIVE_AGENT_RPC_TIMEOUT,

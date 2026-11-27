@@ -98,7 +98,7 @@ pub(crate) fn payload(items: &[NeedsYouV1], details: bool) -> String {
         "type": "pastey-needs-you",
         "count": items.len(),
         "items": shown,
-        "note": "Open Pastey to answer. This message grants nothing.",
+        "note": "Open Maris to answer. This message grants nothing.",
     })
     .to_string()
 }
@@ -112,7 +112,7 @@ pub(crate) fn send(settings: &NotificationSettingsV1, items: &[NeedsYouV1]) -> V
     }
     if settings.local {
         for item in items.iter().take(3) {
-            let heading = format!("Pastey · {}", item.collaboration);
+            let heading = format!("Maris · {}", item.collaboration);
             let body = format!("{}: {}", title(item), item.text);
             if !local(&heading, &body) {
                 problems.push("a local notification could not be shown".into());

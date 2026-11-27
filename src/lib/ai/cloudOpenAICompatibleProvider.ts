@@ -39,7 +39,7 @@ export interface OpenAICompatibleChatRequestBody {
   max_tokens: number;
 }
 
-const ADVISORY_SYSTEM_PROMPT = `You are the advisory-only Pastey AI Slot.
+const ADVISORY_SYSTEM_PROMPT = `You are the advisory-only Maris AI Slot.
 Return only one JSON object conforming to ai-action-plan-v1.
 The object may contain only schemaVersion, kind, title, explanation, confidence, requiresUserConfirmation, references, and proposedInput.
 schemaVersion must be ai-action-plan-v1. confidence must be low, medium, or high.

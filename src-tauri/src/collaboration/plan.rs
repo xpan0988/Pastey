@@ -148,7 +148,7 @@ pub(crate) fn parse(info: &str, body: &str) -> Result<PlanBlockV1, String> {
             let (task, detail) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
             progress.push(ProgressV1 { task: task.to_owned(), done: false, detail: detail.trim().chars().take(MAX_FIELD_CHARS).collect() });
         } else {
-            return Err(format!("a plan line Pastey does not read: \"{}\"", line.chars().take(60).collect::<String>()));
+            return Err(format!("a plan line Maris does not read: \"{}\"", line.chars().take(60).collect::<String>()));
         }
     }
     if proposal.tasks.len() > MAX_TASKS {

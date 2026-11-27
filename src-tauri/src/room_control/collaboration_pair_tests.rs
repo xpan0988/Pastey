@@ -154,7 +154,7 @@ async fn a_member_on_another_device_joins_with_consent_and_messages_cross_with_r
     assert_eq!(plans.len(), 1);
     let prompt = &plans[0].prompt;
     assert!(prompt.contains("From: user on "), "{prompt}");
-    assert!(prompt.contains("[Pastey briefing for web"), "{prompt}");
+    assert!(prompt.contains("[Maris briefing for web"), "{prompt}");
     assert!(prompt.contains("- api, a Codex session on "), "{prompt}");
     assert!(prompt.contains("- web (you), a Codex session: owns web/"), "{prompt}");
 

@@ -945,7 +945,7 @@ impl CollaborationServiceV1 {
                 &id,
                 None,
                 format!(
-                    "Pastey refused {refused} entr{} from {}: over its bounds, or about members it does not run.",
+                    "Maris refused {refused} entr{} from {}: over its bounds, or about members it does not run.",
                     if refused == 1 { "y" } else { "ies" },
                     sender.device_label
                 ),

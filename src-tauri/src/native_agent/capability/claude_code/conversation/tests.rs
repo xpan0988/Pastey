@@ -2250,7 +2250,7 @@ fn installed_codex_and_claude_code_take_automatic_turns_within_their_grants() {
         assert!(plan.automatic, "{} started without approval", plan.alias);
         eprintln!("--- {}'s automatic prompt ---\n{}\n---", plan.alias, plan.prompt);
         assert!(
-            plan.prompt.contains("Since your last turn:") || plan.prompt.contains("[Pastey briefing for "),
+            plan.prompt.contains("Since your last turn:") || plan.prompt.contains("[Maris briefing for "),
             "the briefing or the digest is in the prompt"
         );
         let status = match plan.provider {
