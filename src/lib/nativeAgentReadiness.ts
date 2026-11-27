@@ -160,8 +160,8 @@ export function knownFullAccess(shares: PeerShareKnowledge | undefined): boolean
 function availabilityBlocker(availability: NativeAgentTargetAvailability, where: string, agent: string): string {
   switch (availability.state) {
     case "checking": return `Checking ${agent} on ${where}…`;
-    case "unknown": return `Pastey could not check ${agent} on ${where}. Check again.`;
-    case "incompatible": return `${agent} on ${where} needs an update before Pastey can use it.`;
+    case "unknown": return `Maris could not check ${agent} on ${where}. Check again.`;
+    case "incompatible": return `${agent} on ${where} needs an update before Maris can use it.`;
     case "unavailable": return `${agent} is not available on ${where}.`;
     case "available": return "";
   }

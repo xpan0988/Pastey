@@ -112,9 +112,9 @@ impl CodexSessionSourceV1 {
                 source: PASTEY_SOURCE.into(),
                 observed_at_ms,
                 detail: Some(if hold.running {
-                    "a Pastey task is running a turn in it now".into()
+                    "a Maris task is running a turn in it now".into()
                 } else {
-                    "Pastey keeps it open, idle, for its own conversation in this folder".into()
+                    "Maris keeps it open, idle, for its own conversation in this folder".into()
                 }),
             };
         }
@@ -167,7 +167,7 @@ impl CodexSessionSourceV1 {
                 state: LiveStateV1::NotRunning,
                 source: PROCESS_SOURCE.into(),
                 observed_at_ms,
-                detail: Some("no Codex process other than Pastey's own runs on this Host".into()),
+                detail: Some("no Codex process other than Maris's own runs on this Host".into()),
             };
         }
         let desktop = holders
@@ -262,7 +262,7 @@ impl CodexSessionSourceV1 {
             resume = super::ResumeAssessmentV1 {
                 verdict: super::ResumeVerdictV1::Safe,
                 reasons: vec![
-                    "only Pastey's own idle session has it open; continuing closes that session first".into(),
+                    "only Maris's own idle session has it open; continuing closes that session first".into(),
                 ],
             };
         }
@@ -333,7 +333,7 @@ impl CodexSessionSourceV1 {
             let page = match reader.request("model/list", params) {
                 Ok(page) => page,
                 Err(HistoryReadErrorV1::Oversized) => {
-                    return unavailable("its answer was larger than Pastey reads")
+                    return unavailable("its answer was larger than Maris reads")
                 }
                 Err(HistoryReadErrorV1::Failed(reason)) => return unavailable(&reason),
             };
@@ -810,7 +810,7 @@ fn read_native_default(
         Err(error) => {
             let reason = match error {
                 HistoryReadErrorV1::Oversized => {
-                    "its answer was larger than Pastey reads".to_owned()
+                    "its answer was larger than Maris reads".to_owned()
                 }
                 HistoryReadErrorV1::Failed(reason) => reason,
             };

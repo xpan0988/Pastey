@@ -28,7 +28,7 @@ export function remoteFindBlocks(input: RemoteFindInput): { blocks: ComposerBloc
     return { blocks: null, error: "Enter part of the file name to look for." };
   }
   if (/[/\\]/.test(filenameHint)) {
-    return { blocks: null, error: "Enter a file name, not a folder path. Pastey searches only the locations you choose below." };
+    return { blocks: null, error: "Enter a file name, not a folder path. Maris searches only the locations you choose below." };
   }
   const extension = input.extension.trim().replace(/^\./, "").toLowerCase();
   if (extension && !/^[a-z0-9]{1,16}$/.test(extension)) {

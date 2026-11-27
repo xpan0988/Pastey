@@ -193,7 +193,7 @@ export function SessionListView({ list, target, openKey, liveKey, current = null
         return <li key={key}>
           <button type="button" className={`nav-session${openKey === key ? " selected" : ""}`} aria-current={openKey === key ? "page" : undefined} onClick={() => onOpen(session)}>
             <span className="nav-session-title">{liveKey === key ? <Dot tone="live" pulse /> : null}{session.title ?? "(untitled)"}</span>
-            <span className="nav-session-meta"><span className={`nav-chip ${CHIP_TONE[chip.tone]}`}>{chip.label}</span> · {providerLabel(session.provider)}{session.origin === "pastey" ? " · by Pastey" : ""} · {relativeTime(session.lastActivityAtMs)} · <span title={status.explanation}>{status.label}</span></span>
+            <span className="nav-session-meta"><span className={`nav-chip ${CHIP_TONE[chip.tone]}`}>{chip.label}</span> · {providerLabel(session.provider)}{session.origin === "pastey" ? " · by Maris" : ""} · {relativeTime(session.lastActivityAtMs)} · <span title={status.explanation}>{status.label}</span></span>
           </button>
         </li>;
       })}

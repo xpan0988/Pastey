@@ -586,7 +586,7 @@ fn native_conformance_probe(sandbox_home: &Path) -> AppResult<()> {
         let spawned = (|| -> AppResult<_> {
             workspace.verify_ready_for_launch()?;
             let command = vec![
-                path_argument(&current_exe, "Pastey verifier executable")?,
+                path_argument(&current_exe, "Maris verifier executable")?,
                 PROBE_CHILD_CLI.into(),
                 path_argument(&workspace.input, "native verifier input")?,
                 path_argument(&workspace.output, "native verifier output")?,
@@ -682,7 +682,7 @@ fn probe_cancellation(sandbox_home: &Path, probe_root: &Path) -> AppResult<()> {
     let request = WindowsSandboxLaunch {
         sandbox_home: sandbox_home.to_path_buf(),
         command: vec![
-            path_argument(&current_exe, "Pastey verifier executable")?,
+            path_argument(&current_exe, "Maris verifier executable")?,
             PROBE_CANCEL_CHILD_CLI.into(),
         ],
         cwd: probe_root.to_path_buf(),

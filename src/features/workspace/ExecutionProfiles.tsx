@@ -20,7 +20,7 @@ function ProfileLines({ profile }: { profile: ExecutionProfile }) {
   </div>;
 }
 
-const BOUNDARY_NOTE = "The Agents enforce these settings themselves; Pastey approves nothing. Their sandbox, network list and deny rules are the boundary. Auto mode and auto-review are a model's judgement, not a boundary. These turns use each Agent's account on this device.";
+const BOUNDARY_NOTE = "The Agents enforce these settings themselves; Maris approves nothing. Their sandbox, network list and deny rules are the boundary. Auto mode and auto-review are a model's judgement, not a boundary. These turns use each Agent's account on this device.";
 
 /** Picks a preset or edits one as JSON, and asks for explicit consent to
  * exactly what it passes. `onConfirm` receives a confirmed profile. */
@@ -212,7 +212,7 @@ export function NotificationSettingsSection() {
   const command = program.trim() ? program.trim().split(/\s+/) : [];
   return <section className="section" aria-label="Collaboration notifications">
     <div className="section-head-row"><div className="section-head"><h2>When a collaboration needs you</h2>
-      <p>You are told once for each new question, approval, message to approve or problem. A notification only says that something needs you: you answer in Pastey, where every approval stays bound to the exact request.</p></div>
+      <p>You are told once for each new question, approval, message to approve or problem. A notification only says that something needs you: you answer in Maris, where every approval stays bound to the exact request.</p></div>
       <button type="button" className="btn btn-sm" onClick={() => void testNotification().then((problems) => setMessage(problems.length ? { tone: "bad", text: problems.join("; ") } : { tone: "ok", text: "Test sent." }))}>Send a test</button></div>
     {message ? <Notice tone={message.tone}>{message.text}</Notice> : null}
     <div className="card"><div className="card-body stack" style={{ gap: 10 }}>

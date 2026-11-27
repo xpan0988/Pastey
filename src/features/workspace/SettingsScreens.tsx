@@ -115,18 +115,18 @@ function GeneralSettings({ config, onConfigChange }: { config: AppConfig; onConf
           <Segmented label="Appearance" value={appearance} onChange={(value) => { setAppearance(value); saveAppearance(value); }} options={[{ value: "system", label: "System" }, { value: "light", label: "Light" }, { value: "dark", label: "Dark" }]} /></div>
         <div className="setting-row"><span><strong>{enter} key in messages</strong><small>{enterMode === "send" ? `${enter} sends; Shift+${enter} adds a line.` : `${enter} adds a line; ${isApplePlatform() ? "⌘" : "Ctrl+"}${enter} sends.`} An input method's {enter} only confirms its text.</small></span>
           <Segmented label={`${enter} key in messages`} value={enterMode} onChange={(value) => { setEnterMode(value); saveEnterKeyMode(value); }} options={[{ value: "send", label: "Sends" }, { value: "newline", label: "Adds a line" }]} /></div>
-        <div className="setting-row"><span><strong>Global shortcut</strong><small>Opens Pastey from anywhere.</small></span><span className="value mono">{config.shortcut}</span></div>
+        <div className="setting-row"><span><strong>Global shortcut</strong><small>Opens Maris from anywhere.</small></span><span className="value mono">{config.shortcut}</span></div>
       </div>
     </section>
     <section className="section" aria-label="Receiving">
       <div className="section-head"><h2>Receiving</h2><p>Where text and files other devices send you are kept.</p></div>
       <div className="card">
-        <div className="setting-row"><span><strong>Receiving folder</strong><small className="mono">{config.inbox_dir ?? "Pastey's default Inbox folder"}</small></span>
+        <div className="setting-row"><span><strong>Receiving folder</strong><small className="mono">{config.inbox_dir ?? "Maris's default Inbox folder"}</small></span>
           <span className="row">{config.inbox_dir ? <button type="button" className="btn btn-sm" onClick={() => void revealInFolder(config.inbox_dir!)}><Icon name="folder" small />Open</button> : null}
             <button type="button" className="btn btn-sm" disabled={pending} onClick={() => void chooseFolder()}>Change…</button>
             {config.inbox_dir ? <button type="button" className="btn btn-sm" disabled={pending} onClick={() => void save({ ...config, inbox_dir: null })}>Use default</button> : null}</span></div>
-        <div className="setting-row"><span><strong>Save received files</strong><small>Off: received files stay in Pastey's temporary storage instead of the receiving folder.</small></span><Switch label="Save received files" checked={config.save_received_files_to_inbox} disabled={pending} onChange={(value) => toggle("save_received_files_to_inbox", value)} /></div>
-        <div className="setting-row"><span><strong>Save received images</strong><small>Off: received images stay in Pastey's temporary storage instead of the receiving folder.</small></span><Switch label="Save received images" checked={config.save_received_images_to_inbox} disabled={pending} onChange={(value) => toggle("save_received_images_to_inbox", value)} /></div>
+        <div className="setting-row"><span><strong>Save received files</strong><small>Off: received files stay in Maris's temporary storage instead of the receiving folder.</small></span><Switch label="Save received files" checked={config.save_received_files_to_inbox} disabled={pending} onChange={(value) => toggle("save_received_files_to_inbox", value)} /></div>
+        <div className="setting-row"><span><strong>Save received images</strong><small>Off: received images stay in Maris's temporary storage instead of the receiving folder.</small></span><Switch label="Save received images" checked={config.save_received_images_to_inbox} disabled={pending} onChange={(value) => toggle("save_received_images_to_inbox", value)} /></div>
       </div>
       {error ? <p className="error-text" role="alert">{error}</p> : null}
     </section>
@@ -228,7 +228,7 @@ function AgentSettings() {
   const claude = capabilities?.find((capability) => capability.agentId === CLAUDE_CODE_AGENT_ID);
   return <>
     <section className="section" aria-label="Native Agents on this device">
-      <div className="section-head-row"><div className="section-head"><h2>On this device</h2><p>Native Agents keep their own sign-in, model, tools, sandbox and context. Pastey only starts them, moves files when you approve, and reports what they return. The model and reasoning shown are what each Agent itself reports for a new task outside any project folder; change them in the Agent's own settings.</p></div>
+      <div className="section-head-row"><div className="section-head"><h2>On this device</h2><p>Native Agents keep their own sign-in, model, tools, sandbox and context. Maris only starts them, moves files when you approve, and reports what they return. The model and reasoning shown are what each Agent itself reports for a new task outside any project folder; change them in the Agent's own settings.</p></div>
         <button type="button" className="btn btn-sm" disabled={checking} onClick={() => void check()}><Icon name="refresh" small />{checking ? "Checking…" : "Check again"}</button></div>
       <div className="card">
         <div className="setting-row"><span><strong>Codex</strong><small>{capabilities === null ? "Checking…" : availabilityCopy(codex ? { state: codex.state, reason: codex.reason, detail: codex.detail, backend: codex.backend } : { state: "unavailable" }, null, false)}</small>{configRow("codex")}</span>
@@ -362,7 +362,7 @@ function ProviderForm({ provider, pending, onCancel, onSubmit }: { provider: Man
       <label className="field" style={{ flex: "1 1 140px" }}><span className="field-label">Timeout (ms)</span><input className="input" type="number" min="1000" max="300000" value={timeoutMillis} disabled={pending} onChange={(event) => setTimeoutMillis(event.target.value)} /></label>
       <label className="field" style={{ flex: "1 1 140px" }}><span className="field-label">Max output tokens</span><input className="input" type="number" min="1" max="32768" value={maxOutputTokens} disabled={pending} onChange={(event) => setMaxOutputTokens(event.target.value)} /></label>
     </div>
-    <p className="xsmall subtle">The key is sent only to this device's Pastey when you save, and cannot be viewed again.</p>
+    <p className="xsmall subtle">The key is sent only to this device's Maris when you save, and cannot be viewed again.</p>
     <div className="row"><span className="spacer" /><button type="button" className="btn" disabled={pending} onClick={() => { setApiKey(""); onCancel(); }}>Cancel</button><button type="submit" className="btn btn-primary" disabled={pending}>Save</button></div>
   </form>;
 }
@@ -392,10 +392,10 @@ function AdvancedSettings({ config, onConfigChange }: { config: AppConfig; onCon
   return <>
     <section className="section">
       <div className="card">
-        <div className="setting-row"><span><strong>Developer tools</strong><small>Lets the transfer window and internet congestion control overrides in Pastey's configuration take effect. It does not affect Developer Mode terminals, which always need the other device's Accept.</small></span><Switch label="Developer tools" checked={config.dev_tools_enabled} disabled={pending} onChange={(value) => void setDevTools(value)} /></div>
+        <div className="setting-row"><span><strong>Developer tools</strong><small>Lets the transfer window and internet congestion control overrides in Maris's configuration take effect. It does not affect Developer Mode terminals, which always need the other device's Accept.</small></span><Switch label="Developer tools" checked={config.dev_tools_enabled} disabled={pending} onChange={(value) => void setDevTools(value)} /></div>
         <div className="setting-row"><span><strong>Transfer grouping</strong><small>How many small files are sent together. Dynamic adapts to the connection.</small></span>
           <select className="select select-sm" style={{ width: "auto" }} value={config.micro_flow_group_mode} disabled={pending} onChange={(event) => void saveConfig({ ...config, micro_flow_group_mode: event.target.value as AppConfig["micro_flow_group_mode"] })} aria-label="Transfer grouping"><option value="dynamic">Dynamic</option><option value="fixed">Fixed</option></select></div>
-        <div className="setting-row"><span><strong>Transfer window</strong><small>{config.dev_tools_enabled ? "Chunks in flight per transfer. Automatic lets Pastey tune it." : "Chunks in flight per transfer. Turn on Developer tools to override Pastey's automatic tuning."}</small></span>
+        <div className="setting-row"><span><strong>Transfer window</strong><small>{config.dev_tools_enabled ? "Chunks in flight per transfer. Automatic lets Maris tune it." : "Chunks in flight per transfer. Turn on Developer tools to override Maris's automatic tuning."}</small></span>
           <select className="select select-sm" style={{ width: "auto" }} value={config.transfer_window_override ? String(config.transfer_window_override) : "auto"} disabled={pending || !config.dev_tools_enabled} onChange={(event) => void saveConfig({ ...config, transfer_window_override: event.target.value === "auto" ? null : Number(event.target.value) })} aria-label="Transfer window"><option value="auto">Automatic</option>{[1, 2, 4, 8, 12, 16].map((value) => <option key={value} value={value}>{value}</option>)}</select></div>
         <div className="setting-row"><span><strong>Internet congestion control</strong><small>{config.dev_tools_enabled ? "How this device paces what it sends across the internet. BBRv3 is experimental: in emulation it kept throughput under packet loss and kept relay queues short; it has not been measured on real networks. Changing it reconnects internet connectivity, which interrupts transfers across the internet." : "How this device paces what it sends across the internet. Turn on Developer tools to try BBRv3."}</small></span>
           <select className="select select-sm" style={{ width: "auto" }} value={config.internet_congestion_control ?? "default"} disabled={pending || !config.dev_tools_enabled} onChange={(event) => void saveConfig({ ...config, internet_congestion_control: event.target.value === "bbr3" ? "bbr3" : null })} aria-label="Internet congestion control"><option value="default">Default (Cubic)</option><option value="bbr3">BBRv3 (experimental)</option></select></div>
@@ -405,7 +405,7 @@ function AdvancedSettings({ config, onConfigChange }: { config: AppConfig; onCon
     <section className="section">
       <div className="section-head"><h2>Diagnostics</h2><p>For reporting a problem. Logs stay on this device until you share them.</p></div>
       <div className="card">
-        <div className="setting-row"><span><strong>Logs</strong><small>Open the folder with Pastey's logs.</small></span><button type="button" className="btn btn-sm" onClick={() => void openLogsFolder().catch(() => undefined)}><Icon name="folder" small />Open</button></div>
+        <div className="setting-row"><span><strong>Logs</strong><small>Open the folder with Maris's logs.</small></span><button type="button" className="btn btn-sm" onClick={() => void openLogsFolder().catch(() => undefined)}><Icon name="folder" small />Open</button></div>
         <div className="setting-row"><span><strong>Last error</strong><small>{copied ?? "Copy the most recent error to the clipboard."}</small></span><button type="button" className="btn btn-sm" onClick={() => void copyError()}><Icon name="copy" small />Copy</button></div>
       </div>
     </section>
@@ -417,8 +417,8 @@ function AboutSettings({ config }: { config: AppConfig }) {
     <div className="card">
       <div className="setting-row"><span><strong>Version</strong></span><span className="value mono">{config.app_version}</span></div>
       <div className="setting-row"><span><strong>Application data</strong><small className="mono">{config.app_data_path || "—"}</small></span>{config.app_data_path ? <button type="button" className="btn btn-sm" onClick={() => void revealInFolder(config.app_data_path)}><Icon name="folder" small />Reveal</button> : null}</div>
-      <div className="setting-row"><span><strong>Updates</strong><small>Opens the Pastey releases page.</small></span><button type="button" className="btn btn-sm" onClick={() => void checkForUpdates().catch(() => undefined)}>Check for updates</button></div>
+      <div className="setting-row"><span><strong>Updates</strong><small>Opens the Maris releases page.</small></span><button type="button" className="btn btn-sm" onClick={() => void checkForUpdates().catch(() => undefined)}>Check for updates</button></div>
     </div>
-    <Notice tone="neutral">Native Agents own their workspace, sign-in, tools, sandbox and context. Pastey manages movement, authority, effects, completion and what it observes of their lifecycle.</Notice>
+    <Notice tone="neutral">Native Agents own their workspace, sign-in, tools, sandbox and context. Maris manages movement, authority, effects, completion and what it observes of their lifecycle.</Notice>
   </section>;
 }

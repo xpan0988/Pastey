@@ -42,7 +42,7 @@ export function RemoteFileFinder({ roomId, peerName, route }: { roomId: string; 
         const [workspace, events] = await Promise.all([listBridgePlanWorkspace(roomId), listReceivedRoomControlEvents(roomId)]);
         if (!cancelled) setProgress(remoteFindProgress(attemptId, workspace, events, selectedCandidateId));
       } catch (error) {
-        if (!cancelled) setMessage(error instanceof Error ? error.message : "Pastey could not read the search progress.");
+        if (!cancelled) setMessage(error instanceof Error ? error.message : "Maris could not read the search progress.");
       }
     };
     void poll();
@@ -66,10 +66,10 @@ export function RemoteFileFinder({ roomId, peerName, route }: { roomId: string; 
     try {
       const workspace = await createComposedFileBridgePlan({ roomId, originalUserGoal: remoteFindGoal(input, device), blocks: composed.blocks });
       const revision = availableRevisionId(workspace);
-      if (!revision) throw new Error("Pastey did not return the search to review.");
+      if (!revision) throw new Error("Maris did not return the search to review.");
       setRevisionId(revision);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not prepare the search.");
+      setMessage(error instanceof Error ? error.message : "Maris could not prepare the search.");
     } finally { setBusy(false); }
   }
 
@@ -85,7 +85,7 @@ export function RemoteFileFinder({ roomId, peerName, route }: { roomId: string; 
       setAttemptId(nextAttemptId);
       setProgress({ phase: "searching" });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not start the search.");
+      setMessage(error instanceof Error ? error.message : "Maris could not start the search.");
     } finally { setBusy(false); }
   }
 
@@ -97,7 +97,7 @@ export function RemoteFileFinder({ roomId, peerName, route }: { roomId: string; 
       setSelectedCandidateId(candidateId);
       setProgress({ phase: "sending" });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not request that file. Its result may have expired; search again.");
+      setMessage(error instanceof Error ? error.message : "Maris could not request that file. Its result may have expired; search again.");
     } finally { setBusy(false); }
   }
 

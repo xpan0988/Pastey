@@ -139,7 +139,7 @@ impl ExecutionProfileV1 {
             .as_deref()
             .is_some_and(|mode| !CLAUDE_PERMISSION_MODES.contains(&mode))
         {
-            return invalid("That Claude Code permission mode is not one Pastey passes.");
+            return invalid("That Claude Code permission mode is not one Maris passes.");
         }
         for rules in [&claude.allow, &claude.deny] {
             if rules.len() > MAX_RULES || rules.iter().any(|rule| !plain(rule, MAX_RULE_CHARS)) {

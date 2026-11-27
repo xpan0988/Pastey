@@ -54,7 +54,7 @@ export function usePeerSharedWorkspaces(roomId: string, hostRef: string | null, 
       }
     } catch (error) {
       failed = true;
-      if (question === asked.current) setMessage(errorText(error, "Pastey could not ask the other device."));
+      if (question === asked.current) setMessage(errorText(error, "Maris could not ask the other device."));
     } finally {
       if (question === asked.current) setLoading(false);
     }
@@ -140,7 +140,7 @@ function LocalShares({ room, peerName }: { room: RoomInfo; peerName: string }) {
   async function act(action: () => Promise<unknown>) {
     setPending(true); setError(null);
     try { await action(); await refresh(); return true; }
-    catch (nextError) { setError(errorText(nextError, "Pastey could not change this share.")); return false; }
+    catch (nextError) { setError(errorText(nextError, "Maris could not change this share.")); return false; }
     finally { setPending(false); }
   }
 

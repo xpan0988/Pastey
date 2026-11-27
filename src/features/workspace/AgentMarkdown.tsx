@@ -123,7 +123,7 @@ const heading = (level: number) => function Heading({ children }: { children?: R
 
 const COMPONENTS: Components = {
   a: ({ href, node, children }) => <MarkdownLink href={href} node={node as HastNode}>{children}</MarkdownLink>,
-  img: ({ alt, src }) => <span className="md-image" title={src ? `Pastey does not load images from Agent replies: ${src}` : undefined}>[Image{alt ? `: ${alt}` : ""}]</span>,
+  img: ({ alt, src }) => <span className="md-image" title={src ? `Maris does not load images from Agent replies: ${src}` : undefined}>[Image{alt ? `: ${alt}` : ""}]</span>,
   pre: ({ node }) => {
     const code = (node as HastNode | undefined)?.children?.find((child) => child.type === "element" && child.tagName === "code");
     return <CodeBlock code={hastText(code).replace(/\n$/, "")} language={codeLanguage(code)} />;

@@ -1484,7 +1484,7 @@ function App() {
   }
 
   if (!config) {
-    return <div className="app-loading">{error ?? "Loading Pastey…"}</div>;
+    return <div className="app-loading">{error ?? "Loading Maris…"}</div>;
   }
 
   return (
@@ -1495,7 +1495,7 @@ function App() {
           <div className="toast" role="alert">
             <div className="stack" style={{ gap: 2 }}>
               <strong>{joinRequest.device_name} wants to join.</strong>
-              <p>{joinRequest.platform} · Pastey {joinRequest.app_version}</p>
+              <p>{joinRequest.platform} · Maris {joinRequest.app_version}</p>
             </div>
             <div className="row">
               <button type="button" className="btn" disabled={joinRequestBusy !== null} onClick={() => void handleRejectJoinRequest(joinRequest)}>

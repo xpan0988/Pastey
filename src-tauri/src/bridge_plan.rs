@@ -907,7 +907,7 @@ pub(crate) fn build_composed_file_revision(
                     && source_device_ref != selected_device_ref
                 {
                     return invalid_revision(
-                        "Pastey Shared final delivery requires the object to be on the selected device.",
+                        "Maris Shared final delivery requires the object to be on the selected device.",
                     );
                 }
                 let pipeline = landing == ComposedTransferLanding::PipelinePrivate;
@@ -940,7 +940,7 @@ pub(crate) fn build_composed_file_revision(
                     }
                     ComposedTransferLanding::PasteyShared => {
                         return invalid_revision(
-                            "Pastey Shared is available only on the selected device.",
+                            "Maris Shared is available only on the selected device.",
                         )
                     }
                 };
@@ -2949,7 +2949,7 @@ pub(crate) fn reconcile_startup(paths: &AppPaths, now: i64) -> AppResult<usize> 
             step_id: None,
             kind: ActivityKind::AttemptInterrupted,
             occurred_at: now,
-            summary: "Execution interrupted because Pastey restarted.".into(),
+            summary: "Execution interrupted because Maris restarted.".into(),
         };
         let activity_exists: i64 = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM bridge_plan_activities WHERE activity_id = ?1)",

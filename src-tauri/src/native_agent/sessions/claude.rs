@@ -313,7 +313,7 @@ impl ClaudeSessionSourceV1 {
         if !transcript.complete {
             evidence.push(EvidenceV1::new(
                 EvidenceBasisV1::Unknown,
-                "The transcript is larger than Pastey reads; later entries are not included.",
+                "The transcript is larger than Maris reads; later entries are not included.",
                 "transcript",
             ));
         }
@@ -437,14 +437,14 @@ fn transcript_config(transcript: &TranscriptV1) -> NativeAgentConfigV1 {
     };
     if !transcript.complete {
         return unknown(
-            "The transcript is larger than Pastey reads, so its latest reply's model is not known.",
+            "The transcript is larger than Maris reads, so its latest reply's model is not known.",
         );
     }
     let Some((model, reasoning_effort)) = transcript.reply_config.clone() else {
         return unknown("No reply is recorded in this session yet.");
     };
     let note = match (&model, &reasoning_effort) {
-        (None, _) => Some("Claude Code recorded no model Pastey can show for the latest reply."),
+        (None, _) => Some("Claude Code recorded no model Maris can show for the latest reply."),
         (Some(_), None) => Some("Claude Code recorded no effort level with the latest reply."),
         _ => None,
     };

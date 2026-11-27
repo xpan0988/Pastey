@@ -185,7 +185,7 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
   const above = conversationPlace ? null
     : kind === "path" ? <div className="field">
       <input className="input input-mono" value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="C:\Users\you\Projects\app" aria-label={`${agentName} workspace`} disabled={locked} spellCheck={false} autoComplete="off" />
-      <span className="field-hint">{agent.workspace.trim() && !looksLikeFullPath(agent.workspace) ? `This does not look like a full path. ${targetName} looks for exactly this folder.` : `The full path of the folder on ${targetName}. Pastey cannot browse that device.`}</span>
+      <span className="field-hint">{agent.workspace.trim() && !looksLikeFullPath(agent.workspace) ? `This does not look like a full path. ${targetName} looks for exactly this folder.` : `The full path of the folder on ${targetName}. Maris cannot browse that device.`}</span>
     </div>
       : kind === "send" || (kind === "local" && !fixedPath) ? <div className="row">
         <input className="input input-mono" value={agent.workspace} onChange={(event) => agent.setWorkspace(event.target.value)} placeholder="Choose a folder on this device…" aria-label={`${agentName} workspace`} disabled={locked} spellCheck={false} autoComplete="off" />
@@ -208,7 +208,7 @@ export function NewConversation({ roomId, agent, agentId, onChooseAgent, peers, 
         <h3>Start a new conversation</h3>
         {onChooseAgent ? <Segmented label="Agent" value={agentId} options={AGENT_CHOICES} disabled={locked} onChange={onChooseAgent} /> : null}
         <p>{kind === "send"
-          ? `Pastey shows you exactly what it sends to ${targetName}, and sends nothing until you approve. Codex works on the copy there, and the result comes back to be applied here.`
+          ? `Maris shows you exactly what it sends to ${targetName}, and sends nothing until you approve. Codex works on the copy there, and the result comes back to be applied here.`
           : `${agentName} starts fresh in ${label}${targetHostRef ? ` on ${targetName}` : ""}. It does not see your other conversations there; to pick one of those up, open it from the list.`}
           {targetHostRef && kind !== "send" ? ` ${remoteStartLine(targetName, fullAccess)} No files move.` : ""}
           {agentId === CLAUDE_CODE_AGENT_ID ? " It uses its own sign-in, model and settings, and starts only in folders whose Claude Code project settings it already trusts." : ""}</p>
@@ -262,11 +262,11 @@ function availabilityTone(availability: NativeAgentTargetAvailability, disconnec
 export function codexUnavailableCopy(reason: string | null | undefined, where: string): string {
   switch (reason) {
     case "native_agent_not_installed":
-      return `Codex is not installed on ${where}, or Pastey there cannot find the codex command. On ${where}, check that “codex --version” works in a new terminal; if Codex was installed after Pastey started, quit Pastey there and open it again.`;
+      return `Codex is not installed on ${where}, or Maris there cannot find the codex command. On ${where}, check that “codex --version” works in a new terminal; if Codex was installed after Maris started, quit Maris there and open it again.`;
     case "native_agent_launch_failed":
-      return `Pastey on ${where} found Codex but could not start it. Reinstall or update Codex on ${where}, then check again.`;
+      return `Maris on ${where} found Codex but could not start it. Reinstall or update Codex on ${where}, then check again.`;
     case "native_agent_probe_failed":
-      return `Codex on ${where} exits with an error when Pastey checks it (“codex --version”). Run that in a new terminal on ${where} to see why; a Codex installed with npm also needs Node.js on PATH.`;
+      return `Codex on ${where} exits with an error when Maris checks it (“codex --version”). Run that in a new terminal on ${where} to see why; a Codex installed with npm also needs Node.js on PATH.`;
     case "native_agent_probe_timeout":
       return `Codex on ${where} did not answer in time. Check again; its first start can be slow.`;
     case "native_agent_incompatible":
@@ -282,17 +282,17 @@ export function claudeCodeUnavailableCopy(reason: string | null | undefined, whe
   const on = where === "this device" ? "" : ` on ${where}`;
   switch (reason) {
     case "native_agent_not_installed":
-      return `Claude Code is not installed on ${where}, or Pastey there cannot find the claude command. Check that “claude --version” works in a new terminal${on}; if Claude Code was installed after Pastey started, quit Pastey and open it again.`;
+      return `Claude Code is not installed on ${where}, or Maris there cannot find the claude command. Check that “claude --version” works in a new terminal${on}; if Claude Code was installed after Maris started, quit Maris and open it again.`;
     case "native_agent_signed_out":
       return `Claude Code is installed on ${where} but not signed in. Run “claude” in a terminal${on} and sign in, then check again.`;
     case "native_agent_probe_failed":
-      return `Claude Code${on} exits with an error when Pastey checks it (“claude --version”). Run that in a new terminal${on} to see why.`;
+      return `Claude Code${on} exits with an error when Maris checks it (“claude --version”). Run that in a new terminal${on} to see why.`;
     case "native_agent_incompatible":
-      return `Claude Code on ${where} needs an update before Pastey can use it. Update Claude Code, then check again.`;
+      return `Claude Code on ${where} needs an update before Maris can use it. Update Claude Code, then check again.`;
     case "native_agent_platform_unverified":
-      return "Pastey runs Claude Code conversations only on macOS, Linux and Windows.";
+      return "Maris runs Claude Code conversations only on macOS, Linux and Windows.";
     case "native_agent_launch_failed":
-      return `Pastey cannot start Claude Code under its own supervision on ${where}.`;
+      return `Maris cannot start Claude Code under its own supervision on ${where}.`;
     default:
       return `Claude Code is unavailable on ${where}.`;
   }
@@ -303,7 +303,7 @@ export function availabilityCopy(availability: NativeAgentTargetAvailability, re
   if (agentId === CLAUDE_CODE_AGENT_ID) {
     switch (availability.state) {
       case "checking": return `Checking Claude Code on ${where}…`;
-      case "unknown": return `Pastey could not check Claude Code on ${where}: ${availability.message}`;
+      case "unknown": return `Maris could not check Claude Code on ${where}: ${availability.message}`;
       case "available": return remoteName
         ? `Claude Code is available on ${where}. It runs in a folder ${where} shares, with its own sign-in, model and settings there, after ${where} accepts; no files move.`
         : "Claude Code is ready. It runs in your folder with its own sign-in, model and settings.";
@@ -315,7 +315,7 @@ export function availabilityCopy(availability: NativeAgentTargetAvailability, re
   }
   switch (availability.state) {
     case "checking": return `Checking Codex on ${where}…`;
-    case "unknown": return `Pastey could not check Codex on ${where}: ${availability.message}`;
+    case "unknown": return `Maris could not check Codex on ${where}: ${availability.message}`;
     case "incompatible":
     case "unavailable": {
       const reason = availability.reason ?? (availability.state === "incompatible" ? "native_agent_incompatible" : null);
@@ -329,7 +329,7 @@ export function availabilityCopy(availability: NativeAgentTargetAvailability, re
           : "Codex is ready to use its native session.";
       }
       return sendFromHere
-        ? `Codex is available on ${where}. Pastey will review sending your folder there and returning its result.`
+        ? `Codex is available on ${where}. Maris will review sending your folder there and returning its result.`
         : `Codex is available on ${where}. It runs in a folder there after ${where} accepts; no files move.`;
   }
 }

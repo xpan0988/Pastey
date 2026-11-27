@@ -155,18 +155,18 @@ export function taskOutcome(status: Pick<NativeAgentTaskStatus, "state" | "code"
       return { tone: "complete", headline: "Completed", detail: continuing ? `The session${there} now ends with this turn. Its reply is below; it is ${agentName}'s own account, not verified.` : `Its reply is below; it is ${agentName}'s own account, not verified.`, next: null, nothingRan: false };
     case "cancelled":
       if (status.code === "native_agent_full_access_revoked") {
-        return { tone: "danger", headline: "Stop requested: Full Access ended", detail: `${hostName}'s user revoked this device's Full Access while ${agentName} worked, so ${hostName} asked it to stop and no longer accepts its result. Whatever it did before it stopped stays there; Pastey cannot confirm when it stopped.`, next: `Check the folder on ${hostName}. To run there again, someone on ${hostName} must accept, or give Full Access again.`, nothingRan: false };
+        return { tone: "danger", headline: "Stop requested: Full Access ended", detail: `${hostName}'s user revoked this device's Full Access while ${agentName} worked, so ${hostName} asked it to stop and no longer accepts its result. Whatever it did before it stopped stays there; Maris cannot confirm when it stopped.`, next: `Check the folder on ${hostName}. To run there again, someone on ${hostName} must accept, or give Full Access again.`, nothingRan: false };
       }
       if (status.code === STOP_PENDING) {
-        return { tone: "pending", headline: "Stopping…", detail: `Pastey asked ${agentName}${there} to stop and no longer accepts its result. ${agentName} may still be working until it ends; this says Stopped once ${remote ? hostName : "Pastey"} has seen it end.`, next: null, nothingRan: false };
+        return { tone: "pending", headline: "Stopping…", detail: `Maris asked ${agentName}${there} to stop and no longer accepts its result. ${agentName} may still be working until it ends; this says Stopped once ${remote ? hostName : "Maris"} has seen it end.`, next: null, nothingRan: false };
       }
       if (status.code === "native_agent_cancel_delivery_uncertain") {
-        return { tone: "danger", headline: "Stop requested · not confirmed", detail: `Pastey${there} no longer accepts this run's result, but could not confirm that ${agentName} received the request to stop. It may still be working.`, next: `Check the folder${there} before relying on it. Nothing runs again on its own.`, nothingRan: false };
+        return { tone: "danger", headline: "Stop requested · not confirmed", detail: `Maris${there} no longer accepts this run's result, but could not confirm that ${agentName} received the request to stop. It may still be working.`, next: `Check the folder${there} before relying on it. Nothing runs again on its own.`, nothingRan: false };
       }
       return { tone: "neutral", headline: "Stopped", detail: `Stopped at your request. Anything ${agentName} did before it stopped stays${remote ? ` on ${hostName}` : ""}; nothing runs again on its own.`, next: reread, nothingRan: false };
     case "interrupted":
       if (["native_agent_outcome_unknown", "native_agent_reconciliation_required"].includes(status.code ?? "")) {
-        return { tone: "danger", headline: "Outcome unknown", detail: remote ? `This device lost track of the run on ${hostName} while ${agentName} worked (the connection dropped, or Pastey restarted there). It may have finished, failed or stopped.` : `Pastey lost track of ${agentName} while it worked. It may have finished, failed or stopped.`, next: remote ? `Reconcile asks ${hostName} what it knows now. If it does not know either, check the folder there yourself, then Stop. Nothing runs again on its own.` : "Check the folder yourself, then Stop. Nothing runs again on its own.", nothingRan: false };
+        return { tone: "danger", headline: "Outcome unknown", detail: remote ? `This device lost track of the run on ${hostName} while ${agentName} worked (the connection dropped, or Maris restarted there). It may have finished, failed or stopped.` : `Maris lost track of ${agentName} while it worked. It may have finished, failed or stopped.`, next: remote ? `Reconcile asks ${hostName} what it knows now. If it does not know either, check the folder there yourself, then Stop. Nothing runs again on its own.` : "Check the folder yourself, then Stop. Nothing runs again on its own.", nothingRan: false };
       }
       return { tone: "danger", headline: "Interrupted", detail: `${agentName}${there} reports that the turn was interrupted before it finished.${result ? ` ${result}` : ""}`, next: reread, nothingRan: false };
     case "failed":
@@ -186,11 +186,11 @@ export function taskOutcome(status: Pick<NativeAgentTaskStatus, "state" | "code"
     case "native_agent_not_delivered":
       return { tone: "danger", headline: "Not delivered · nothing ran", detail: result ?? `${hostName} refused the request before acting on it.`, next: null, nothingRan: true };
     case "native_agent_start_rejected":
-      return { tone: "danger", headline: `${hostName === "this device" ? "Pastey" : hostName} could not start it · nothing ran`, detail: result ?? `It was accepted, but ${agentName} refused its input or could not start.`, next: reread, nothingRan: true };
+      return { tone: "danger", headline: `${hostName === "this device" ? "Maris" : hostName} could not start it · nothing ran`, detail: result ?? `It was accepted, but ${agentName} refused its input or could not start.`, next: reread, nothingRan: true };
     case "native_agent_conversation_unavailable":
       return { tone: "danger", headline: "Conversation unavailable · nothing ran", detail: `${agentName}${there} could not reopen your earlier conversation in this folder.`, next: "Start a new conversation to run without that context.", nothingRan: true };
     case "native_agent_interrupted_on_restart":
-      return { tone: "danger", headline: "Stopped when Pastey quit", detail: `Pastey quit while ${agentName} worked, and ${agentName} stopped with it. Whatever it did before then stays in the folder; it does not run again on its own.`, next: reread, nothingRan: false };
+      return { tone: "danger", headline: "Stopped when Maris quit", detail: `Maris quit while ${agentName} worked, and ${agentName} stopped with it. Whatever it did before then stays in the folder; it does not run again on its own.`, next: reread, nothingRan: false };
     case "native_agent_failed":
       return { tone: "danger", headline: `${agentName} reported the turn failed`, detail: `The turn ran${there} and ended with a failure${result ? `: ${result}` : "."}${continuing ? " The session now ends with that failed turn." : ""}`, next: continuing ? `Open the session to see what it recorded, then continue it or start a new task.` : "Look at the folder or its sessions to see what happened, then try again.", nothingRan: false };
     default:

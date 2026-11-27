@@ -136,7 +136,7 @@ export function objectFlow(blocks: readonly ComposerBlock[]): ObjectFlowResult {
     }
     if (block.source !== location) return { location, revision, error: `Transfer source must be ${deviceDescription(location)}, where the object is currently located.` };
     if (block.destination === "pastey_shared" && block.source !== "selected_device") {
-      return { location, revision, error: "Pastey Shared final delivery is available only while the object is on the selected device." };
+      return { location, revision, error: "Maris Shared final delivery is available only while the object is on the selected device." };
     }
     const destination = block.destination === "pastey_shared" ? "selected_device" : block.destination;
     if (destination === block.source && block.landingMode === "pipeline_handoff") {

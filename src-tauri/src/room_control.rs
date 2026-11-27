@@ -3968,7 +3968,7 @@ const DELIVERY_REFUSALS: &[(&str, &str, ControlDeliveryFailureV1)] = {
         ),
         (
             "inbox_full",
-            "Room control inbox is full on the other device, which runs an older Pastey. Update Pastey there, or restart it.",
+            "Room control inbox is full on the other device, which runs an older Maris. Update Maris there, or restart it.",
             LegacyInboxFull,
         ),
         (

@@ -19,7 +19,7 @@ const REASON_LABELS: Record<string, string> = {
   refused: "refused by the other device before it did anything",
   replayed: "already received by the other device",
   expired: "expired before delivery",
-  inbox_full: "refused by an older Pastey whose inbox was full",
+  inbox_full: "refused by an older Maris whose inbox was full",
   rejected: "rejected by the other device",
   transport: "no answer (outcome unknown)",
 };

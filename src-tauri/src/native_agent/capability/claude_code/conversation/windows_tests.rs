@@ -813,7 +813,7 @@ fn processes_a_finished_run_left_running_are_ended_before_it_counts() {
             .result
             .as_deref()
             .unwrap()
-            .contains("left processes running, which Pastey ended"),
+            .contains("left processes running, which Maris ended"),
         "{status:?}"
     );
     let descendant = *fixture.processes().last().unwrap();

@@ -513,7 +513,7 @@ pub(in crate::native_agent) fn headless_availability(
     if cfg!(not(any(unix, windows))) {
         return unavailable(
             "native_agent_platform_unverified",
-            "Pastey runs Claude Code conversations only on macOS, Linux and Windows.".into(),
+            "Maris runs Claude Code conversations only on macOS, Linux and Windows.".into(),
         );
     }
     let Some(cli) = cli else {
@@ -534,7 +534,7 @@ pub(in crate::native_agent) fn headless_availability(
         return CapabilityAvailabilityV1 {
             state: NativeAgentCapabilityStateV1::Incompatible,
             reason: Some("native_agent_incompatible"),
-            detail: Some("Claude Code did not report a version Pastey understands.".into()),
+            detail: Some("Claude Code did not report a version Maris understands.".into()),
             backend: None,
         };
     };
@@ -544,7 +544,7 @@ pub(in crate::native_agent) fn headless_availability(
             state: NativeAgentCapabilityStateV1::Incompatible,
             reason: Some("native_agent_incompatible"),
             detail: Some(format!(
-                "Claude Code {shown} is older than {}.{}.{}, the minimum version Pastey requires on this platform. Update Claude Code.",
+                "Claude Code {shown} is older than {}.{}.{}, the minimum version Maris requires on this platform. Update Claude Code.",
                 MINIMUM_VERSION.0, MINIMUM_VERSION.1, MINIMUM_VERSION.2
             )),
             backend: None,
@@ -560,7 +560,7 @@ pub(in crate::native_agent) fn headless_availability(
     if !launcher_available {
         return unavailable(
             "native_agent_launch_failed",
-            "Pastey cannot find its own executable to keep Claude Code on its lifeline.".into(),
+            "Maris cannot find its own executable to keep Claude Code on its lifeline.".into(),
         );
     }
     #[cfg(windows)]
@@ -568,7 +568,7 @@ pub(in crate::native_agent) fn headless_availability(
         return unavailable(
             "native_agent_launch_failed",
             format!(
-                "Pastey cannot create the Job Object that keeps Claude Code contained: {error}."
+                "Maris cannot create the Job Object that keeps Claude Code contained: {error}."
             ),
         );
     }
@@ -673,7 +673,7 @@ fn trust_problem(workspace: &Path, global_config: Option<&Path>) -> Option<Strin
         return None;
     }
     Some(format!(
-        "This folder has Claude Code project configuration that can run commands ({}), and Claude Code has not been told to trust the folder. Pastey runs Claude Code without its trust prompt, so it does not start it here. Open the folder in Claude Code once (run `claude` there) and accept its trust prompt, then try again.",
+        "This folder has Claude Code project configuration that can run commands ({}), and Claude Code has not been told to trust the folder. Maris runs Claude Code without its trust prompt, so it does not start it here. Open the folder in Claude Code once (run `claude` there) and accept its trust prompt, then try again.",
         found.join(", ")
     ))
 }
@@ -773,7 +773,7 @@ impl NativeCapabilityAdapterV1 for ClaudeCodeConversationAdapterV1 {
             {
                 Some(true) => Check { name: "Signed in".into(), ok: Some(true), detail: "`claude auth status` reports signed in.".into() },
                 Some(false) => Check { name: "Signed in".into(), ok: Some(false), detail: "Claude Code is not signed in on this device (`claude auth login`).".into() },
-                None => Check { name: "Signed in".into(), ok: None, detail: "`claude auth status` gave no answer Pastey could read.".into() },
+                None => Check { name: "Signed in".into(), ok: None, detail: "`claude auth status` gave no answer Maris could read.".into() },
             },
             None => Check { name: "Signed in".into(), ok: None, detail: "Claude Code did not answer `auth status` in time, or is not installed.".into() },
         });
@@ -1732,7 +1732,7 @@ impl ConversationRunV1 {
             count => format!("Claude Code completed the turn. It denied {count} actions that needed approval; its own settings decide which do."),
         };
         if left > 0 {
-            summary.push_str(" It left processes running, which Pastey ended.");
+            summary.push_str(" It left processes running, which Maris ended.");
         }
         NativeInvocationOutcomeV1 {
             kind: NativeTurnOutcomeV1::Completed,
@@ -1912,7 +1912,7 @@ impl ConversationRunV1 {
         });
         if let Some(holder) = foreign.or_else(|| (holders.len() > 1).then(|| &holders[0])) {
             return Err(format!(
-                "{} opened this session as Pastey started ({}), so nothing was sent. Let it finish or close it there, then continue.",
+                "{} opened this session as Maris started ({}), so nothing was sent. Let it finish or close it there, then continue.",
                 holder.described(),
                 holder.status
             ));
@@ -1943,7 +1943,7 @@ impl ConversationRunV1 {
             // Nothing was sent, but the process cannot be shown gone.
             return outcome(
                 NativeTurnOutcomeV1::Unknown,
-                format!("{problem} The process Pastey started could not be shown to have ended ({why})."),
+                format!("{problem} The process Maris started could not be shown to have ended ({why})."),
             );
         }
         outcome(NativeTurnOutcomeV1::NotStarted, problem)

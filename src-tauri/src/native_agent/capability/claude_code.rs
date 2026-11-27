@@ -952,7 +952,7 @@ impl ClaudeSessionRunV1 {
             self.stop_background(copy);
             return Err(outcome(
                 NativeTurnOutcomeV1::Unknown,
-                format!("Another process held the session when Claude Code checked, so it started a copy ({copy}), which Pastey stopped. The original session is unchanged; the copy may have begun the prompt."),
+                format!("Another process held the session when Claude Code checked, so it started a copy ({copy}), which Maris stopped. The original session is unchanged; the copy may have begun the prompt."),
             ));
         }
         let continued = short_id_after(&text, "backgrounded · ") == Some(self.short())

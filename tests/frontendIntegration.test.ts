@@ -432,7 +432,7 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   assert.match(tracker, />Load recovery details</);
   assert.match(tracker, /disabled=\{agent\.busy \|\| !agent\.recoveryTaskId\} onClick=\{\(\) => void agent\.stopRecovery\(\)\}/);
   assert.match(tracker, /agent\.recoveryTargetHostRef \? <button[^>]*onClick=\{\(\) => void agent\.reconcileRemote\(\)\}>Reconcile<\/button> : null/);
-  assert.match(tracker, /Pastey will not reuse this workspace until the task is reconciled or explicitly stopped/);
+  assert.match(tracker, /Maris will not reuse this workspace until the task is reconciled or explicitly stopped/);
   assert.match(tracker, />Reconcile</);
   assert.match(tracker, />Stop</);
   assert.match(tracker, />Abandon recovery</);
@@ -443,7 +443,7 @@ test("Native Agent recovery uses the existing card with durable refresh and expl
   assert.match(lifecycle, /nativeAgentTaskNeedsObservation\(observedStatus\)/);
   assert.match(lifecycle, /native_agent_outcome_unknown/);
   assert.match(lifecycle, /reconcileRemoteNativeAgentTask\(\s*roomId,\s*movement\.targetHostRef,\s*movement\.taskId,\s*movement\.movementId/);
-  assert.match(tracker, /Codex completed, but Pastey could not safely capture its result for return/);
+  assert.match(tracker, /Codex completed, but Maris could not safely capture its result for return/);
   assert.match(bindings, /invoke\("get_native_agent_recovery_projection", \{ roomId \}\)/);
   const recoveryType = bindings.slice(
     bindings.indexOf("export interface NativeAgentRecoveryProjection"),
@@ -833,23 +833,23 @@ test("Full Access is one informed, directional decision made only on the control
   // The consent says what it allows, in plain words, including the terminal.
   const allows = fullAccessAllows("School Mac").join(" ");
   assert.match(allows, /Run Codex in any folder on this device, and continue Codex sessions here/);
-  assert.match(allows, /Open a terminal on this device \(PowerShell on Windows, your shell on macOS\) with exactly the rights Pastey has here/);
+  assert.match(allows, /Open a terminal on this device \(PowerShell on Windows, your shell on macOS\) with exactly the rights Maris has here/);
   assert.match(allows, /read, change or delete your files, reach any folder, and run programs/);
   // Folder rules are not presented as limiting the terminal or Codex.
   assert.match(allows, /folder rules decide only which folders are offered for sessions; they do not limit the terminal or Codex/);
   // What it does not do: direction, the Agent's own approvals, the OS.
   const limits = fullAccessLimits("School Mac").join(" ");
   assert.match(limits, /does not let this device control School Mac/);
-  assert.match(limits, /Pastey never answers Codex's own questions\. Whether Codex asks before a command or file change follows Codex's own settings on this device/);
+  assert.match(limits, /Maris never answers Codex's own questions\. Whether Codex asks before a command or file change follows Codex's own settings on this device/);
   assert.match(limits, /It never raises its rights: a Windows UAC prompt, an administrator password, or a macOS privacy prompt/);
-  assert.match(limits, /What Pastey has already been allowed, it has too/);
+  assert.match(limits, /What Maris has already been allowed, it has too/);
   assert.doesNotMatch(limits, /Codex still asks|cannot get past your operating system/);
   // The rights it inherits are stated before granting.
   assert.equal(processRightsWarning("standard"), null);
   assert.match(processRightsWarning("administrator") ?? "", /running as administrator[\s\S]*administrator rights too, with no UAC prompt/);
   assert.match(processRightsWarning("unknown") ?? "", /Whatever rights it has, the other device gets/);
   assert.match(allows, /Run Claude Code, with this device's own Claude Code sign-in, settings and permission rules, in folders shared with School Mac or opened by School Mac/);
-  assert.match(limits, /Pastey never answers Claude Code's own permission prompts either/);
+  assert.match(limits, /Maris never answers Claude Code's own permission prompts either/);
   assert.doesNotMatch(limits, /Claude Code sessions here can still be continued only on this device/);
   assert.match(FULL_ACCESS_ENDS.join(" "), /Revoke Full Access[\s\S]*Forget or revoke the device[\s\S]*Burn this Bridge, or pair it with another device/);
   assert.match(controlLine("Home PC", true), /start there without anyone accepting them/);
@@ -1019,7 +1019,7 @@ test("Codex requests are shown as untrusted text and answered only once, by the 
   assert.match(panel, /respondRemoteNativeDecision\(roomId, status\.taskId, review\.reviewRef, review\.contentDigest, decision\)/);
   assert.match(bindings, /invoke\("respond_remote_native_decision", \{ roomId, taskId, reviewRef, contentDigest, decision \}\)/);
   // Full Access never approves; its consent says where requests go instead.
-  assert.match(fullAccessLimits("School Mac").join(" "), /Pastey never answers Codex's own questions[\s\S]*the question goes to the person using School Mac/);
+  assert.match(fullAccessLimits("School Mac").join(" "), /Maris never answers Codex's own questions[\s\S]*the question goes to the person using School Mac/);
 });
 
 function sessionView(overrides: Partial<SessionView>): SessionView {
@@ -1047,7 +1047,7 @@ test("a session's status comes from Rust's live facts, never from its last messa
   assert.equal(sessionStatusPresentation(sessionView({ status: "interrupted", statusBasis: "inference" })).label, "Interrupted (inferred)");
   // An observation at a moment, never a promise about continuing.
   assert.equal(resumeLabel(sessionView({ resume: { verdict: "unknown", reasons: [] } })), "Whether anything had it open could not be shown");
-  assert.equal(resumeLabel(sessionView({ resume: { verdict: "safe", reasons: [] } })), "Nothing else had it open when Pastey looked");
+  assert.equal(resumeLabel(sessionView({ resume: { verdict: "safe", reasons: [] } })), "Nothing else had it open when Maris looked");
 });
 
 test("a Host that has not shared its sessions says where to allow it", () => {
@@ -1584,7 +1584,7 @@ test("Device details, network tests and this device's diagnostics are reachable 
   }
   assert.match(device, /Test connection/);
   assert.match(device, /getLastBenchmarkResults\(\)/);
-  assert.match(device, /No measurement for this Bridge yet\. Pastey does not estimate speed/);
+  assert.match(device, /No measurement for this Bridge yet\. Maris does not estimate speed/);
   // This device: identity, profile, runtimes and a local-only speed test.
   assert.match(settings, /\{ route: "settings-this-device", label: "This device", icon: "device" \}/);
   assert.match(thisDevice, /<DeviceIdentitySettings \/>/);
@@ -1606,7 +1606,7 @@ test("Device details, network tests and this device's diagnostics are reachable 
 test("Sessions follow the Agents device and mark the ones Pastey started", () => {
   const sessions = readFileSync("src/features/workspace/NativeSessionsCard.tsx", "utf8");
   assert.doesNotMatch(sessions, /aria-label="Device"/);
-  assert.match(sessions, /session\.origin === "pastey" \? " · by Pastey" : ""/);
+  assert.match(sessions, /session\.origin === "pastey" \? " · by Maris" : ""/);
   // Every answer reports what the device shares now; nothing is guessed.
   assert.match(sessions, /if \(response\.outcome === "ok" \|\| response\.outcome === "not_authorized"\) shares\?\.adopt\(response\.scopes, response\.fullAccess === true\);/);
 });
@@ -1719,10 +1719,10 @@ test("who has a session open is said in plain words, with how Pastey knows, per 
   assert.match(running.text, /cannot tell which threads it has open\. If it has this one open, Codex refuses the continuation and nothing runs/);
   // Pastey's own conversation is never blamed on another client.
   const own = codex(codexLive("attached", "Pastey's own Codex session"), { status: "idle" });
-  assert.match(sessionHoldLine(own, "Windows").text, /Pastey's own conversation in this folder has it open, idle\. Continuing closes that first/);
-  assert.equal(sessionStatusPresentation(own).label, "Open in Pastey, idle");
+  assert.match(sessionHoldLine(own, "Windows").text, /Maris's own conversation in this folder has it open, idle\. Continuing closes that first/);
+  assert.equal(sessionStatusPresentation(own).label, "Open in Maris, idle");
   const ownRunning = codex(codexLive("running", "Pastey's own Codex session"), { status: "running", resume: { verdict: "unsafe", reasons: [] } });
-  assert.match(continuationAvailability(ownRunning, true).reason, /A Pastey task is running a turn in this thread/);
+  assert.match(continuationAvailability(ownRunning, true).reason, /A Maris task is running a turn in this thread/);
   assert.doesNotMatch(continuationAvailability(ownRunning, true).reason, /Codex app or a terminal/);
   assert.deepEqual(continuationChip(ownRunning, true), { label: "Running", tone: "live" });
   // Another client's hold names that device and what to do there.
@@ -1931,7 +1931,7 @@ test("an Agent reply never becomes HTML, never loads anything and never navigate
   }
   assert.doesNotMatch(html, /javascript:|data:text|file:\/\//);
   // An image is a placeholder: its address is never requested.
-  assert.match(html, /<span class="md-image" title="Pastey does not load images from Agent replies: https:\/\/tracker.invalid\/pixel.png">\[Image: tracker\]<\/span>/);
+  assert.match(html, /<span class="md-image" title="Maris does not load images from Agent replies: https:\/\/tracker.invalid\/pixel.png">\[Image: tracker\]<\/span>/);
 
   assert.equal(safeUrl("https://example.com/a b"), "https://example.com/a%20b");
   assert.equal(safeUrl(" HTTPS://EXAMPLE.com "), "https://example.com/");

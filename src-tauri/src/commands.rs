@@ -440,7 +440,7 @@ fn managed_self_check_request(
         requester_host_ref: requester.clone(),
         participant_host_refs: vec![requester.clone(), remote.clone()],
         roots: Vec::new(),
-        original_user_goal: "Pastey bounded Bridge Device managed self-check.".into(),
+        original_user_goal: "Maris bounded Bridge Device managed self-check.".into(),
         expected_outcome: "Search, authored Transfer, and remote Execute complete through Core."
             .into(),
         steps: vec![
@@ -1865,7 +1865,7 @@ fn options_refusal(options: &crate::native_agent::NativeSessionOptionsV1, error:
     if options.is_empty() || error != "Remote native Agent protocol is incompatible." {
         return error;
     }
-    "That device's Pastey cannot apply a chosen model or reasoning effort, so nothing was sent. Update Pastey there, or choose \u{201c}Use native configuration\u{201d}.".into()
+    "That device's Maris cannot apply a chosen model or reasoning effort, so nothing was sent. Update Maris there, or choose \u{201c}Use native configuration\u{201d}.".into()
 }
 
 async fn require_remote_native_capability(
@@ -2925,11 +2925,11 @@ pub async fn propose_remote_native_codex_workspace_movement(
     .await?;
     let workspace = std::path::Path::new(&source_workspace)
         .canonicalize()
-        .map_err(|_| "Pastey could not open the selected workspace.".to_string())?;
+        .map_err(|_| "Maris could not open the selected workspace.".to_string())?;
     let scope_root = workspace
         .parent()
         .map(std::path::Path::to_path_buf)
-        .ok_or_else(|| "Pastey could not bind the selected workspace.".to_string())?;
+        .ok_or_else(|| "Maris could not bind the selected workspace.".to_string())?;
     let movement_id = format!("native-agent-movement:{}", uuid::Uuid::new_v4());
     let task_id = format!("native-agent:{}", uuid::Uuid::new_v4());
     let now = storage::now_ts();
@@ -5660,7 +5660,7 @@ pub async fn start_bridge_plan_attempt(
         .get_revision(&approval.approval.revision_id)
         .map_err(|error| error.message())?;
     if bridge_plan::framework_execution_unavailable(&revision.revision) {
-        return Err("This immutable Plan contains Transform or Execute intent. Pastey Core can review these framework steps, but no Agent implementation is currently available to execute them.".into());
+        return Err("This immutable Plan contains Transform or Execute intent. Maris Core can review these framework steps, but no Agent implementation is currently available to execute them.".into());
     }
     let attempt = store
         .create_attempt_from_approval(&attempt_id, &approval_id, now)
@@ -6879,7 +6879,7 @@ pub(crate) async fn execute_bridge_plan_transfer_attempt_inner(
     .await;
     let success_summary = match &grant.destination {
         bridge_plan::TransferDestination::UserSelectedLocation { .. } => {
-            "Transfer saved in the approved Pastey Shared location on the selected device."
+            "Transfer saved in the approved Maris Shared location on the selected device."
         }
         bridge_plan::TransferDestination::SelectedDevice { .. } => {
             "Transfer delivered to the selected device Inbox."

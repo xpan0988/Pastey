@@ -26,7 +26,7 @@ export function providerLabel(provider: NativeSessionProvider): string {
   return provider === "claude_code" ? "Claude Code" : "Codex";
 }
 
-const ORIGINS: Record<string, string> = { desktop: "desktop app", cli: "terminal", pastey: "Pastey", sdk: "SDK", other: "other", unknown: "unknown origin" };
+const ORIGINS: Record<string, string> = { desktop: "desktop app", cli: "terminal", pastey: "Maris", sdk: "SDK", other: "other", unknown: "unknown origin" };
 
 export function originLabel(origin: string): string {
   return ORIGINS[origin] ?? origin;
@@ -44,12 +44,12 @@ export function sessionStatusPresentation(session: Pick<SessionView, "status" | 
   switch (session.status) {
     case "running":
       return liveSourceKind(session.live.source) === "pastey"
-        ? { label: "Running", tone: "live", explanation: "A Pastey task is running a turn in it now." }
+        ? { label: "Running", tone: "live", explanation: "A Maris task is running a turn in it now." }
         : { label: "Running", tone: "live", explanation: `${name} reports it executing now (${session.live.source}).` };
     case "idle":
       return session.live.state === "attached"
         ? liveSourceKind(session.live.source) === "pastey"
-          ? { label: "Open in Pastey, idle", tone: "done", explanation: "Pastey's own conversation in this folder keeps it open between tasks. Nothing is running." }
+          ? { label: "Open in Maris, idle", tone: "done", explanation: "Maris's own conversation in this folder keeps it open between tasks. Nothing is running." }
           : { label: "Open, idle", tone: "live", explanation: `A ${name} process holds it but is not executing.` }
         : { label: "Idle", tone: "done", explanation: "No recorded turn, and nothing runs it." };
     case "completed":
@@ -69,8 +69,8 @@ export function sessionStatusPresentation(session: Pick<SessionView, "status" | 
  * observation, not a promise: continuing is decided again at launch. */
 export function resumeLabel(session: Pick<SessionView, "resume">): string {
   switch (session.resume.verdict) {
-    case "safe": return "Nothing else had it open when Pastey looked";
-    case "unsafe": return "Open in another process when Pastey looked";
+    case "safe": return "Nothing else had it open when Maris looked";
+    case "unsafe": return "Open in another process when Maris looked";
     case "unknown": return "Whether anything had it open could not be shown";
   }
 }
@@ -93,8 +93,8 @@ export function sessionHoldLine(session: Pick<SessionView, "provider" | "live">,
   const kind = liveSourceKind(live.source);
   if (kind === "pastey") {
     return live.state === "running"
-      ? { text: "A Pastey task is running a turn in it now.", how: "Pastey's own record of the Codex sessions it has open." }
-      : { text: "Pastey's own conversation in this folder has it open, idle. Continuing closes that first; nothing is lost.", how: "Pastey's own record of the Codex sessions it has open." };
+      ? { text: "A Maris task is running a turn in it now.", how: "Maris's own record of the Codex sessions it has open." }
+      : { text: "Maris's own conversation in this folder has it open, idle. Continuing closes that first; nothing is lost.", how: "Maris's own record of the Codex sessions it has open." };
   }
   if (kind === "lock") {
     const how = "Codex's writer lock for this exact thread, read without taking it.";
@@ -105,7 +105,7 @@ export function sessionHoldLine(session: Pick<SessionView, "provider" | "live">,
   if (kind === "process") {
     const how = `${hostName}'s list of running programs. There, Codex's per-thread lock cannot be read without taking it, so this covers every Codex app and terminal on the device at once.`;
     if (live.state === "not_running") return { text: `No Codex app or terminal is running on ${hostName}, so nothing has it open.`, how };
-    return { text: `Codex is running on ${hostName} (the app or a terminal), and Pastey cannot tell which threads it has open. If it has this one open, Codex refuses the continuation and nothing runs.`, how };
+    return { text: `Codex is running on ${hostName} (the app or a terminal), and Maris cannot tell which threads it has open. If it has this one open, Codex refuses the continuation and nothing runs.`, how };
   }
   if (kind === "claude") {
     const how = "Claude Code's own list of active sessions (claude agents).";
@@ -123,8 +123,8 @@ export function sessionHoldLine(session: Pick<SessionView, "provider" | "live">,
  * provider's own saved history on that device, not a running program. */
 export function sessionPersistenceLine(session: Pick<SessionView, "provider" | "workspaceLabel">, hostName: string): string {
   return session.provider === "codex"
-    ? `Saved by Codex on ${hostName}, for the folder ${session.workspaceLabel}. A thread is Codex's saved history, not a running program: it stays when the Codex app or a terminal quits, and Pastey reads it through a read-only Codex of its own.`
-    : `Saved by Claude Code on ${hostName}, for the folder ${session.workspaceLabel}. A session is Claude Code's saved transcript, not a running program: it stays when Claude Code quits, and Pastey reads that transcript directly.`;
+    ? `Saved by Codex on ${hostName}, for the folder ${session.workspaceLabel}. A thread is Codex's saved history, not a running program: it stays when the Codex app or a terminal quits, and Maris reads it through a read-only Codex of its own.`
+    : `Saved by Claude Code on ${hostName}, for the folder ${session.workspaceLabel}. A session is Claude Code's saved transcript, not a running program: it stays when Claude Code quits, and Maris reads that transcript directly.`;
 }
 
 /** A short verdict for a list row: can it be continued from here now? */
@@ -210,7 +210,7 @@ export function continuationAvailability(
       allowed: false,
       reason: session.provider === "codex"
         ? liveSourceKind(session.live?.source ?? "") === "pastey"
-          ? "A Pastey task is running a turn in this thread now. Wait for it to finish, then look again."
+          ? "A Maris task is running a turn in this thread now. Wait for it to finish, then look again."
           : `This Codex thread is open in another Codex client on ${hostName} (the Codex app or a terminal). Close it there, then look again.`
         : `A Claude Code process on ${hostName} holds this session (the desktop app, a terminal or a background session). Let it finish or close it, then look again.`,
     };
@@ -220,21 +220,21 @@ export function continuationAvailability(
   const remoteProblem = onThisDevice ? null
     : share === null ? `${hostName} no longer shares this folder with this Bridge. Look for sessions again.`
       : share && !(share.readSessions && share.agentRequests) ? `${hostName} shares ${share.label} for its sessions, but not for agent requests, so a continuation would be refused. ${shareLocation(hostName)} → ${share.label}, and turn on “Agent requests”.`
-        : !session.lastTurn.marker ? `${hostName} did not say which ${session.provider === "codex" ? "turn this thread" : "message this session"} ends with, so Pastey cannot check that it is unchanged. Update Pastey on ${hostName}.`
+        : !session.lastTurn.marker ? `${hostName} did not say which ${session.provider === "codex" ? "turn this thread" : "message this session"} ends with, so Maris cannot check that it is unchanged. Update Maris on ${hostName}.`
           : null;
   if (session.provider === "codex") {
     if (session.lastTurn.outcome === "unreadable") return { allowed: false, reason: "This thread's history cannot be read, so it cannot be continued safely." };
     if (remoteProblem) return { allowed: false, reason: remoteProblem };
     if (!onThisDevice) {
-      return { allowed: true, reason: `Someone on ${hostName} must Accept (unless this device has Full Access there). Then Codex there reopens this thread, refusing if the Codex app or a terminal has it open, and Pastey checks that it still ends with the turn you see here.` };
+      return { allowed: true, reason: `Someone on ${hostName} must Accept (unless this device has Full Access there). Then Codex there reopens this thread, refusing if the Codex app or a terminal has it open, and Maris checks that it still ends with the turn you see here.` };
     }
-    return { allowed: true, reason: "Codex reopens this thread, refusing if the Codex app or a terminal has it open, and Pastey checks that it still ends with the turn you see here." };
+    return { allowed: true, reason: "Codex reopens this thread, refusing if the Codex app or a terminal has it open, and Maris checks that it still ends with the turn you see here." };
   }
   if (session.resume.verdict === "unknown") {
-    return { allowed: false, reason: `Pastey cannot show that nothing holds this session: ${session.resume.reasons.join("; ") || "no live source"}.` };
+    return { allowed: false, reason: `Maris cannot show that nothing holds this session: ${session.resume.reasons.join("; ") || "no live source"}.` };
   }
   if (remoteProblem) return { allowed: false, reason: remoteProblem };
-  const inPlace = "Claude Code continues this same session in its own folder, only while no other Claude Code process has it open, and Pastey checks that it still ends with the message you see here. If another process takes it as the turn starts, nothing is sent, or the outcome is reported as unknown; it is never silently copied.";
+  const inPlace = "Claude Code continues this same session in its own folder, only while no other Claude Code process has it open, and Maris checks that it still ends with the message you see here. If another process takes it as the turn starts, nothing is sent, or the outcome is reported as unknown; it is never silently copied.";
   return onThisDevice
     ? { allowed: true, reason: inPlace }
     : { allowed: true, reason: `Someone on ${hostName} must Accept (unless this device has Full Access there). Then ${inPlace.charAt(0).toLowerCase()}${inPlace.slice(1)}` };

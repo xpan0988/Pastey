@@ -697,7 +697,7 @@ impl NativeCapabilityAdapterV1 for CodexNativeAdapterV1 {
         vec![match answer {
             Some((true, output)) if output.contains("Logged in") => Check { name: "Signed in".into(), ok: Some(true), detail: "`codex login status` reports signed in.".into() },
             Some((_, output)) if output.to_lowercase().contains("not logged in") => Check { name: "Signed in".into(), ok: Some(false), detail: "Codex is not signed in on this device (`codex login`).".into() },
-            Some(_) => Check { name: "Signed in".into(), ok: None, detail: "`codex login status` gave no answer Pastey could read.".into() },
+            Some(_) => Check { name: "Signed in".into(), ok: None, detail: "`codex login status` gave no answer Maris could read.".into() },
             None => Check { name: "Signed in".into(), ok: None, detail: "Codex did not answer `login status` in time, or is not installed.".into() },
         }]
     }
@@ -1300,7 +1300,7 @@ impl CodexResponseCaptureV1 {
             (Some(_), Some(_)) => "Codex completed its native task.",
             (Some(_), None) => "Codex completed its native task with an empty response.",
             (None, _) if unreadable => {
-                "Codex completed its native task, but Pastey could not read its final response."
+                "Codex completed its native task, but Maris could not read its final response."
             }
             (None, _) => "Codex completed its native task without a final response.",
         };
@@ -1833,11 +1833,11 @@ fn shown_stderr(stderr: &str) -> String {
 pub(in crate::native_agent) fn codex_unavailable_summary(reason: Option<&str>) -> &'static str {
     match reason {
         Some(REASON_NOT_INSTALLED) => {
-            "Codex is not installed on this Host, or Pastey cannot find the `codex` command there."
+            "Codex is not installed on this Host, or Maris cannot find the `codex` command there."
         }
         Some(REASON_LAUNCH_FAILED) => "Codex was found on this Host but could not be started.",
         Some(REASON_PROBE_FAILED) => {
-            "Codex on this Host exited with an error when Pastey checked it (`codex --version`)."
+            "Codex on this Host exited with an error when Maris checked it (`codex --version`)."
         }
         Some(REASON_PROBE_TIMEOUT) => "Codex on this Host did not answer in time.",
         Some(REASON_INCOMPATIBLE) => {
@@ -1906,12 +1906,12 @@ fn select_launcher(
 }
 
 #[cfg(target_os = "macos")]
-const NOT_INSTALLED_DETAIL: &str = "Pastey found no `codex` command on PATH and no desktop app with a bundled Codex in /Applications or ~/Applications. Install the ChatGPT desktop app with Codex, or the Codex CLI.";
+const NOT_INSTALLED_DETAIL: &str = "Maris found no `codex` command on PATH and no desktop app with a bundled Codex in /Applications or ~/Applications. Install the ChatGPT desktop app with Codex, or the Codex CLI.";
 #[cfg(windows)]
-const NOT_INSTALLED_DETAIL: &str = "Pastey looked for codex.exe and codex.cmd in every folder on PATH, including the current user and system PATH, and for a desktop app with a bundled Codex, and found neither. Check that `codex --version` works in a new terminal, or run scripts/diagnose-windows-codex.ps1.";
+const NOT_INSTALLED_DETAIL: &str = "Maris looked for codex.exe and codex.cmd in every folder on PATH, including the current user and system PATH, and for a desktop app with a bundled Codex, and found neither. Check that `codex --version` works in a new terminal, or run scripts/diagnose-windows-codex.ps1.";
 #[cfg(not(any(target_os = "macos", windows)))]
 const NOT_INSTALLED_DETAIL: &str =
-    "Pastey found no `codex` command on PATH. Install the Codex CLI.";
+    "Maris found no `codex` command on PATH. Install the Codex CLI.";
 
 fn with_backend(
     mut report: CapabilityAvailabilityV1,
@@ -1941,7 +1941,7 @@ fn probe_launcher(launcher: &CodexLauncherV1, timeout: Duration) -> CapabilityAv
         ProbeRunV1::NotStarted { error, .. } => unusable(
             Unavailable,
             REASON_LAUNCH_FAILED,
-            format!("Pastey found {program} but could not start it: {error}"),
+            format!("Maris found {program} but could not start it: {error}"),
         ),
         ProbeRunV1::TimedOut => unusable(
             Unavailable,
@@ -2619,7 +2619,7 @@ impl CodexAppServerV1 {
             Ok(entries) => entries,
             Err(_) => {
                 return Some(
-                    "Codex on this device did not list its models, so Pastey could not check the chosen model or effort, and nothing was sent.".into(),
+                    "Codex on this device did not list its models, so Maris could not check the chosen model or effort, and nothing was sent.".into(),
                 )
             }
         };
@@ -2822,7 +2822,7 @@ impl CodexAppServerV1 {
                     } else {
                         // A client capability Pastey never advertised. The
                         // protocol's own refusal grants nothing.
-                        let _ = self.send(json!({"id": request_id, "error": {"code": -32601, "message": "Pastey does not handle this request."}}));
+                        let _ = self.send(json!({"id": request_id, "error": {"code": -32601, "message": "Maris does not handle this request."}}));
                     }
                 }
                 (Some("serverRequest/resolved"), None) => {
@@ -3888,7 +3888,7 @@ mod tests {
         assert!(outcome.output.is_none());
         assert_eq!(
             outcome.summary.as_deref(),
-            Some("Codex completed its native task, but Pastey could not read its final response.")
+            Some("Codex completed its native task, but Maris could not read its final response.")
         );
 
         let mut later_unreadable = CodexResponseCaptureV1::default();

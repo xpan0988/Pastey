@@ -49,14 +49,14 @@ export function BridgeFullAccessSection({ room, peerName }: { room: RoomInfo; pe
   async function act(action: () => Promise<BridgeFullAccess>) {
     setPending(true); setError(null);
     try { setState(await action()); return true; }
-    catch (nextError) { setError(errorText(nextError, "Pastey could not change Full Access.")); return false; }
+    catch (nextError) { setError(errorText(nextError, "Maris could not change Full Access.")); return false; }
     finally { setPending(false); }
   }
 
   async function removeFolder(grant: FullAccessGrant, folder: string) {
     setPending(true); setError(null);
     try { await removeFullAccessFolder(grant.grantId, folder); setState(await getBridgeFullAccess(room.id)); }
-    catch (nextError) { setError(errorText(nextError, "Pastey could not remove that folder.")); }
+    catch (nextError) { setError(errorText(nextError, "Maris could not remove that folder.")); }
     finally { setPending(false); }
   }
 
@@ -65,7 +65,7 @@ export function BridgeFullAccessSection({ room, peerName }: { room: RoomInfo; pe
     <div className="row"><h3 className="spacer">Full Access</h3>{state ? <Badge tone={grant ? "warn" : "neutral"}>{grant ? "On" : "Off"}</Badge> : null}</div>
     {state === null ? <p className="small muted">Checking…</p>
       : grant ? <>
-        <p className="small">{grant.deviceLabel} can control this device without anyone here: run Codex, continue sessions and open a terminal with Pastey's rights. Since {sinceLabel(grant.grantedAt)}.</p>
+        <p className="small">{grant.deviceLabel} can control this device without anyone here: run Codex, continue sessions and open a terminal with Maris's rights. Since {sinceLabel(grant.grantedAt)}.</p>
         {state.processRights === "administrator" ? <Notice tone="bad">{processRightsWarning(state.processRights)}</Notice> : null}
         {grant.folders.length ? <div className="card"><div className="list">
           {grant.folders.map((folder) => <ListRow key={folder} leading={<Icon name="folder" small />} title={folder.split(/[\\/]/).filter(Boolean).pop() ?? folder} meta={<span className="mono">{folder}</span>} side={<button type="button" className="btn btn-sm" disabled={pending} onClick={() => void removeFolder(grant, folder)}>Remove</button>} />)}
@@ -83,7 +83,7 @@ export function BridgeFullAccessSection({ room, peerName }: { room: RoomInfo; pe
     {consent && state ? <FullAccessConsentDialog peerName={peerName} fingerprint={state.displayFingerprint} rights={state.processRights} pending={pending} onClose={() => setConsent(false)} onGrant={() => void act(() => grantFullAccess(room.id, true)).then((ok) => { if (ok) setConsent(false); })} /> : null}
     {confirmRevoke && grant ? <Dialog title={`Revoke ${grant.deviceLabel}'s Full Access?`} onClose={() => { if (!pending) setConfirmRevoke(false); }} footer={<><button type="button" className="btn" disabled={pending} onClick={() => setConfirmRevoke(false)}>Cancel</button><button type="button" className="btn btn-danger-solid" disabled={pending} onClick={() => void act(() => revokeFullAccess(room.id)).then(() => setConfirmRevoke(false))}>Revoke</button></>}>
       <p>From now on, everything {grant.deviceLabel} asks for here waits for your Accept again. A terminal it has open on this device closes now, and Codex tasks Full Access started here are asked to stop.</p>
-      <p className="small muted">A stop is a request: Pastey no longer accepts those tasks' results, but cannot always confirm when Codex stops, and anything it already did stays. Giving Full Access again later is a new decision.</p>
+      <p className="small muted">A stop is a request: Maris no longer accepts those tasks' results, but cannot always confirm when Codex stops, and anything it already did stays. Giving Full Access again later is a new decision.</p>
     </Dialog> : null}
   </section>;
 }
@@ -108,7 +108,7 @@ export function FullAccessConsentDialog({ peerName, fingerprint, rights, pending
     <p className="small"><strong>It lasts</strong> through reconnects and restarts until one of these ends it:</p>
     <ul className="small consent-list">{FULL_ACCESS_ENDS.map((line) => <li key={line}>{line}</li>)}</ul>
     {fingerprint ? <><p className="small muted">The device this Bridge is paired with, as its pairing code proved. It should match {peerName}'s Settings → This device:</p><p className="mono fingerprint-callout">{fingerprint}</p></> : null}
-    <label className="check"><input type="checkbox" checked={understood} disabled={pending} onChange={(event) => setUnderstood(event.target.checked)} /><span>I understand that {peerName} can use this device with Pastey's rights here{rights === "administrator" ? ", which are administrator rights" : ""}, while Full Access is on.</span></label>
+    <label className="check"><input type="checkbox" checked={understood} disabled={pending} onChange={(event) => setUnderstood(event.target.checked)} /><span>I understand that {peerName} can use this device with Maris's rights here{rights === "administrator" ? ", which are administrator rights" : ""}, while Full Access is on.</span></label>
   </Dialog>;
 }
 
@@ -124,13 +124,13 @@ export function FullAccessSettings() {
   async function act(action: () => Promise<unknown>) {
     setPending(true); setError(null);
     try { await action(); await refresh(); }
-    catch (nextError) { setError(errorText(nextError, "Pastey could not change Full Access.")); }
+    catch (nextError) { setError(errorText(nextError, "Maris could not change Full Access.")); }
     finally { setPending(false); }
   }
 
   return <section className="section" aria-label="Full Access">
     <div className="section-head"><h2>Full Access</h2>
-      <p>Devices that can control this one through Pastey without anyone here: run Codex, continue sessions and open a terminal as you. Give it from inside a Bridge (Bridge details → Full Access). It applies in one direction only.</p></div>
+      <p>Devices that can control this one through Maris without anyone here: run Codex, continue sessions and open a terminal as you. Give it from inside a Bridge (Bridge details → Full Access). It applies in one direction only.</p></div>
     <div className="card"><div className="list">
       {grants.length === 0 ? <p className="list-empty">No device has Full Access. Every request from another device waits for your Accept.</p>
         : grants.map((grant) => <ListRow key={grant.grantId} leading={<Icon name="shield" />} title={grant.deviceLabel} meta={<><span className="mono">{grant.displayFingerprint}</span> · since {sinceLabel(grant.grantedAt)}{grant.folders.length ? ` · ${grant.folders.length} folder${grant.folders.length === 1 ? "" : "s"} opened` : ""}</>} side={<button type="button" className="btn btn-danger btn-sm" disabled={pending} onClick={() => void act(() => revokeFullAccess(grant.bridgeId))}>Revoke</button>} />)}
@@ -174,7 +174,7 @@ export function FullAccessBanner({ room, peerName, onOpenDetails }: { room: Room
   async function close(session: DeveloperTerminalSession) {
     setError(null);
     try { setHosted((await closeHostedDeveloperTerminal(room.id, session.terminalSessionId)).sessions.filter((next) => next.role === "host" && next.state === "active")); }
-    catch (nextError) { setError(errorText(nextError, "Pastey could not close that terminal.")); }
+    catch (nextError) { setError(errorText(nextError, "Maris could not close that terminal.")); }
   }
 
   if (!state) return null;

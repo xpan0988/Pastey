@@ -402,7 +402,7 @@ pub async fn request_nearby_join(
         .lock()
         .get(device_id)
         .cloned()
-        .ok_or_else(|| AppError::NotFound("No nearby Pastey devices found.".into()))?;
+        .ok_or_else(|| AppError::NotFound("No nearby Maris devices found.".into()))?;
 
     // A device with a Bridge already is Busy to new devices, but a device it
     // paired with before may start another Bridge with it.
@@ -412,10 +412,10 @@ pub async fn request_nearby_join(
 
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
-        .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+        .map_err(|_| AppError::Network("Firewall may be blocking Maris.".into()))?;
     let response_port = socket
         .local_addr()
-        .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?
+        .map_err(|_| AppError::Network("Firewall may be blocking Maris.".into()))?
         .port();
     let request = NearbyJoinRequest {
         kind: "join_request".into(),
@@ -439,7 +439,7 @@ pub async fn request_nearby_join(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(JOIN_REQUEST_CONNECT_TIMEOUT_SECS))
         .build()
-        .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+        .map_err(|_| AppError::Network("Firewall may be blocking Maris.".into()))?;
     let response = client
         .post(&join_url)
         .json(&request)
@@ -452,7 +452,7 @@ pub async fn request_nearby_join(
                 .remove(&request.request_id);
             logging::write_transfer_line("[pastey antenna] event=nearby_unreachable");
             logging::write_transfer_line("[pastey antenna] event=blocked_network_suspected");
-            AppError::Network("Device found, but Pastey could not connect to it.".into())
+            AppError::Network("Device found, but Maris could not connect to it.".into())
         })?;
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -468,7 +468,7 @@ pub async fn request_nearby_join(
             .lock()
             .remove(&request.request_id);
         return Err(AppError::Network(
-            "Device found, but Pastey could not connect to it.".into(),
+            "Device found, but Maris could not connect to it.".into(),
         ));
     }
 
@@ -487,7 +487,7 @@ pub async fn request_nearby_join(
             logging::write_transfer_line("[pastey antenna] event=join_timeout");
             AppError::Timeout("Join request timed out.".into())
         })?
-        .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+        .map_err(|_| AppError::Network("Firewall may be blocking Maris.".into()))?;
         let (size, source) = response;
         let Ok(response) = serde_json::from_slice::<NearbyJoinResponse>(&buffer[..size]) else {
             continue;
@@ -515,7 +515,7 @@ pub async fn send_join_response_to(
 ) -> AppResult<()> {
     let socket = UdpSocket::bind(("0.0.0.0", 0))
         .await
-        .map_err(|_| AppError::Network("Firewall may be blocking Pastey.".into()))?;
+        .map_err(|_| AppError::Network("Firewall may be blocking Maris.".into()))?;
     let payload = serde_json::to_vec(response)?;
     socket.send_to(&payload, target).await.map_err(|_| {
         AppError::Network(
@@ -590,7 +590,7 @@ pub fn validate_peer_address(input: &str) -> AppResult<String> {
     Ok(address.to_ascii_lowercase())
 }
 
-const PUBLIC_ADDRESS_REFUSAL: &str = "Use an address on a private or overlay network (for example Tailscale or WireGuard). Pastey must not be exposed directly to the internet.";
+const PUBLIC_ADDRESS_REFUSAL: &str = "Use an address on a private or overlay network (for example Tailscale or WireGuard). Maris must not be exposed directly to the internet.";
 
 /// Whether an IPv4 address can name another device at all.
 fn is_device_ipv4(ip: Ipv4Addr) -> bool {
@@ -788,7 +788,7 @@ async fn exchange_with<T>(
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return Err(AppError::Timeout(
-                "The other device did not answer. Check the code, that Pastey is open on the other device, and, for another network, that both devices are on the same overlay network.".into(),
+                "The other device did not answer. Check the code, that Maris is open on the other device, and, for another network, that both devices are on the same overlay network.".into(),
             ));
         }
         if sent < sends && now >= next_send {

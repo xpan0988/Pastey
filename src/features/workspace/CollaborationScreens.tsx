@@ -239,7 +239,7 @@ function ReadinessPanel({ id, disabled, onReleased }: { id: string; disabled: bo
     </div>
     <label className="row small" style={{ gap: 8 }}>
       <input type="checkbox" checked={planFirst} onChange={(event) => setPlanFirst(event.target.checked)} />
-      <span>Plan together first: members plan read only and must all accept one plan Pastey finds no structural problem in before anyone implements.</span>
+      <span>Plan together first: members plan read only and must all accept one plan Maris finds no structural problem in before anyone implements.</span>
     </label>
     {error ? <Notice tone="bad">{error}</Notice> : null}
     {results === null ? <span className="small subtle">Checking each member…</span> : results.map((result) => <div key={result.alias} className="stack" style={{ gap: 4 }}>
@@ -278,7 +278,7 @@ function PlanPanel({ view, disabled, onAdopt }: { view: CollaborationView; disab
       <ul className="xsmall" style={{ margin: 0, paddingLeft: 16 }}>
         {shown.body.proposal.tasks.map((task) => <li key={task.id}>{done.has(task.id) ? "✓ " : ""}<strong>{task.id}</strong> · {task.owner} · {task.title}{(task.after ?? []).length ? ` · after ${(task.after ?? []).join(", ")}` : ""}{(task.paths ?? []).length ? ` · ${(task.paths ?? []).join(", ")}` : ""}</li>)}
       </ul>
-      {(shown.body.problems ?? []).length ? <Notice tone="warn">Pastey's checks: {(shown.body.problems ?? []).join("; ")}</Notice> : null}
+      {(shown.body.problems ?? []).length ? <Notice tone="warn">Maris's checks: {(shown.body.problems ?? []).join("; ")}</Notice> : null}
     </>}
   </div></div>;
 }
@@ -338,7 +338,7 @@ function MemberCard({ member, link, guest, waiting, disabled, onApprove, onResum
       ? <NativeDecisionPanel status={{ taskId: member.live.taskId, state: "running", nativeDecisions: member.live.decisions }} remote={false} hostName="this device" />
       : null}
     {member.live?.awaitingDecision && (member.live.decisions ?? []).length === 0
-      ? <Notice tone="warn">{providerLabel(member.provider)} waits for an answer Pastey cannot show here. Stop the turn, or answer it in {providerLabel(member.provider)} itself.</Notice>
+      ? <Notice tone="warn">{providerLabel(member.provider)} waits for an answer Maris cannot show here. Stop the turn, or answer it in {providerLabel(member.provider)} itself.</Notice>
       : null}
     <div className="row row-wrap" style={{ gap: 6 }}>
       {waiting.length > 0 ? <button type="button" className="btn btn-sm btn-primary" disabled={disabled} onClick={() => onApprove(waiting)}>Approve {waiting.length} for {member.alias}</button> : null}
@@ -450,7 +450,7 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
       return <div className="stack" style={{ gap: 2 }}>
         <span className="small"><strong>{entry.member}</strong> · {kind} {turnOutcomeLabel(body.state, body.code)}</span>
         {counts ? <span className="xsmall subtle" title={body.activity?.files?.join("\n")}>{counts} · reported by the Agent's harness</span> : null}
-        {body.files ? <span className="xsmall subtle mono" title="From Pastey's scans of the folder at the turn's start and end">{fileStateLabel(body.files)}</span> : null}
+        {body.files ? <span className="xsmall subtle mono" title="From Maris's scans of the folder at the turn's start and end">{fileStateLabel(body.files)}</span> : null}
         {meta}
       </div>;
     }
@@ -478,14 +478,14 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
     }
     case "plan_proposed":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> proposed plan r{body.revision}: {body.proposal.tasks.length} tasks{body.proposal.understanding ? ` · ${body.proposal.understanding}` : ""}</span>
-        {(body.problems ?? []).length ? <span className="xsmall" style={{ color: "var(--danger)" }}>Pastey's checks: {(body.problems ?? []).join("; ")}</span> : <span className="xsmall subtle">Pastey's checks: no structural problem</span>}{meta}</div>;
+        {(body.problems ?? []).length ? <span className="xsmall" style={{ color: "var(--danger)" }}>Maris's checks: {(body.problems ?? []).join("; ")}</span> : <span className="xsmall subtle">Maris's checks: no structural problem</span>}{meta}</div>;
     case "plan_accepted":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> accepted plan r{body.revision} and committed to its tasks in it</span>{meta}</div>;
     case "plan_adopted":
       return <div className="stack" style={{ gap: 2 }}><span className="small">Shared plan r{body.revision} adopted {body.byUser ? "by you" : "— every member accepted it"}; implementation starts</span>{meta}</div>;
     case "plan_progress":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> reported: {body.items.map((item) => `${item.task} ${item.done ? "done" : "blocked"}${item.detail ? ` (${item.detail})` : ""}`).join("; ")}</span>
-        {(body.verified ?? []).map((line) => <span key={line} className="xsmall subtle">Pastey checked: {line}</span>)}{meta}</div>;
+        {(body.verified ?? []).map((line) => <span key={line} className="xsmall subtle">Maris checked: {line}</span>)}{meta}</div>;
     case "wait":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{entry.member}</strong> waits for <strong>{body.on}</strong>: {body.reason} <span className="subtle">(until {timeOfDay(body.until)})</span></span>{meta}</div>;
     case "attention":
@@ -513,7 +513,7 @@ function EntryCard({ entry, entries, members, link, disabled, onApprove, onDismi
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong> {body.change === "left" ? "left" : body.change === "invited" ? (entry.host ? `was invited from ${link?.deviceLabel ?? "the other device"}` : `was invited on ${link?.deviceLabel ?? "the other device"}`) : body.change === "declined" ? "was declined by its device's user" : "joined"} ({providerLabel(body.provider)}){body.role && body.change !== "left" ? ` · ${body.role}` : ""}</span>{meta}</div>;
     case "files_outside":
       return <div className="stack" style={{ gap: 2 }}><span className="small"><strong>{body.alias}</strong>'s folder changed between its turns</span>
-        <span className="xsmall subtle mono" title="From Pastey's scans: by you, another app, or another client of its conversation">{fileChangesLabel(body)}</span>{meta}</div>;
+        <span className="xsmall subtle mono" title="From Maris's scans: by you, another app, or another client of its conversation">{fileChangesLabel(body)}</span>{meta}</div>;
     case "grant":
       return <div className="stack" style={{ gap: 2 }}><span className="small">{body.change === "granted"
         ? <>You allowed <strong>{body.alias}</strong> {body.turns} automatic turn{body.turns === 1 ? "" : "s"} until {timeOfDay(body.expiresAt)}</>
@@ -551,7 +551,7 @@ function CreateCollaborationDialog({ onClose, onCreated }: { onClose: () => void
     } catch (cause) { setError(errorText(cause, "The collaboration could not be created.")); } finally { setPending(false); }
   };
   return <Dialog wide title="New collaboration" onClose={onClose}
-    description="Each member is Pastey's Codex or Claude Code conversation in a folder of this device; once created, you can also invite one from a device paired with this one. Every turn they run carries a short note about the collaboration."
+    description="Each member is Maris's Codex or Claude Code conversation in a folder of this device; once created, you can also invite one from a device paired with this one. Every turn they run carries a short note about the collaboration."
     footer={<><button type="button" className="btn btn-sm" onClick={onClose}>Cancel</button>
       <button type="button" className="btn btn-sm btn-primary" disabled={pending || !!problem} onClick={() => void create()}>Create</button></>}>
     <div className="stack-lg">
@@ -608,7 +608,7 @@ function AddMemberDialog({ view, onClose, onAdd }: { view: CollaborationView; on
     try { await onAdd(member, firstMessage); } catch (cause) { setError(errorText(cause, "The member could not be added.")); } finally { setPending(false); }
   };
   return <Dialog wide title={`Add a member to ${view.name}`} onClose={onClose}
-    description="Pastey's Codex or Claude Code conversation in a folder of this device. Its first turn starts with a briefing Pastey compiles from the Journal: open items, each member's latest summary, the decisions and whether you confirmed them, recent turns and changed files. No model writes it."
+    description="Maris's Codex or Claude Code conversation in a folder of this device. Its first turn starts with a briefing Maris compiles from the Journal: open items, each member's latest summary, the decisions and whether you confirmed them, recent turns and changed files. No model writes it."
     footer={<><button type="button" className="btn btn-sm" onClick={onClose}>Cancel</button>
       <button type="button" className="btn btn-sm btn-primary" disabled={pending || !!problem} onClick={() => void add()}>{firstMessage.trim() ? "Add and start" : "Add"}</button></>}>
     <div className="stack-lg">
@@ -635,7 +635,7 @@ function LinkNotice({ link, ended }: { link: CollaborationLink; ended: boolean }
     {link.home
       ? `Members on ${link.deviceLabel} run there: its user approves their turns and allows automatic turns. Each device sends the other what it writes.`
       : `This device runs its own members here, with your approval or your automatic-turn allowance. The goal and members are edited on ${link.deviceLabel}.`}
-    {link.unsent > 0 && !ended ? ` ${link.unsent} entr${link.unsent === 1 ? "y waits" : "ies wait"} for ${link.deviceLabel}; Pastey sends ${link.unsent === 1 ? "it" : "them"} when it is reachable.` : ""}
+    {link.unsent > 0 && !ended ? ` ${link.unsent} entr${link.unsent === 1 ? "y waits" : "ies wait"} for ${link.deviceLabel}; Maris sends ${link.unsent === 1 ? "it" : "them"} when it is reachable.` : ""}
   </Notice>;
 }
 

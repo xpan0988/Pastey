@@ -134,7 +134,7 @@ function PerformanceSection({ room, hostRef, name, connected, linkBenchmark }: {
       setResult(diagnostics);
       if (diagnostics.linkBenchmark) setLast(diagnostics.linkBenchmark);
     } catch (nextError) {
-      setError(nextError instanceof Error ? nextError.message : "Pastey could not test this connection.");
+      setError(nextError instanceof Error ? nextError.message : "Maris could not test this connection.");
     } finally { inFlight.current = false; setRunning(false); }
   }
 
@@ -150,7 +150,7 @@ function PerformanceSection({ room, hostRef, name, connected, linkBenchmark }: {
       <div className="row"><strong className="spacer" style={{ fontSize: "var(--text-lg)" }}>{shown.headline}</strong><Badge tone={last.link_quality === "Excellent" || last.link_quality === "Good" ? "ok" : "warn"}>{last.link_quality}</Badge></div>
       <p className="xsmall subtle">{benchmarkScope(last.benchmark_mode, true)}. Real file transfers also depend on both disks.</p>
       <Facts rows={shown.facts} />
-    </div></section> : <p className="small muted">No measurement for this Bridge yet. Pastey does not estimate speed; test the connection to measure it.</p>}
+    </div></section> : <p className="small muted">No measurement for this Bridge yet. Maris does not estimate speed; test the connection to measure it.</p>}
     {result ? <DiagnosticGroup title="Connection checks" facts={[
       ["Identity", result.connection.identity],
       ["Secure session", result.connection.secureSession],

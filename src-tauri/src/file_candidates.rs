@@ -145,7 +145,7 @@ pub(crate) fn validate_shareable_folder(
     }
     if overlaps(Some(paths.app_data_dir.clone())) {
         return Err(AppError::InvalidInput(
-            "Pastey's own data cannot be shared for Bridge search.".into(),
+            "Maris's own data cannot be shared for Bridge search.".into(),
         ));
     }
     if canonical.components().any(|component| {
@@ -739,7 +739,7 @@ fn resolve_scope(
         "downloads" => "~/Downloads",
         "desktop" => "~/Desktop",
         "documents" => "~/Documents",
-        "pastey_shared" => "Pastey Shared",
+        "pastey_shared" => "Maris Shared",
         _ => label,
     };
     let Some(root) = root else {

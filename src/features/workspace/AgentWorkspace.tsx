@@ -440,7 +440,7 @@ function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, 
   async function showDevice() {
     setShown(null);
     try { await presentDeviceIdentity(room.id, hostRef); setShown({ text: `Shown. ${name} can now trust ${me.name} in this Bridge's Workspaces there.`, ok: true }); }
-    catch (error) { setShown({ text: error instanceof Error ? error.message : `Pastey could not reach ${name}.`, ok: false }); }
+    catch (error) { setShown({ text: error instanceof Error ? error.message : `Maris could not reach ${name}.`, ok: false }); }
   }
 
   return <div className="stack access-summary">
@@ -451,7 +451,7 @@ function RemoteAccessSummary({ room, hostRef, name, connected, paired, sharing, 
         {line.steps.length && line.state !== "ok" ? <details className="disclosure"><summary><Icon name="chevron" small />How to allow it</summary><ol className="small disclosure-body">{line.steps.map((step) => <li key={step}>{step}</li>)}</ol></details> : null}
       </li>)}
     </ul>
-    <div className="row"><button type="button" className="btn btn-sm" disabled={!connected} onClick={() => void showDevice()}>Show this device to {name} again</button><span className="xsmall subtle spacer">{connected ? `Pastey does this when the Bridge opens, so ${name}'s user can trust this device. It grants nothing.` : `${name} is not connected right now.`}</span></div>
+    <div className="row"><button type="button" className="btn btn-sm" disabled={!connected} onClick={() => void showDevice()}>Show this device to {name} again</button><span className="xsmall subtle spacer">{connected ? `Maris does this when the Bridge opens, so ${name}'s user can trust this device. It grants nothing.` : `${name} is not connected right now.`}</span></div>
     {onOpenDetails ? <button type="button" className="btn btn-link small" onClick={onOpenDetails}>This device's own shares: Bridge details → Workspaces</button> : null}
     {shown ? <Notice tone={shown.ok ? "ok" : "bad"}>{shown.text}</Notice> : null}
   </div>;

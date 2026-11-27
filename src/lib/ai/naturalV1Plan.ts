@@ -218,7 +218,7 @@ export function buildDeterministicAskBridgeNaturalV1Plan(userRequest: string): A
     status: unsupported ? "unsupported_future" : "supported",
     requiresUserConfirmation: true,
     steps,
-    unsupportedReason: unsupported ? "Transform and Execute are framework-defined intents, but Pastey Core has no Agent implementation to execute them yet." : undefined,
+    unsupportedReason: unsupported ? "Transform and Execute are framework-defined intents, but Maris Core has no Agent implementation to execute them yet." : undefined,
   };
 }
 

@@ -24,7 +24,7 @@ export function peerAddressProblem(input: string): string | null {
     const [a, b] = octets.map(Number);
     const privateOrOverlay = a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
     if (!privateOrOverlay) {
-      return "Use an address on a private or overlay network (for example Tailscale or WireGuard). Pastey must not be exposed directly to the internet.";
+      return "Use an address on a private or overlay network (for example Tailscale or WireGuard). Maris must not be exposed directly to the internet.";
     }
     return null;
   }
@@ -47,18 +47,18 @@ export function bridgeConnectionErrorMessage(error: unknown, viaAddress: boolean
   }
   if (/did not answer|timed out while waiting for room discovery/i.test(message)) {
     return viaAddress
-      ? "The other device did not answer at that address. Check that Pastey is open there with this Bridge, that both devices are connected to the same overlay network, and that the code has not expired or been burned."
-      : "No device on this network answered for that code. Check the code, that it has not expired or been burned, and that Pastey is open on the other device. If it is on another network, enter its overlay address.";
+      ? "The other device did not answer at that address. Check that Maris is open there with this Bridge, that both devices are connected to the same overlay network, and that the code has not expired or been burned."
+      : "No device on this network answered for that code. Check the code, that it has not expired or been burned, and that Maris is open on the other device. If it is on another network, enter its overlay address.";
   }
   if (/identity does not match|Bridge is burned/i.test(message)) {
     return "That address answered for a different or ended Bridge. Check the address and the code.";
   }
   if (/delivery|connect|Network|unreachable/i.test(message)) {
     return viaAddress
-      ? "The other device was found but could not be reached to finish joining. Check that its firewall allows Pastey on the overlay network."
+      ? "The other device was found but could not be reached to finish joining. Check that its firewall allows Maris on the overlay network."
       : "The other device was found but could not be reached to finish joining.";
   }
-  return message || "Pastey could not join this Bridge.";
+  return message || "Maris could not join this Bridge.";
 }
 
 /** What the Bridge's connection to its other device truthfully is now. */

@@ -206,7 +206,7 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
       setText("");
       await onRefresh();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not send this text.");
+      setMessage(error instanceof Error ? error.message : "Maris could not send this text.");
     } finally { setBusy(false); }
   }
 
@@ -220,7 +220,7 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
       const selected = await open({ multiple: true, directory: false });
       enqueuePaths(typeof selected === "string" ? [selected] : Array.isArray(selected) ? selected : []);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not choose files.");
+      setMessage(error instanceof Error ? error.message : "Maris could not choose files.");
     }
   }
 
@@ -240,7 +240,7 @@ function ShareView({ room, items, queueItems, transfers, peers, task, active, on
       </div>
     </div>
     <div className="composer-wrap">
-      {!selectedRoute ? <div style={{ maxWidth: "var(--content-w)", margin: "0 auto 8px" }}><Notice tone="neutral">{peers.length === 0 ? "No device is connected to this Bridge right now. Pastey keeps trying; open Bridge details to pair or set an address." : "Choose a device to send to."}</Notice></div> : null}
+      {!selectedRoute ? <div style={{ maxWidth: "var(--content-w)", margin: "0 auto 8px" }}><Notice tone="neutral">{peers.length === 0 ? "No device is connected to this Bridge right now. Maris keeps trying; open Bridge details to pair or set an address." : "Choose a device to send to."}</Notice></div> : null}
       <section className={`composer${dragging ? " dragging" : ""}`} aria-label="Send to the other device">
         <ComposerInput
           inputRef={inputRef}
@@ -397,7 +397,7 @@ function PlanExecutionCard({ task }: { task: AgentTaskController }) {
 
 function ResultCard({ task }: { task: AgentTaskController }) {
   return <Notice tone={task.status?.state === "completed" ? "ok" : task.presentation?.tone === "danger" ? "bad" : "neutral"} title={task.presentation?.label}>
-    This is the terminal state the Host reported. Result content is not shown here, and Pastey does not infer success on its own.
+    This is the terminal state the Host reported. Result content is not shown here, and Maris does not infer success on its own.
   </Notice>;
 }
 

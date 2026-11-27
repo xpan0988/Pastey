@@ -796,7 +796,7 @@ fn codex_threads_come_from_its_app_server_scoped_by_workspace_and_live_state_sta
     );
     assert!(continuation_problem(PROVIDER_CODEX, busy, None)
         .unwrap()
-        .contains("A Pastey task is running a turn"));
+        .contains("A Maris task is running a turn"));
 
     let snapshot = source
         .inspect(&[workspace.clone()], "t-done")

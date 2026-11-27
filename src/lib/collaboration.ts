@@ -600,7 +600,7 @@ export function waitingByRecipient(entries: CollaborationEntry[]): Record<string
 }
 
 export function basisLabel(basis: CollaborationBasis): string {
-  return basis === "fact" ? "Pastey" : basis === "claim" ? "Agent's statement" : "You";
+  return basis === "fact" ? "Maris" : basis === "claim" ? "Agent's statement" : "You";
 }
 
 export function providerLabel(provider: CollaborationProvider): string {
@@ -741,7 +741,7 @@ export function memberStateLabel(member: CollaborationMember): string {
     case "ending": return member.paused ? "Paused · its last turn is still ending" : "Busy · a turn is ending, or another task holds its folder";
     case "dependency_wait": return `Waiting for ${member.condition.on}: ${member.condition.reason}`;
     case "provider_failure": return "Paused · its last turn failed before doing anything (often a usage limit, sign-in or model)";
-    case "outcome_unknown": return "Outcome unknown · Pastey cannot tell what its last turn did, and will not run it again";
+    case "outcome_unknown": return "Outcome unknown · Maris cannot tell what its last turn did, and will not run it again";
     default: break;
   }
   if (member.paused) return member.busy ? "Paused · its last turn is still ending" : "Paused";

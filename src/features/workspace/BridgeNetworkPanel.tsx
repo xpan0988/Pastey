@@ -9,7 +9,7 @@ import { Badge, Dot, Field, Icon, Notice, type Tone } from "./ui";
 const REACHABILITY_COPY = {
   connected: "Connected",
   reconnecting: "Reconnecting…",
-  disconnected: "Not reachable. Pastey keeps trying.",
+  disconnected: "Not reachable. Maris keeps trying.",
   none: "No other device yet",
 } as const;
 
@@ -60,13 +60,13 @@ export function BridgeConnectionSection({ room, onPairingChanged }: { room: Room
     setPairCode("");
     await onPairingChanged();
     return "Paired with the device that showed this code.";
-  }, "Pastey could not pair with that code.");
+  }, "Maris could not pair with that code.");
 
   const showNewCode = () => act(async () => {
     await openBridgePairing(room.id);
     await onPairingChanged();
     return "Shown. On the other device, open New Bridge and enter the new code.";
-  }, "Pastey could not create a new code.");
+  }, "Maris could not create a new code.");
 
   useEffect(() => {
     let cancelled = false;
@@ -86,8 +86,8 @@ export function BridgeConnectionSection({ room, onPairingChanged }: { room: Room
       const stored = await setBridgePeerAddress(room.id, address === null ? null : address.trim());
       setSaved(stored);
       setDraft(stored ?? "");
-      return stored ? "Saved. Pastey will look for the other device there when it is not on this network." : "Removed. Pastey will look only on this network.";
-    }, "Pastey could not save this address.");
+      return stored ? "Saved. Maris will look for the other device there when it is not on this network." : "Removed. Maris will look only on this network.";
+    }, "Maris could not save this address.");
   }
 
   const statusLabel = pairing === "pairing_required" ? "Pairing required" : REACHABILITY_COPY[reachability];
@@ -120,11 +120,11 @@ export function BridgeConnectionSection({ room, onPairingChanged }: { room: Room
     <section className="inspector-section" aria-label="Another network">
       <h3>Reach it on another network</h3>
       <p className="small muted"><strong>Across the internet:</strong> {bridgeInternetLine(internet)}</p>
-      <p className="small muted">{saved ? <>Pastey also looks for it at <span className="mono">{saved}</span>.</> : "No private-network address."} An address gives the other device no permissions.</p>
+      <p className="small muted">{saved ? <>Maris also looks for it at <span className="mono">{saved}</span>.</> : "No private-network address."} An address gives the other device no permissions.</p>
       <details className="disclosure" open={!!saved}>
         <summary><Icon name="chevron" small />{saved ? "Change address" : "Add a private-network address"}</summary>
         <div className="disclosure-body stack">
-          <p className="xsmall subtle">Its address on a private network you both use, such as Tailscale or WireGuard. Pastey tries it first when reconnecting, then this network.</p>
+          <p className="xsmall subtle">Its address on a private network you both use, such as Tailscale or WireGuard. Maris tries it first when reconnecting, then this network.</p>
           <input className="input input-mono" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="home-pc.tail1234.ts.net" aria-label="Remote address for this Bridge" disabled={busy} />
           <div className="row">
             {saved ? <button type="button" className="btn btn-sm" disabled={busy} onClick={() => save(null)}>Remove</button> : null}
@@ -151,13 +151,13 @@ export function ShowDeviceIdentity({ room }: { room: RoomInfo }) {
       await presentDeviceIdentity(room.id, peerHostRef);
       setMessage({ text: "Shown. On the other device, this Bridge's Workspaces can now trust this one.", ok: true });
     } catch (error) {
-      setMessage({ text: error instanceof Error ? error.message : "Pastey could not reach the other device.", ok: false });
+      setMessage({ text: error instanceof Error ? error.message : "Maris could not reach the other device.", ok: false });
     } finally { setBusy(false); }
   }
 
   return <section className="inspector-section" aria-label="Show this device">
     <h3>Let the other device trust this one</h3>
-    <p className="small muted">While this Bridge is open, Pastey shows this device's identity to the other device once per connection, so its user can compare fingerprints and choose to trust it. It grants nothing by itself. If the other device says it has not seen this one, show it again.</p>
+    <p className="small muted">While this Bridge is open, Maris shows this device's identity to the other device once per connection, so its user can compare fingerprints and choose to trust it. It grants nothing by itself. If the other device says it has not seen this one, show it again.</p>
     <div><button type="button" className="btn btn-sm" disabled={busy || !peerHostRef} onClick={() => void showDevice()}>Show this device again</button></div>
     {message ? <Notice tone={message.ok ? "ok" : "bad"}>{message.text}</Notice> : null}
   </section>;

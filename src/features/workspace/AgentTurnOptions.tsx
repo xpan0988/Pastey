@@ -240,7 +240,7 @@ export function AgentTurnOptionsChoice({ agent, provider, hostName, choice, cata
               : null}
       </p>
       {unlistedCodex ? <p className="xsmall warn-text">{provider} on {hostName} does not list this model, so it would refuse the turn before anything is sent.</p> : null}
-      <p className="xsmall subtle">Applied by {provider} on {hostName} to {where}. {persistenceLine(agent, provider, where)} Pastey keeps neither and changes no settings.</p>
+      <p className="xsmall subtle">Applied by {provider} on {hostName} to {where}. {persistenceLine(agent, provider, where)} Maris keeps neither and changes no settings.</p>
     </div>
   </details>;
 }

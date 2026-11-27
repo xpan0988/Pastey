@@ -47,12 +47,12 @@ function DeviceProfileSection() {
 
   return <>
     <section className="section" aria-label="Device">
-      <div className="section-head-row"><div className="section-head"><h2>Device</h2><p>As this device reports itself to Pastey and to the devices it pairs with.</p></div>
+      <div className="section-head-row"><div className="section-head"><h2>Device</h2><p>As this device reports itself to Maris and to the devices it pairs with.</p></div>
         <button type="button" className="btn btn-sm" disabled={busy !== null} onClick={() => void refreshProfile()}><Icon name="refresh" small />{busy === "profile" ? "Refreshing…" : "Refresh"}</button></div>
       <div className="card">{profile ? <FactList rows={deviceProfileFacts(profile)} /> : <p className="list-empty">{error ?? "Loading…"}</p>}</div>
     </section>
     <section className="section" aria-label="Runtimes">
-      <div className="section-head-row"><div className="section-head"><h2>Runtimes</h2><p>What Pastey found installed. A quick check reads known locations; a full check also asks each runtime its version.</p></div>
+      <div className="section-head-row"><div className="section-head"><h2>Runtimes</h2><p>What Maris found installed. A quick check reads known locations; a full check also asks each runtime its version.</p></div>
         <div className="row"><button type="button" className="btn btn-sm" disabled={busy !== null} onClick={() => void probe("quick")}>{busy === "quick" ? "Checking…" : "Quick check"}</button><button type="button" className="btn btn-sm" disabled={busy !== null} onClick={() => void probe("full")}>{busy === "full" ? "Checking…" : "Full check"}</button></div></div>
       <div className="card">{capabilities ? <FactList rows={[...runtimeFacts(capabilities), ...(capabilities.gpu_acceleration.cuda_available || capabilities.gpu_acceleration.metal_available ? [["GPU acceleration", [capabilities.gpu_acceleration.metal_available ? "Metal" : null, capabilities.gpu_acceleration.cuda_available ? "CUDA" : null].filter(Boolean).join(", ")] as FactRow] : [])]} /> : <p className="list-empty">Not checked yet.</p>}</div>
       {error && profile ? <p className="error-text">{error}</p> : null}
@@ -83,11 +83,11 @@ function LocalSpeedTest() {
 
   const shown = result ? benchmarkFacts(result) : null;
   return <section className="section" aria-label="Local speed test">
-    <div className="section-head"><h2>Local speed test</h2><p>How fast this device alone can move data through Pastey, with no network involved. To measure the connection to another device, open that device from its Bridge.</p></div>
+    <div className="section-head"><h2>Local speed test</h2><p>How fast this device alone can move data through Maris, with no network involved. To measure the connection to another device, open that device from its Bridge.</p></div>
     <div className="card">
       <div className="card-body">
         <div className="row-wrap">
-          <Segmented label="What to measure" value={mode} onChange={setMode} disabled={running} options={[{ value: "pastey_pipeline", label: "Pastey pipeline" }, { value: "raw_memory", label: "Raw memory" }]} />
+          <Segmented label="What to measure" value={mode} onChange={setMode} disabled={running} options={[{ value: "pastey_pipeline", label: "Maris pipeline" }, { value: "raw_memory", label: "Raw memory" }]} />
           <Segmented label="How long" value={duration} onChange={setDuration} disabled={running} options={DURATIONS} />
           <span className="spacer" />
           <button type="button" className="btn btn-primary" disabled={running} onClick={() => void run()}>{running ? "Running…" : "Run local test"}</button>

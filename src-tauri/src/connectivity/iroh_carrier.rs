@@ -82,7 +82,7 @@ impl EndpointHooks for PinnedOnly {
         if conn.alpn() != ALPN {
             return AfterHandshakeOutcome::Reject {
                 error_code: 1u32.into(),
-                reason: b"not a Pastey tunnel".to_vec(),
+                reason: b"not a Maris tunnel".to_vec(),
             };
         }
         // An outbound connection went to a key a Bridge pins; an inbound
@@ -90,7 +90,7 @@ impl EndpointHooks for PinnedOnly {
         if conn.side().is_server() && !self.sink.admits(CARRIER, &conn.remote_id().to_string()) {
             return AfterHandshakeOutcome::Reject {
                 error_code: 2u32.into(),
-                reason: b"not a paired Pastey device".to_vec(),
+                reason: b"not a paired Maris device".to_vec(),
             };
         }
         AfterHandshakeOutcome::Accept

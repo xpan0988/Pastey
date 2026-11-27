@@ -32,11 +32,11 @@ export function NewBridgeScreen({
   const busyRef = useRef(false);
   const [message, setMessage] = useState<string | null>(null);
   const [nearbyDevices, setNearbyDevices] = useState<NearbyDevice[]>([]);
-  const [nearbyMessage, setNearbyMessage] = useState("Looking for nearby Pastey devices…");
+  const [nearbyMessage, setNearbyMessage] = useState("Looking for nearby Maris devices…");
 
   async function loadNearby(cancelled?: () => boolean) {
     if (!nearbyDiscoveryAvailable) {
-      setNearbyMessage("Nearby discovery is available in the Pastey desktop app.");
+      setNearbyMessage("Nearby discovery is available in the Maris desktop app.");
       return;
     }
     try {
@@ -44,11 +44,11 @@ export function NewBridgeScreen({
       if (cancelled?.()) return;
       const unique = uniqueNearbyDevices(devices);
       setNearbyDevices(unique);
-      setNearbyMessage(unique.length === 0 ? "No nearby devices found. Keep Pastey open on the other device." : "");
+      setNearbyMessage(unique.length === 0 ? "No nearby devices found. Keep Maris open on the other device." : "");
     } catch {
       if (cancelled?.()) return;
       setNearbyDevices([]);
-      setNearbyMessage("Pastey cannot see nearby devices on this network.");
+      setNearbyMessage("Maris cannot see nearby devices on this network.");
     }
   }
 
@@ -80,7 +80,7 @@ export function NewBridgeScreen({
       <header className="page-header">{menuButton}<div className="page-header-main"><h1>New Bridge</h1><p>Pair this device with one of your other devices.</p></div></header>
       <div className="page-body"><div className="content stack-lg">
         <section className="section">
-          <div className="section-head-row"><div className="section-head"><h2>Nearby</h2><p>Pastey devices on this network. A device you paired before connects without a code.</p></div>
+          <div className="section-head-row"><div className="section-head"><h2>Nearby</h2><p>Maris devices on this network. A device you paired before connects without a code.</p></div>
             <button type="button" className="btn btn-sm" disabled={busyAction !== null} onClick={() => void run("refresh", async () => { await loadNearby(); })}><Icon name="refresh" small />{busyAction === "refresh" ? "Refreshing…" : "Refresh"}</button></div>
           <div className="card"><div className="list">
             {nearbyDevices.map((device) => {
@@ -131,7 +131,7 @@ function nearbyDeviceSummary(device: NearbyDevice): string {
   const seen = device.last_seen_seconds_ago <= 3
     ? "Online"
     : `Seen ${Math.max(0, Math.round(device.last_seen_seconds_ago))}s ago`;
-  return [platform, device.app_version ? `Pastey ${device.app_version}` : null, seen].filter(Boolean).join(" · ");
+  return [platform, device.app_version ? `Maris ${device.app_version}` : null, seen].filter(Boolean).join(" · ");
 }
 
 type InboxFilter = "all" | "text" | "files";

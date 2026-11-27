@@ -84,7 +84,7 @@ export function remoteAccessGuidance(facts: RemoteAccessFacts): AccessLine[] {
     id: "decisions",
     label: "Codex's own approval prompts",
     state: facts.connected ? "ok" : "unknown",
-    detail: `Answered here, by you. Pastey proves this device's identity to ${where} before each run; this needs no trust or permission. Claude Code asks nothing: run from Pastey, it refuses what its own settings on ${where} would ask about.`,
+    detail: `Answered here, by you. Maris proves this device's identity to ${where} before each run; this needs no trust or permission. Claude Code asks nothing: run from Maris, it refuses what its own settings on ${where} would ask about.`,
     steps: [],
   });
 

@@ -8,15 +8,15 @@ export type FactRow = [label: string, value: string];
 /** What a measurement exercised, in the user's terms. */
 export function benchmarkScope(mode: BenchmarkMode, overBridge: boolean): string {
   if (overBridge) {
-    return "Pastey's transfer pipeline over this Bridge's current connection, in memory (no disk reads or writes)";
+    return "Maris's transfer pipeline over this Bridge's current connection, in memory (no disk reads or writes)";
   }
   return mode === "raw_memory"
     ? "Raw in-memory throughput on this device only (no network)"
-    : "Pastey's transfer pipeline on this device only, over loopback (no network)";
+    : "Maris's transfer pipeline on this device only, over loopback (no network)";
 }
 
 export function benchmarkModeLabel(mode: BenchmarkMode): string {
-  return mode === "raw_memory" ? "Raw memory" : "Pastey pipeline";
+  return mode === "raw_memory" ? "Raw memory" : "Maris pipeline";
 }
 
 /** One measured result: the headline average and the facts it came with. */

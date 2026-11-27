@@ -3102,7 +3102,7 @@ pub fn write_temp_file(paths: &AppPaths, file_name: &str, bytes: &[u8]) -> AppRe
 pub fn delete_temp_file(paths: &AppPaths, file_path: &Path) -> AppResult<bool> {
     if !file_path.starts_with(&paths.temp_dir) {
         return Err(AppError::InvalidInput(
-            "temp file path is outside pastey temp storage".into(),
+            "temp file path is outside Maris temp storage".into(),
         ));
     }
 

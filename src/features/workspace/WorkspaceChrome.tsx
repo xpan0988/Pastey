@@ -22,7 +22,7 @@ export function BridgeNavigation({ route, rooms, activeRoom, inboxCount, collabo
   const activeRooms = rooms.filter((room) => room.status !== "burned");
   return (
     <aside className="sidebar" aria-label="Navigation">
-      <div className="sidebar-brand"><strong>Pastey</strong></div>
+      <div className="sidebar-brand"><strong>Maris</strong></div>
       <button type="button" className={`nav-item primary${route === "new-bridge" ? " active" : ""}`} onClick={() => onNavigate("new-bridge")}><Icon name="plus" />New Bridge</button>
       <button type="button" className={`nav-item${route === "inbox" ? " active" : ""}`} onClick={() => onNavigate("inbox")}>
         <Icon name="inbox" />Inbox{inboxCount > 0 ? <span className="count">{inboxCount}</span> : null}

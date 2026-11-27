@@ -2328,7 +2328,7 @@ impl NativeAgentServiceV1 {
             source_workspace_name: source_workspace_name.clone(),
             target_host_ref: target_host_ref.into(),
             review_summary: format!(
-                "Pastey will send \"{source_workspace_name}\" to the selected device and ask it to run Codex. Codex runs only if that device accepts; the result then returns here."
+                "Maris will send \"{source_workspace_name}\" to the selected device and ask it to run Codex. Codex runs only if that device accepts; the result then returns here."
             ),
             state: NativeAgentWorkspaceMovementStateV1::AwaitingApproval,
             code: None,
@@ -8785,7 +8785,7 @@ done
         assert_eq!(terminal.output, None);
         assert_eq!(
             terminal.result.as_deref(),
-            Some("Codex completed its native task, but Pastey could not read its final response.")
+            Some("Codex completed its native task, but Maris could not read its final response.")
         );
         service.shutdown();
         let _ = fs::remove_dir_all(root);

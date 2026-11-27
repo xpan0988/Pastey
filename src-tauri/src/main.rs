@@ -170,8 +170,8 @@ fn main() {
     // opening a second Host on this device's data.
     if let LaunchMode::Refused(argument) = launch_mode(std::env::args_os().skip(1)) {
         eprintln!(
-            "pastey: unsupported argument {argument:?}. The Pastey app starts only without \
-             arguments; if an MCP client or launcher starts Pastey with this argument, \
+            "pastey: unsupported argument {argument:?}. The Maris app starts only without \
+             arguments; if an MCP client or launcher starts Maris with this argument, \
              remove that entry."
         );
         std::process::exit(2);
@@ -460,7 +460,7 @@ fn install_global_shortcut(app: &AppHandle) -> AppResult<()> {
 fn install_tray(app: &AppHandle) -> AppResult<()> {
     let menu = MenuBuilder::new(app)
         .text("toggle", "Show / Hide")
-        .text("new_room", "Open pastey")
+        .text("new_room", "Open Maris")
         .separator()
         .text("quit", "Quit")
         .build()

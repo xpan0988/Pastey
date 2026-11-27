@@ -39,7 +39,7 @@ export function InternetSettings() {
       <div style={{ padding: "12px 16px" }}><details className="disclosure">
         <summary><Icon name="chevron" small />{relay ? "Relay: your own" : "Relay: n0's public relays"}</summary>
         <div className="disclosure-body stack">
-          <p className="xsmall subtle">A relay passes traffic along when the two networks block a direct path. It sees this device's IP address, its connection key and how much is sent, never what: everything is encrypted between the two devices. n0's public relays are offered for development and hobby use. For dependable use, run your own iroh relay and enter its address; with your own relay Pastey publishes nothing to n0.</p>
+          <p className="xsmall subtle">A relay passes traffic along when the two networks block a direct path. It sees this device's IP address, its connection key and how much is sent, never what: everything is encrypted between the two devices. n0's public relays are offered for development and hobby use. For dependable use, run your own iroh relay and enter its address; with your own relay Maris publishes nothing to n0.</p>
           <input className="input input-mono" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="https://relay.example.com" aria-label="Relay address" disabled={pending || !view} />
           <div className="row">
             {relay ? <button type="button" className="btn btn-sm" disabled={pending} onClick={() => void apply(view?.enabled ?? false, null)}>Use n0's relays</button> : null}

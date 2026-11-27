@@ -542,12 +542,12 @@ impl CodexThreadRunV1 {
             Some(version) if keeps_writer_locks(version) => {}
             Some(version) => {
                 return Err(not_started(&format!(
-                    "This Codex ({version}) is older than 0.163, the first to keep thread writer locks, so Pastey cannot rule out another client writing to the same thread, and nothing ran. Update Codex."
+                    "This Codex ({version}) is older than 0.163, the first to keep thread writer locks, so Maris cannot rule out another client writing to the same thread, and nothing ran. Update Codex."
                 )))
             }
             None => {
                 return Err(not_started(
-                    "This Codex did not report its version, so Pastey cannot tell that it keeps thread writer locks, and nothing ran. Update Codex.",
+                    "This Codex did not report its version, so Maris cannot tell that it keeps thread writer locks, and nothing ran. Update Codex.",
                 ))
             }
         }
@@ -568,7 +568,7 @@ impl CodexThreadRunV1 {
         match self.own_holds.release_idle(&self.thread_id, &self.workspace) {
             OwnHoldReleaseV1::InUse => {
                 return Err(not_started(
-                    "A Pastey task is running a turn in this Codex thread, so nothing ran. Wait for it to finish, then continue.",
+                    "A Maris task is running a turn in this Codex thread, so nothing ran. Wait for it to finish, then continue.",
                 ))
             }
             OwnHoldReleaseV1::HeldElsewhere => return Err(not_started(ANOTHER_FOLDER)),
@@ -597,7 +597,7 @@ impl CodexThreadRunV1 {
             .is_some_and(|lock| lock.exists())
         {
             return Err(not_started(
-                "This Codex does not keep thread writer locks, so Pastey cannot rule out another client writing to the same thread, and nothing ran. Update Codex to 0.163 or later.",
+                "This Codex does not keep thread writer locks, so Maris cannot rule out another client writing to the same thread, and nothing ran. Update Codex to 0.163 or later.",
             ));
         }
         // The thread must belong to exactly this folder: resuming it with
@@ -1427,7 +1427,7 @@ exec /usr/bin/perl -e 'use Fcntl qw(:flock); $| = 1; open(my $f, ">>", $ARGV[0])
         assert!(outcome
             .summary
             .unwrap()
-            .contains("A Pastey task is running a turn"));
+            .contains("A Maris task is running a turn"));
         assert!(alive(holder), "a session in use is never closed");
         let log = received(&fixture);
         assert!(

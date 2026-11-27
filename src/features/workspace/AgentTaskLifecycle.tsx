@@ -435,12 +435,12 @@ export async function observeNativeAgentMovementAfterReturnRetry(
 export const STATE_COPY: Record<NativeV2ProductState, { label: string; detail: string; tone: LifecycleTone }> = {
   draft: { label: "Awaiting review", detail: "The PM proposal is an immutable Draft. Nothing can execute yet.", tone: "pending" },
   approved: { label: "Awaiting Host admission", detail: "Requester approval is recorded. Participating Hosts must still admit the Plan.", tone: "pending" },
-  checking_readiness: { label: "Awaiting Host readiness", detail: "Pastey is checking the whole Plan scope. Approval does not imply execution.", tone: "pending" },
+  checking_readiness: { label: "Awaiting Host readiness", detail: "Maris is checking the whole Plan scope. Approval does not imply execution.", tone: "pending" },
   preparing: { label: "Preparing", detail: "Participating Hosts are deriving bounded local execution state.", tone: "pending" },
   running: { label: "Running", detail: "Managed execution is active under the approved Plan.", tone: "live" },
   completed: { label: "Completed", detail: "The Host reported the Plan terminal state.", tone: "complete" },
   failed: { label: "Failed", detail: "The Host reported a terminal failure.", tone: "danger" },
-  interrupted: { label: "Interrupted / indeterminate", detail: "Pastey cannot safely infer a successful result.", tone: "danger" },
+  interrupted: { label: "Interrupted / indeterminate", detail: "Maris cannot safely infer a successful result.", tone: "danger" },
   cancelled: { label: "Cancelled", detail: "The managed attempt was cancelled. The Bridge was not burned.", tone: "neutral" },
 };
 
@@ -470,7 +470,7 @@ export function useAgentTaskLifecycle() {
       setStatus(await getNativeV2PlanStatus(id));
       setMessage(null);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not read this Plan status.");
+      setMessage(error instanceof Error ? error.message : "Maris could not read this Plan status.");
     }
   }, [revisionId]);
 
@@ -504,7 +504,7 @@ export function useAgentTaskLifecycle() {
       setMessage(null);
     } catch (error) {
       setStatus(null);
-      setMessage(error instanceof Error ? error.message : "Pastey could not open this Draft.");
+      setMessage(error instanceof Error ? error.message : "Maris could not open this Draft.");
     } finally { setBusy(null); }
   }, [revisionInput]);
 
@@ -514,7 +514,7 @@ export function useAgentTaskLifecycle() {
     try {
       setStatus(await approveNativeV2Plan(status.revisionId, `native-v2-approval-${crypto.randomUUID()}`, nowSeconds() + ONE_DAY_SECONDS));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not approve this Draft.");
+      setMessage(error instanceof Error ? error.message : "Maris could not approve this Draft.");
     } finally { setBusy(null); }
   }, [status]);
 
@@ -524,7 +524,7 @@ export function useAgentTaskLifecycle() {
     try {
       setStatus(await startNativeV2PlanAttempt(status.approvalId, `native-v2-attempt-${crypto.randomUUID()}`, nowSeconds() + ONE_DAY_SECONDS));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not begin Host readiness.");
+      setMessage(error instanceof Error ? error.message : "Maris could not begin Host readiness.");
     } finally { setBusy(null); }
   }, [status]);
 
@@ -534,7 +534,7 @@ export function useAgentTaskLifecycle() {
     try {
       setStatus(await cancelNativeV2PlanAttempt(status.attemptId));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not cancel this managed attempt.");
+      setMessage(error instanceof Error ? error.message : "Maris could not cancel this managed attempt.");
     } finally { setBusy(null); }
   }, [status]);
 
@@ -602,7 +602,7 @@ export function useNativeAgentTask(roomId: string) {
 
   const refreshCapabilities = useCallback(async () => {
     try { setCapabilities(await listNativeAgentCapabilities()); }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not inspect native Agents."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Maris could not inspect native Agents."); }
   }, []);
 
   const loadRecoveryProjection = useCallback(async (
@@ -651,7 +651,7 @@ export function useNativeAgentTask(roomId: string) {
       if (rememberedStatus) { setStatus(rememberedStatus); setTaskHostRef(remembered.hostRef); restoreOrigin(remembered, rememberedStatus.taskId); }
       if (rememberedMovement) setMovement(rememberedMovement);
     }).catch((error) => {
-      if (!cancelled) setMessage(error instanceof Error ? error.message : "Pastey could not recover unresolved native Agent work.");
+      if (!cancelled) setMessage(error instanceof Error ? error.message : "Maris could not recover unresolved native Agent work.");
     });
     return () => { cancelled = true; };
   }, [loadRecoveryProjection, roomId]);
@@ -665,7 +665,7 @@ export function useNativeAgentTask(roomId: string) {
     // the finished task, so its response stays readable.
     setRecoveryProjection(null);
     void loadRecoveryProjection(undefined, true).catch((error) => {
-      setMessage(error instanceof Error ? error.message : "Pastey could not load the next unresolved native Agent task.");
+      setMessage(error instanceof Error ? error.message : "Maris could not load the next unresolved native Agent task.");
     });
   }, [loadRecoveryProjection, movement, recoveryCorrelation?.taskId, status]);
   useEffect(() => {
@@ -674,7 +674,7 @@ export function useNativeAgentTask(roomId: string) {
     let cancelled = false;
     const poll = async () => {
       try { setStatus(await getNativeAgentTaskStatus(observedStatus.taskId)); }
-      catch (error) { setMessage(error instanceof Error ? error.message : "Pastey lost the native Agent task outcome."); }
+      catch (error) { setMessage(error instanceof Error ? error.message : "Maris lost the native Agent task outcome."); }
       if (!cancelled) window.setTimeout(() => void poll(), 1_000);
     };
     const timer = window.setTimeout(() => void poll(), 1_000);
@@ -685,7 +685,7 @@ export function useNativeAgentTask(roomId: string) {
       || (movement.state === "interrupted" && movement.code !== "native_agent_reconciliation_required")) return;
     const timer = window.setTimeout(() => {
       void getNativeAgentWorkspaceMovementStatus(movement.movementId).then(setMovement).catch((error) => {
-        setMessage(error instanceof Error ? error.message : "Pastey lost the workspace movement outcome.");
+        setMessage(error instanceof Error ? error.message : "Maris lost the workspace movement outcome.");
       });
     }, 1_000);
     return () => window.clearTimeout(timer);
@@ -732,7 +732,7 @@ export function useNativeAgentTask(roomId: string) {
       setMovement,
       () => cancelled,
       undefined,
-      (error) => setMessage(error instanceof Error ? error.message : "Pastey could not observe the retried result Return."),
+      (error) => setMessage(error instanceof Error ? error.message : "Maris could not observe the retried result Return."),
     ).finally(() => {
       if (!cancelled) {
         setReturnRetryObservation((current) => current?.movement.movementId === observation.movement.movementId
@@ -800,7 +800,7 @@ export function useNativeAgentTask(roomId: string) {
       beginTurn(started.taskId, null, place, followUp, sent, null, agentId);
       return true;
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)}.`); return false; }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Maris could not start ${nativeAgentDisplayName(agentId)}.`); return false; }
     finally { setBusy(false); }
   }, [beginTurn, busy, origin, taskText, workspace]);
 
@@ -834,11 +834,11 @@ export function useNativeAgentTask(roomId: string) {
       } catch (error) {
         setStatus(started);
         setTaskHostRef(hostRef);
-        setMessage(error instanceof Error ? error.message : "Pastey could not load the remote task correlation.");
+        setMessage(error instanceof Error ? error.message : "Maris could not load the remote task correlation.");
       }
       return true;
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not start ${nativeAgentDisplayName(agentId)} there.`); return false; }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Maris could not start ${nativeAgentDisplayName(agentId)} there.`); return false; }
     finally { setBusy(false); }
   }, [beginTurn, busy, loadRecoveryProjection, origin, restoreOrigin, taskText, workspace]);
 
@@ -855,7 +855,7 @@ export function useNativeAgentTask(roomId: string) {
       rememberStartedNativeTask(roomId, { taskId: proposed.taskId, hostRef, movementId: proposed.movementId });
       beginTurn(proposed.taskId, hostRef, place, false, sent, proposed.movementId);
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not prepare the workspace review."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Maris could not prepare the workspace review."); }
     finally { setBusy(false); }
   }, [beginTurn, busy, taskText, workspace]);
 
@@ -865,7 +865,7 @@ export function useNativeAgentTask(roomId: string) {
     try { setMovement(await approveRemoteNativeCodexWorkspaceMovement(movement.movementId, roomId, peerSessionId)); }
     catch (error) {
       try { setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId)); } catch { /* retain the original actionable error */ }
-      setMessage(error instanceof Error ? error.message : "Pastey could not start the approved workspace movement.");
+      setMessage(error instanceof Error ? error.message : "Maris could not start the approved workspace movement.");
     }
     finally { setBusy(false); }
   }, [busy, movement]);
@@ -874,7 +874,7 @@ export function useNativeAgentTask(roomId: string) {
     if (!cancellableTaskId) return;
     setBusy(true);
     try { setStatus(await cancelNativeAgentTask(cancellableTaskId)); }
-    catch (error) { setMessage(error instanceof Error ? error.message : `Pastey could not stop ${nativeAgentDisplayName(status?.agentId)}.`); }
+    catch (error) { setMessage(error instanceof Error ? error.message : `Maris could not stop ${nativeAgentDisplayName(status?.agentId)}.`); }
     finally { setBusy(false); }
   }, [cancellableTaskId, status?.agentId]);
 
@@ -885,7 +885,7 @@ export function useNativeAgentTask(roomId: string) {
       setStatus(await cancelRemoteNativeAgentTask(roomId, peerSessionId, hostRef, cancellableTaskId));
       if (movement) setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId));
     }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not cancel remote Codex."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Maris could not cancel remote Codex."); }
     finally { setBusy(false); }
   }, [cancellableTaskId, movement]);
 
@@ -900,7 +900,7 @@ export function useNativeAgentTask(roomId: string) {
         recoveryCorrelation.movementId,
       );
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not reconcile the remote task.");
+      setMessage(error instanceof Error ? error.message : "Maris could not reconcile the remote task.");
     } finally { setBusy(false); }
   }, [busy, recoveryCorrelation, roomId]);
 
@@ -917,7 +917,7 @@ export function useNativeAgentTask(roomId: string) {
     try { setMovement(await retryNativeAgentWorkspaceResultReturn(movement.movementId, roomId)); }
     catch (error) {
       try { setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId)); } catch { /* preserve delivery error */ }
-      setMessage(error instanceof Error ? error.message : "Pastey could not retry the durable result Return.");
+      setMessage(error instanceof Error ? error.message : "Maris could not retry the durable result Return.");
     } finally { setBusy(false); }
   }, [busy, movement, returnRetryObservation, roomId]);
 
@@ -928,14 +928,14 @@ export function useNativeAgentTask(roomId: string) {
       setStatus(await stopBridgeNativeAgentTask(roomId, recoveryCorrelation.taskId));
       if (movement) setMovement(await getNativeAgentWorkspaceMovementStatus(movement.movementId));
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not abandon the unresolved recovery.");
+      setMessage(error instanceof Error ? error.message : "Maris could not abandon the unresolved recovery.");
     } finally { setBusy(false); }
   }, [busy, movement, recoveryCorrelation, roomId]);
 
   const refreshRecoveryProjection = useCallback(async () => {
     try { await loadRecoveryProjection(); }
     catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not load durable native Agent recovery details.");
+      setMessage(error instanceof Error ? error.message : "Maris could not load durable native Agent recovery details.");
     }
   }, [loadRecoveryProjection]);
 
@@ -943,7 +943,7 @@ export function useNativeAgentTask(roomId: string) {
     if (!movement || movement.state !== "conflict_recovery_required" || busy) return;
     setBusy(true); setMessage(null);
     try { await revealNativeAgentConflictResult(movement.movementId); }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not reveal the retained result."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Maris could not reveal the retained result."); }
     finally { setBusy(false); }
   }, [busy, movement]);
 
@@ -951,7 +951,7 @@ export function useNativeAgentTask(roomId: string) {
     if (!movement || movement.state !== "conflict_recovery_required" || busy) return;
     setBusy(true); setMessage(null);
     try { setMovement(await discardNativeAgentConflictResult(movement.movementId)); }
-    catch (error) { setMessage(error instanceof Error ? error.message : "Pastey could not discard the retained result."); }
+    catch (error) { setMessage(error instanceof Error ? error.message : "Maris could not discard the retained result."); }
     finally { setBusy(false); }
   }, [busy, movement]);
 

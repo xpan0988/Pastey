@@ -5,7 +5,7 @@
 //! must not echo paths or authority/credential-bearing state.
 
 pub(crate) const PRODUCTION_UNAVAILABLE_REASON: &str =
-    "The Host-owned Codex Windows sandbox setup or Pastey native resource-projection, environment, standard-I/O, process-session, cancellation, and NoRawNetwork conformance probe did not complete successfully.";
+    "The Host-owned Codex Windows sandbox setup or Maris native resource-projection, environment, standard-I/O, process-session, cancellation, and NoRawNetwork conformance probe did not complete successfully.";
 
 const WITHHELD_DIAGNOSTIC: &str =
     "Windows native conformance failed, but its detail was withheld by the verifier diagnostic boundary.";

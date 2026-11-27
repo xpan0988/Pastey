@@ -72,8 +72,8 @@ export function TaskTurn({ roomId, agent, peers, members, fullAccess = null }: {
       {status && response?.kind !== "text" ? <div className="turn-status"><Dot tone={outcome?.tone === "danger" ? "bad" : outcome?.tone === "complete" ? "ok" : outcome?.tone === "live" ? "live" : outcome?.tone === "pending" ? "warn" : "neutral"} pulse={active} /><strong>{outcome?.headline ?? status.state}</strong></div> : null}
       {status && status.state !== "completed" ? <TaskStages status={status} remote={!!agent.taskHostRef} hostName={hostName} fullAccess={fullAccess} /> : null}
       {response?.kind === "text"
-        ? <><AgentMarkdown text={response.text} />{response.truncated ? <small className="subtle">Pastey shortened this reply to fit its size limit.</small> : null}</>
-        : response?.kind === "undisplayable" ? <small className="muted">The task completed with output Pastey cannot display as text.</small>
+        ? <><AgentMarkdown text={response.text} />{response.truncated ? <small className="subtle">Maris shortened this reply to fit its size limit.</small> : null}</>
+        : response?.kind === "undisplayable" ? <small className="muted">The task completed with output Maris cannot display as text.</small>
           : response?.kind === "none" ? <small className="muted">The task completed, but no reply text came back.</small> : null}
       {outcome && status?.state !== "completed" && (outcome.detail || outcome.next) ? <div className="turn-outcome">
         {outcome.detail ? <p>{outcome.detail}</p> : null}
@@ -91,11 +91,11 @@ export function TaskTurn({ roomId, agent, peers, members, fullAccess = null }: {
           <li>Return and apply the result here if the source is unchanged.</li>
         </ol> : null}
         {agent.movement.state === "awaiting_approval" && !movementPeer ? <Notice tone="warn">{movementHostName} is not connected. You can approve once it reconnects.</Notice> : null}
-        {remoteReconciliationRequired ? <Notice tone="warn">The remote task outcome is indeterminate. Pastey will not reuse this workspace until the task is reconciled or explicitly stopped.</Notice> : null}
-        {consequenceAbandonmentRequired ? <Notice tone="bad">{agent.movement.code === "native_agent_result_snapshot_recovery_failed" ? "Codex completed, but Pastey could not safely capture its result for return. Abandon this movement to release the original workspace; Codex will not run again." : "Pastey could not retain the returned result. Retry its exact Return or abandon this movement; the Agent’s recorded task outcome will remain unchanged."}</Notice> : null}
-        {resultReturnRetryRequired ? <Notice tone="info">The exact Agent result is durable. Pastey can retry its Return without running Codex again.</Notice> : null}
+        {remoteReconciliationRequired ? <Notice tone="warn">The remote task outcome is indeterminate. Maris will not reuse this workspace until the task is reconciled or explicitly stopped.</Notice> : null}
+        {consequenceAbandonmentRequired ? <Notice tone="bad">{agent.movement.code === "native_agent_result_snapshot_recovery_failed" ? "Codex completed, but Maris could not safely capture its result for return. Abandon this movement to release the original workspace; Codex will not run again." : "Maris could not retain the returned result. Retry its exact Return or abandon this movement; the Agent’s recorded task outcome will remain unchanged."}</Notice> : null}
+        {resultReturnRetryRequired ? <Notice tone="info">The exact Agent result is durable. Maris can retry its Return without running Codex again.</Notice> : null}
         {agent.movement.state === "conflict_recovery_required" ? <>
-          <Notice tone="warn">Your original workspace changed while Codex was working. Pastey preserved the result and did not overwrite your changes.</Notice>
+          <Notice tone="warn">Your original workspace changed while Codex was working. Maris preserved the result and did not overwrite your changes.</Notice>
           <div className="row"><button type="button" className="btn btn-sm" disabled={agent.busy} onClick={() => void agent.revealConflictResult()}>Reveal result</button><button type="button" className="btn btn-danger btn-sm" disabled={agent.busy} onClick={() => void agent.discardConflictResult()}>Discard result</button></div>
         </> : null}
       </div> : null}

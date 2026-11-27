@@ -49,7 +49,7 @@ impl AppError {
                 _ => "File transfer failed because the file could not be read or written."
                     .to_string(),
             },
-            Self::Sql(_) | Self::Json(_) => "Could not update local pastey storage.".to_string(),
+            Self::Sql(_) | Self::Json(_) => "Could not update local Maris storage.".to_string(),
             Self::Http(error) if error.is_timeout() => "Transfer interrupted".to_string(),
             Self::Http(error) if error.is_connect() => "Peer disconnected".to_string(),
             Self::Http(_) => "Transfer interrupted".to_string(),

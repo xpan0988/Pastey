@@ -16,16 +16,16 @@ export interface NativeDecisionPresentation {
 
 const UNAVAILABLE_COPY: Record<string, string> = {
   native_decision_content_incomplete: "Codex did not include everything needed to review this (the command or its folder), so it cannot be approved here.",
-  native_decision_widens_permissions: "This command also asks for wider sandbox permissions, which Pastey cannot show in full, so it cannot be approved here.",
+  native_decision_widens_permissions: "This command also asks for wider sandbox permissions, which Maris cannot show in full, so it cannot be approved here.",
   native_decision_accept_not_offered: "Codex does not offer a one-time approval for this request.",
   native_decision_content_unrenderable: "This request contains characters that could disguise what it does, so it is not shown and cannot be approved here.",
   native_decision_content_too_large: "This request is too large to show in full, so it cannot be approved here.",
-  native_decision_content_unavailable: "Pastey did not receive the exact changes, so they cannot be approved here.",
+  native_decision_content_unavailable: "Maris did not receive the exact changes, so they cannot be approved here.",
   native_decision_content_changed: "The changes were updated after they were shown, so they cannot be approved.",
-  native_decision_session_scope: "Codex asks to allow writes for the rest of its session; Pastey only gives one-time approvals.",
+  native_decision_session_scope: "Codex asks to allow writes for the rest of its session; Maris only gives one-time approvals.",
   native_decision_outside_task: "This request does not belong to this task's turn.",
-  native_decision_unsupported: "Pastey cannot answer this kind of request (for example a permission grant, a question or a form).",
-  native_decision_malformed: "Codex sent this request in a form Pastey cannot read safely.",
+  native_decision_unsupported: "Maris cannot answer this kind of request (for example a permission grant, a question or a form).",
+  native_decision_malformed: "Codex sent this request in a form Maris cannot read safely.",
   native_decision_requester_unverified: "Only the device that started this task, after proving its identity, can answer Codex here, and this task has no such device.",
 };
 
@@ -39,7 +39,7 @@ export function nativeDecisionTitle(review: NativeDecisionReview): string {
   switch (review.kind) {
     case "command_execution": return review.content?.networkHost ? "Codex asks for network access" : "Codex asks to run a command";
     case "file_change": return "Codex asks to change files";
-    case "unsupported": return "Codex is waiting for something Pastey cannot answer";
+    case "unsupported": return "Codex is waiting for something Maris cannot answer";
   }
 }
 
@@ -88,7 +88,7 @@ export function nativeDecisionPresentation(
   if (!options.remote) {
     return {
       title, ...closed,
-      stateLabel: "Waiting. Pastey answers Codex's requests only on the device that started a task from another device.",
+      stateLabel: "Waiting. Maris answers Codex's requests only on the device that started a task from another device.",
       note,
     };
   }

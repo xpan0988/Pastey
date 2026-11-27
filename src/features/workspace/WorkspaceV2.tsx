@@ -134,7 +134,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
       await props.onCreateBridge();
       setRoute("bridge");
     } catch (error) {
-      const next = error instanceof Error ? error.message : "Pastey could not create a Bridge.";
+      const next = error instanceof Error ? error.message : "Maris could not create a Bridge.";
       setMessage(next);
       throw error;
     }
@@ -158,7 +158,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
       if (!pending) setRoute("bridge");
       return pending;
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not join this nearby device.");
+      setMessage(error instanceof Error ? error.message : "Maris could not join this nearby device.");
       throw error;
     }
   }
@@ -207,7 +207,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
       }
       await refreshDeveloperWorkspaces();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not complete terminal admission.");
+      setMessage(error instanceof Error ? error.message : "Maris could not complete terminal admission.");
     } finally {
       setAdmissionBusy(null);
     }
@@ -225,7 +225,7 @@ export function WorkspaceV2(props: WorkspaceV2Props) {
       if (accept) await acceptNativeInvocationReview(pendingReview.taskId);
       else await denyNativeInvocationReview(pendingReview.taskId);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Pastey could not complete Agent admission.");
+      setMessage(error instanceof Error ? error.message : "Maris could not complete Agent admission.");
     } finally {
       await refreshInvocationReviews();
       setReviewBusy(null);
