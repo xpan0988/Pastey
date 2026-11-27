@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "pastey",
+  "productName": "Maris",
   "version": "2.0.0",
   "identifier": "dev.localfirst.pastey",
   "build": {
@@ -16,7 +16,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "pastey",
+        "title": "Maris",
         "width": 760,
         "height": 760,
         "resizable": true,
@@ -35,6 +35,11 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "wix": {
+        "upgradeCode": "631b48a7-fbc4-52c4-9c0f-c45790993090"
+      }
+    }
   }
 }

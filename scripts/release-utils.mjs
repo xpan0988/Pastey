@@ -141,7 +141,7 @@ export function releaseNotesContent(version, title, date) {
 }
 
 export function artifactSourceVersion(artifact) {
-  const match = path.basename(artifact).match(/^pastey_([^_]+)_/i);
+  const match = path.basename(artifact).match(/^maris_([^_]+)_/i);
   if (!match) return null;
   try {
     parseSemver(match[1]);
@@ -161,14 +161,14 @@ export function windowsReleasePolicy(version) {
   const prerelease = isPrerelease(version);
   const artifacts = [{
     version,
-    expectedSourceSuffix: `pastey_${version}_x64-setup.exe`,
-    outputName: `pastey_${version}_x64-setup.exe`,
+    expectedSourceSuffix: `Maris_${version}_x64-setup.exe`,
+    outputName: `maris_${version}_x64-setup.exe`,
   }];
   if (!prerelease) {
     artifacts.push({
       version,
-      expectedSourceSuffix: `pastey_${version}_x64_en-US.msi`,
-      outputName: `pastey_${version}_x64_en-US.msi`,
+      expectedSourceSuffix: `Maris_${version}_x64_en-US.msi`,
+      outputName: `maris_${version}_x64_en-US.msi`,
     });
   }
   return { bundles: prerelease ? ["nsis"] : ["nsis", "msi"], artifacts };
@@ -179,15 +179,15 @@ export function targetArtifactsForRunner(os, version) {
   if (os === "macOS") {
     return [{
       version,
-      expectedSourceSuffix: `pastey_${version}_aarch64.dmg`,
-      outputName: `pastey_${version}_aarch64.dmg`,
+      expectedSourceSuffix: `Maris_${version}_aarch64.dmg`,
+      outputName: `maris_${version}_aarch64.dmg`,
     }];
   }
   if (os === "Windows") return windowsReleasePolicy(version).artifacts;
   if (os === "Linux") {
     return [
-      { version, expectedSourceExtension: ".AppImage", outputName: `pastey_${version}_x86_64.AppImage` },
-      { version, expectedSourceExtension: ".deb", outputName: `pastey_${version}_amd64.deb` },
+      { version, expectedSourceExtension: ".AppImage", outputName: `maris_${version}_x86_64.AppImage` },
+      { version, expectedSourceExtension: ".deb", outputName: `maris_${version}_amd64.deb` },
     ];
   }
   throw new Error(`Unsupported RUNNER_OS ${JSON.stringify(os)}.`);

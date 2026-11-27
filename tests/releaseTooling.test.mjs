@@ -144,14 +144,14 @@ test("Windows bundle and artifact requirements follow the SemVer release type", 
   for (const version of ["2.0.0-beta.1", "2.0.0-beta.2", "2.0.0-rc.1"]) {
     const policy = windowsReleasePolicy(version);
     assert.deepEqual(policy.bundles, ["nsis"]);
-    assert.deepEqual(policy.artifacts.map((artifact) => artifact.outputName), [`pastey_${version}_x64-setup.exe`]);
+    assert.deepEqual(policy.artifacts.map((artifact) => artifact.outputName), [`maris_${version}_x64-setup.exe`]);
     assert.deepEqual(targetArtifactsForRunner("Windows", version), policy.artifacts);
   }
   const stable = windowsReleasePolicy("2.0.0");
   assert.deepEqual(stable.bundles, ["nsis", "msi"]);
   assert.deepEqual(stable.artifacts.map((artifact) => artifact.outputName), [
-    "pastey_2.0.0_x64-setup.exe",
-    "pastey_2.0.0_x64_en-US.msi",
+    "maris_2.0.0_x64-setup.exe",
+    "maris_2.0.0_x64_en-US.msi",
   ]);
   assert.deepEqual(targetArtifactsForRunner("Windows", "2.0.0"), stable.artifacts);
   assert.throws(() => windowsReleasePolicy("2.0.0-beta.01"), /Invalid semantic version/);
@@ -159,11 +159,11 @@ test("Windows bundle and artifact requirements follow the SemVer release type", 
 
 test("Windows prerelease targets require the exact complete source version", () => {
   const [target] = targetArtifactsForRunner("Windows", "2.0.0-beta.2");
-  assert.equal(sourceMatchesTarget("/bundle/pastey_2.0.0-beta.2_x64-setup.exe", target), true);
+  assert.equal(sourceMatchesTarget("/bundle/Maris_2.0.0-beta.2_x64-setup.exe", target), true);
   for (const source of [
-    "/bundle/pastey_2.0.0_x64-setup.exe",
-    "/bundle/pastey_2.0.0-beta.1_x64-setup.exe",
-    "/bundle/pastey_2.0.0-beta.20_x64-setup.exe",
+    "/bundle/Maris_2.0.0_x64-setup.exe",
+    "/bundle/Maris_2.0.0-beta.1_x64-setup.exe",
+    "/bundle/Maris_2.0.0-beta.20_x64-setup.exe",
   ]) {
     assert.equal(sourceMatchesTarget(source, target), false, source);
   }
@@ -172,17 +172,17 @@ test("Windows prerelease targets require the exact complete source version", () 
 test("artifact matching requires the complete source version", () => {
   const version = "2.0.0-beta.1";
   const artifacts = [
-    ["pastey_2.0.0-beta.1_aarch64.dmg", { version, expectedSourceSuffix: `pastey_${version}_aarch64.dmg` }],
-    ["pastey_2.0.0-beta.1_x64-setup.exe", { version, expectedSourceSuffix: `pastey_${version}_x64-setup.exe` }],
-    ["pastey_2.0.0-beta.1_x64_en-US.msi", { version, expectedSourceSuffix: `pastey_${version}_x64_en-US.msi` }],
-    ["pastey_2.0.0-beta.1_x86_64.AppImage", { version, expectedSourceExtension: ".AppImage" }],
-    ["pastey_2.0.0-beta.1_amd64.deb", { version, expectedSourceExtension: ".deb" }],
+    ["Maris_2.0.0-beta.1_aarch64.dmg", { version, expectedSourceSuffix: `Maris_${version}_aarch64.dmg` }],
+    ["Maris_2.0.0-beta.1_x64-setup.exe", { version, expectedSourceSuffix: `Maris_${version}_x64-setup.exe` }],
+    ["Maris_2.0.0-beta.1_x64_en-US.msi", { version, expectedSourceSuffix: `Maris_${version}_x64_en-US.msi` }],
+    ["Maris_2.0.0-beta.1_x86_64.AppImage", { version, expectedSourceExtension: ".AppImage" }],
+    ["Maris_2.0.0-beta.1_amd64.deb", { version, expectedSourceExtension: ".deb" }],
   ];
   for (const [name, target] of artifacts) {
     assert.equal(artifactSourceVersion(name), version);
     assert.equal(sourceMatchesTarget(`/bundle/${name}`, target), true, name);
     assert.equal(sourceMatchesTarget(`/bundle/${name.replace(version, "2.0.0")}`, target), false, name);
   }
-  assert.equal(sourceMatchesTarget("/bundle/pastey_2.0.0_x86_64.AppImage", { version: "2.0.0", expectedSourceExtension: ".AppImage" }), true);
-  assert.equal(artifactSourceVersion("pastey_2.0.0-beta.01_amd64.deb"), null);
+  assert.equal(sourceMatchesTarget("/bundle/Maris_2.0.0_x86_64.AppImage", { version: "2.0.0", expectedSourceExtension: ".AppImage" }), true);
+  assert.equal(artifactSourceVersion("Maris_2.0.0-beta.01_amd64.deb"), null);
 });
